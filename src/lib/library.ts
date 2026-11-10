@@ -3,7 +3,7 @@ import { cached } from "./cache";
 import { searchAll } from "./search";
 import type { Media } from "./types";
 import { useEffect, useState } from "react";
-import { parseEpisode, scanLibrary, type LibFile } from "../sources/local";
+import { parseEpisode, scanErrors, scanLibrary, stripExt, type LibFile } from "../sources/local";
 import { useSettings } from "./settings";
 
 /** One title on disk: a movie file, or every episode file of a show grouped together. */
@@ -22,14 +22,16 @@ export interface DriveTitle {
   media?: Media;
 }
 
-const TAG_RX = /\b(2160p|1080p|720p|576p|480p|4k|uhd|hdr10\+?|hdr|dv|dolby[ ._-]?vision|x26[45]|h\.?26[45]|hevc|avc|web[ ._-]?(dl|rip)?|blu[ ._-]?ray|bdrip|brrip|remux|dts(-?hd)?|truehd|atmos|aac|ac3|eac3|ddp?5\.1|5\.1|7\.1|dual[ ._-]?audio|multi|dub(bed)?|proper|repack|extended|10bit|s\d{1,2}e\d{1,4}|s\d{1,2}|e\d{1,4})\b.*$/i;
+const TAG_RX = /\b(2160p|1080p|720p|576p|480p|4k|uhd|hdr10\+?|hdr|dv|dolby[ ._-]?vision|x26[45]|h\.?26[45]|hevc|avc|web[ ._-]?(dl|rip)?|blu[ ._-]?ray|bdrip|brrip|remux|dts(-?hd)?|truehd|atmos|aac|ac3|eac3|ddp?5\.1|5\.1|7\.1|dual[ ._-]?audio|multi|dub(bed)?|proper|repack|extended|10bit|s\d{1,2}e\d{1,4}|s\d{1,2}|e\d{1,4}|\d{1,2}x\d{2,3})\b.*$/i;
 
 /** "Neon.Ronin.S01E04.1080p.WEB.x265-GRP.mkv" → { title: "Neon Ronin" }, "Dust Prophet (2024).mkv" → { title, year } */
 export function parseName(file: string) {
-  let base = file.replace(/\.[a-z0-9]{2,4}$/i, "").replace(/\[[^\]]*\]/g, " ");
+  let base = stripExt(file).replace(/\[[^\]]*\]/g, " ").replace(/_/g, " ");
   let year: number | undefined;
-  const y = base.match(/[ ._(\[-]((?:19|20)\d{2})(?:[ ._)\]-]|$)/);
-  if (y) {
+  // The release year is the LAST plausible year: "Blade Runner 2049 (2017)" is from 2017.
+  const ys = [...base.matchAll(/[ ._(\[-]((?:19|20)\d{2})(?=[ ._)\]-]|$)/g)].filter((m) => Number(m[1]) <= new Date().getFullYear() + 1);
+  const y = ys.at(-1);
+  if (y && y.index != null && y.index > 0) {
     year = Number(y[1]);
     base = base.slice(0, y.index);
   }
@@ -51,7 +53,7 @@ export function groupDrive(files: LibFile[]): DriveTitle[] {
   const map = new Map<string, DriveTitle>();
   for (const f of files) {
     const parts = f.path.split(/[\\/]/);
-    const ep = parseEpisode(f.name);
+    const ep = parseEpisode(f.name, f.path);
     const isShow = ep.episode != null;
     let { title, year } = parseName(f.name);
     if (isShow && title.length < 2) {
@@ -85,7 +87,14 @@ export async function matchDrive(t: DriveTitle): Promise<Media | undefined> {
     const fit = (m: Media) =>
       (normTitle(m.title) === n || normTitle(m.originalTitle ?? "") === n) && (!t.year || !m.year || Math.abs(m.year - t.year) <= 1);
     const kindOk = (m: Media) => (t.isShow ? m.kind !== "movie" : m.kind === "movie");
-    return res.find((m) => fit(m) && kindOk(m)) ?? res.find(fit) ?? res.find(kindOk) ?? null;
+    // No results usually means offline: throw so the miss isn't cached for a week.
+    if (!res.length) throw new Error("no results");
+    // Only accept a near title (no "first result of any kind" guess, which matched Sample.mkv to random shows).
+    const near = (m: Media) => {
+      const mt = normTitle(m.title);
+      return (mt.startsWith(n) || n.startsWith(mt)) && Math.min(mt.length, n.length) >= 3 && (!t.year || !m.year || Math.abs(m.year - t.year) <= 1);
+    };
+    return res.find((m) => fit(m) && kindOk(m)) ?? res.find(fit) ?? res.find((m) => near(m) && kindOk(m)) ?? null;
   }).then((m) => m ?? undefined);
 }
 
@@ -96,7 +105,7 @@ export const qualityBadge = (q?: number) => (q && q >= 2160 ? "4K" : q && q >= 7
 /** Everything on the user's drive, grouped and matched to the catalog. */
 export function useDrive(force = 0) {
   const s = useSettings();
-  const [state, setState] = useState<{ loading: boolean; titles: DriveTitle[]; files: number; at?: number; error?: string }>({ loading: true, titles: [], files: 0 });
+  const [state, setState] = useState<{ loading: boolean; titles: DriveTitle[]; files: number; at?: number; error?: string; warning?: string }>({ loading: true, titles: [], files: 0 });
   const paths = s.libraryPaths.join("|");
   useEffect(() => {
     let live = true;
@@ -109,7 +118,9 @@ export function useDrive(force = 0) {
       .then((files) => {
         if (!live) return;
         const titles = groupDrive(files);
-        setState({ loading: false, titles, files: files.length, at: Date.now() });
+        const errs = scanErrors();
+        const warning = errs.length ? `Couldn't read ${errs.map((e) => e.path).join(", ")} (${errs[0].message})` : undefined;
+        setState({ loading: false, titles, files: files.length, at: Date.now(), warning });
         titles.forEach((t) =>
           matchDrive(t)
             .then((media) => live && media && setState((x) => ({ ...x, titles: x.titles.map((y) => (y.id === t.id ? { ...y, media } : y)) })))

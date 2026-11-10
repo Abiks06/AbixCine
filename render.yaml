@@ -11,6 +11,11 @@ services:
     envVars:
       - key: NODE_VERSION
         value: "22"
+      - key: NODE_ENV
+        value: production
+      # Render's edge adds one proxy hop; only that X-Forwarded-For entry is trusted.
+      - key: TRUST_PROXY_HOPS
+        value: "1"
       - key: JWT_SECRET
         generateValue: true
       - key: DATABASE_URL

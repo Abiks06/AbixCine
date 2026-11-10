@@ -5,7 +5,7 @@ import { useLocation } from "react-router-dom";
 import { AudioToggle } from "../components/AudioToggle";
 import { Avatar } from "../components/Avatar";
 import { Icon } from "../components/Icon";
-import { errorMessage, getApiBase, signOut, updateProfile, useAuth } from "../lib/account";
+import { errorMessage, getApiBase, leaveGuest, signOut, updateProfile, useAuth } from "../lib/account";
 import { updateSettings, useSettings } from "../lib/settings";
 import { getHealth, reliability, resetHealth } from "../sources/health";
 import { scanLibrary } from "../sources/local";
@@ -64,11 +64,23 @@ export function Settings() {
     <div className="page settings">
       <h1 className="page-title">Settings</h1>
 
+      {!user && (
+        <section className="panel">
+          <h2>Account</h2>
+          <div className="account-row">
+            <div className="account-info">
+              <strong>Using AbixCine without an account</strong>
+              <span className="muted">Progress, My List and settings are saved on this PC only. Sign in to sync them to every device; nothing here is lost.</span>
+            </div>
+            <button className="btn btn-ion sm" onClick={leaveGuest}><Icon name="user" size={15} /> Sign in or create account</button>
+          </div>
+        </section>
+      )}
       {user && (
         <section className="panel">
           <h2>Account</h2>
           <div className="account-row">
-            <button className="avatar-cycle" title="Change color" onClick={() => updateProfile({ avatarHue: (user.avatarHue + 47) % 360 })}>
+            <button className="avatar-cycle" title="Change color" onClick={() => updateProfile({ avatarHue: (user.avatarHue + 47) % 360 }).catch((e) => setProfileMsg(errorMessage(e)))}>
               <Avatar user={user} size={56} />
             </button>
             <div className="account-info">

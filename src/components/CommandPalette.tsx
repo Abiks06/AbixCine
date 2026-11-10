@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { signOut } from "../lib/account";
+import { sized } from "./Art";
+import { getAuth, leaveGuest, signOut } from "../lib/account";
 import { encodeKey } from "../lib/catalog";
 import { searchAll } from "../lib/search";
 import { getSettings, updateSettings } from "../lib/settings";
@@ -59,7 +60,9 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
       { id: "sources", label: "Add a media folder", icon: "folder", run: go("/settings#sources") },
       { id: "dub", label: `Default anime audio: switch to ${getSettings().animeAudio === "sub" ? "Dub" : "Sub"}`, icon: "cc", run: () => updateSettings({ animeAudio: getSettings().animeAudio === "sub" ? "dub" : "sub" }) },
       { id: "motion", label: `${getSettings().reduceMotion ? "Enable" : "Reduce"} motion`, icon: "spark", run: () => updateSettings({ reduceMotion: !getSettings().reduceMotion }) },
-      { id: "signout", label: "Sign out", icon: "logout", run: () => signOut() },
+      getAuth().user
+        ? { id: "signout", label: "Sign out", icon: "logout", run: () => signOut() }
+        : { id: "signin", label: "Sign in to sync", icon: "user", run: () => leaveGuest() },
     ],
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [open],
@@ -108,7 +111,7 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
               {i === results.length && <div className="pal-sep">Actions</div>}
               <button className={`pal-item ${i === sel ? "on" : ""}`} onMouseEnter={() => setSel(i)} onClick={() => run(it)}>
                 {it.media ? (
-                  <span className="pal-thumb" style={it.media.poster ? { backgroundImage: `url(${it.media.poster})` } : { ["--h" as any]: it.media.hue ?? 260 }} />
+                  <span className="pal-thumb" style={it.media.poster ? { backgroundImage: `url(${sized(it.media.poster, "w92")})` } : { ["--h" as any]: it.media.hue ?? 260 }} />
                 ) : (
                   <span className="pal-icon"><Icon name={it.icon!} size={16} /></span>
                 )}

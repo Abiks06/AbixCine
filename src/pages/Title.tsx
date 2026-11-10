@@ -7,9 +7,10 @@ import { Card, kindLabel } from "../components/Card";
 import { Icon } from "../components/Icon";
 import { SmartSource } from "../components/SmartSource";
 import { TitleArt } from "../components/TitleArt";
-import { decodeKey, encodeKey, getDetail } from "../lib/catalog";
+import { decodeKey, getDetail } from "../lib/catalog";
 import { fmtAgo, fmtDate, fmtMoney, fmtRuntime, languageName } from "../lib/format";
-import { getProgress, useContinueWatching } from "../lib/progress";
+import { getProgress, useProgressEntry } from "../lib/progress";
+import { watchHref } from "../lib/play";
 import { audioFor, setAudioFor, useSettings } from "../lib/settings";
 import { tmdbSeason } from "../lib/tmdb";
 import type { Episode } from "../lib/types";
@@ -25,7 +26,7 @@ export function Title() {
   const isTmdbSeries = key.includes(":tv:") || (key.startsWith("tmdb:") && !!d?.seasons);
   const [season, setSeason] = useState(1);
   const eps = useAsync(() => (isTmdbSeries ? tmdbSeason(key, season) : Promise.resolve([] as Episode[])), [key, season, isTmdbSeries]);
-  const progress = useContinueWatching().find((p) => p.media.key === key);
+  const progress = useProgressEntry(key);
   useSettings(); // re-render when the audio preference changes
   const saved = useWatchlist().some((e) => e.media.key === key);
   const [tab, setTab] = useState<Tab>("episodes");
@@ -50,11 +51,11 @@ export function Title() {
   if (!d || !req) return <div className="tp"><div className="tp-skeleton" /></div>;
 
   const watch = (s?: number, e?: number) => {
-    const qs = new URLSearchParams({ ...(s != null ? { s: String(s) } : {}), ...(e != null ? { e: String(e) } : {}), ...(audio ? { a: audio } : {}) });
-    nav(`/watch/${encodeKey(key)}${qs.size ? `?${qs}` : ""}`, { viewTransition: true });
+    nav(watchHref(key, s, e, audio), { viewTransition: true, state: { from: "app" } });
   };
+  const epTag = progress?.episode != null ? `${progress.season != null ? `S${progress.season} · ` : ""}E${progress.episode}` : "";
   const playLabel = progress
-    ? progress.episode != null ? `Resume ${progress.season != null ? `S${progress.season} · ` : ""}E${progress.episode}` : "Resume"
+    ? progress.upNext ? `Play ${epTag}` : epTag ? `Resume ${epTag}` : "Resume"
     : hasEps ? "Play E1" : "Play";
   const length = d.kind === "movie" ? fmtRuntime(d.runtime) : d.seasons?.length ? `${d.seasons.length} season${d.seasons.length > 1 ? "s" : ""}` : animeEps ? `${animeEps} episodes` : "";
   const what = startE != null ? `${startS != null ? `S${startS} ` : ""}E${startE}` : "this film";
@@ -77,7 +78,7 @@ export function Title() {
     <div className="tp">
       <Ambient media={d} />
       <div className="backdrop" style={{ viewTransitionName: "hero" }}>
-        <Art media={d} variant="backdrop" />
+        <Art media={d} variant="backdrop" size="lg" priority />
         <div className="shade" />
       </div>
       <div className="pad tp-body">
@@ -113,7 +114,7 @@ export function Title() {
                 <a className="btn glass" href={`https://www.youtube.com/watch?v=${d.trailerYouTubeId}`} target="_blank" rel="noreferrer">Trailer</a>
               )}
             </div>
-            {progress && progress.duration > 0 && (
+            {progress && !progress.upNext && progress.duration > 0 && (
               <div className="resume">
                 <div className="resume-bar"><i style={{ width: `${(progress.position / progress.duration) * 100}%` }} /></div>
                 <span>{Math.max(1, Math.round((progress.duration - progress.position) / 60))}m left{progress.episode != null ? ` in E${progress.episode}` : ""}</span>
@@ -147,7 +148,7 @@ export function Title() {
               return (
                 <button key={e.number} className={`ep ${isCur ? "cur" : ""}`} style={{ ["--i" as any]: Math.min(i, 14) }} onClick={() => watch(s, e.number)}>
                   <div className="th">
-                    {still ? <img src={still} alt="" loading="lazy" /> : <Art media={d} variant="backdrop" />}
+                    {still ? <img src={still} alt="" loading="lazy" /> : <Art media={d} variant="backdrop" size="sm" />}
                     {p && p.duration > 0 && <div className="w" style={{ width: `${watched ? 100 : (p.position / p.duration) * 100}%` }} />}
                     <span className="hoverplay"><Icon name="play" size={12} /></span>
                   </div>

@@ -7,6 +7,60 @@ const inflight = new Map<string, Promise<unknown>>();
 const PREFIX = "abx.cache.";
 /** How long to wait for fresh data before showing the stale copy (the refresh still lands in the cache). */
 const STALE_WAIT_MS = 4000;
+/** The catalog cache must never crowd out progress, My List or settings in localStorage. */
+const MAX_DISK = 300;
+const MAX_MEM = 500;
+const MAX_AGE_MS = 14 * 24 * 3600_000;
+
+function cacheKeys() {
+  const out: { k: string; at: number }[] = [];
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k?.startsWith(PREFIX)) continue;
+      let at = 0;
+      try {
+        at = JSON.parse(localStorage.getItem(k) ?? "{}").at ?? 0;
+      } catch {
+        /* corrupt: oldest */
+      }
+      out.push({ k, at });
+    }
+  } catch {
+    /* storage blocked */
+  }
+  return out.sort((a, b) => a.at - b.at);
+}
+
+/** Drop the oldest catalog entries until at most `keep` remain. */
+function evict(keep: number) {
+  const keys = cacheKeys();
+  for (const { k } of keys.slice(0, Math.max(0, keys.length - keep))) localStorage.removeItem(k);
+}
+
+function persist(key: string, entry: unknown) {
+  const v = JSON.stringify(entry);
+  try {
+    localStorage.setItem(PREFIX + key, v);
+  } catch {
+    // Quota: make room by halving the catalog cache, then try once more.
+    try {
+      evict(Math.floor(MAX_DISK / 2));
+      localStorage.setItem(PREFIX + key, v);
+    } catch {
+      /* memory cache still works */
+    }
+  }
+}
+
+// Boot: forget entries nobody has needed for two weeks, and keep the count bounded.
+try {
+  const now = Date.now();
+  for (const { k, at } of cacheKeys()) if (now - at > MAX_AGE_MS) localStorage.removeItem(k);
+  evict(MAX_DISK);
+} catch {
+  /* ignore */
+}
 
 export async function cached<T>(key: string, ttlMs: number, fetcher: () => Promise<T>): Promise<T> {
   const now = Date.now();
@@ -30,12 +84,10 @@ export async function cached<T>(key: string, ttlMs: number, fetcher: () => Promi
     const p = fetcher()
       .then((value) => {
         const entry = { at: Date.now(), value };
+        mem.delete(key);
         mem.set(key, entry);
-        try {
-          localStorage.setItem(PREFIX + key, JSON.stringify(entry));
-        } catch {
-          /* quota: memory cache still works */
-        }
+        if (mem.size > MAX_MEM) mem.delete(mem.keys().next().value!);
+        persist(key, entry);
         return value;
       })
       .finally(() => inflight.delete(key));

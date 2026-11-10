@@ -1,5 +1,4 @@
-import { Fragment, useState } from "react";
-import { Ambient } from "../components/Ambient";
+import { Fragment } from "react";
 import { Hero } from "../components/Hero";
 import { Row } from "../components/Row";
 import { useAuth } from "../lib/account";
@@ -7,7 +6,6 @@ import { useFreshness } from "../lib/fresh";
 import { ANIME_FEEDS, loadAnimeFeed } from "../lib/anilist";
 import { useSettings } from "../lib/settings";
 import { FEEDS, loadFeed, TOP10 } from "../lib/tmdb";
-import type { Media } from "../lib/types";
 import { useAsync } from "../lib/useAsync";
 
 const EYEBROWS = ["Fresh", "Everyone's watching", "All-time", "By genre", "By genre"];
@@ -20,13 +18,12 @@ export function Browse({ kind }: { kind: "movie" | "tv" }) {
   const data = useAsync(
     () => Promise.all([...feeds, TOP10[kind]].map((f, i) => loadFeed(f, i + (kind === "tv" ? 20 : 10)))),
     [kind, s.tmdbKey, auth.tmdbProxy, fresh],
+    { keepPrevious: true },
   );
-  const [active, setActive] = useState<Media>();
   const d = data.data;
   return (
     <div className="page page-flush">
-      <Ambient media={active} />
-      <Hero items={d?.[1] ?? []} label={kind === "movie" ? "Popular movie" : "Popular series"} onActive={setActive} />
+      <Hero items={d?.[1] ?? []} label={kind === "movie" ? "Popular movie" : "Popular series"} />
       <div className="rows pad">
         {feeds.map((f, i) => (
           <Fragment key={f.id}>
@@ -41,12 +38,10 @@ export function Browse({ kind }: { kind: "movie" | "tv" }) {
 
 export function Anime() {
   const fresh = useFreshness();
-  const data = useAsync(() => Promise.all(ANIME_FEEDS.map(loadAnimeFeed)), [fresh]);
-  const [active, setActive] = useState<Media>();
+  const data = useAsync(() => Promise.all(ANIME_FEEDS.map(loadAnimeFeed)), [fresh], { keepPrevious: true });
   return (
     <div className="page page-flush">
-      <Ambient media={active} />
-      <Hero items={data.data?.[1] ?? []} label="This season" onActive={setActive} />
+      <Hero items={data.data?.[1] ?? []} label="This season" />
       <div className="rows pad">
         {ANIME_FEEDS.map((f, i) =>
           i === 3 ? (

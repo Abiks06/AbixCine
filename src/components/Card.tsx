@@ -1,4 +1,4 @@
-import type { MouseEvent, ReactNode } from "react";
+import { memo, type MouseEvent, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { encodeKey } from "../lib/catalog";
 import { previewLight } from "../lib/light";
@@ -41,7 +41,8 @@ interface Props {
   to?: string;
 }
 
-export function Card({ media, index = 0, variant = "landscape", rank, move, extra, sub, right, label, progress, to }: Props) {
+/** Memoised: shelves re-render on scroll and on stage-light changes, cards rarely need to. */
+export const Card = memo(function Card({ media, index = 0, variant = "landscape", rank, move, extra, sub, right, label, progress, to }: Props) {
   const saved = useWatchlist().some((e) => e.media.key === media.key);
   const port = variant !== "landscape";
   const card = (
@@ -53,12 +54,13 @@ export function Card({ media, index = 0, variant = "landscape", rank, move, extr
       onClick={tagForMorph}
       onMouseEnter={() => previewLight(media)}
       onMouseLeave={() => previewLight(null)}
+      onFocus={() => previewLight(media)}
+      onBlur={() => previewLight(null)}
       style={{ ["--i" as any]: Math.min(index, 12) }}
     >
       <div className="art-wrap">
-        <Art media={media} variant={port ? "poster" : "backdrop"} />
+        <Art media={media} variant={port ? "poster" : "backdrop"} size="md" />
         {!port && <div className="shade" />}
-        {!port && <div className={`lt ${extra ? "lift" : ""}`}>{media.title}</div>}
         {extra}
         <span className="hoverplay"><Icon name="play" size={13} /></span>
         <button
@@ -96,7 +98,7 @@ export function Card({ media, index = 0, variant = "landscape", rank, move, extr
       {card}
     </div>
   );
-}
+});
 
 export function CardSkeleton({ variant = "landscape" }: { variant?: CardVariant }) {
   return (

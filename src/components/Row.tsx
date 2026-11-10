@@ -34,14 +34,23 @@ export function Row({
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const [edges, setEdges] = useState({ left: false, right: true });
-  const list = ranked ? items?.slice(0, 10) : items;
+  const list = useMemo(() => (ranked ? items?.slice(0, 10) : items), [ranked, items]);
   const moves = useMemo(() => (ranked && chart && list?.length ? rankMoves(chart, list) : null), [ranked, chart, list]);
 
+  // Scroll fires dozens of times a second: measure once per frame, and only re-render when an edge flips.
+  const frame = useRef(0);
   const update = () => {
-    const el = ref.current;
-    if (!el) return;
-    setEdges({ left: el.scrollLeft > 4, right: el.scrollLeft + el.clientWidth < el.scrollWidth - 4 });
+    if (frame.current) return;
+    frame.current = requestAnimationFrame(() => {
+      frame.current = 0;
+      const el = ref.current;
+      if (!el) return;
+      const left = el.scrollLeft > 4;
+      const right = el.scrollLeft + el.clientWidth < el.scrollWidth - 4;
+      setEdges((e) => (e.left === left && e.right === right ? e : { left, right }));
+    });
   };
+  useEffect(() => () => cancelAnimationFrame(frame.current), []);
   useEffect(() => {
     update();
   }, [items]);

@@ -12,8 +12,10 @@ export interface ProviderHealth {
   /** Successful lookups / plays and failures, decayed so old history fades. */
   ok: number;
   fail: number;
-  /** EWMA of probe latency in ms. */
+  /** EWMA of probe latency in ms (how fast a stream answers). */
   latency?: number;
+  /** EWMA of how long find() takes (a search, not a probe; can be much slower). */
+  lookupMs?: number;
   lastOk?: number;
   lastFail?: number;
 }
@@ -26,6 +28,10 @@ interface TitlePick {
 
 const HKEY = "abx.health.v1";
 const PKEY = "abx.picks.v1";
+const BKEY = "abx.badurls.v1";
+/** A specific file/stream that failed to play is penalised for a day, without blaming its whole provider. */
+const BAD_URL_MS = 24 * 3600_000;
+const MAX_BAD = 200;
 const DECAY = 0.92; // each new event shrinks old counts a little
 const ALPHA = 0.3; // EWMA weight for a new latency sample
 const MAX_PICKS = 400;
@@ -47,6 +53,7 @@ function write(k: string, v: unknown) {
 
 let health: Record<string, ProviderHealth> = read(HKEY, {});
 let picks: Record<string, TitlePick> = read(PKEY, {});
+let badUrls: Record<string, number> = read(BKEY, {});
 
 export const getHealth = (providerId: string): ProviderHealth => health[providerId] ?? { ok: 0, fail: 0 };
 
@@ -66,6 +73,20 @@ export const recordProbe = (c: StreamCandidate) => c.providerId !== "manual" && 
 /** A provider lookup threw or timed out. */
 export const recordLookupFailure = (providerId: string) => bump(providerId, false);
 
+/** How long a successful lookup took, so its timeout is based on searches, not on stream probes. */
+export function recordLookup(providerId: string, ms: number) {
+  const h = { ...getHealth(providerId) };
+  h.lookupMs = h.lookupMs == null ? ms : h.lookupMs * (1 - ALPHA) + ms * ALPHA;
+  health = { ...health, [providerId]: h };
+  write(HKEY, health);
+}
+
+/** This exact URL failed to play recently (a file the player can't decode, a dead link). */
+export function badUrl(url: string) {
+  const at = badUrls[url];
+  return !!at && Date.now() - at < BAD_URL_MS;
+}
+
 /** Playback outcome: the strongest signal, so it counts double. */
 export function recordPlayback(req: PlaybackRequest, c: StreamCandidate, ok: boolean) {
   if (c.providerId === "manual") return;
@@ -83,6 +104,19 @@ export function recordPlayback(req: PlaybackRequest, c: StreamCandidate, ok: boo
   } else {
     picks = { ...picks };
     for (const key of [k, exactKey(req)]) if (picks[key]?.url === c.url) delete picks[key];
+    const now = Date.now();
+    badUrls = Object.fromEntries(
+      Object.entries({ ...badUrls, [c.url]: now })
+        .filter(([, at]) => now - at < BAD_URL_MS)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, MAX_BAD),
+    );
+    write(BKEY, badUrls);
+  }
+  if (ok && badUrls[c.url]) {
+    const { [c.url]: _, ...rest } = badUrls;
+    badUrls = rest;
+    write(BKEY, badUrls);
   }
   write(PKEY, picks);
 }
@@ -107,18 +141,23 @@ export function recentlyFailed(providerId: string) {
   return !!h.lastFail && Date.now() - h.lastFail < 10 * 60_000 && (!h.lastOk || h.lastOk < h.lastFail);
 }
 
-/** How long to wait for a provider: generous for new ones, tighter for ones we know are quick. */
+/**
+ * How long to wait for a provider's search: generous for new ones and right after a failure
+ * (so a slow-but-healthy provider can recover), tighter for ones we know are quick.
+ */
 export function lookupTimeout(providerId: string, base: number) {
-  const l = getHealth(providerId).latency;
-  if (l == null) return base;
-  return Math.round(Math.max(2500, Math.min(base, l * 6 + 1500)));
+  const h = getHealth(providerId);
+  if (h.lookupMs == null || recentlyFailed(providerId)) return base;
+  return Math.round(Math.max(2500, Math.min(base, h.lookupMs * 3 + 1500)));
 }
 
 export function resetHealth() {
   health = {};
   picks = {};
+  badUrls = {};
   write(HKEY, health);
   write(PKEY, picks);
+  write(BKEY, badUrls);
 }
 
 export const healthSnapshot = () => ({ ...health });

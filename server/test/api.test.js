@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 
 process.env.JWT_SECRET ??= "test-secret-test-secret-test-secret-123";
+process.env.NODE_ENV ??= "test";
 const { buildApp } = await import("../src/app.js");
 const { migrate, pool, q } = await import("../src/db.js");
 
@@ -58,14 +59,55 @@ test("progress sync keeps the newest write", async () => {
   assert.deepEqual(s.settings, { preferredQuality: 720, animeAudio: "dub" }); // libraryPaths stays local
 });
 
-test("refresh rotation and reuse detection", async () => {
+test("refresh rotation, retry grace and reuse detection", async () => {
   let r = await call("POST", "/auth/refresh", { refreshToken: tokens.refreshToken });
   assert.equal(r.statusCode, 200);
   const next = r.json();
-  r = await call("POST", "/auth/refresh", { refreshToken: tokens.refreshToken }); // reuse of old token
+  // A retry of the old token right away (lost response) is refused but doesn't sign the user out.
+  r = await call("POST", "/auth/refresh", { refreshToken: tokens.refreshToken });
   assert.equal(r.statusCode, 401);
-  r = await call("POST", "/auth/refresh", { refreshToken: next.refreshToken }); // family revoked
+  r = await call("POST", "/auth/refresh", { refreshToken: next.refreshToken });
+  assert.equal(r.statusCode, 200);
+  const third = r.json();
+  // Reuse long after rotation is a theft signal: the whole family dies.
+  await q(`UPDATE refresh_tokens SET replaced_at = now() - interval '5 minutes' WHERE replaced_at IS NOT NULL`);
+  r = await call("POST", "/auth/refresh", { refreshToken: next.refreshToken });
   assert.equal(r.statusCode, 401);
+  r = await call("POST", "/auth/refresh", { refreshToken: third.refreshToken });
+  assert.equal(r.statusCode, 401);
+  tokens = (await call("POST", "/auth/login", { email, password: "correct horse" })).json();
+});
+
+test("sync timestamps are validated and clamped", async () => {
+  const t = tokens.accessToken;
+  const media = { key: "anilist:22", kind: "anime", title: "Y", genres: [], overview: "" };
+  let r = await call("PUT", "/progress/anilist:22", { media, position: 1, duration: 10, updatedAt: "soon" }, t);
+  assert.equal(r.statusCode, 400);
+  r = await call("PUT", "/progress/anilist:22", { media, position: 1, duration: 10, updatedAt: 1e20 }, t);
+  assert.equal(r.statusCode, 200); // used to be a 500 "Invalid time value"; now clamped
+  // A device clock in the year 3000 must not lock the row forever.
+  await call("PUT", "/progress/anilist:22", { media, episode: 1, position: 1, duration: 10, updatedAt: 32503680000000 }, t);
+  await new Promise((res) => setTimeout(res, 5));
+  r = await call("PUT", "/progress/anilist:22", { media, episode: 2, position: 1, duration: 10, updatedAt: Date.now() + 6 * 60_000 }, t);
+  const s = (await call("GET", "/sync", null, t)).json();
+  assert.equal(s.progress.find((p) => p.media.key === "anilist:22").episode, 2);
+  r = await call("PUT", "/watchlist/tmdb:movie:1", { media: { blob: "x".repeat(9000) } }, t);
+  assert.equal(r.statusCode, 400);
+});
+
+test("sign out everywhere kills access tokens", async () => {
+  const t = tokens.accessToken;
+  assert.equal((await call("POST", "/auth/logout-all", null, t)).statusCode, 200);
+  assert.equal((await call("GET", "/me", null, t)).statusCode, 401);
+  assert.equal((await call("POST", "/auth/refresh", { refreshToken: tokens.refreshToken })).statusCode, 401);
+  tokens = (await call("POST", "/auth/login", { email, password: "correct horse" })).json();
+  assert.equal((await call("GET", "/me", null, tokens.accessToken)).statusCode, 200);
+});
+
+test("health checks the database", async () => {
+  const r = await call("GET", "/health");
+  assert.equal(r.statusCode, 200);
+  assert.equal(r.json().ok, true);
 });
 
 test("tmdb proxy is off without a key", async () => {

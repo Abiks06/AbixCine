@@ -1,6 +1,5 @@
-import { useState } from "react";
+import { useMemo } from "react";
 import { Link } from "react-router-dom";
-import { Ambient } from "../components/Ambient";
 import { Card } from "../components/Card";
 import { DriveSection } from "../components/Drive";
 import { FitsTonight } from "../components/FitsTonight";
@@ -10,9 +9,9 @@ import { Row } from "../components/Row";
 import { SectionHead } from "../components/SectionHead";
 import { useAuth } from "../lib/account";
 import { ANIME_FEEDS, loadAnimeFeed } from "../lib/anilist";
-import { encodeKey } from "../lib/catalog";
 import { useFreshness } from "../lib/fresh";
 import { useContinueWatching } from "../lib/progress";
+import { watchHref } from "../lib/play";
 import { useSettings } from "../lib/settings";
 import { FEEDS, hasTmdb, loadFeed, TOP10 } from "../lib/tmdb";
 import type { Media } from "../lib/types";
@@ -22,18 +21,21 @@ export function Home() {
   const s = useSettings();
   const auth = useAuth();
   const fresh = useFreshness();
-  const feeds = useAsync(() => Promise.all([...FEEDS.home, TOP10.movie, TOP10.tv].map(loadFeed)), [s.tmdbKey, auth.tmdbProxy, fresh]);
-  const anime = useAsync(() => loadAnimeFeed(ANIME_FEEDS[1], 1), [fresh]);
+  // One slow or failed feed shouldn't blank the whole page: each row settles on its own.
+  const feeds = useAsync(
+    () => Promise.all([...FEEDS.home, TOP10.movie, TOP10.tv].map((f, i) => loadFeed(f, i).catch(() => [] as Media[]))),
+    [s.tmdbKey, auth.tmdbProxy, fresh],
+    { keepPrevious: true },
+  );
+  const anime = useAsync(() => loadAnimeFeed(ANIME_FEEDS[1], 1), [fresh], { keepPrevious: true });
   const cont = useContinueWatching();
-  const [active, setActive] = useState<Media>();
   const d = feeds.data;
   const loading = feeds.loading && !d;
-  const pool = d ? [...d[4].slice(0, 6), ...d[1].slice(0, 6), ...d[2].slice(0, 4), ...d[3].slice(0, 2)] : [];
+  const pool = useMemo(() => (d ? [...d[4].slice(0, 6), ...d[1].slice(0, 6), ...d[2].slice(0, 4), ...d[3].slice(0, 2)] : []), [d]);
 
   return (
     <div className="page-flush">
-      <Ambient media={active} />
-      <Hero items={d?.[0] ?? []} label="tonight" onActive={setActive} />
+      <Hero items={d?.[0] ?? []} label="tonight" />
       <div className="rows pad">
         {!hasTmdb() && (
           <Link to="/settings" className="notice" viewTransition>
@@ -48,9 +50,9 @@ export function Home() {
             <div className="track">
               {cont.map((p, i) => {
                 const left = Math.max(1, Math.round((p.duration - p.position) / 60));
-                const where = [p.episode != null ? `${p.season != null ? `S${p.season} · ` : ""}E${p.episode}` : null, p.audio ? (p.audio === "dub" ? "Dub" : "Sub") : null, `${left}m left`].filter(Boolean).join(" · ");
-                const qs = new URLSearchParams({ ...(p.season != null ? { s: String(p.season) } : {}), ...(p.episode != null ? { e: String(p.episode) } : {}), ...(p.audio ? { a: p.audio } : {}) });
-                return <Card key={p.media.key} media={p.media} index={i} progress={(p.position / p.duration) * 100} sub={where} right={<span />} to={`/watch/${encodeKey(p.media.key)}?${qs}`} />;
+                const ep = p.episode != null ? `${p.season != null ? `S${p.season} · ` : ""}E${p.episode}` : null;
+                const where = [p.upNext ? `Up next${ep ? ` ${ep}` : ""}` : ep, p.audio ? (p.audio === "dub" ? "Dub" : "Sub") : null, p.upNext ? null : `${left}m left`].filter(Boolean).join(" · ");
+                return <Card key={p.media.key} media={p.media} index={i} progress={p.upNext ? undefined : (p.position / p.duration) * 100} sub={where} right={<span />} to={watchHref(p.media.key, p.season, p.episode, p.audio)} />;
               })}
             </div>
           </section>
