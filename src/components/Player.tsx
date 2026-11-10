@@ -1,4 +1,4 @@
-import Hls from "hls.js";
+import type Hls from "hls.js";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { fmtTime } from "../lib/format";
 import { candLine } from "../sources/registry";
@@ -130,29 +130,41 @@ export function Player({ candidates, onSourceResult, title, subtitle, startAt, o
       if (resumeAt.current > 0 && resumeAt.current < (v.duration || Infinity) - 5) v.currentTime = resumeAt.current;
       v.play().catch(() => {});
     };
-    if (curKind === "hls" && Hls.isSupported()) {
-      const hls = new Hls({ enableWorker: true, lowLatencyMode: false, maxBufferLength: 60, backBufferLength: 30 });
+    let cancelled = false;
+    const attachHls = (H: typeof Hls) => {
+      if (cancelled) return;
+      if (!H.isSupported()) {
+        v.src = curUrl;
+        v.addEventListener("loadedmetadata", seekAndPlay, { once: true });
+        return;
+      }
+      const hls = new H({ enableWorker: true, lowLatencyMode: false, maxBufferLength: 60, backBufferLength: 30 });
       hlsRef.current = hls;
       let recoveries = 0;
-      hls.on(Hls.Events.MANIFEST_PARSED, (_, d) => {
+      hls.on(H.Events.MANIFEST_PARSED, (_, d) => {
         setLevels(d.levels.map((l) => ({ height: l.height })));
         seekAndPlay();
       });
-      hls.on(Hls.Events.ERROR, (_, d) => {
+      hls.on(H.Events.ERROR, (_, d) => {
         if (!d.fatal) return;
         // Media errors get two local repair attempts, then the next source. Never an endless loop.
-        if (d.type === Hls.ErrorTypes.MEDIA_ERROR && recoveries < 2) {
+        if (d.type === H.ErrorTypes.MEDIA_ERROR && recoveries < 2) {
           if (recoveries++ === 1) hls.swapAudioCodec();
           hls.recoverMediaError();
         } else failover(d.details);
       });
       hls.loadSource(curUrl);
       hls.attachMedia(v);
+    };
+    // hls.js (~600 kB) is only parsed when a stream actually needs it; local files never load it.
+    if (curKind === "hls") {
+      import("hls.js").then((m) => attachHls(m.default), () => failover("player failed to load"));
     } else {
       v.src = curUrl;
       v.addEventListener("loadedmetadata", seekAndPlay, { once: true });
     }
     return () => {
+      cancelled = true;
       v.removeEventListener("loadedmetadata", seekAndPlay);
       if (v.currentTime > 1) resumeAt.current = v.currentTime;
       hlsRef.current?.destroy();

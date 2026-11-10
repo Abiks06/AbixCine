@@ -9,17 +9,28 @@ export interface LibFile {
   size: number;
 }
 
-let index: { at: number; key: string; files: LibFile[] } | null = null;
+let index: { at: number; key: string; files: LibFile[]; errors: ScanError[] } | null = null;
+
+export interface ScanError {
+  path: string;
+  message: string;
+}
+
+/** Folders that failed on the last scan (unplugged drive, permissions). */
+export const scanErrors = () => index?.errors ?? [];
 
 /** Scan the library folders (Rust side walks the disk) with a 5 minute cache. */
 export async function scanLibrary(paths: string[], force = false): Promise<LibFile[]> {
   if (!isTauri() || !paths.length) return [];
   const key = paths.join("|");
   if (!force && index && index.key === key && Date.now() - index.at < 300_000) return index.files;
-  const files = await invoke<LibFile[]>("scan_library", { paths });
-  index = { at: Date.now(), key, files };
-  return files;
+  const r = await invoke<{ files: LibFile[]; errors: ScanError[] }>("scan_library", { paths });
+  index = { at: Date.now(), key, files: r.files, errors: r.errors };
+  return r.files;
 }
+
+/** Strip a real video extension only ("Dune.2021" is a stem, not "Dune" + ".2021"). */
+export const stripExt = (name: string) => name.replace(/\.(mkv|mp4|m4v|webm|mov|ts|m3u8|avi)$/i, "");
 
 const QUALITY_RX = /(2160|1080|720|576|480)p|\b4k\b/i;
 export function qualityOf(name: string) {
@@ -42,7 +53,7 @@ export interface EpisodeInfo {
  * Years ("Stargate.1994") and codec tags ("x264") are never read as episode numbers.
  */
 export function parseEpisode(name: string, path = ""): EpisodeInfo {
-  const base = name.replace(/\.[a-z0-9]{2,4}$/i, "").replace(/_/g, " ").replace(/\[[^\]]*\]/g, " ");
+  const base = stripExt(name).replace(/_/g, " ").replace(/\[[^\]]*\]/g, " ");
   let m = base.match(/\bs(\d{1,2})[ ._-]*e(\d{1,4})(?:[ ._-]*-?[ ._-]*e(\d{1,4}))?(?!\d)/i)
     || base.match(/(?<![a-z\d])(\d{1,2})x(\d{2,3})(?:-(\d{2,3}))?\b/i);
   if (m) return { season: Number(m[1]), episode: Number(m[2]), ...(m[3] ? { last: Number(m[3]) } : {}) };

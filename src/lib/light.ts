@@ -1,9 +1,11 @@
+import { sized } from "../components/Art";
 import type { Media } from "./types";
 
 /**
  * Stage light: the whole app is lit by whatever title has focus. Two colors are sampled
- * from its artwork and eased into the --a1 / --a2 custom properties on :root, which the
- * background gradients, glows and play-button halo all read.
+ * from its artwork. --a1 / --a2 on :root (read by glows and halos) switch instantly; the big
+ * stage gradient eases through its own --l1 / --l2 on the .light layer only, so a light change
+ * restyles one element instead of the whole page every frame.
  */
 type Pair = [string, string];
 const cache = new Map<string, Pair>();
@@ -17,7 +19,7 @@ const hashHue = (s: string) => {
 };
 
 function fromHue(h: number): Pair {
-  return [`hsl(${h} 70% 42%)`, `hsl(${(h + 45) % 360} 70% 24%)`];
+  return [`hsl(${h} 50% 30%)`, `hsl(${(h + 45) % 360} 50% 20%)`];
 }
 
 function hexToHsl(hex: string): [number, number, number] {
@@ -36,8 +38,12 @@ function rgbToHsl(r: number, g: number, b: number): [number, number, number] {
   return [h * 60, s, l];
 }
 
-/** Keep sampled colors in a range that reads as light on near-black: saturated, mid-dark. */
-const tone = ([h, s]: [number, number, number], l: number) => `hsl(${Math.round(h)} ${Math.round(Math.max(0.45, Math.min(0.85, s)) * 100)}% ${l}%)`;
+/**
+ * Keep sampled colors in a range that reads as light on near-black without drowning the brand:
+ * moderate saturation, dark. The CSS also blends them toward violet, so every title still feels AbixCine.
+ */
+const tone = ([h, s]: [number, number, number], l: number) =>
+  `hsl(${Math.round(h)} ${Math.round(Math.max(0.3, Math.min(0.55, s)) * 100)}% ${Math.min(l, 30)}%)`;
 
 /** Two dominant hues of an image: bucket pixels by hue, weight by how vivid they are. */
 function sample(src: string): Promise<Pair> {
@@ -74,13 +80,14 @@ function sample(src: string): Promise<Pair> {
       }
     };
     img.onerror = reject;
-    img.src = src;
+    // 32×18 pixels are all we read, so fetch the smallest rendition, not the 4K backdrop.
+    img.src = sized(src, "w92") ?? src;
   });
 }
 
 async function colorsFor(m: Media): Promise<Pair> {
   const src = m.backdrop ?? m.poster;
-  const id = src ?? m.key;
+  const id = m.key;
   const hit = cache.get(id);
   if (hit) return hit;
   let pair: Pair;
@@ -104,6 +111,10 @@ function apply(m: Media | undefined) {
     const r = document.documentElement.style;
     r.setProperty("--a1", a1);
     r.setProperty("--a2", a2);
+    document.querySelectorAll<HTMLElement>(".light").forEach((el) => {
+      el.style.setProperty("--l1", a1);
+      el.style.setProperty("--l2", a2);
+    });
   });
 }
 
@@ -113,7 +124,12 @@ export function setStageLight(m: Media | undefined) {
   apply(m);
 }
 
-/** Hovering a card borrows the light for a moment; leaving hands it back. */
+/**
+ * Hovering a card borrows the light for a moment; leaving hands it back. Debounced, so sweeping
+ * the pointer along a shelf doesn't sample every card it crosses.
+ */
+let hoverTimer: ReturnType<typeof setTimeout> | undefined;
 export function previewLight(m: Media | null) {
-  apply(m ?? base);
+  clearTimeout(hoverTimer);
+  hoverTimer = setTimeout(() => apply(m ?? base), m ? 140 : 60);
 }

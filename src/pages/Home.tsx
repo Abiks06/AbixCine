@@ -1,6 +1,5 @@
-import { useState } from "react";
+import { useMemo } from "react";
 import { Link } from "react-router-dom";
-import { Ambient } from "../components/Ambient";
 import { Card } from "../components/Card";
 import { DriveSection } from "../components/Drive";
 import { FitsTonight } from "../components/FitsTonight";
@@ -22,18 +21,21 @@ export function Home() {
   const s = useSettings();
   const auth = useAuth();
   const fresh = useFreshness();
-  const feeds = useAsync(() => Promise.all([...FEEDS.home, TOP10.movie, TOP10.tv].map(loadFeed)), [s.tmdbKey, auth.tmdbProxy, fresh]);
-  const anime = useAsync(() => loadAnimeFeed(ANIME_FEEDS[1], 1), [fresh]);
+  // One slow or failed feed shouldn't blank the whole page: each row settles on its own.
+  const feeds = useAsync(
+    () => Promise.all([...FEEDS.home, TOP10.movie, TOP10.tv].map((f, i) => loadFeed(f, i).catch(() => [] as Media[]))),
+    [s.tmdbKey, auth.tmdbProxy, fresh],
+    { keepPrevious: true },
+  );
+  const anime = useAsync(() => loadAnimeFeed(ANIME_FEEDS[1], 1), [fresh], { keepPrevious: true });
   const cont = useContinueWatching();
-  const [active, setActive] = useState<Media>();
   const d = feeds.data;
   const loading = feeds.loading && !d;
-  const pool = d ? [...d[4].slice(0, 6), ...d[1].slice(0, 6), ...d[2].slice(0, 4), ...d[3].slice(0, 2)] : [];
+  const pool = useMemo(() => (d ? [...d[4].slice(0, 6), ...d[1].slice(0, 6), ...d[2].slice(0, 4), ...d[3].slice(0, 2)] : []), [d]);
 
   return (
     <div className="page-flush">
-      <Ambient media={active} />
-      <Hero items={d?.[0] ?? []} label="tonight" onActive={setActive} />
+      <Hero items={d?.[0] ?? []} label="tonight" />
       <div className="rows pad">
         {!hasTmdb() && (
           <Link to="/settings" className="notice" viewTransition>

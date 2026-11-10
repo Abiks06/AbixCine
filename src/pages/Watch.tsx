@@ -193,7 +193,7 @@ export function Watch() {
     <div className="race-page">
       <Ambient media={d ?? undefined} />
       <div className="race-bg" aria-hidden>
-        {d && <Art media={d} variant="backdrop" />}
+        {d && <Art media={d} variant="backdrop" size="lg" priority />}
         <div className="race-shade" />
       </div>
       <button className="back race-back" onClick={back}><Icon name="back" size={18} /> Back</button>

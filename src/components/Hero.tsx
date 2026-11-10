@@ -5,6 +5,8 @@ import { fmtRuntime } from "../lib/format";
 import { useFeatured, type Featured } from "../lib/useLogos";
 import { toggleList, useWatchlist } from "../lib/watchlist";
 import { playHref } from "../lib/play";
+import { setStageLight } from "../lib/light";
+import { useSettings } from "../lib/settings";
 import type { Media } from "../lib/types";
 import { Art } from "./Art";
 import { kindLabel } from "./Card";
@@ -33,14 +35,15 @@ export function Hero({ items, label, onActive }: { items: Media[]; label: string
   const cur = n ? i % n : 0;
   const m = picks[cur];
 
-  useEffect(() => {
-    if (n < 2 || paused) return;
-    const t = setTimeout(() => setI((x) => (x + 1) % n), SLIDE_MS);
-    return () => clearTimeout(t);
-  }, [n, cur, paused]);
+  // The slide advances when its progress bar finishes (onAnimationEnd below), so pausing on hover or
+  // focus keeps bar and slide in step. Reduced motion: no autoplay at all (WCAG 2.2.2).
+  const still = useSettings().reduceMotion || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+  const advance = () => n > 1 && setI((x) => (x + 1) % n);
 
   useEffect(() => {
-    if (m) onActive?.(m);
+    if (!m) return;
+    setStageLight(m);
+    onActive?.(m);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [m?.key, m?.backdrop]);
 
@@ -50,13 +53,22 @@ export function Hero({ items, label, onActive }: { items: Media[]; label: string
   const len = length(m);
 
   return (
-    <section className="hero" onMouseEnter={() => setPaused(true)} onMouseLeave={() => setPaused(false)}>
+    <section
+      className="hero"
+      onMouseEnter={() => setPaused(true)}
+      onMouseLeave={() => setPaused(false)}
+      onFocus={() => setPaused(true)}
+      onBlur={(e) => !e.currentTarget.contains(e.relatedTarget) && setPaused(false)}
+    >
       <div className="hero-stage" style={{ viewTransitionName: "hero" }}>
-        {picks.map((p, j) => (
-          <div key={p.key} className={`hero-bg ${j === cur ? "on" : ""}`}>
-            <Art media={p} variant="backdrop" />
-          </div>
-        ))}
+        {picks.map((p, j) =>
+          // Only the current slide and its neighbours hold images (so crossfades still work); the rest would decode art nobody sees.
+          j === cur || j === (cur + 1) % n || j === (cur + n - 1) % n ? (
+            <div key={p.key} className={`hero-bg ${j === cur ? "on" : ""}`}>
+              <Art media={p} variant="backdrop" size="lg" priority={j === cur} />
+            </div>
+          ) : null,
+        )}
       </div>
       <div className="shade" />
       <div className="copy pad" key={m.key}>
@@ -87,7 +99,9 @@ export function Hero({ items, label, onActive }: { items: Media[]; label: string
       <div className="heroNav pad">
         {picks.map((p, j) => (
           <button key={p.key} className={j === cur ? "on" : j < cur ? "done" : ""} onClick={() => setI(j)} aria-label={`Show ${p.title}`}>
-            {j === cur && <i key={cur} style={{ animationPlayState: paused ? "paused" : "running", animationDuration: `${SLIDE_MS}ms` }} />}
+            {j === cur && !still && (
+              <i key={cur} onAnimationEnd={advance} style={{ animationPlayState: paused ? "paused" : "running", animationDuration: `${SLIDE_MS}ms` }} />
+            )}
           </button>
         ))}
       </div>
@@ -97,7 +111,7 @@ export function Hero({ items, label, onActive }: { items: Media[]; label: string
           <div className="row3">
             {upNext.map((p) => (
               <button key={p.key} className="mini" onClick={() => setI(picks.indexOf(p))}>
-                <Art media={p} variant="backdrop" />
+                <Art media={p} variant="backdrop" size="sm" />
                 <span className="lt">{p.title}</span>
               </button>
             ))}

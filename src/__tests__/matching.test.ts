@@ -66,3 +66,8 @@ describe("isDone", () => {
   });
   it("episodes are done at the credits", () => expect(isDone(1340, 1440)).toBe(true));
 });
+
+describe("scanner stems (no extension)", () => {
+  it("keeps the year on a stem", () => expect(parseName("Dune.2021.2160p")).toEqual({ title: "Dune", year: 2021 }));
+  it("parses episode stems", () => expect(parseEpisode("Show.S01E02.x264")).toEqual({ season: 1, episode: 2 }));
+});

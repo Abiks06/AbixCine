@@ -78,7 +78,7 @@ export function Title() {
     <div className="tp">
       <Ambient media={d} />
       <div className="backdrop" style={{ viewTransitionName: "hero" }}>
-        <Art media={d} variant="backdrop" />
+        <Art media={d} variant="backdrop" size="lg" priority />
         <div className="shade" />
       </div>
       <div className="pad tp-body">
@@ -148,7 +148,7 @@ export function Title() {
               return (
                 <button key={e.number} className={`ep ${isCur ? "cur" : ""}`} style={{ ["--i" as any]: Math.min(i, 14) }} onClick={() => watch(s, e.number)}>
                   <div className="th">
-                    {still ? <img src={still} alt="" loading="lazy" /> : <Art media={d} variant="backdrop" />}
+                    {still ? <img src={still} alt="" loading="lazy" /> : <Art media={d} variant="backdrop" size="sm" />}
                     {p && p.duration > 0 && <div className="w" style={{ width: `${watched ? 100 : (p.position / p.duration) * 100}%` }} />}
                     <span className="hoverplay"><Icon name="play" size={12} /></span>
                   </div>

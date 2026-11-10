@@ -3,7 +3,7 @@ import { cached } from "./cache";
 import { searchAll } from "./search";
 import type { Media } from "./types";
 import { useEffect, useState } from "react";
-import { parseEpisode, scanLibrary, type LibFile } from "../sources/local";
+import { parseEpisode, scanErrors, scanLibrary, stripExt, type LibFile } from "../sources/local";
 import { useSettings } from "./settings";
 
 /** One title on disk: a movie file, or every episode file of a show grouped together. */
@@ -26,7 +26,7 @@ const TAG_RX = /\b(2160p|1080p|720p|576p|480p|4k|uhd|hdr10\+?|hdr|dv|dolby[ ._-]
 
 /** "Neon.Ronin.S01E04.1080p.WEB.x265-GRP.mkv" → { title: "Neon Ronin" }, "Dust Prophet (2024).mkv" → { title, year } */
 export function parseName(file: string) {
-  let base = file.replace(/\.[a-z0-9]{2,4}$/i, "").replace(/\[[^\]]*\]/g, " ").replace(/_/g, " ");
+  let base = stripExt(file).replace(/\[[^\]]*\]/g, " ").replace(/_/g, " ");
   let year: number | undefined;
   // The release year is the LAST plausible year: "Blade Runner 2049 (2017)" is from 2017.
   const ys = [...base.matchAll(/[ ._(\[-]((?:19|20)\d{2})(?=[ ._)\]-]|$)/g)].filter((m) => Number(m[1]) <= new Date().getFullYear() + 1);
@@ -105,7 +105,7 @@ export const qualityBadge = (q?: number) => (q && q >= 2160 ? "4K" : q && q >= 7
 /** Everything on the user's drive, grouped and matched to the catalog. */
 export function useDrive(force = 0) {
   const s = useSettings();
-  const [state, setState] = useState<{ loading: boolean; titles: DriveTitle[]; files: number; at?: number; error?: string }>({ loading: true, titles: [], files: 0 });
+  const [state, setState] = useState<{ loading: boolean; titles: DriveTitle[]; files: number; at?: number; error?: string; warning?: string }>({ loading: true, titles: [], files: 0 });
   const paths = s.libraryPaths.join("|");
   useEffect(() => {
     let live = true;
@@ -118,7 +118,9 @@ export function useDrive(force = 0) {
       .then((files) => {
         if (!live) return;
         const titles = groupDrive(files);
-        setState({ loading: false, titles, files: files.length, at: Date.now() });
+        const errs = scanErrors();
+        const warning = errs.length ? `Couldn't read ${errs.map((e) => e.path).join(", ")} (${errs[0].message})` : undefined;
+        setState({ loading: false, titles, files: files.length, at: Date.now(), warning });
         titles.forEach((t) =>
           matchDrive(t)
             .then((media) => live && media && setState((x) => ({ ...x, titles: x.titles.map((y) => (y.id === t.id ? { ...y, media } : y)) })))
