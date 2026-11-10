@@ -2,12 +2,14 @@ import { useEffect, useRef, useState, lazy, Suspense } from "react";
 import { createHashRouter, Outlet, RouterProvider, useLocation } from "react-router-dom";
 import { CommandPalette } from "./components/CommandPalette";
 import { Splash } from "./components/Splash";
-import { TopBar } from "./components/TopBar";
+import { Rail } from "./components/Rail";
+import { TitleBar } from "./components/TitleBar";
 import { bootAccount, useAuth } from "./lib/account";
 import { getSettings, useSettings } from "./lib/settings";
 import { Auth } from "./pages/Auth";
 import { Anime, Browse } from "./pages/Browse";
 import { Home } from "./pages/Home";
+import { Library } from "./pages/Library";
 import { MyList } from "./pages/MyList";
 import { Search } from "./pages/Search";
 import { Settings } from "./pages/Settings";
@@ -26,7 +28,6 @@ function Shell() {
   const watching = loc.pathname.startsWith("/watch/");
   const main = useRef<HTMLElement>(null);
   const [palette, setPalette] = useState(false);
-  const [scrolled, setScrolled] = useState(false);
 
   useEffect(() => {
     main.current?.scrollTo({ top: 0 });
@@ -45,13 +46,16 @@ function Shell() {
 
   return (
     <div className={`app ${watching ? "is-watching" : ""} ${s.reduceMotion ? "reduce-motion" : ""}`}>
+      <div className="light" aria-hidden />
+      <div className="grain" aria-hidden />
       <Splash skip={SKIP_SPLASH} />
       {!user ? (
         <Auth />
       ) : (
         <>
-          {!watching && <TopBar onOpenPalette={() => setPalette(true)} scrolled={scrolled} />}
-          <main ref={main} className="main" onScroll={(e) => setScrolled(e.currentTarget.scrollTop > 40)}>
+          {!watching && <TitleBar onOpenPalette={() => setPalette(true)} />}
+          {!watching && <Rail />}
+          <main ref={main} className="main">
             <Outlet />
           </main>
           <CommandPalette open={palette} onClose={() => setPalette(false)} />
@@ -70,13 +74,14 @@ const router = createHashRouter([
       { path: "/series", element: <Browse kind="tv" /> },
       { path: "/anime", element: <Anime /> },
       { path: "/list", element: <MyList /> },
+      { path: "/library", element: <Library /> },
       { path: "/search", element: <Search /> },
       { path: "/settings", element: <Settings /> },
       { path: "/title/:key", element: <Title /> },
       {
         path: "/watch/:key",
         element: (
-          <Suspense fallback={<div className="resolver"><span className="mini-spin" /></div>}>
+          <Suspense fallback={<div className="race-page"><span className="spin" /></div>}>
             <Watch />
           </Suspense>
         ),

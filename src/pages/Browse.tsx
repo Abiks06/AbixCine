@@ -25,11 +25,11 @@ export function Browse({ kind }: { kind: "movie" | "tv" }) {
     <div className="page page-flush">
       <Ambient media={active} />
       <Hero items={d?.[1] ?? []} label={kind === "movie" ? "Popular movie" : "Popular series"} onActive={setActive} />
-      <div className="shelves">
+      <div className="rows pad">
         {feeds.map((f, i) => (
           <Fragment key={f.id}>
             <Row eyebrow={EYEBROWS[i]} title={f.title} variant="landscape" items={d?.[i]} loading={!d} />
-            {i === 0 && <Row eyebrow="Trending today" title={TOP10[kind].title} ranked items={d?.[feeds.length]} loading={!d} />}
+            {i === 0 && <Row eyebrow="Trending today" title={TOP10[kind].title} ranked chart={TOP10[kind].id} items={d?.[feeds.length]} loading={!d} />}
           </Fragment>
         ))}
       </div>
@@ -44,7 +44,7 @@ export function Anime() {
     <div className="page page-flush">
       <Ambient media={active} />
       <Hero items={data.data?.[1] ?? []} label="This season" onActive={setActive} />
-      <div className="shelves">
+      <div className="rows pad">
         {ANIME_FEEDS.map((f, i) =>
           i === 3 ? (
             <Row key={f.id} eyebrow="Ranked by fans" title={f.title} ranked items={data.data?.[i]} loading={!data.data} />

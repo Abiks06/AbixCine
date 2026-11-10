@@ -1,7 +1,9 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { Ambient } from "../components/Ambient";
-import { Art } from "../components/Art";
+import { Card } from "../components/Card";
+import { DriveSection } from "../components/Drive";
+import { FitsTonight } from "../components/FitsTonight";
 import { Hero } from "../components/Hero";
 import { Icon } from "../components/Icon";
 import { Row } from "../components/Row";
@@ -19,17 +21,18 @@ export function Home() {
   const s = useSettings();
   const auth = useAuth();
   const feeds = useAsync(() => Promise.all([...FEEDS.home, TOP10.movie, TOP10.tv].map(loadFeed)), [s.tmdbKey, auth.tmdbProxy]);
-  const anime = useAsync(() => loadAnimeFeed(ANIME_FEEDS[0], 0), []);
+  const anime = useAsync(() => loadAnimeFeed(ANIME_FEEDS[1], 1), []);
   const cont = useContinueWatching();
   const [active, setActive] = useState<Media>();
   const d = feeds.data;
   const loading = feeds.loading && !d;
+  const pool = d ? [...d[1].slice(0, 9), ...d[2].slice(0, 6), ...d[3].slice(0, 3)] : [];
 
   return (
-    <div className="page page-flush">
+    <div className="page-flush">
       <Ambient media={active} />
-      <Hero items={d?.[0] ?? []} label="Trending" onActive={setActive} />
-      <div className="shelves">
+      <Hero items={d?.[0] ?? []} label="tonight" onActive={setActive} />
+      <div className="rows pad">
         {!hasTmdb() && (
           <Link to="/settings" className="notice" viewTransition>
             <Icon name="info" />
@@ -38,39 +41,26 @@ export function Home() {
           </Link>
         )}
         {cont.length > 0 && (
-          <section className="row">
+          <section className="sec">
             <SectionHead eyebrow="Pick up where you left off" title="Continue watching" />
-            <div className="row-track">
-              {cont.map((p, i) => (
-                <Link
-                  key={p.media.key}
-                  className="wide-card"
-                  style={{ ["--i" as any]: i }}
-                  viewTransition
-                  to={`/watch/${encodeKey(p.media.key)}?${new URLSearchParams({ ...(p.season != null ? { s: String(p.season) } : {}), ...(p.episode != null ? { e: String(p.episode) } : {}), ...(p.audio ? { a: p.audio } : {}) })}`}
-                >
-                  <Art media={p.media} variant="backdrop" />
-                  <div className="wide-card-body">
-                    <div className="card-title">{p.media.title}</div>
-                    <div className="card-sub">
-                      {p.episode != null && <span className="type-pill">{p.season != null ? `S${p.season} · ` : ""}E{p.episode}</span>}
-                      {p.audio && <span className="type-pill">{p.audio.toUpperCase()}</span>}
-                      <span>{Math.max(1, Math.round((p.duration - p.position) / 60))} min left</span>
-                    </div>
-                  </div>
-                  <div className="card-progress"><i style={{ width: `${(p.position / p.duration) * 100}%` }} /></div>
-                  <span className="wide-play"><Icon name="play" size={18} /></span>
-                </Link>
-              ))}
+            <div className="track">
+              {cont.map((p, i) => {
+                const left = Math.max(1, Math.round((p.duration - p.position) / 60));
+                const where = [p.episode != null ? `${p.season != null ? `S${p.season} · ` : ""}E${p.episode}` : null, p.audio ? (p.audio === "dub" ? "Dub" : "Sub") : null, `${left}m left`].filter(Boolean).join(" · ");
+                const qs = new URLSearchParams({ ...(p.season != null ? { s: String(p.season) } : {}), ...(p.episode != null ? { e: String(p.episode) } : {}), ...(p.audio ? { a: p.audio } : {}) });
+                return <Card key={p.media.key} media={p.media} index={i} progress={(p.position / p.duration) * 100} sub={where} right={<span />} to={`/watch/${encodeKey(p.media.key)}?${qs}`} />;
+              })}
             </div>
           </section>
         )}
-        <Row eyebrow="Out now" title="Popular movies" to="/movies" variant="landscape" items={d?.[1]} loading={loading} />
-        <Row eyebrow="Trending today" title="Top 10 movies" ranked items={d?.[4]} loading={loading} />
-        <Row eyebrow="Out now" title="Popular series" to="/series" variant="landscape" items={d?.[2]} loading={loading} />
-        <Row eyebrow="Trending today" title="Top 10 series" ranked items={d?.[5]} loading={loading} />
-        <Row eyebrow="Simulcast and classics" title="Trending anime" to="/anime" items={anime.data} loading={anime.loading && !anime.data} />
-        <Row eyebrow="The best of the best" title="Critically acclaimed" variant="landscape" items={d?.[3]} loading={loading} />
+        <FitsTonight pool={pool} />
+        <Row eyebrow="Trending today" title="Top 10 films right now" ranked chart={TOP10.movie.id} items={d?.[4]} loading={loading} />
+        <Row eyebrow="One entry per show · switch sub and dub any time" title="Anime this season" to="/anime" items={anime.data} loading={anime.loading && !anime.data} />
+        <DriveSection limit={6} />
+        <Row eyebrow="Out now" title="Popular films" to="/movies" items={d?.[1]} loading={loading} />
+        <Row eyebrow="Trending today" title="Top 10 series right now" ranked chart={TOP10.tv.id} items={d?.[5]} loading={loading} />
+        <Row eyebrow="Out now" title="Popular series" to="/series" items={d?.[2]} loading={loading} />
+        <Row eyebrow="The best of the best" title="Critically acclaimed" items={d?.[3]} loading={loading} />
       </div>
     </div>
   );

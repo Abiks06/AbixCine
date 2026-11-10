@@ -40,7 +40,7 @@ export function demoDetail(key: string): MediaDetail {
   const base = demoList(kind as MediaKind, Math.floor(id / 1000)).find((m) => m.key === key) ?? demoList("movie", 1)[0];
   return {
     ...base,
-    runtime: kind === "movie" ? 118 : 24,
+    runtime: kind === "movie" ? 84 + ((id * 37) % 80) : kind === "tv" ? 28 + ((id * 13) % 32) : 24,
     tagline: "Every signal leads somewhere.",
     seasons: kind === "tv" ? [1, 2, 3].map((n) => ({ number: n, name: `Season ${n}`, episodeCount: 8 })) : undefined,
     episodeCount: kind === "anime" ? 12 : undefined,

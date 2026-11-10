@@ -1,10 +1,11 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { rankMoves } from "../lib/ranks";
 import type { Media } from "../lib/types";
 import { Card, CardSkeleton, type CardVariant } from "./Card";
 import { Icon } from "./Icon";
 import { SectionHead } from "./SectionHead";
 
-/** Horizontally scrolling shelf with arrow paging. */
+/** A shelf: eyebrow, title, and a snap-scrolling track with arrow paging. */
 export function Row({
   title,
   eyebrow,
@@ -12,8 +13,11 @@ export function Row({
   items,
   loading,
   children,
-  variant = "poster",
+  variant = "landscape",
   ranked,
+  chart,
+  right,
+  id,
 }: {
   title: string;
   eyebrow?: string;
@@ -23,9 +27,15 @@ export function Row({
   children?: ReactNode;
   variant?: CardVariant;
   ranked?: boolean;
+  /** Ranked rows only: an id to remember yesterday's order under, for movement arrows. */
+  chart?: string;
+  right?: ReactNode;
+  id?: string;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const [edges, setEdges] = useState({ left: false, right: true });
+  const list = ranked ? items?.slice(0, 10) : items;
+  const moves = useMemo(() => (ranked && chart && list?.length ? rankMoves(chart, list) : null), [ranked, chart, list]);
 
   const update = () => {
     const el = ref.current;
@@ -41,25 +51,29 @@ export function Row({
   };
 
   if (!loading && !children && !items?.length) return null;
-  const list = ranked ? items?.slice(0, 10) : items;
   return (
-    <section className={`row row-${ranked ? "rank" : variant}`}>
+    <section className="sec" id={id}>
       <SectionHead
-        eyebrow={eyebrow}
+        eyebrow={ranked && chart ? `${eyebrow ?? "Trending today"}${moves ? " · movement since yesterday" : ""}` : eyebrow}
         title={title}
         to={to}
         right={
-          <div className="row-nav">
-            <button className="icon-btn round" disabled={!edges.left} onClick={() => page(-1)} aria-label="Scroll left"><Icon name="chevL" /></button>
-            <button className="icon-btn round" disabled={!edges.right} onClick={() => page(1)} aria-label="Scroll right"><Icon name="chevR" /></button>
-          </div>
+          <>
+            {right}
+            <div className="row-nav">
+              <button className="nav-btn" disabled={!edges.left} onClick={() => page(-1)} aria-label="Scroll left"><Icon name="chevL" size={16} /></button>
+              <button className="nav-btn" disabled={!edges.right} onClick={() => page(1)} aria-label="Scroll right"><Icon name="chevR" size={16} /></button>
+            </div>
+          </>
         }
       />
-      <div className="row-track" ref={ref} onScroll={update}>
+      <div className={`track ${ranked ? "ranked" : ""}`} ref={ref} onScroll={update}>
         {children ??
           (loading
             ? Array.from({ length: 8 }, (_, i) => <CardSkeleton key={i} variant={ranked ? "rank" : variant} />)
-            : list!.map((m, i) => <Card key={m.key} media={m} index={i} variant={ranked ? "rank" : variant} rank={ranked ? i + 1 : undefined} />))}
+            : list!.map((m, i) => (
+                <Card key={m.key} media={m} index={i} variant={ranked ? "rank" : variant} rank={ranked ? i + 1 : undefined} move={moves?.[m.key]} />
+              )))}
       </div>
     </section>
   );

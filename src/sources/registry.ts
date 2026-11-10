@@ -109,3 +109,16 @@ export function manualCandidate(url: string): StreamCandidate {
     kind: /\.m3u8(\?|$)/i.test(url) ? "hls" : "file",
   };
 }
+
+/** 0–100 for display: how good a pick this is (quality fit, speed, provider priority). */
+export function displayScore(c: StreamCandidate) {
+  if (!c.probe?.ok || c.score == null) return 0;
+  return Math.max(1, Math.min(99, Math.round((c.score / 75) * 100)));
+}
+
+/** "2160p · 2 ms · 98" style line for a candidate. */
+export function candLine(c: StreamCandidate) {
+  if (c.probe && !c.probe.ok) return c.probe.error === "timeout" ? "timed out" : "offline";
+  const q = c.probe?.quality ?? c.quality;
+  return [q ? `${q}p` : null, c.probe ? `${c.probe.latencyMs} ms` : null, c.score != null ? String(displayScore(c)) : null].filter(Boolean).join(" · ");
+}
