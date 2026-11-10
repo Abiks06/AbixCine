@@ -10,9 +10,9 @@ import { Row } from "../components/Row";
 import { SectionHead } from "../components/SectionHead";
 import { useAuth } from "../lib/account";
 import { ANIME_FEEDS, loadAnimeFeed } from "../lib/anilist";
-import { encodeKey } from "../lib/catalog";
 import { useFreshness } from "../lib/fresh";
 import { useContinueWatching } from "../lib/progress";
+import { watchHref } from "../lib/play";
 import { useSettings } from "../lib/settings";
 import { FEEDS, hasTmdb, loadFeed, TOP10 } from "../lib/tmdb";
 import type { Media } from "../lib/types";
@@ -48,9 +48,9 @@ export function Home() {
             <div className="track">
               {cont.map((p, i) => {
                 const left = Math.max(1, Math.round((p.duration - p.position) / 60));
-                const where = [p.episode != null ? `${p.season != null ? `S${p.season} · ` : ""}E${p.episode}` : null, p.audio ? (p.audio === "dub" ? "Dub" : "Sub") : null, `${left}m left`].filter(Boolean).join(" · ");
-                const qs = new URLSearchParams({ ...(p.season != null ? { s: String(p.season) } : {}), ...(p.episode != null ? { e: String(p.episode) } : {}), ...(p.audio ? { a: p.audio } : {}) });
-                return <Card key={p.media.key} media={p.media} index={i} progress={(p.position / p.duration) * 100} sub={where} right={<span />} to={`/watch/${encodeKey(p.media.key)}?${qs}`} />;
+                const ep = p.episode != null ? `${p.season != null ? `S${p.season} · ` : ""}E${p.episode}` : null;
+                const where = [p.upNext ? `Up next${ep ? ` ${ep}` : ""}` : ep, p.audio ? (p.audio === "dub" ? "Dub" : "Sub") : null, p.upNext ? null : `${left}m left`].filter(Boolean).join(" · ");
+                return <Card key={p.media.key} media={p.media} index={i} progress={p.upNext ? undefined : (p.position / p.duration) * 100} sub={where} right={<span />} to={watchHref(p.media.key, p.season, p.episode, p.audio)} />;
               })}
             </div>
           </section>

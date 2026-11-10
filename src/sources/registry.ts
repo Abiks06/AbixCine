@@ -1,7 +1,7 @@
 import { getSettings } from "../lib/settings";
 import type { PlaybackRequest } from "../lib/types";
 import { jellyfinProvider } from "./jellyfin";
-import { getHealth, lastPick, lookupTimeout, recentlyFailed, recordLookupFailure, recordProbe, reliability } from "./health";
+import { badUrl, getHealth, lastPick, lookupTimeout, recentlyFailed, recordLookup, recordLookupFailure, recordProbe, reliability } from "./health";
 import { localProvider } from "./local";
 import { mockProviders } from "./mock";
 import type { SourceProvider, StreamCandidate } from "./types";
@@ -32,7 +32,7 @@ function withTimeout<T>(p: Promise<T>, ms: number, ctl: AbortController): Promis
 }
 
 /** Highest RESOLUTION=WxH in a master playlist, or undefined. */
-function hlsMaxHeight(manifest: string) {
+export function hlsMaxHeight(manifest: string) {
   let best: number | undefined;
   for (const m of manifest.matchAll(/RESOLUTION=\d+x(\d+)/g)) best = Math.max(best ?? 0, Number(m[1]));
   return best;
@@ -53,11 +53,12 @@ async function probe(c: StreamCandidate): Promise<StreamCandidate> {
     );
     if (!res.ok && res.status !== 206) throw new Error(`HTTP ${res.status}`);
     let quality = c.quality;
-    if (c.kind === "hls") quality = hlsMaxHeight(await res.text()) ?? quality;
+    // The body read gets its own deadline: a server that sends headers then stalls mustn't hang the race.
+    if (c.kind === "hls") quality = hlsMaxHeight(await withTimeout(res.text(), PROBE_TIMEOUT, ctl)) ?? quality;
     else ctl.abort(); // don't download the file
     return { ...c, quality, probe: { ok: true, latencyMs: Math.round(performance.now() - t0), quality } };
-  } catch (e: any) {
-    return { ...c, probe: { ok: false, latencyMs: Math.round(performance.now() - t0), error: e?.message ?? "failed" } };
+  } catch (e: unknown) {
+    return { ...c, probe: { ok: false, latencyMs: Math.round(performance.now() - t0), error: e instanceof Error ? e.message : "failed" } };
   }
 }
 
@@ -68,9 +69,10 @@ async function probe(c: StreamCandidate): Promise<StreamCandidate> {
  *  - track record: how often this provider answered and played before;
  *  - memory: it played this title (or this exact episode) last time;
  *  - speed: this probe's latency blended with the provider's average;
- *  - provider priority (local files beat a server stream at the same quality).
+ *  - provider priority (local files beat a server stream at the same quality);
+ *  - this exact file failed to play in the last day (e.g. a codec the player can't decode).
  */
-function score(c: StreamCandidate, preferred: number, priority: number, req: PlaybackRequest): StreamCandidate {
+export function score(c: StreamCandidate, preferred: number, priority: number, req: PlaybackRequest): StreamCandidate {
   if (!c.probe?.ok) return { ...c, score: -1000 + priority, why: [] };
   const q = c.probe.quality ?? c.quality ?? 720;
   const qScore = q <= preferred ? q / preferred : 1 - (q - preferred) / (preferred * 4);
@@ -81,11 +83,13 @@ function score(c: StreamCandidate, preferred: number, priority: number, req: Pla
   const pick = lastPick(req);
   const memory = pick ? (pick.url === c.url ? 12 : pick.providerId === c.providerId ? 6 : 0) : 0;
   const shaky = recentlyFailed(c.providerId) ? 12 : 0;
+  const broken = badUrl(c.url) ? 40 : 0;
   const why: string[] = [];
   if (memory) why.push(pick!.url === c.url ? "played last time" : "had this show before");
   if (rel > 0.8 && getHealth(c.providerId).ok > 3) why.push("reliable");
   if (shaky) why.push("failed recently");
-  return { ...c, why, score: qScore * 60 - latency * 25 + (rel - 0.5) * 30 + memory - shaky + priority * 0.5 };
+  if (broken) why.push("wouldn't play last time");
+  return { ...c, why, score: qScore * 60 - latency * 25 + (rel - 0.5) * 30 + memory - shaky - broken + priority * 0.5 };
 }
 
 const sortByScore = (a: StreamCandidate, b: StreamCandidate) => b.score! - a.score!;
@@ -100,10 +104,14 @@ export interface ResolveOptions {
    */
   early?: boolean;
   signal?: AbortSignal;
+  /** Learn from this race (health stats). Off for previews, so a title visit + Play doesn't count twice. */
+  record?: boolean;
 }
 
 /** After a confident pick appears, give the others this long to beat it. */
 const GRACE_MS = 350;
+/** Longer grace when a better pick may still be coming (last time's source, or the 4K you asked for). */
+const PATIENT_GRACE_MS = 1200;
 /** If anything playable exists by now, go with the best so far. */
 const SOFT_DEADLINE_MS = 2500;
 
@@ -116,6 +124,12 @@ export function resolveSources(req: PlaybackRequest, onEvent?: (e: ResolveEvent)
   const enabled = PROVIDERS.filter((p) => p.isEnabled(s));
   const prio = Object.fromEntries(PROVIDERS.map((p) => [p.id, p.priority]));
   const seen = new Set<string>();
+  const record = opts.record !== false;
+  const pick = lastPick(req);
+  const pending = new Set(enabled.map((p) => p.id));
+  /** Probes count once per provider per race, so a provider returning 3 files doesn't get 3 votes. */
+  const probed = new Set<string>();
+  let raw: StreamCandidate[] = [];
   let ranked: StreamCandidate[] = [];
   let settled = false;
 
@@ -133,28 +147,45 @@ export function resolveSources(req: PlaybackRequest, onEvent?: (e: ResolveEvent)
       (c.probe.quality ?? c.quality ?? 720) >= Math.min(s.preferredQuality, 1080) &&
       c.probe.latencyMs < 800 &&
       !recentlyFailed(c.providerId) &&
+      !badUrl(c.url) &&
       reliability(c.providerId) >= 0.45;
+    const graceFor = (c: StreamCandidate) => {
+      const q = c.probe?.quality ?? c.quality ?? 720;
+      const waitingForPick = !!pick && pick.url !== c.url && pending.has(pick.providerId);
+      return waitingForPick || q < s.preferredQuality ? PATIENT_GRACE_MS : GRACE_MS;
+    };
     const add = (c: StreamCandidate) => {
       if (opts.signal?.aborted) return;
-      recordProbe(c);
-      ranked = [...ranked, score(c, s.preferredQuality, prio[c.providerId] ?? 0, req)].sort(sortByScore);
+      if (record && !probed.has(c.providerId)) {
+        probed.add(c.providerId);
+        recordProbe(c);
+      }
+      raw = [...raw, c];
+      // Re-score everyone: health may have changed since earlier candidates arrived.
+      ranked = raw.map((x) => score(x, s.preferredQuality, prio[x.providerId] ?? 0, req)).sort(sortByScore);
       opts.onUpdate?.(ranked);
-      if (opts.early && !settled && !graceTimer && confident(c)) graceTimer = setTimeout(finish, GRACE_MS);
+      if (opts.early && !settled && !graceTimer && confident(c)) graceTimer = setTimeout(finish, graceFor(c));
     };
     const softTimer = setTimeout(() => opts.early && ranked.some((c) => c.probe?.ok) && finish(), SOFT_DEADLINE_MS);
 
     const runs = enabled.map(async (p) => {
       onEvent?.({ providerId: p.id, status: "searching" });
       const ctl = new AbortController();
-      opts.signal?.addEventListener("abort", () => ctl.abort());
+      const onAbort = () => ctl.abort();
+      opts.signal?.addEventListener("abort", onAbort, { once: true });
       let found: StreamCandidate[];
+      const t0 = performance.now();
       try {
         found = await withTimeout(p.find(req, s, ctl.signal), lookupTimeout(p.id, PROVIDER_TIMEOUT), ctl);
-      } catch (e: any) {
-        const timeout = e?.message === "timeout";
-        if (!opts.signal?.aborted) recordLookupFailure(p.id);
-        onEvent?.({ providerId: p.id, status: timeout ? "timeout" : "error", error: e?.message });
+        if (record) recordLookup(p.id, performance.now() - t0);
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (!opts.signal?.aborted && record) recordLookupFailure(p.id);
+        onEvent?.({ providerId: p.id, status: msg === "timeout" ? "timeout" : "error", error: msg });
         return;
+      } finally {
+        pending.delete(p.id);
+        opts.signal?.removeEventListener("abort", onAbort);
       }
       const fresh = found.filter((c) => !seen.has(c.url) && (seen.add(c.url), true));
       onEvent?.({ providerId: p.id, status: "done", count: fresh.length });

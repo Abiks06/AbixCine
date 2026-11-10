@@ -18,6 +18,11 @@ interface Props {
   onEnded?: () => void;
   onNext?: () => void;
   onBack: () => void;
+  /** Re-run the source search when every candidate has died. */
+  onRetry?: () => void;
+  /** Count down into the next episode when this one ends. */
+  autoplayNext?: boolean;
+  nextLabel?: string;
   audio?: Audio;
   onAudio?: (a: Audio) => void;
   media?: { title: string; logo?: string; overview?: string; year?: number; rating?: number };
@@ -25,7 +30,25 @@ interface Props {
 
 const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2];
 
-export function Player({ candidates, onSourceResult, title, subtitle, startAt, onProgress, onEnded, onNext, onBack, audio, onAudio, media }: Props) {
+const UP_NEXT_SECS = 8;
+
+function savedVolume() {
+  try {
+    const v = Number(localStorage.getItem("abx.vol") ?? 1);
+    return Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : 1;
+  } catch {
+    return 1;
+  }
+}
+
+/** Keep the newest value of a prop in a ref, so long-lived handlers don't go stale or force re-attaches. */
+function useLatest<T>(v: T) {
+  const r = useRef(v);
+  r.current = v;
+  return r;
+}
+
+export function Player({ candidates, onSourceResult, title, subtitle, startAt, onProgress, onEnded, onNext, onBack, onRetry, autoplayNext, nextLabel, audio, onAudio, media }: Props) {
   const wrap = useRef<HTMLDivElement>(null);
   const video = useRef<HTMLVideoElement>(null);
   const hlsRef = useRef<Hls | null>(null);
@@ -35,7 +58,7 @@ export function Player({ candidates, onSourceResult, title, subtitle, startAt, o
   const [time, setTime] = useState(0);
   const [dur, setDur] = useState(0);
   const [buffered, setBuffered] = useState(0);
-  const [vol, setVol] = useState(() => Number(localStorage.getItem("abx.vol") ?? 1));
+  const [vol, setVol] = useState(savedVolume);
   const [muted, setMuted] = useState(false);
   const [speed, setSpeed] = useState(1);
   const [waiting, setWaiting] = useState(true);
@@ -45,32 +68,44 @@ export function Player({ candidates, onSourceResult, title, subtitle, startAt, o
   const [isFull, setIsFull] = useState(false);
   const [levels, setLevels] = useState<{ height: number }[]>([]);
   const [level, setLevel] = useState(-1);
+  /** Every source died: show a recovery card instead of an endless spinner. */
+  const [failed, setFailed] = useState<string | null>(null);
+  /** Episode finished: seconds left on the up-next countdown, or 0 for a plain end card. */
+  const [ended, setEnded] = useState<number | null>(null);
 
   const cur = candidates[idx];
+  // Late backup sources change `candidates` while we play; read them through refs so they never
+  // re-attach (and rewind) the stream that's already running.
+  const candsRef = useLatest(candidates);
+  const idxRef = useLatest(idx);
+  const resultRef = useLatest(onSourceResult);
+  const progressRef = useLatest(onProgress);
 
+  const toastTimer = useRef<number>();
   const flash = (msg: string) => {
     setToast(msg);
-    setTimeout(() => setToast((t) => (t === msg ? null : t)), 2400);
+    clearTimeout(toastTimer.current);
+    toastTimer.current = window.setTimeout(() => setToast(null), 2400);
   };
+  useEffect(() => () => clearTimeout(toastTimer.current), []);
 
   // Try the next candidate when the current one dies, keeping the playhead.
-  const failover = useCallback(
-    (why: string) => {
-      const v = video.current;
-      if (v && v.currentTime > 1) resumeAt.current = v.currentTime;
-      setIdx((i) => {
-        if (candidates[i]) onSourceResult?.(candidates[i], false);
-        const next = candidates.findIndex((c, j) => j > i && c.probe?.ok !== false);
-        if (next === -1) {
-          flash(`Playback failed: ${why}`);
-          return i;
-        }
-        flash(`Switched to ${candidates[next].providerName} (${why})`);
-        return next;
-      });
-    },
-    [candidates, onSourceResult],
-  );
+  // Side effects live outside the state updater so StrictMode can't double-count a failure.
+  const failover = useCallback((why: string) => {
+    const v = video.current;
+    if (v && v.currentTime > 1) resumeAt.current = v.currentTime;
+    const list = candsRef.current;
+    const i = idxRef.current;
+    if (list[i]) resultRef.current?.(list[i], false);
+    const next = list.findIndex((c, j) => j > i && c.probe?.ok !== false);
+    if (next === -1) {
+      setWaiting(false);
+      setFailed(why);
+      return;
+    }
+    flash(`Switched to ${list[next].providerName} (${why})`);
+    setIdx(next);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // First frame from a source counts as a successful play (once per source).
   const reported = useRef(new Set<string>());
@@ -81,10 +116,12 @@ export function Player({ candidates, onSourceResult, title, subtitle, startAt, o
     }
   };
 
-  // Attach the source.
+  // Attach the source. Keyed on the URL only: a new candidates array with the same current source is a no-op.
+  const curUrl = cur?.url;
+  const curKind = cur?.kind;
   useEffect(() => {
     const v = video.current;
-    if (!v || !cur) return;
+    if (!v || !curUrl) return;
     setWaiting(true);
     setLevels([]);
     hlsRef.current?.destroy();
@@ -93,29 +130,35 @@ export function Player({ candidates, onSourceResult, title, subtitle, startAt, o
       if (resumeAt.current > 0 && resumeAt.current < (v.duration || Infinity) - 5) v.currentTime = resumeAt.current;
       v.play().catch(() => {});
     };
-    if (cur.kind === "hls" && Hls.isSupported()) {
+    if (curKind === "hls" && Hls.isSupported()) {
       const hls = new Hls({ enableWorker: true, lowLatencyMode: false, maxBufferLength: 60, backBufferLength: 30 });
       hlsRef.current = hls;
+      let recoveries = 0;
       hls.on(Hls.Events.MANIFEST_PARSED, (_, d) => {
         setLevels(d.levels.map((l) => ({ height: l.height })));
         seekAndPlay();
       });
       hls.on(Hls.Events.ERROR, (_, d) => {
         if (!d.fatal) return;
-        if (d.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
-        else failover(d.details);
+        // Media errors get two local repair attempts, then the next source. Never an endless loop.
+        if (d.type === Hls.ErrorTypes.MEDIA_ERROR && recoveries < 2) {
+          if (recoveries++ === 1) hls.swapAudioCodec();
+          hls.recoverMediaError();
+        } else failover(d.details);
       });
-      hls.loadSource(cur.url);
+      hls.loadSource(curUrl);
       hls.attachMedia(v);
     } else {
-      v.src = cur.url;
+      v.src = curUrl;
       v.addEventListener("loadedmetadata", seekAndPlay, { once: true });
     }
     return () => {
+      v.removeEventListener("loadedmetadata", seekAndPlay);
+      if (v.currentTime > 1) resumeAt.current = v.currentTime;
       hlsRef.current?.destroy();
       hlsRef.current = null;
     };
-  }, [cur, failover]);
+  }, [curUrl, curKind, failover]);
 
   useEffect(() => {
     const v = video.current;
@@ -126,14 +169,30 @@ export function Player({ candidates, onSourceResult, title, subtitle, startAt, o
     try { localStorage.setItem("abx.vol", String(vol)); } catch { /* ignore */ }
   }, [vol, muted, speed]);
 
-  // Report progress every 5s.
+  // Report progress every 10s while playing, plus on pause, when the window hides, and on the way out.
+  const report = useCallback(() => {
+    const v = video.current;
+    if (v && v.duration && v.currentTime > 0) progressRef.current?.(v.currentTime, v.duration);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     const t = setInterval(() => {
-      const v = video.current;
-      if (v && v.duration && !v.paused) onProgress?.(v.currentTime, v.duration);
-    }, 5000);
-    return () => clearInterval(t);
-  }, [onProgress]);
+      if (video.current && !video.current.paused) report();
+    }, 10_000);
+    const onHide = () => document.hidden && report();
+    document.addEventListener("visibilitychange", onHide);
+    return () => {
+      clearInterval(t);
+      document.removeEventListener("visibilitychange", onHide);
+      report();
+    };
+  }, [report]);
+
+  // Up-next countdown.
+  useEffect(() => {
+    if (!ended) return;
+    const t = setTimeout(() => (ended <= 1 ? onNext?.() : setEnded(ended - 1)), 1000);
+    return () => clearTimeout(t);
+  }, [ended, onNext]);
 
   // Auto-hide controls.
   const idleTimer = useRef<number>();
@@ -145,8 +204,10 @@ export function Player({ candidates, onSourceResult, title, subtitle, startAt, o
   useEffect(() => () => clearTimeout(idleTimer.current), []);
 
   const toggle = () => {
-    const v = video.current!;
-    v.paused ? v.play() : v.pause();
+    const v = video.current;
+    if (!v) return;
+    if (v.paused) v.play().catch(() => {});
+    else v.pause();
   };
   const seek = (d: number) => {
     const v = video.current!;
@@ -154,8 +215,8 @@ export function Player({ candidates, onSourceResult, title, subtitle, startAt, o
     flash(`${d > 0 ? "+" : ""}${d}s`);
   };
   const toggleFull = () => {
-    if (document.fullscreenElement) document.exitFullscreen();
-    else wrap.current?.requestFullscreen();
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+    else wrap.current?.requestFullscreen().catch(() => {});
   };
   useEffect(() => {
     const f = () => setIsFull(!!document.fullscreenElement);
@@ -163,10 +224,13 @@ export function Player({ candidates, onSourceResult, title, subtitle, startAt, o
     return () => document.removeEventListener("fullscreenchange", f);
   }, []);
 
-  // Keyboard shortcuts.
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if ((e.target as HTMLElement)?.tagName === "INPUT") return;
+  // Keyboard shortcuts. The handler lives in a ref so the listener is attached once, not on every timeupdate.
+  const keyRef = useRef<(e: KeyboardEvent) => void>(() => {});
+  keyRef.current = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+      // Leave Ctrl/Alt/Win combos (Ctrl+K palette, Alt+Tab…) to the app and the OS.
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
       poke();
       switch (e.key) {
         case " ": case "k": e.preventDefault(); toggle(); break;
@@ -181,10 +245,12 @@ export function Player({ candidates, onSourceResult, title, subtitle, startAt, o
         case "n": onNext?.(); break;
         case "Escape": if (!document.fullscreenElement) panel ? setPanel(null) : onBack(); break;
       }
-    };
+  };
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => keyRef.current(e);
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  });
+  }, []);
 
   // Ambient bleed: a tiny copy of the picture, blurred huge behind the screen, so the frame glows with the scene.
   const bleed = useRef<HTMLCanvasElement>(null);
@@ -193,10 +259,11 @@ export function Player({ candidates, onSourceResult, title, subtitle, startAt, o
     let last = 0;
     const draw = (t: number) => {
       raf = requestAnimationFrame(draw);
-      if (t - last < 90) return;
+      // ~6 fps is plenty for a 64×36 glow; skip entirely while paused or hidden.
+      if (t - last < 160) return;
       last = t;
       const v = video.current, c = bleed.current;
-      if (!v || !c || v.readyState < 2) return;
+      if (!v || !c || v.readyState < 2 || v.paused || document.hidden) return;
       try {
         c.getContext("2d")?.drawImage(v, 0, 0, c.width, c.height);
       } catch {
@@ -216,6 +283,7 @@ export function Player({ candidates, onSourceResult, title, subtitle, startAt, o
     const v = video.current;
     resumeAt.current = v?.currentTime ?? 0;
     setIdx(i);
+    setFailed(null);
     setPanel(null);
     flash(`Switched to ${candidates[i].providerName} at ${fmtTime(v?.currentTime ?? 0)}`);
   };
@@ -229,7 +297,10 @@ export function Player({ candidates, onSourceResult, title, subtitle, startAt, o
           playsInline
           onClick={toggle}
           onDoubleClick={toggleFull}
-          onPlay={() => setPlaying(true)}
+          onPlay={() => {
+            setPlaying(true);
+            setEnded(null);
+          }}
           onPause={() => setPlaying(false)}
           onWaiting={() => setWaiting(true)}
           onPlaying={() => {
@@ -239,16 +310,62 @@ export function Player({ candidates, onSourceResult, title, subtitle, startAt, o
           onCanPlay={() => setWaiting(false)}
           onTimeUpdate={(e) => {
             const v = e.currentTarget;
-            setTime(v.currentTime);
+            // Quarter-second steps: smooth enough for the scrubber, far fewer re-renders.
+            setTime(Math.round(v.currentTime * 4) / 4);
             if (v.buffered.length) setBuffered(v.buffered.end(v.buffered.length - 1));
           }}
           onDurationChange={(e) => setDur(e.currentTarget.duration)}
-          onEnded={() => { const v = video.current; if (v) onProgress?.(v.duration, v.duration); onEnded?.(); }}
-          onError={() => cur?.kind === "file" && failover("unsupported or unreachable file")}
+          onEnded={() => {
+            const v = video.current;
+            if (v) onProgress?.(v.duration, v.duration);
+            onEnded?.();
+            setEnded(onNext && autoplayNext ? UP_NEXT_SECS : 0);
+          }}
+          onError={() => !hlsRef.current && failover("unsupported or unreachable file")}
         />
         {waiting && <div className="spinner" aria-label="Loading" />}
       </div>
       {toast && <div className="glass toast" key={toast}><i className="dot" />{toast}</div>}
+
+      {failed && (
+        <div className="p-card glass" role="alertdialog" aria-label="Playback failed" onClick={(e) => e.stopPropagation()}>
+          <h3>Couldn't play this</h3>
+          <p className="muted">Every source stalled or refused ({failed}). Your place is saved at {fmtTime(resumeAt.current)}.</p>
+          <div className="acts">
+            {onRetry && <button className="btn play" onClick={onRetry} autoFocus><Icon name="play" size={16} /> Search sources again</button>}
+            {candidates.length > 1 && <button className="btn glass" onClick={() => setPanel("sources")}><Icon name="layers" size={16} /> Choose a source</button>}
+            <button className="btn glass" onClick={onBack}><Icon name="back" size={16} /> Back</button>
+          </div>
+        </div>
+      )}
+      {ended !== null && !failed && (
+        <div className="p-card glass up-next" role="dialog" aria-label={onNext ? "Up next" : "Finished"} onClick={(e) => e.stopPropagation()}>
+          {onNext ? (
+            <>
+              <div className="eyebrow">Up next{ended > 0 ? ` in ${ended}s` : ""}</div>
+              <h3>{nextLabel ?? "Next episode"}</h3>
+              {ended > 0 && <div className="upnext-bar" style={{ ["--d" as string]: `${UP_NEXT_SECS}s` }}><i /></div>}
+              <div className="acts">
+                <button className="btn play" onClick={onNext} autoFocus><Icon name="next" size={16} /> Play now</button>
+                {ended > 0 ? (
+                  <button className="btn glass" onClick={() => setEnded(0)}>Cancel</button>
+                ) : (
+                  <button className="btn glass" onClick={onBack}><Icon name="back" size={16} /> Back</button>
+                )}
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="eyebrow">Finished</div>
+              <h3>{title}</h3>
+              <div className="acts">
+                <button className="btn play" onClick={() => { const v = video.current; if (v) { v.currentTime = 0; v.play().catch(() => {}); } setEnded(null); }} autoFocus><Icon name="replay10" size={16} /> Watch again</button>
+                <button className="btn glass" onClick={onBack}><Icon name="back" size={16} /> Back</button>
+              </div>
+            </>
+          )}
+        </div>
+      )}
 
       <div className="chrome">
         <div className="ptop">
@@ -292,8 +409,8 @@ export function Player({ candidates, onSourceResult, title, subtitle, startAt, o
             }}
           >
             <div className="c">
-              <span className="buf" style={{ width: `${dur ? (buffered / dur) * 100 : 0}%` }} />
-              <i style={{ width: `${pct}%` }} />
+              <span className="buf" style={{ transform: `scaleX(${dur ? buffered / dur : 0})` }} />
+              <i style={{ transform: `scaleX(${pct / 100})` }} />
             </div>
             <span className="knob" style={{ left: `${pct}%` }} />
           </div>

@@ -4,6 +4,7 @@ import { encodeKey } from "../lib/catalog";
 import { fmtRuntime } from "../lib/format";
 import { useFeatured, type Featured } from "../lib/useLogos";
 import { toggleList, useWatchlist } from "../lib/watchlist";
+import { playHref } from "../lib/play";
 import type { Media } from "../lib/types";
 import { Art } from "./Art";
 import { kindLabel } from "./Card";
@@ -72,7 +73,7 @@ export function Hero({ items, label, onActive }: { items: Media[]; label: string
         </div>
         <p className="desc">{m.overview}</p>
         <div className="acts">
-          <button className="btn play" onClick={() => nav(`/watch/${encodeKey(m.key)}`, { viewTransition: true })}>
+          <button className="btn play" onClick={() => nav(playHref(m), { viewTransition: true, state: { from: "app" } })}>
             <Icon name="play" size={16} /> Play
           </button>
           <Link className="btn glass" to={`/title/${encodeKey(m.key)}`} viewTransition>
