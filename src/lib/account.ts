@@ -23,7 +23,7 @@ interface AuthState {
 
 const KEY = "abx.auth.v1";
 const API_KEY = "abx.api";
-export const DEFAULT_API = import.meta.env.VITE_API_URL ?? "http://localhost:8787";
+export const DEFAULT_API = import.meta.env.VITE_API_URL ?? "https://abixcine-api.onrender.com";
 
 export const getApiBase = () => {
   try {

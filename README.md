@@ -32,7 +32,7 @@ Optional: put `TMDB_KEY=...` in `server/.env` so everyone signed in gets the rea
 1. Push this repo to GitHub.
 2. Render dashboard → **New → Blueprint** → pick the repo. `render.yaml` creates the web service and a Postgres database, and generates `JWT_SECRET`.
 3. Set `TMDB_KEY` on the service (optional).
-4. In the app's sign-in screen, click **Server** and enter the Render URL (e.g. `https://abixcine-api.onrender.com`), or build with `VITE_API_URL` set.
+4. The app talks to `https://abixcine-api.onrender.com` by default. To use another server, click **Server** on the sign-in screen, or build with `VITE_API_URL` set (e.g. `http://localhost:8787` for the local API).
 
 Notes on Render's free plan: the web service sleeps after 15 minutes idle (first request then takes ~1 minute), and free Postgres databases expire after 30 days. The paid starter tiers remove both.
 
