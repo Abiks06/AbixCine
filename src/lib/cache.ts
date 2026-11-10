@@ -5,6 +5,8 @@
 const mem = new Map<string, { at: number; value: unknown }>();
 const inflight = new Map<string, Promise<unknown>>();
 const PREFIX = "abx.cache.";
+/** How long to wait for fresh data before showing the stale copy (the refresh still lands in the cache). */
+const STALE_WAIT_MS = 4000;
 
 export async function cached<T>(key: string, ttlMs: number, fetcher: () => Promise<T>): Promise<T> {
   const now = Date.now();
@@ -42,9 +44,12 @@ export async function cached<T>(key: string, ttlMs: number, fetcher: () => Promi
   };
 
   if (hit) {
-    // Stale: serve immediately, refresh in background.
-    run().catch(() => {});
-    return hit.value as T;
+    // Stale: fetch fresh so what you see is current, but never leave you staring at a spinner.
+    // If the network is slow or down, fall back to the last good copy.
+    return Promise.race([
+      run(),
+      new Promise<T>((resolve) => setTimeout(() => resolve(hit!.value as T), STALE_WAIT_MS)),
+    ]).catch(() => hit!.value as T);
   }
   return run();
 }

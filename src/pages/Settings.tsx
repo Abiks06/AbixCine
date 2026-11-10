@@ -7,7 +7,9 @@ import { Avatar } from "../components/Avatar";
 import { Icon } from "../components/Icon";
 import { errorMessage, getApiBase, signOut, updateProfile, useAuth } from "../lib/account";
 import { updateSettings, useSettings } from "../lib/settings";
+import { getHealth, reliability, resetHealth } from "../sources/health";
 import { scanLibrary } from "../sources/local";
+import { PROVIDERS } from "../sources/registry";
 
 export function Settings() {
   const s = useSettings();
@@ -21,6 +23,7 @@ export function Settings() {
   const [name, setName] = useState(user?.name ?? "");
   const [profileMsg, setProfileMsg] = useState<string | null>(null);
   const [showExternal, setShowExternal] = useState(s.jellyfin.enabled);
+  const [, setHealthTick] = useState(0);
 
   useEffect(() => {
     if (loc.hash === "#sources") sourcesRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -126,6 +129,29 @@ export function Settings() {
             </div>
           </div>
         )}
+
+        <div className="picker-stats">
+          <div className="setting-line">
+            <div>
+              <strong>Source picker</strong>
+              <span className="muted">Every source is asked at once. The pick weighs quality, speed, each source's track record and what played this show last time. The rest stay on standby as backup servers.</span>
+            </div>
+            <button className="btn btn-glass sm" onClick={() => { resetHealth(); setHealthTick((n) => n + 1); }}>Reset history</button>
+          </div>
+          <div className="health-list">
+            {PROVIDERS.filter((p) => p.isEnabled(s)).map((p) => {
+              const h = getHealth(p.id);
+              const seen = h.ok + h.fail > 0.5;
+              return (
+                <div key={p.id} className="health">
+                  <span>{p.name}</span>
+                  <span className="muted">{seen ? `${Math.round(reliability(p.id) * 100)}% reliable` : "no history yet"}{h.latency != null ? ` · ~${Math.round(h.latency)} ms` : ""}</span>
+                  <i style={{ ["--w" as any]: `${seen ? reliability(p.id) * 100 : 0}%` }} />
+                </div>
+              );
+            })}
+          </div>
+        </div>
       </section>
 
       <section className="panel">

@@ -44,6 +44,12 @@ export function demoDetail(key: string): MediaDetail {
     tagline: "Every signal leads somewhere.",
     seasons: kind === "tv" ? [1, 2, 3].map((n) => ({ number: n, name: `Season ${n}`, episodeCount: 8 })) : undefined,
     episodeCount: kind === "anime" ? 12 : undefined,
+    crew: [{ name: "Mara Quill", job: "Director" }, { name: "Tomas Reyes", job: "Writer" }],
+    releaseDate: `${base.year ?? 2024}-03-14`,
+    budget: kind === "movie" ? 40_000_000 + (id % 9) * 15_000_000 : undefined,
+    revenue: kind === "movie" ? 90_000_000 + (id % 7) * 60_000_000 : undefined,
+    originalLanguage: kind === "anime" ? "ja" : "en",
+    companies: ["Demo Pictures"],
     cast: ["Ada Vance", "Kenji Mori", "Lea Okafor", "Sam Reyes", "Iris Hale"].map((name) => ({ name, character: "Character" })),
     related: demoList(base.kind, Math.floor(id / 1000) + 7, 10),
   };

@@ -11,6 +11,7 @@ import { SectionHead } from "../components/SectionHead";
 import { useAuth } from "../lib/account";
 import { ANIME_FEEDS, loadAnimeFeed } from "../lib/anilist";
 import { encodeKey } from "../lib/catalog";
+import { useFreshness } from "../lib/fresh";
 import { useContinueWatching } from "../lib/progress";
 import { useSettings } from "../lib/settings";
 import { FEEDS, hasTmdb, loadFeed, TOP10 } from "../lib/tmdb";
@@ -20,13 +21,14 @@ import { useAsync } from "../lib/useAsync";
 export function Home() {
   const s = useSettings();
   const auth = useAuth();
-  const feeds = useAsync(() => Promise.all([...FEEDS.home, TOP10.movie, TOP10.tv].map(loadFeed)), [s.tmdbKey, auth.tmdbProxy]);
-  const anime = useAsync(() => loadAnimeFeed(ANIME_FEEDS[1], 1), []);
+  const fresh = useFreshness();
+  const feeds = useAsync(() => Promise.all([...FEEDS.home, TOP10.movie, TOP10.tv].map(loadFeed)), [s.tmdbKey, auth.tmdbProxy, fresh]);
+  const anime = useAsync(() => loadAnimeFeed(ANIME_FEEDS[1], 1), [fresh]);
   const cont = useContinueWatching();
   const [active, setActive] = useState<Media>();
   const d = feeds.data;
   const loading = feeds.loading && !d;
-  const pool = d ? [...d[1].slice(0, 9), ...d[2].slice(0, 6), ...d[3].slice(0, 3)] : [];
+  const pool = d ? [...d[4].slice(0, 6), ...d[1].slice(0, 6), ...d[2].slice(0, 4), ...d[3].slice(0, 2)] : [];
 
   return (
     <div className="page-flush">
@@ -54,12 +56,15 @@ export function Home() {
           </section>
         )}
         <FitsTonight pool={pool} />
-        <Row eyebrow="Trending today" title="Top 10 films right now" ranked chart={TOP10.movie.id} items={d?.[4]} loading={loading} />
+        <Row eyebrow="Trending today" title="Top 10 films right now" ranked chart={TOP10.movie.id} items={d?.[7]} loading={loading} />
+        <Row eyebrow="In the last six weeks" title="New releases" to="/movies" items={d?.[4]} loading={loading} />
         <Row eyebrow="One entry per show · switch sub and dub any time" title="Anime this season" to="/anime" items={anime.data} loading={anime.loading && !anime.data} />
         <DriveSection limit={6} />
         <Row eyebrow="Out now" title="Popular films" to="/movies" items={d?.[1]} loading={loading} />
-        <Row eyebrow="Trending today" title="Top 10 series right now" ranked chart={TOP10.tv.id} items={d?.[5]} loading={loading} />
+        <Row eyebrow="Trending today" title="Top 10 series right now" ranked chart={TOP10.tv.id} items={d?.[8]} loading={loading} />
+        <Row eyebrow="Premiered recently" title="New series" to="/series" items={d?.[5]} loading={loading} />
         <Row eyebrow="Out now" title="Popular series" to="/series" items={d?.[2]} loading={loading} />
+        <Row eyebrow="In the next two months" title="Coming soon" items={d?.[6]} loading={loading} />
         <Row eyebrow="The best of the best" title="Critically acclaimed" items={d?.[3]} loading={loading} />
       </div>
     </div>

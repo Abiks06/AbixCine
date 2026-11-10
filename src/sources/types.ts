@@ -16,6 +16,8 @@ export interface StreamCandidate {
   /** Filled in by the ranker. */
   probe?: { ok: boolean; latencyMs: number; quality?: number; error?: string };
   score?: number;
+  /** Short reasons the ranker liked it: "played last time", "fastest", "best quality". */
+  why?: string[];
 }
 
 /**

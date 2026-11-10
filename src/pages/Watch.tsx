@@ -10,7 +10,7 @@ import { getProgress, saveProgress } from "../lib/progress";
 import { setAudioFor, useSettings, type Audio } from "../lib/settings";
 import { reqKey, type PlaybackRequest } from "../lib/types";
 import { useAsync } from "../lib/useAsync";
-import { candLine, displayScore, manualCandidate, PROVIDERS, resolveSources, type ResolveEvent } from "../sources/registry";
+import { candLine, displayScore, manualCandidate, PROVIDERS, recordPlayback, resolveSources, type ResolveEvent } from "../sources/registry";
 import type { StreamCandidate } from "../sources/types";
 
 export function Watch() {
@@ -25,19 +25,29 @@ export function Watch() {
 
   const req: PlaybackRequest | null = useMemo(() => (d ? { media: d, season, episode, audio } : null), [d, season, episode, audio]);
   const [events, setEvents] = useState<Record<string, ResolveEvent>>({});
+  /** The ranked list at the moment the picker committed to a winner. */
   const [cands, setCands] = useState<StreamCandidate[] | null>(null);
+  /** Everything found so far, still updating while slower sources finish. */
+  const [ranked, setRanked] = useState<StreamCandidate[]>([]);
   const [manual, setManual] = useState("");
   const [go, setGo] = useState(false);
 
   useEffect(() => {
     if (!req) return;
     let live = true;
+    const ctl = new AbortController();
     setCands(null);
+    setRanked([]);
     setEvents({});
     setGo(false);
-    resolveSources(req, (e) => live && setEvents((x) => ({ ...x, [e.providerId]: e }))).then((c) => live && setCands(c));
+    resolveSources(req, (e) => live && setEvents((x) => ({ ...x, [e.providerId]: e })), {
+      early: true,
+      signal: ctl.signal,
+      onUpdate: (r) => live && setRanked(r),
+    }).then((c) => live && setCands(c));
     return () => {
       live = false;
+      ctl.abort();
     };
     // Re-resolve when sources change in settings.
   }, [req && reqKey(req), settings.libraryPaths, settings.jellyfin]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -73,6 +83,14 @@ export function Watch() {
   const back = () => nav(`/title/${encodeKey(key)}`, { viewTransition: true });
   const epLabel = episode != null ? `${season != null ? `Season ${season} · ` : ""}Episode ${episode}` : undefined;
   const playable = cands?.filter((c) => c.probe?.ok);
+  // The player keeps the committed order (so the current index stays put); sources that
+  // answer later are appended as backup servers.
+  const playerCands = useMemo(() => {
+    if (!cands) return null;
+    const late = ranked.filter((r) => r.probe?.ok && !cands.some((c) => c.url === r.url));
+    return [...cands.filter((c) => c.probe?.ok), ...late, ...cands.filter((c) => !c.probe?.ok)];
+  }, [cands, ranked]);
+  const onSourceResult = useCallback((c: StreamCandidate, ok: boolean) => req && recordPlayback(req, c, ok), [req]);
 
   // Hold the race result on screen for a beat so you see which source won, then play.
   useEffect(() => {
@@ -81,11 +99,12 @@ export function Watch() {
     return () => clearTimeout(t);
   }, [cands]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  if (go && cands && playable && playable.length > 0 && d) {
+  if (go && playerCands && playable && playable.length > 0 && d) {
     return (
       <Player
         key={reqKey(req!)}
-        candidates={cands}
+        candidates={playerCands}
+        onSourceResult={onSourceResult}
         title={d.title}
         subtitle={epLabel}
         startAt={getProgress(key, season, episode)?.position}
@@ -103,6 +122,11 @@ export function Watch() {
   const enabled = PROVIDERS.filter((p) => p.isEnabled(settings));
   const best = playable?.[0];
   const done = Object.values(events).filter((e) => e.status !== "searching").length;
+  const laneBusy = (id: string) => {
+    const e = events[id];
+    return !e || e.status === "searching" || (e.status === "done" && (e.count ?? 0) > ranked.filter((c) => c.providerId === id).length);
+  };
+  const stillRacing = enabled.some((p) => laneBusy(p.id));
   const chip = [season != null ? `S${String(season).padStart(2, "0")}` : null, episode != null ? `E${String(episode).padStart(2, "0")}` : null].filter(Boolean).join(" · ");
   return (
     <div className="race-page">
@@ -159,6 +183,7 @@ export function Watch() {
                 onSubmit={(e) => {
                   e.preventDefault();
                   if (manual.trim()) {
+                    setRanked([]);
                     setCands([{ ...manualCandidate(manual.trim()), probe: { ok: true, latencyMs: 0 } }]);
                     setGo(true);
                   }
@@ -175,14 +200,14 @@ export function Watch() {
         <aside className="glass panel">
           <div className="h">
             <span><Icon name="layers" size={16} /> Source race</span>
-            <span className="auto">{cands ? "DONE" : "LIVE"}</span>
+            <span className="auto">{!cands ? "LIVE" : stillRacing ? "PICKED" : "DONE"}</span>
           </div>
           {enabled.map((p, i) => {
             const e = events[p.id];
-            const mine = cands?.filter((c) => c.providerId === p.id) ?? [];
+            const mine = ranked.filter((c) => c.providerId === p.id);
             const top = mine.find((c) => c.probe?.ok) ?? mine[0];
-            const st = !e || e.status === "searching" || (!cands && e.status === "done") ? "busy" : top?.probe?.ok ? "ok" : e.status === "done" && !top ? "none" : "fail";
-            const win = best && top === best;
+            const st = top?.probe?.ok ? "ok" : laneBusy(p.id) ? "busy" : e?.status === "done" && !top ? "none" : "fail";
+            const win = !!best && top?.url === best.url;
             return (
               <div key={p.id} className={`rl ${st} ${win ? "win" : ""}`} style={{ ["--i" as any]: i }}>
                 <span className="rl-i">{i + 1}</span>
@@ -200,9 +225,13 @@ export function Watch() {
           )}
           <div className="rlog">
             {best ? (
-              <>→ pick <b>{best.providerName}</b> · {best.label} · score {displayScore(best)}</>
+              <>
+                → pick <b>{best.providerName}</b> · {best.label} · score {displayScore(best)}
+                {best.why?.length ? ` · ${best.why.join(", ")}` : ""}
+                {stillRacing ? " · others keep racing as backups" : ""}
+              </>
             ) : (
-              "score = quality fit + speed + source priority"
+              "score = quality fit + speed + track record + last pick"
             )}
           </div>
         </aside>

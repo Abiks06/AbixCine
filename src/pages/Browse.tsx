@@ -3,6 +3,7 @@ import { Ambient } from "../components/Ambient";
 import { Hero } from "../components/Hero";
 import { Row } from "../components/Row";
 import { useAuth } from "../lib/account";
+import { useFreshness } from "../lib/fresh";
 import { ANIME_FEEDS, loadAnimeFeed } from "../lib/anilist";
 import { useSettings } from "../lib/settings";
 import { FEEDS, loadFeed, TOP10 } from "../lib/tmdb";
@@ -14,10 +15,11 @@ const EYEBROWS = ["Fresh", "Everyone's watching", "All-time", "By genre", "By ge
 export function Browse({ kind }: { kind: "movie" | "tv" }) {
   const s = useSettings();
   const auth = useAuth();
+  const fresh = useFreshness();
   const feeds = FEEDS[kind];
   const data = useAsync(
     () => Promise.all([...feeds, TOP10[kind]].map((f, i) => loadFeed(f, i + (kind === "tv" ? 20 : 10)))),
-    [kind, s.tmdbKey, auth.tmdbProxy],
+    [kind, s.tmdbKey, auth.tmdbProxy, fresh],
   );
   const [active, setActive] = useState<Media>();
   const d = data.data;
@@ -38,7 +40,8 @@ export function Browse({ kind }: { kind: "movie" | "tv" }) {
 }
 
 export function Anime() {
-  const data = useAsync(() => Promise.all(ANIME_FEEDS.map(loadAnimeFeed)), []);
+  const fresh = useFreshness();
+  const data = useAsync(() => Promise.all(ANIME_FEEDS.map(loadAnimeFeed)), [fresh]);
   const [active, setActive] = useState<Media>();
   return (
     <div className="page page-flush">

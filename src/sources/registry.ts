@@ -1,11 +1,15 @@
 import { getSettings } from "../lib/settings";
 import type { PlaybackRequest } from "../lib/types";
 import { jellyfinProvider } from "./jellyfin";
+import { getHealth, lastPick, lookupTimeout, recentlyFailed, recordLookupFailure, recordProbe, reliability } from "./health";
 import { localProvider } from "./local";
+import { mockProviders } from "./mock";
 import type { SourceProvider, StreamCandidate } from "./types";
 
 /** All known providers. Register new ones here. */
-export const PROVIDERS: SourceProvider[] = [localProvider, jellyfinProvider];
+export const PROVIDERS: SourceProvider[] = [localProvider, jellyfinProvider, ...mockProviders];
+
+export { recordPlayback } from "./health";
 
 const PROVIDER_TIMEOUT = 8000;
 const PROBE_TIMEOUT = 5000;
@@ -58,45 +62,106 @@ async function probe(c: StreamCandidate): Promise<StreamCandidate> {
 }
 
 /**
- * Score: reachable first, then closeness to preferred quality, then response time,
- * then provider priority. Tuned so a 1080p local file beats a 1080p server stream,
- * and a reachable 720p beats an unreachable 4K.
+ * Score a candidate. In order of weight:
+ *  - reachable at all (an unreachable 4K never beats a reachable 720p);
+ *  - closeness to the preferred quality (overshoot is mildly penalised);
+ *  - track record: how often this provider answered and played before;
+ *  - memory: it played this title (or this exact episode) last time;
+ *  - speed: this probe's latency blended with the provider's average;
+ *  - provider priority (local files beat a server stream at the same quality).
  */
-function score(c: StreamCandidate, preferred: number, priority: number) {
-  if (!c.probe?.ok) return -1000 + priority;
+function score(c: StreamCandidate, preferred: number, priority: number, req: PlaybackRequest): StreamCandidate {
+  if (!c.probe?.ok) return { ...c, score: -1000 + priority, why: [] };
   const q = c.probe.quality ?? c.quality ?? 720;
-  const qScore = q <= preferred ? q / preferred : 1 - (q - preferred) / (preferred * 4); // overshoot is mildly penalised
-  const latency = Math.min(c.probe.latencyMs, 3000) / 3000;
-  return qScore * 60 - latency * 25 + priority * 0.5;
+  const qScore = q <= preferred ? q / preferred : 1 - (q - preferred) / (preferred * 4);
+  const avg = getHealth(c.providerId).latency;
+  const ms = avg == null ? c.probe.latencyMs : c.probe.latencyMs * 0.6 + avg * 0.4;
+  const latency = Math.min(ms, 3000) / 3000;
+  const rel = reliability(c.providerId);
+  const pick = lastPick(req);
+  const memory = pick ? (pick.url === c.url ? 12 : pick.providerId === c.providerId ? 6 : 0) : 0;
+  const shaky = recentlyFailed(c.providerId) ? 12 : 0;
+  const why: string[] = [];
+  if (memory) why.push(pick!.url === c.url ? "played last time" : "had this show before");
+  if (rel > 0.8 && getHealth(c.providerId).ok > 3) why.push("reliable");
+  if (shaky) why.push("failed recently");
+  return { ...c, why, score: qScore * 60 - latency * 25 + (rel - 0.5) * 30 + memory - shaky + priority * 0.5 };
 }
 
+const sortByScore = (a: StreamCandidate, b: StreamCandidate) => b.score! - a.score!;
+
+export interface ResolveOptions {
+  /** Called with the full ranked list each time a probe lands (including after the promise resolved). */
+  onUpdate?: (ranked: StreamCandidate[]) => void;
+  /**
+   * Resolve as soon as there is a confident pick instead of waiting for every source:
+   * good quality, quick, from a provider that hasn't been failing. Slower sources keep
+   * racing in the background and arrive through onUpdate as backup servers.
+   */
+  early?: boolean;
+  signal?: AbortSignal;
+}
+
+/** After a confident pick appears, give the others this long to beat it. */
+const GRACE_MS = 350;
+/** If anything playable exists by now, go with the best so far. */
+const SOFT_DEADLINE_MS = 2500;
+
 /**
- * Ask every enabled provider in parallel, probe what they return, and rank it.
- * `onEvent` streams per-provider status so the UI can show progress.
+ * Ask every enabled provider in parallel, probe what each returns as soon as it returns
+ * it, and rank everything. `onEvent` streams per-provider status so the UI can show the race.
  */
-export async function resolveSources(req: PlaybackRequest, onEvent?: (e: ResolveEvent) => void): Promise<StreamCandidate[]> {
+export function resolveSources(req: PlaybackRequest, onEvent?: (e: ResolveEvent) => void, opts: ResolveOptions = {}): Promise<StreamCandidate[]> {
   const s = getSettings();
   const enabled = PROVIDERS.filter((p) => p.isEnabled(s));
-  const results = await Promise.all(
-    enabled.map(async (p) => {
+  const prio = Object.fromEntries(PROVIDERS.map((p) => [p.id, p.priority]));
+  const seen = new Set<string>();
+  let ranked: StreamCandidate[] = [];
+  let settled = false;
+
+  return new Promise((resolve) => {
+    let graceTimer: ReturnType<typeof setTimeout> | undefined;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(graceTimer);
+      clearTimeout(softTimer);
+      resolve(ranked);
+    };
+    const confident = (c: StreamCandidate) =>
+      !!c.probe?.ok &&
+      (c.probe.quality ?? c.quality ?? 720) >= Math.min(s.preferredQuality, 1080) &&
+      c.probe.latencyMs < 800 &&
+      !recentlyFailed(c.providerId) &&
+      reliability(c.providerId) >= 0.45;
+    const add = (c: StreamCandidate) => {
+      if (opts.signal?.aborted) return;
+      recordProbe(c);
+      ranked = [...ranked, score(c, s.preferredQuality, prio[c.providerId] ?? 0, req)].sort(sortByScore);
+      opts.onUpdate?.(ranked);
+      if (opts.early && !settled && !graceTimer && confident(c)) graceTimer = setTimeout(finish, GRACE_MS);
+    };
+    const softTimer = setTimeout(() => opts.early && ranked.some((c) => c.probe?.ok) && finish(), SOFT_DEADLINE_MS);
+
+    const runs = enabled.map(async (p) => {
       onEvent?.({ providerId: p.id, status: "searching" });
       const ctl = new AbortController();
+      opts.signal?.addEventListener("abort", () => ctl.abort());
+      let found: StreamCandidate[];
       try {
-        const found = await withTimeout(p.find(req, s, ctl.signal), PROVIDER_TIMEOUT, ctl);
-        onEvent?.({ providerId: p.id, status: "done", count: found.length });
-        return found;
+        found = await withTimeout(p.find(req, s, ctl.signal), lookupTimeout(p.id, PROVIDER_TIMEOUT), ctl);
       } catch (e: any) {
         const timeout = e?.message === "timeout";
+        if (!opts.signal?.aborted) recordLookupFailure(p.id);
         onEvent?.({ providerId: p.id, status: timeout ? "timeout" : "error", error: e?.message });
-        return [];
+        return;
       }
-    }),
-  );
-  const probed = await Promise.all(results.flat().map(probe));
-  const prio = Object.fromEntries(PROVIDERS.map((p) => [p.id, p.priority]));
-  return probed
-    .map((c) => ({ ...c, score: score(c, s.preferredQuality, prio[c.providerId] ?? 0) }))
-    .sort((a, b) => b.score! - a.score!);
+      const fresh = found.filter((c) => !seen.has(c.url) && (seen.add(c.url), true));
+      onEvent?.({ providerId: p.id, status: "done", count: fresh.length });
+      await Promise.all(fresh.map((c) => probe(c).then(add)));
+    });
+    Promise.all(runs).then(finish);
+  });
 }
 
 /** A stream URL the user pasted (their own server, a public-domain file, etc.). */
@@ -113,7 +178,7 @@ export function manualCandidate(url: string): StreamCandidate {
 /** 0–100 for display: how good a pick this is (quality fit, speed, provider priority). */
 export function displayScore(c: StreamCandidate) {
   if (!c.probe?.ok || c.score == null) return 0;
-  return Math.max(1, Math.min(99, Math.round((c.score / 75) * 100)));
+  return Math.max(1, Math.min(99, Math.round((c.score / 80) * 100)));
 }
 
 /** "2160p · 2 ms · 98" style line for a candidate. */

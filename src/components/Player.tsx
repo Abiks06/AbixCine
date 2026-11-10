@@ -9,6 +9,8 @@ import type { Audio } from "../lib/settings";
 
 interface Props {
   candidates: StreamCandidate[];
+  /** Told when a source starts playing or dies, so the picker learns. */
+  onSourceResult?: (c: StreamCandidate, ok: boolean) => void;
   title: string;
   subtitle?: string;
   startAt?: number;
@@ -23,7 +25,7 @@ interface Props {
 
 const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2];
 
-export function Player({ candidates, title, subtitle, startAt, onProgress, onEnded, onNext, onBack, audio, onAudio, media }: Props) {
+export function Player({ candidates, onSourceResult, title, subtitle, startAt, onProgress, onEnded, onNext, onBack, audio, onAudio, media }: Props) {
   const wrap = useRef<HTMLDivElement>(null);
   const video = useRef<HTMLVideoElement>(null);
   const hlsRef = useRef<Hls | null>(null);
@@ -57,6 +59,7 @@ export function Player({ candidates, title, subtitle, startAt, onProgress, onEnd
       const v = video.current;
       if (v && v.currentTime > 1) resumeAt.current = v.currentTime;
       setIdx((i) => {
+        if (candidates[i]) onSourceResult?.(candidates[i], false);
         const next = candidates.findIndex((c, j) => j > i && c.probe?.ok !== false);
         if (next === -1) {
           flash(`Playback failed: ${why}`);
@@ -66,8 +69,17 @@ export function Player({ candidates, title, subtitle, startAt, onProgress, onEnd
         return next;
       });
     },
-    [candidates],
+    [candidates, onSourceResult],
   );
+
+  // First frame from a source counts as a successful play (once per source).
+  const reported = useRef(new Set<string>());
+  const onPlaying = () => {
+    if (cur && !reported.current.has(cur.url)) {
+      reported.current.add(cur.url);
+      onSourceResult?.(cur, true);
+    }
+  };
 
   // Attach the source.
   useEffect(() => {
@@ -220,7 +232,10 @@ export function Player({ candidates, title, subtitle, startAt, onProgress, onEnd
           onPlay={() => setPlaying(true)}
           onPause={() => setPlaying(false)}
           onWaiting={() => setWaiting(true)}
-          onPlaying={() => setWaiting(false)}
+          onPlaying={() => {
+            setWaiting(false);
+            onPlaying();
+          }}
           onCanPlay={() => setWaiting(false)}
           onTimeUpdate={(e) => {
             const v = e.currentTarget;
@@ -252,9 +267,9 @@ export function Player({ candidates, title, subtitle, startAt, onProgress, onEnd
                 {candidates.map((c, i) => (
                   <button key={c.url} className={i === idx ? "on" : ""} disabled={c.probe?.ok === false} onClick={() => i !== idx && switchTo(i)}>
                     <span className="src-name">{c.providerName}</span>
-                    <small>{i === 0 ? "AUTO" : ""}</small>
+                    <small>{i === idx ? "NOW" : i === 0 ? "AUTO PICK" : "BACKUP"}</small>
                     <small className="src-file">{c.label}</small>
-                    <small>{candLine(c) || "ready"}</small>
+                    <small>{candLine(c) || "ready"}{c.why?.length ? ` · ${c.why[0]}` : ""}</small>
                   </button>
                 ))}
               </div>

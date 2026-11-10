@@ -77,14 +77,22 @@ export async function searchAnime(q: string): Promise<Media[]> {
   }
 }
 
+const STAFF_ROLE = /^(Director|Original Creator|Original Story|Series Composition|Music|Character Design|Script|Chief Director|Animation Director)/;
+const titleCase = (s: string) => s.replace(/_/g, " ").toLowerCase().replace(/^\w/, (c) => c.toUpperCase());
+const isoDate = (d?: { year?: number; month?: number; day?: number }) =>
+  d?.year ? `${d.year}-${String(d.month ?? 1).padStart(2, "0")}-${String(d.day ?? 1).padStart(2, "0")}` : undefined;
+
 export async function anilistDetail(key: string): Promise<MediaDetail> {
   if (key.startsWith("demo:")) return demoDetail(key);
   const id = Number(key.split(":")[1]);
-  return cached(`anilist:detail:${id}`, 6 * HOUR, async () => {
+  return cached(`anilist:detail:v2:${id}`, 3 * HOUR, async () => {
     const d = await gql(
       `query($id:Int){ Media(id:$id,type:ANIME){ ${FIELDS} duration nextAiringEpisode { episode airingAt }
         trailer { id site }
-        characters(perPage:12,sort:ROLE){ edges { role node { name { full } image { medium } } } }
+        source season seasonYear startDate { year month day } endDate { year month day } popularity
+        studios(isMain:true){ nodes { name } }
+        staff(perPage:12,sort:RELEVANCE){ edges { role node { name { full } image { medium } } } }
+        characters(perPage:16,sort:[ROLE,RELEVANCE]){ edges { role node { name { full } image { medium } } voiceActors(language:JAPANESE,sort:RELEVANCE){ name { full } } } }
         recommendations(perPage:14,sort:RATING_DESC){ nodes { mediaRecommendation { ${FIELDS} } } } } }`,
       { id },
     );
@@ -96,7 +104,24 @@ export async function anilistDetail(key: string): Promise<MediaDetail> {
       episodeCount: m.episodes ?? (m.nextAiringEpisode ? m.nextAiringEpisode.episode - 1 : undefined),
       nextAiring: m.nextAiringEpisode ? { episode: m.nextAiringEpisode.episode, at: m.nextAiringEpisode.airingAt * 1000 } : undefined,
       trailerYouTubeId: m.trailer?.site === "youtube" ? m.trailer.id : undefined,
-      cast: m.characters.edges.map((e: any) => ({ name: e.node.name.full, character: e.role, photo: e.node.image?.medium })),
+      cast: m.characters.edges.map((e: any) => ({
+        name: e.node.name.full,
+        character: e.role ? e.role[0] + e.role.slice(1).toLowerCase() : undefined,
+        photo: e.node.image?.medium,
+        actor: e.voiceActors?.[0]?.name?.full,
+      })),
+      crew: (m.staff?.edges ?? [])
+        .filter((e: any) => STAFF_ROLE.test(e.role ?? ""))
+        .map((e: any) => ({ name: e.node.name.full, job: (e.role as string).replace(/\s*\(.*\)$/, ""), photo: e.node.image?.medium })),
+      companies: m.studios?.nodes?.map((n: any) => n.name) ?? [],
+      releaseDate: isoDate(m.startDate),
+      endDate: isoDate(m.endDate),
+      source: m.source ? titleCase(m.source) : undefined,
+      seasonLabel: m.season && m.seasonYear ? `${titleCase(m.season)} ${m.seasonYear}` : undefined,
+      format: m.format ? (m.format.length <= 3 ? m.format : titleCase(m.format)) : undefined,
+      originalLanguage: "ja",
+      voteCount: m.popularity ?? undefined,
+      fetchedAt: Date.now(),
       related: m.recommendations.nodes.map((n: any) => n.mediaRecommendation).filter(Boolean).map(toMedia),
     };
   });

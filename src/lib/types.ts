@@ -39,7 +39,34 @@ export interface MediaDetail extends Media {
   /** Absolute episode count (anime). */
   episodeCount?: number;
   trailerYouTubeId?: string;
-  cast: { name: string; character?: string; photo?: string }[];
+  cast: { name: string; character?: string; photo?: string; /** Anime: the voice actor. */ actor?: string }[];
+  /** Key people behind it: directors, writers, creators, composers, studios' staff. */
+  crew: { name: string; job: string; photo?: string }[];
+  /** ISO date of first release / first air date. */
+  releaseDate?: string;
+  endDate?: string;
+  budget?: number;
+  revenue?: number;
+  originalLanguage?: string;
+  /** Age rating in the user's region (falls back to US). */
+  certification?: string;
+  companies?: string[];
+  networks?: string[];
+  countries?: string[];
+  imdbId?: string;
+  homepage?: string;
+  voteCount?: number;
+  collection?: string;
+  /** Series: what aired last and what airs next. */
+  lastEpisode?: { season: number; episode: number; name?: string; airDate?: string };
+  nextEpisode?: { season: number; episode: number; name?: string; airDate?: string };
+  totalEpisodes?: number;
+  /** Anime: source material and season label, e.g. "Manga", "Fall 2025". */
+  source?: string;
+  seasonLabel?: string;
+  format?: string;
+  /** When this record was fetched, so the UI can say how fresh it is. */
+  fetchedAt?: number;
   related: Media[];
   status?: string;
   nextAiring?: { episode: number; at: number };

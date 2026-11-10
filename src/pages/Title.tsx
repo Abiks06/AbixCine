@@ -8,7 +8,7 @@ import { Icon } from "../components/Icon";
 import { SmartSource } from "../components/SmartSource";
 import { TitleArt } from "../components/TitleArt";
 import { decodeKey, encodeKey, getDetail } from "../lib/catalog";
-import { fmtRuntime } from "../lib/format";
+import { fmtAgo, fmtDate, fmtMoney, fmtRuntime, languageName } from "../lib/format";
 import { getProgress, useContinueWatching } from "../lib/progress";
 import { audioFor, setAudioFor, useSettings } from "../lib/settings";
 import { tmdbSeason } from "../lib/tmdb";
@@ -16,7 +16,7 @@ import type { Episode } from "../lib/types";
 import { useAsync } from "../lib/useAsync";
 import { toggleList, useWatchlist } from "../lib/watchlist";
 
-type Tab = "episodes" | "cast" | "more";
+type Tab = "episodes" | "cast" | "details" | "more";
 
 export function Title() {
   const key = decodeKey(useParams().key!);
@@ -58,7 +58,7 @@ export function Title() {
     : hasEps ? "Play E1" : "Play";
   const length = d.kind === "movie" ? fmtRuntime(d.runtime) : d.seasons?.length ? `${d.seasons.length} season${d.seasons.length > 1 ? "s" : ""}` : animeEps ? `${animeEps} episodes` : "";
   const what = startE != null ? `${startS != null ? `S${startS} ` : ""}E${startE}` : "this film";
-  const tabs: [Tab, string][] = [...(hasEps ? [["episodes", "Episodes"] as [Tab, string]] : []), ["cast", anime ? "Characters" : "Cast"], ["more", "More like this"]];
+  const tabs: [Tab, string][] = [...(hasEps ? [["episodes", "Episodes"] as [Tab, string]] : []), ["cast", anime ? "Characters & crew" : "Cast & crew"], ["details", "Details"], ["more", "More like this"]];
   const curTab = hasEps || tab !== "episodes" ? tab : "cast";
 
   const changeAudio = (a: "sub" | "dub") => {
@@ -92,7 +92,9 @@ export function Title() {
             {d.tagline && <div className="tagline">{d.tagline}</div>}
             <div className="meta">
               {d.rating ? <span className="chip score">★ {d.rating.toFixed(1)} {key.startsWith("anilist:") ? "AniList" : "TMDB"}</span> : null}
+              {d.certification && <span className="chip cert">{d.certification}</span>}
               {length && <span className="chip">{length}</span>}
+              {d.budget ? <span className="chip">{fmtMoney(d.budget)} budget</span> : null}
               {d.kind !== "movie" && d.runtime ? <span className="chip">{d.runtime}m episodes</span> : null}
               {d.status && <span className="chip">{d.status.replace(/_/g, " ").toLowerCase().replace(/^\w/, (c) => c.toUpperCase())}</span>}
               {anime && <span className="chip hi">SUB | DUB</span>}
@@ -175,10 +177,25 @@ export function Title() {
                 <div className="person-img" style={c.photo ? { backgroundImage: `url(${c.photo})` } : undefined}>{!c.photo && c.name[0]}</div>
                 <div className="person-name">{c.name}</div>
                 {c.character && <div className="person-role">{c.character}</div>}
+                {c.actor && <div className="person-role">CV {c.actor}</div>}
               </div>
             ))}
+            {d.crew.length > 0 && (
+              <>
+                <h5 className="people-hd">Behind the camera</h5>
+                {d.crew.map((c, i) => (
+                  <div key={c.name + c.job} className="person crew" style={{ ["--i" as any]: Math.min(i + d.cast.length, 20) }}>
+                    <div className="person-img" style={c.photo ? { backgroundImage: `url(${c.photo})` } : undefined}>{!c.photo && c.name[0]}</div>
+                    <div className="person-name">{c.name}</div>
+                    <div className="person-role">{c.job}</div>
+                  </div>
+                ))}
+              </>
+            )}
           </div>
         )}
+
+        {curTab === "details" && <Details d={d} anime={anime} />}
 
         {curTab === "more" && (
           <div className="grid">
@@ -187,6 +204,67 @@ export function Title() {
           </div>
         )}
         <div style={{ height: 80 }} />
+      </div>
+    </div>
+  );
+}
+
+type Detail = Awaited<ReturnType<typeof getDetail>>;
+
+/** Everything else worth knowing, as a fact sheet. Rows with no data are left out. */
+function Details({ d, anime }: { d: Detail; anime: boolean }) {
+  const people = (jobs: RegExp) => [...new Set(d.crew.filter((c) => jobs.test(c.job)).map((c) => c.name))].join(", ");
+  const ep = (e?: Detail["lastEpisode"]) => (e ? `S${e.season} · E${e.episode}${e.name ? ` · ${e.name}` : ""}${e.airDate ? ` (${fmtDate(e.airDate)})` : ""}` : "");
+  const multiple = d.budget && d.revenue ? d.revenue / d.budget : 0;
+  const ended = !!d.status && !/return|airing|production|releasing|planned/i.test(d.status);
+  const rows: [string, string | undefined | null][] = [
+    [d.kind === "movie" ? "Released" : "First aired", fmtDate(d.releaseDate)],
+    ["Last aired", d.kind !== "movie" && ended ? fmtDate(d.endDate) : ""],
+    ["Season", d.seasonLabel],
+    ["Format", d.format],
+    ["Runtime", d.runtime ? (d.kind === "movie" ? fmtRuntime(d.runtime) : `${d.runtime} min per episode`) : ""],
+    ["Episodes", d.totalEpisodes ? String(d.totalEpisodes) : d.episodeCount ? String(d.episodeCount) : ""],
+    ["Last episode", ep(d.lastEpisode)],
+    [
+      "Next episode",
+      ep(d.nextEpisode) ||
+        (d.nextAiring ? `E${d.nextAiring.episode} · ${new Date(d.nextAiring.at).toLocaleString(undefined, { weekday: "short", day: "numeric", month: "short", hour: "numeric", minute: "2-digit" })}` : ""),
+    ],
+    ["Status", d.status ? d.status.replace(/_/g, " ").toLowerCase().replace(/^\w/, (c) => c.toUpperCase()) : ""],
+    ["Budget", fmtMoney(d.budget)],
+    ["Box office", d.revenue ? `${fmtMoney(d.revenue)}${multiple ? ` · ${multiple.toFixed(1)}× budget` : ""}` : ""],
+    [d.kind === "movie" || anime ? "Director" : "Created by", people(d.kind === "movie" || anime ? /^(Chief )?Director$/ : /^Creator$/)],
+    ["Written by", people(/Screenplay|Writer|Story|Novel|Series Composition|Script|Original Creator/)],
+    ["Music", people(/Music|Composer/)],
+    ["Source material", d.source],
+    [anime ? "Studio" : "Production", d.companies?.slice(0, 4).join(", ")],
+    ["Network", d.networks?.join(", ")],
+    ["Country", d.countries?.join(", ")],
+    ["Original language", languageName(d.originalLanguage)],
+    ["Age rating", d.certification],
+    ["Collection", d.collection],
+    ["Original title", d.originalTitle && d.originalTitle !== d.title ? d.originalTitle : ""],
+    ["Votes", d.voteCount ? d.voteCount.toLocaleString() : ""],
+  ];
+  return (
+    <div className="facts">
+      <dl>
+        {rows
+          .filter(([, v]) => v)
+          .map(([k, v], i) => (
+            <div key={k} className="fact" style={{ ["--i" as any]: Math.min(i, 20) }}>
+              <dt>{k}</dt>
+              <dd>{v}</dd>
+            </div>
+          ))}
+      </dl>
+      <div className="facts-foot">
+        {d.imdbId && <a className="btn glass sm" href={`https://www.imdb.com/title/${d.imdbId}/`} target="_blank" rel="noreferrer">IMDb</a>}
+        {d.homepage && <a className="btn glass sm" href={d.homepage} target="_blank" rel="noreferrer">Official site</a>}
+        <span className="muted">
+          Data from {d.key.startsWith("anilist:") ? "AniList" : d.key.startsWith("demo:") ? "the demo catalog" : "TMDB"}
+          {d.fetchedAt ? ` · updated ${fmtAgo(d.fetchedAt)}` : ""}
+        </span>
       </div>
     </div>
   );
