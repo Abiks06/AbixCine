@@ -1,0 +1,27 @@
+# Render Blueprint: New > Blueprint in the Render dashboard, point it at this repo.
+services:
+  - type: web
+    name: abixcine-api
+    runtime: node
+    rootDir: server
+    plan: free
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: JWT_SECRET
+        generateValue: true
+      - key: DATABASE_URL
+        fromDatabase:
+          name: abixcine-db
+          property: connectionString
+      - key: TMDB_KEY
+        sync: false
+
+databases:
+  - name: abixcine-db
+    plan: free
+    databaseName: abixcine
+    user: abixcine

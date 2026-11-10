@@ -1,0 +1,77 @@
+import pg from "pg";
+
+const url = process.env.DATABASE_URL;
+
+/**
+ * Production (Render): a real Postgres via DATABASE_URL.
+ * Local dev with no DATABASE_URL: an embedded Postgres (PGlite) stored in ./data, so
+ * `npm run dev` works on any machine with nothing else installed.
+ */
+let pool;
+let embedded = null;
+if (url) {
+  // Render's managed Postgres requires TLS from outside its private network.
+  const needsSsl = /render\.com|sslmode=require/.test(url) || process.env.PGSSL === "1";
+  pool = new pg.Pool({ connectionString: url, ssl: needsSsl ? { rejectUnauthorized: false } : undefined, max: Number(process.env.PG_POOL_MAX ?? 5) });
+} else {
+  const { PGlite } = await import("@electric-sql/pglite");
+  const dir = process.env.PGLITE_DIR ?? "./data/pglite";
+  const { mkdirSync } = await import("node:fs");
+  const { dirname } = await import("node:path");
+  mkdirSync(dirname(dir), { recursive: true });
+  embedded = new PGlite(dir);
+  pool = { query: (t, p) => embedded.query(t, p), end: () => embedded.close() };
+  console.log("[db] DATABASE_URL not set: using embedded Postgres in ./data/pglite");
+}
+export { pool };
+
+export const q = (text, params) => pool.query(text, params);
+
+/** Idempotent schema setup, run on boot. Small enough not to need a migration tool yet. */
+export async function migrate() {
+  const run = embedded ? (sql) => embedded.exec(sql) : (sql) => q(sql);
+  await run(`
+    CREATE TABLE IF NOT EXISTS users (
+      id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      email         text NOT NULL,
+      name          text NOT NULL,
+      password_hash text NOT NULL,
+      avatar_hue    int  NOT NULL DEFAULT 260,
+      created_at    timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower ON users (lower(email));
+
+    CREATE TABLE IF NOT EXISTS refresh_tokens (
+      id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id     uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      token_hash  text NOT NULL UNIQUE,
+      device      text,
+      expires_at  timestamptz NOT NULL,
+      revoked_at  timestamptz,
+      created_at  timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS refresh_tokens_user ON refresh_tokens (user_id);
+
+    CREATE TABLE IF NOT EXISTS progress (
+      user_id    uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      media_key  text NOT NULL,
+      data       jsonb NOT NULL,
+      updated_at timestamptz NOT NULL,
+      PRIMARY KEY (user_id, media_key)
+    );
+
+    CREATE TABLE IF NOT EXISTS watchlist (
+      user_id   uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      media_key text NOT NULL,
+      media     jsonb NOT NULL,
+      added_at  timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY (user_id, media_key)
+    );
+
+    CREATE TABLE IF NOT EXISTS user_settings (
+      user_id    uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      data       jsonb NOT NULL DEFAULT '{}'::jsonb,
+      updated_at timestamptz NOT NULL DEFAULT now()
+    );
+  `);
+}
