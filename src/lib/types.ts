@@ -70,6 +70,35 @@ export interface MediaDetail extends Media {
   related: Media[];
   status?: string;
   nextAiring?: { episode: number; at: number };
+  /** The same title in other databases, for ID-based matching (Jellyfin provider ids, file tags, AniSkip). */
+  ids?: MediaIds;
+  /** Other names to match files by: AniList synonyms, and the first season's title for sequels. */
+  altTitles?: string[];
+  /** Anime: neighbouring entries in watch order (AniList splits seasons into separate entries). */
+  prequel?: FranchiseEntry;
+  sequel?: FranchiseEntry;
+}
+
+export interface MediaIds {
+  tmdb?: number;
+  tmdbKind?: "movie" | "tv";
+  imdb?: string;
+  tvdb?: number;
+  anilist?: number;
+  mal?: number;
+}
+
+/** One entry in an anime's season chain. */
+export interface FranchiseEntry {
+  key: string;
+  title: string;
+  year?: number;
+  format?: string;
+  episodes?: number;
+  status?: string;
+  poster?: string;
+  /** Not out yet: don't offer it as "next". */
+  unreleased?: boolean;
 }
 
 /** What the player asks the source layer to find. */
@@ -81,6 +110,9 @@ export interface PlaybackRequest {
   absolute?: number;
   /** Anime only: subtitled original audio or English dub. */
   audio?: "sub" | "dub";
+  /** Extra names files may use (AniList sequels are often filed under the first season's title). */
+  altTitles?: string[];
+  ids?: MediaIds;
 }
 
 export const reqKey = (r: PlaybackRequest) =>

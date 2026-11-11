@@ -1,0 +1,5 @@
+[
+  {"type":"TV","anilist_id":16498,"mal_id":16498,"themoviedb_id":{"tv":1429},"tvdb_id":267440,"imdb_id":["tt2560140"],"season":{"tvdb":1,"tmdb":1}},
+  {"type":"TV","anilist_id":20958,"mal_id":25777,"themoviedb_id":{"tv":1429},"tvdb_id":267440,"imdb_id":["tt2560140"],"season":{"tvdb":2,"tmdb":2}},
+  {"type":"MOVIE","anilist_id":21519,"mal_id":32281,"themoviedb_id":{"movie":372058},"imdb_id":["tt5311514"]}
+]

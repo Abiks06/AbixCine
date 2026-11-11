@@ -13,6 +13,15 @@ export interface StreamCandidate {
   /** Vertical resolution if known (from filename, manifest, or server metadata). */
   quality?: number;
   subtitles?: { lang: string; label: string; url: string }[];
+  /**
+   * What mpv should open instead of `url`, when that's better: the file path on disk, or a
+   * server's original (untranscoded) stream. `url` stays what the built-in player can handle.
+   */
+  nativeUrl?: string;
+  /** The built-in player can't decode this well (HEVC, DTS/TrueHD, 10-bit, AVI…): prefer mpv. */
+  needsMpv?: boolean;
+  /** Short codec summary for the source panel, e.g. "HEVC · DTS-HD 7.1". */
+  codec?: string;
   /** Filled in by the ranker. */
   probe?: { ok: boolean; latencyMs: number; quality?: number; error?: string };
   score?: number;
@@ -32,6 +41,12 @@ export interface SourceProvider {
   category: "local" | "external";
   /** Higher wins ties. Local files beat network sources by default. */
   priority: number;
+  /**
+   * Fallback tier shown in the player's source panel (see TIERS in registry.ts):
+   * 1 on this PC, 2 your own server, 3 a licensed service or addon. Defaults from `category`.
+   * It is a label for people; the ranking itself comes from score().
+   */
+  tier?: 1 | 2 | 3;
   isEnabled(s: Settings): boolean;
   find(req: PlaybackRequest, s: Settings, signal: AbortSignal): Promise<StreamCandidate[]>;
 }

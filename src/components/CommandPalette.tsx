@@ -8,6 +8,8 @@ import { getSettings, updateSettings } from "../lib/settings";
 import type { Media } from "../lib/types";
 import { kindLabel } from "./Card";
 import { Icon } from "./Icon";
+import { playerBus } from "../player/bus";
+import { SPEEDS } from "../player/params";
 
 interface Item {
   id: string;
@@ -48,8 +50,30 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
   }, [q]);
 
   const go = (to: string) => () => nav(to, { viewTransition: true });
+  /** While something is playing, the palette doubles as a remote: everything goes through the player bus. */
+  const playerActions: Item[] = useMemo(() => {
+    const st = open ? playerBus.state() : null;
+    if (!st) return [];
+    const send = (c: Parameters<typeof playerBus.send>[0]) => () => void playerBus.send(c);
+    const others = st.sources.filter((x, i, all) => x.providerId !== st.source?.providerId && all.findIndex((y) => y.providerId === x.providerId) === i);
+    return [
+      { id: "p-toggle", label: st.playing ? "Pause" : "Play", icon: st.playing ? "pause" : "play", hint: "Player", run: send({ type: "toggle" }) },
+      { id: "p-back30", label: "Back 30 seconds", icon: "replay10", hint: "Player", run: send({ type: "seekBy", seconds: -30 }) },
+      { id: "p-fwd85", label: "Skip 85 seconds (intro)", icon: "fwd10", hint: "Player", run: send({ type: "seekBy", seconds: 85 }) },
+      ...others.map((x) => ({ id: `p-src-${x.providerId}`, label: `Switch source to ${x.providerName}`, icon: "layers", hint: "Player", run: send({ type: "setProvider", provider: x.providerId }) })),
+      ...SPEEDS.filter((r) => r !== st.speed).map((r) => ({ id: `p-speed-${r}`, label: `Speed ${r}×`, icon: "spark", hint: "Player", run: send({ type: "setSpeed", rate: r }) })),
+      ...(st.subtitles.length
+        ? [
+            { id: "p-sub-off", label: "Subtitles off", icon: "cc", hint: "Player", run: send({ type: "setSubtitle", index: -1 }) },
+            ...st.subtitles.map((t) => ({ id: `p-sub-${t.index}`, label: `Subtitles: ${t.label}`, icon: "cc", hint: "Player", run: send({ type: "setSubtitle", index: t.index }) })),
+          ]
+        : []),
+    ];
+  }, [open]);
+
   const actions: Item[] = useMemo(
     () => [
+      ...playerActions,
       { id: "home", label: "Go to Home", icon: "home", run: go("/") },
       { id: "movies", label: "Go to Movies", icon: "film", run: go("/movies") },
       { id: "series", label: "Go to Series", icon: "tv", run: go("/series") },
@@ -65,7 +89,7 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
         : { id: "signin", label: "Sign in to sync", icon: "user", run: () => leaveGuest() },
     ],
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [open],
+    [open, playerActions],
   );
 
   const term = q.trim().toLowerCase();

@@ -5,11 +5,15 @@ import { Splash } from "./components/Splash";
 import { Rail } from "./components/Rail";
 import { TitleBar } from "./components/TitleBar";
 import { bootAccount, useAuth } from "./lib/account";
+import { bootUpdates } from "./lib/updater";
+import { bootAlerts } from "./lib/alerts";
+import { UpdateToast, WhatsNew } from "./components/Updates";
 import { getSettings, useSettings } from "./lib/settings";
 import { Auth } from "./pages/Auth";
 import { Anime, Browse } from "./pages/Browse";
 import { Home } from "./pages/Home";
 import { Library } from "./pages/Library";
+import { History } from "./pages/History";
 import { MyList } from "./pages/MyList";
 import { Search } from "./pages/Search";
 import { Settings } from "./pages/Settings";
@@ -19,6 +23,8 @@ import { Title } from "./pages/Title";
 const Watch = lazy(() => import("./pages/Watch").then((m) => ({ default: m.Watch })));
 
 void bootAccount();
+void bootUpdates();
+bootAlerts();
 const SKIP_SPLASH = getSettings().reduceMotion || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
 
 function Shell() {
@@ -61,6 +67,8 @@ function Shell() {
             <Outlet />
           </main>
           <CommandPalette open={palette} onClose={() => setPalette(false)} />
+          {!watching && <UpdateToast />}
+          {!watching && <WhatsNew />}
         </>
       )}
     </div>
@@ -77,6 +85,7 @@ const router = createHashRouter([
       { path: "/anime", element: <Anime /> },
       { path: "/list", element: <MyList /> },
       { path: "/library", element: <Library /> },
+      { path: "/history", element: <History /> },
       { path: "/search", element: <Search /> },
       { path: "/settings", element: <Settings /> },
       { path: "/title/:key", element: <Title /> },

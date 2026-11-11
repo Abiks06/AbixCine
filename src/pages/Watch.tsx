@@ -8,6 +8,7 @@ import { TitleArt } from "../components/TitleArt";
 import { decodeKey, encodeKey, getDetail } from "../lib/catalog";
 import type { MediaDetail } from "../lib/types";
 import { getEntry, getProgress, saveProgress } from "../lib/progress";
+import { recordWatch } from "../lib/history";
 import { watchHref } from "../lib/play";
 import { useWatchlist } from "../lib/watchlist";
 import { setAudioFor, useSettings, type Audio } from "../lib/settings";
@@ -15,6 +16,11 @@ import { reqKey, type PlaybackRequest } from "../lib/types";
 import { useAsync } from "../lib/useAsync";
 import { candLine, displayScore, manualCandidate, PROVIDERS, recordPlayback, resolveSources, type ResolveEvent } from "../sources/registry";
 import type { StreamCandidate } from "../sources/types";
+import { parsePlayerParams } from "../player/params";
+import { playerBus } from "../player/bus";
+import { probeMpv } from "../player/mpv";
+import { seasonPlacement } from "../lib/anilist";
+import { skipTimes } from "../lib/aniskip";
 
 export function Watch() {
   const key = decodeKey(useParams().key!);
@@ -26,6 +32,8 @@ export function Watch() {
   const episode = params.get("e") ? Number(params.get("e")) : undefined;
   const a = params.get("a");
   const audio: Audio | undefined = a === "sub" || a === "dub" ? a : undefined;
+  // Player options from the link (t, speed, provider, controls, autoplay, muted, sub, title).
+  const pp = useMemo(() => parsePlayerParams(params), [params]);
   const detail = useAsync(() => getDetail(key), [key]);
   // Offline / catalog down: local files and Jellyfin only need a title, so fall back to the copy
   // saved with progress or My List instead of spinning forever.
@@ -42,13 +50,39 @@ export function Watch() {
     setAttempt((n) => n + 1);
   }, [detail]);
 
+  // Find mpv now, so the player knows which engine to use the moment a source wins.
+  useEffect(() => void probeMpv(settings.mpvPath), [settings.mpvPath]);
+  // AniList splits a show into one entry per season. Work out which season this entry is and how
+  // many episodes came before it, so "Show S02E03" and "Show - 28" files both match.
+  const anilist = key.startsWith("anilist:");
+  const placement = useAsync(() => (anilist ? seasonPlacement(key) : Promise.resolve(null)), [key]);
+  const placed = !anilist || !placement.loading;
+  const reqSeason = season ?? (anilist && episode != null ? placement.data?.season : undefined);
   // Seasons before this one, so absolute-numbered anime files ("Show - 26") still match S2E1.
   const absolute = useMemo(() => {
-    if (!d?.seasons || season == null || episode == null) return undefined;
+    if (episode == null) return undefined;
+    if (anilist) return placement.data?.before ? placement.data.before + episode : undefined;
+    if (!d?.seasons || season == null) return undefined;
     const before = d.seasons.filter((x) => x.number > 0 && x.number < season).reduce((n, x) => n + x.episodeCount, 0);
     return before ? before + episode : undefined;
-  }, [d, season, episode]);
-  const req: PlaybackRequest | null = useMemo(() => (d ? { media: d, season, episode, absolute, audio } : null), [d, season, episode, absolute, audio]);
+  }, [d, season, episode, anilist, placement.data]);
+  const req: PlaybackRequest | null = useMemo(
+    () =>
+      d && placed
+        ? {
+            media: d,
+            season: reqSeason,
+            episode,
+            absolute,
+            audio,
+            ids: d.ids,
+            altTitles: [...(d.altTitles ?? []), ...(placement.data?.rootTitles ?? [])].filter((t, i, a) => t !== d.title && a.indexOf(t) === i),
+          }
+        : null,
+    [d, placed, reqSeason, episode, absolute, audio, placement.data],
+  );
+  // Skip intro / recap / credits (anime, from AniSkip).
+  const skips = useAsync(() => skipTimes(d?.ids?.mal, episode), [d?.ids?.mal, episode]);
   const [events, setEvents] = useState<Record<string, ResolveEvent>>({});
   /** The ranked list at the moment the picker committed to a winner. */
   const [cands, setCands] = useState<StreamCandidate[] | null>(null);
@@ -68,6 +102,7 @@ export function Watch() {
     resolveSources(req, (e) => live && setEvents((x) => ({ ...x, [e.providerId]: e })), {
       early: true,
       signal: ctl.signal,
+      prefer: pp.provider,
       onUpdate: (r) => live && setRanked(r),
     }).then((c) => live && setCands(c));
     return () => {
@@ -75,9 +110,9 @@ export function Watch() {
       ctl.abort();
     };
     // Re-resolve when sources change in settings.
-  }, [req && reqKey(req), settings.libraryPaths, settings.jellyfin, attempt]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [req && reqKey(req), settings.libraryPaths, settings.jellyfin, attempt, pp.provider]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const next = useMemo(() => {
+  const next = useMemo((): { s?: number; e: number; key?: string; title?: string } | null => {
     if (!d || episode == null) return null;
     if (d.seasons && season != null) {
       const cur = d.seasons.find((s) => s.number === season);
@@ -86,13 +121,23 @@ export function Watch() {
       return ns ? { s: ns.number, e: 1 } : null;
     }
     if (d.episodeCount && episode < d.episodeCount) return { s: undefined, e: episode + 1 };
+    // Last episode of an AniList entry: carry on into the next season's entry, once it's out.
+    if (d.sequel && !d.sequel.unreleased && (!d.episodeCount || episode >= d.episodeCount) && !d.nextAiring) return { e: 1, key: d.sequel.key, title: d.sequel.title };
     return null;
   }, [d, season, episode]);
 
-  const href = (s?: number, e?: number, a?: Audio) => watchHref(key, s, e, a);
+  /**
+   * Link options that should survive moving to the next episode or flipping sub/dub: the viewer's
+   * current speed (read live from the player), plus provider/controls/muted/sub from the link.
+   * The start time and title override belong to this episode only.
+   */
+  const carry = () => ({ speed: playerBus.state()?.speed ?? pp.speed, provider: pp.provider, controls: pp.controls, muted: pp.muted, sub: pp.sub });
+  const href = (s?: number, e?: number, a?: Audio) => watchHref(key, s, e, a, carry());
   const goNext = useCallback(() => {
-    if (next) nav(href(next.s, next.e, audio), { replace: true, state: loc.state });
-  }, [next, key, nav, audio, loc.state]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (!next) return;
+    if (next.key) nav(watchHref(next.key, undefined, next.e, audio, carry()), { replace: true, state: loc.state });
+    else nav(href(next.s, next.e, audio), { replace: true, state: loc.state });
+  }, [next, key, nav, audio, loc.state, pp]); // eslint-disable-line react-hooks/exhaustive-deps
   /** Flip sub/dub mid-episode: remember the choice for this show and resume at the same spot. */
   const switchAudio = (a: Audio) => {
     setAudioFor(key, a);
@@ -100,7 +145,12 @@ export function Watch() {
   };
 
   const onProgress = useCallback(
-    (position: number, duration: number) => d && saveProgress({ media: d, season, episode, audio, position, duration }, next && { season: next.s, episode: next.e }),
+    (position: number, duration: number) => {
+      if (!d) return;
+      const nextMedia = next?.key && d.sequel ? { key: d.sequel.key, kind: d.kind, title: d.sequel.title, overview: "", year: d.sequel.year, poster: d.sequel.poster, genres: d.genres } : undefined;
+      saveProgress({ media: d, season, episode, audio, position, duration }, next && { season: next.s, episode: next.e, media: nextMedia });
+      recordWatch({ media: d, season, episode, position, duration });
+    },
     [d, season, episode, audio, next],
   );
 
@@ -142,13 +192,15 @@ export function Watch() {
         onSourceResult={onSourceResult}
         title={d.title}
         subtitle={epLabel}
-        startAt={getProgress(key, season, episode)?.position}
+        startAt={pp.start ?? getProgress(key, season, episode)?.position}
+        params={pp}
         audio={audio}
         onAudio={audio ? switchAudio : undefined}
         media={d}
         onProgress={onProgress}
         onNext={next ? goNext : undefined}
-        nextLabel={next ? `${next.s != null ? `Season ${next.s} · ` : ""}Episode ${next.e}` : undefined}
+        nextLabel={next ? (next.key ? `${next.title} · Episode 1` : `${next.s != null ? `Season ${next.s} · ` : ""}Episode ${next.e}`) : undefined}
+        skips={skips.data ?? undefined}
         autoplayNext={settings.autoplayNext}
         onRetry={() => {
           setGo(false);

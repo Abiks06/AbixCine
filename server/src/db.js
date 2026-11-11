@@ -81,5 +81,52 @@ export async function migrate() {
     CREATE INDEX IF NOT EXISTS refresh_tokens_family ON refresh_tokens (family_id);
     CREATE INDEX IF NOT EXISTS refresh_tokens_expiry ON refresh_tokens (expires_at);
     CREATE INDEX IF NOT EXISTS progress_user_updated ON progress (user_id, updated_at DESC);
+
+    -- v3: per-episode watch history, email codes, Google/Discord sign-in
+    CREATE TABLE IF NOT EXISTS watch_history (
+      user_id    uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      media_key  text NOT NULL,
+      ep_key     text NOT NULL,
+      data       jsonb NOT NULL,
+      updated_at timestamptz NOT NULL,
+      PRIMARY KEY (user_id, media_key, ep_key)
+    );
+    CREATE INDEX IF NOT EXISTS watch_history_user_updated ON watch_history (user_id, updated_at DESC);
+
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at timestamptz;
+    -- Accounts made with Google/Discord have no password.
+    ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL;
+
+    CREATE TABLE IF NOT EXISTS email_codes (
+      id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id    uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      purpose    text NOT NULL,
+      code_hash  text NOT NULL,
+      attempts   int  NOT NULL DEFAULT 0,
+      expires_at timestamptz NOT NULL,
+      used_at    timestamptz,
+      created_at timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS email_codes_user ON email_codes (user_id, purpose, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS user_identities (
+      provider   text NOT NULL,
+      subject    text NOT NULL,
+      user_id    uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      email      text,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY (provider, subject)
+    );
+    CREATE INDEX IF NOT EXISTS user_identities_user ON user_identities (user_id);
+
+    CREATE TABLE IF NOT EXISTS oauth_pending (
+      state      text PRIMARY KEY,
+      provider   text NOT NULL,
+      poll_hash  text NOT NULL,
+      verifier   text NOT NULL,
+      user_id    uuid REFERENCES users(id) ON DELETE CASCADE,
+      error      text,
+      created_at timestamptz NOT NULL DEFAULT now()
+    );
   `);
 }

@@ -27,6 +27,7 @@ function save() {
 }
 
 export const inList = (key: string) => list.some((e) => e.media.key === key);
+export const getWatchlistItems = () => list;
 
 export function toggleList(m: Media) {
   if (inList(m.key)) {

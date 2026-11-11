@@ -21,6 +21,7 @@ function mock(id: string, name: string, delay: number, quality: number, url: str
     name,
     category: "external",
     priority,
+    tier: 3,
     isEnabled: () => ON && localStorage.getItem(`abx.mock.off.${id}`) !== "1",
     async find(req, _s, signal) {
       await wait(delay, signal);

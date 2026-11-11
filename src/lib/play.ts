@@ -1,11 +1,20 @@
 import { encodeKey } from "./catalog";
+import { playerParamsToQuery, type PlayerParams } from "../player/params";
 import { getEntry } from "./progress";
 import { audioFor, type Audio } from "./settings";
 import type { Media } from "./types";
 
-/** One place that builds /watch links, so every Play button carries episode and sub/dub. */
-export function watchHref(key: string, s?: number, e?: number, a?: Audio) {
-  const qs = new URLSearchParams({ ...(s != null ? { s: String(s) } : {}), ...(e != null ? { e: String(e) } : {}), ...(a ? { a } : {}) });
+/**
+ * One place that builds /watch links, so every Play button carries episode and sub/dub.
+ * `opts` adds player options (start time, speed, provider…), see src/player/params.ts.
+ */
+export function watchHref(key: string, s?: number, e?: number, a?: Audio, opts?: PlayerParams) {
+  const qs = new URLSearchParams({
+    ...(s != null ? { s: String(s) } : {}),
+    ...(e != null ? { e: String(e) } : {}),
+    ...(a ? { a } : {}),
+    ...(opts ? playerParamsToQuery(opts) : {}),
+  });
   return `/watch/${encodeKey(key)}${qs.size ? `?${qs}` : ""}`;
 }
 

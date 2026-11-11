@@ -1,0 +1,17 @@
+# Render's free plan puts the API to sleep after 15 idle minutes, and waking it takes ~30 s.
+# This pings /health every 10 minutes from 05:00 to 23:00 UTC, so it's awake for most of the
+# day while staying inside the free plan's 750 instance hours a month. Overnight it still
+# sleeps, and the app already waits for it to wake up.
+name: Keep API awake
+
+on:
+  schedule:
+    - cron: "*/10 5-22 * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - run: curl -fsS --max-time 90 --retry 2 https://abixcine-api.onrender.com/health

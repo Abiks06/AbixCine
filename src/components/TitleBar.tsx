@@ -3,6 +3,10 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { signOut, useAuth } from "../lib/account";
+import { alertText, clearAlerts, markAllRead, useAlerts } from "../lib/alerts";
+import { encodeKey } from "../lib/catalog";
+import { watchHref } from "../lib/play";
+import { audioFor } from "../lib/settings";
 import { useSettings } from "../lib/settings";
 import { Avatar } from "./Avatar";
 import { Icon } from "./Icon";
@@ -23,6 +27,9 @@ export function TitleBar({ onOpenPalette }: { onOpenPalette: () => void }) {
   const { user } = useAuth();
   const s = useSettings();
   const [menu, setMenu] = useState(false);
+  const [bell, setBell] = useState(false);
+  const alerts = useAlerts();
+  const unread = alerts.filter((a) => !a.read).length;
   const w = isTauri() ? getCurrentWindow() : null;
 
   const servers = s.jellyfin.enabled ? 1 : 0;
@@ -48,6 +55,41 @@ export function TitleBar({ onOpenPalette }: { onOpenPalette: () => void }) {
         <i className="dot" />
         <span>{status}</span>
       </Link>
+      <div className="menu-wrap">
+        <button className="avatar-btn bell" onClick={() => { setBell((b) => !b); if (!bell) setTimeout(markAllRead, 1500); }} aria-label={unread ? `${unread} new episode alerts` : "Episode alerts"}>
+          <Icon name="bell" size={18} />
+          {unread > 0 && <span className="bell-n">{unread > 9 ? "9+" : unread}</span>}
+        </button>
+        {bell && (
+          <>
+            <div className="menu-scrim" onClick={() => setBell(false)} />
+            <div className="menu glass alerts-menu">
+              <div className="menu-head alerts-head">
+                <strong>New episodes</strong>
+                {alerts.length > 0 && <button className="link-btn" onClick={clearAlerts}>Clear</button>}
+              </div>
+              {alerts.length === 0 && <p className="muted alerts-empty">Shows in My List and Continue watching show up here when a new episode or season comes out.</p>}
+              {alerts.slice(0, 12).map((a) => (
+                <button
+                  key={a.id}
+                  className={`alert-row ${a.read ? "" : "new"}`}
+                  onClick={() => {
+                    setBell(false);
+                    const anime = a.key.startsWith("anilist:");
+                    nav(a.kind === "season" ? `/title/${encodeKey(a.key)}` : watchHref(a.key, a.season, a.episode, anime ? audioFor(a.key) : undefined), { viewTransition: true, state: { from: "app" } });
+                  }}
+                >
+                  {a.poster ? <img src={a.poster} alt="" /> : <span className="alert-ph" />}
+                  <span className="alert-txt">
+                    <b>{a.title}</b>
+                    <small>{alertText(a)}</small>
+                  </span>
+                </button>
+              ))}
+            </div>
+          </>
+        )}
+      </div>
       {user && (
         <div className="menu-wrap">
           <button className="avatar-btn" onClick={() => setMenu((m) => !m)} aria-label="Account">
