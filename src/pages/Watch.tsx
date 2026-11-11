@@ -85,7 +85,7 @@ export function Watch() {
       ctl.abort();
     };
     // Re-resolve when sources change in settings, the viewer asks to check more, or the catalog reloads.
-  }, [req && reqKey(req), settings.libraryPaths, settings.jellyfin, settings.disabledSources, retry, deep, attempt]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [req && reqKey(req), settings.libraryPaths, settings.jellyfin, settings.disabledSources, settings.enabledExtras, retry, deep, attempt]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // AniList seasons are separate entries: know the next one so the last episode leads into it.
   const aniSeasons = useAsync(() => (key.startsWith("anilist:") ? animeSeasons(key).catch(() => [] as AnimeSeason[]) : Promise.resolve([] as AnimeSeason[])), [key]);

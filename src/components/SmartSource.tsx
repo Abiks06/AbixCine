@@ -33,7 +33,7 @@ export function SmartSource({ req, what, onPlay }: { req: PlaybackRequest; what:
       live = false;
       ctl.abort();
     };
-  }, [reqKey(req), s.libraryPaths, s.jellyfin, s.disabledSources]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [reqKey(req), s.libraryPaths, s.jellyfin, s.disabledSources, s.enabledExtras]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const list = cands ?? ranked;
   const best = list.find((c) => c.probe?.ok);

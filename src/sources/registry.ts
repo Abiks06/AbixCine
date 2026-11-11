@@ -271,7 +271,8 @@ export function score(c: StreamCandidate, preferred: number, priority: number, r
   const qScore = q <= preferred ? q / preferred : 1 - (q - preferred) / (preferred * 4);
   const avg = getHealth(c.providerId).latency;
   const ms = avg == null ? c.probe.latencyMs : c.probe.latencyMs * 0.6 + avg * 0.4;
-  const latency = Math.min(ms, 12000) / 12000;
+  const startupMs = ms + (c.lookupMs ?? getHealth(c.providerId).lookupMs ?? 0);
+  const latency = Math.min(startupMs, 12000) / 12000;
   const rel = reliability(c.providerId);
   const pick = lastPick(req);
   const memory = pick ? (pick.providerId === c.providerId ? 8 : 0) : 0;
@@ -319,7 +320,7 @@ const GRACE_MS = 900;
 const RESULT_TTL = 120_000;
 const results = new Map<string, { at: number; ranked: StreamCandidate[]; events: ResolveEvent[]; budget: number }>();
 const resultKey = (req: PlaybackRequest, s: Settings) =>
-  `${reqKey(req)}|${JSON.stringify([s.libraryPaths, s.jellyfin.enabled && s.jellyfin.url, s.disabledSources, s.preferredQuality])}`;
+  `${reqKey(req)}|${JSON.stringify([s.libraryPaths, s.jellyfin.enabled && s.jellyfin.url, s.disabledSources, s.enabledExtras, s.preferredQuality])}`;
 
 /** Forget cached races (after a source is toggled or a playback failure was recorded). */
 export const clearResolveCache = () => results.clear();
@@ -345,7 +346,8 @@ export function resolveSources(req: PlaybackRequest, onEvent?: (e: ResolveEvent)
   const hit = results.get(ck);
   // Reuse a recent race that found something (the title page's check feeds the player);
   // its unchecked servers are verified on demand from the server list.
-  if (hit && Date.now() - hit.at < RESULT_TTL && (hit.budget >= budget || hit.ranked.some((c) => c.probe?.ok))) {
+  const hasUncheckedEmbeds = hit?.ranked.some((c) => c.kind === "embed" && !c.probe);
+  if (hit && Date.now() - hit.at < RESULT_TTL && (hit.budget >= budget || !hasUncheckedEmbeds)) {
     // Re-score so anything that failed since (or was played since) moves accordingly.
     const again = hit.ranked.map((c) => score(c, s.preferredQuality, prio[c.providerId] ?? 0, req)).sort(sortByScore);
     hit.events.forEach((e) => onEvent?.(e));
@@ -440,7 +442,10 @@ export function resolveSources(req: PlaybackRequest, onEvent?: (e: ResolveEvent)
       } finally {
         opts.signal?.removeEventListener("abort", onAbort);
       }
-      const fresh = found.filter((c) => !seen.has(c.url) && (seen.add(c.url), true));
+      const lookupMs = Math.round(performance.now() - t0);
+      const fresh = found
+        .filter((c) => !seen.has(c.url) && (seen.add(c.url), true))
+        .map((c) => ({ ...c, lookupMs }));
       emit({ providerId: p.id, status: "done", count: fresh.length });
       const embeds = fresh.filter((c) => c.kind === "embed");
       await Promise.all(fresh.filter((c) => c.kind !== "embed").map((c) => probe(c).then(upsert)));

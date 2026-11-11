@@ -60,6 +60,8 @@ export interface StreamCandidate {
   skip?: { intro?: [number, number]; outro?: [number, number] };
   /** Filled in by the ranker. */
   probe?: { ok: boolean; latencyMs: number; quality?: number; error?: string };
+  /** Time this provider's lookup took in the current source race, used to rank time-to-play. */
+  lookupMs?: number;
   score?: number;
   /** Short reasons the ranker liked it: "played last time", "fastest", "best quality". */
   why?: string[];
