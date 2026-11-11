@@ -21,7 +21,8 @@ export function normTitle(s: string) {
     .toLowerCase()
     .normalize("NFKD")
     .replace(/[̀-ͯ]/g, "")
-    .replace(/[._\-:'’!?,()[\]]/g, " ")
+    .replace(/['’`]/g, "") // "Journey's" and "Journeys" are the same release name
+    .replace(/[._\-:!?,()[\]&]/g, " ")
     .replace(/\b(the|a|an)\b/g, " ")
     .replace(/\s+/g, " ")
     .trim();

@@ -19,16 +19,17 @@ import { Search } from "./pages/Search";
 import { Settings } from "./pages/Settings";
 import { Title } from "./pages/Title";
 
-// The player pulls in hls.js (~400 kB), so load it only when you press play.
+// The player pulls in hls.js (~600 kB), so load it only when you press play.
 const Watch = lazy(() => import("./pages/Watch").then((m) => ({ default: m.Watch })));
 
-bootAccount();
+void bootAccount();
 const SKIP_SPLASH = getSettings().reduceMotion || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
 
 function Shell() {
   const loc = useLocation();
   const s = useSettings();
-  const { user } = useAuth();
+  const { user, guest } = useAuth();
+  const inApp = !!user || !!guest;
   const watching = loc.pathname.startsWith("/watch/");
   const main = useRef<HTMLElement>(null);
   const [palette, setPalette] = useState(false);
@@ -68,6 +69,7 @@ function Shell() {
   }, [watching]);
 
   useEffect(() => {
+    if (!inApp) return;
     const onKey = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
         e.preventDefault();
@@ -84,14 +86,14 @@ function Shell() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  }, [inApp]);
 
   return (
     <div ref={app} className={`app ${watching ? "is-watching" : ""} ${s.reduceMotion ? "reduce-motion" : ""}`}>
       <div className="light" aria-hidden />
       <div className="grain" aria-hidden />
       <Splash skip={SKIP_SPLASH} />
-      {!user ? (
+      {!inApp ? (
         <Auth />
       ) : (
         <>
@@ -114,8 +116,8 @@ const router = createHashRouter([
     element: <Shell />,
     children: [
       { path: "/", element: <Home /> },
-      { path: "/movies", element: <Browse kind="movie" /> },
-      { path: "/series", element: <Browse kind="tv" /> },
+      { path: "/movies", element: <Browse key="movie" kind="movie" /> },
+      { path: "/series", element: <Browse key="tv" kind="tv" /> },
       { path: "/anime", element: <Anime /> },
       { path: "/list", element: <MyList /> },
       { path: "/library", element: <Library /> },

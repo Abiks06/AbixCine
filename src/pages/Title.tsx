@@ -74,10 +74,11 @@ export function Title() {
 
   const watch = (s?: number, e?: number, srv?: string) => {
     const qs = new URLSearchParams({ ...(s != null ? { s: String(s) } : {}), ...(e != null ? { e: String(e) } : {}), ...(audio ? { a: audio } : {}), ...(srv ? { srv } : {}) });
-    nav(`/watch/${encodeKey(seasonKey)}${qs.size ? `?${qs}` : ""}`, { viewTransition: true });
+    nav(`/watch/${encodeKey(seasonKey)}${qs.size ? `?${qs}` : ""}`, { viewTransition: true, state: { from: "app" } });
   };
+  const epTag = progress?.episode != null ? `${progress.season != null ? `S${progress.season} · ` : ""}E${progress.episode}` : "";
   const playLabel = progress
-    ? progress.episode != null ? `Resume ${progress.season != null ? `S${progress.season} · ` : ""}E${progress.episode}` : "Resume"
+    ? progress.upNext ? `Play ${epTag}` : epTag ? `Resume ${epTag}` : "Resume"
     : hasEps ? "Play E1" : "Play";
   const length =
     d.kind === "movie"
@@ -112,7 +113,7 @@ export function Title() {
     <div className="tp">
       <Ambient media={d} />
       <div className="backdrop" style={{ viewTransitionName: "hero" }}>
-        <Art media={d} variant="backdrop" hd />
+        <Art media={d} variant="backdrop" hd priority />
         <div className="shade" />
       </div>
       <div className="pad tp-body">
@@ -148,7 +149,7 @@ export function Title() {
                 <a className="btn glass" href={`https://www.youtube.com/watch?v=${d.trailerYouTubeId}`} target="_blank" rel="noreferrer">Trailer</a>
               )}
             </div>
-            {progress && progress.duration > 0 && (
+            {progress && !progress.upNext && progress.duration > 0 && (
               <div className="resume">
                 <div className="resume-bar"><i style={{ width: `${(progress.position / progress.duration) * 100}%` }} /></div>
                 <span>{Math.max(1, Math.round((progress.duration - progress.position) / 60))}m left{progress.episode != null ? ` in E${progress.episode}` : ""}</span>

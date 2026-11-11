@@ -6,7 +6,9 @@ import { Icon } from "../components/Icon";
 import { Ambient } from "../components/Ambient";
 import { TitleArt } from "../components/TitleArt";
 import { decodeKey, encodeKey, getDetail } from "../lib/catalog";
-import { getProgress, saveProgress } from "../lib/progress";
+import type { MediaDetail } from "../lib/types";
+import { getEntry, getProgress, saveProgress } from "../lib/progress";
+import { useWatchlist } from "../lib/watchlist";
 import { audioFor, setAudioFor, useSettings, type Audio } from "../lib/settings";
 import { tmdbSeason } from "../lib/tmdb";
 import { animeEpisodes, animeSeasons, type AnimeSeason } from "../lib/anilist";
@@ -19,19 +21,40 @@ export function Watch() {
   const key = decodeKey(useParams().key!);
   const [params] = useSearchParams();
   const nav = useNavigate();
+  const loc = useLocation();
   /** Set when the player flipped sub/dub or moved episode: skip the race showcase. */
-  const quick = !!(useLocation().state as { quick?: boolean } | null)?.quick;
+  const quick = !!(loc.state as { quick?: boolean } | null)?.quick;
   const settings = useSettings();
   const season = params.get("s") ? Number(params.get("s")) : undefined;
   const episode = params.get("e") ? Number(params.get("e")) : undefined;
   const audioParam = (params.get("a") as Audio | null) ?? undefined;
   /** A server the viewer chose on the title page or the race screen. */
   const preferred = params.get("srv") ?? undefined;
-  const { data: d } = useAsync(() => getDetail(key), [key]);
+  const detail = useAsync(() => getDetail(key), [key]);
+  // Offline / catalog down: local files and Jellyfin only need a title, so fall back to the copy
+  // saved with progress or My List instead of spinning forever.
+  const list = useWatchlist();
+  const d: MediaDetail | undefined = useMemo(() => {
+    if (detail.data) return detail.data;
+    if (!detail.error) return undefined;
+    const m = getEntry(key)?.media ?? list.find((w) => w.media.key === key)?.media;
+    return m ? { ...m, cast: [], crew: [], related: [] } : undefined;
+  }, [detail.data, detail.error, key, list]);
+  const [attempt, setAttempt] = useState(0);
+  const reloadCatalog = useCallback(() => {
+    if (detail.error) detail.reload();
+    setAttempt((n) => n + 1);
+  }, [detail]);
 
   const isAnime = key.startsWith("anilist:") || d?.kind === "anime";
   const audio = audioParam ?? (isAnime ? audioFor(key) : undefined);
-  const req: PlaybackRequest | null = useMemo(() => (d ? { media: d, season, episode, audio } : null), [d, season, episode, audio]);
+  // Seasons before this one, so absolute-numbered anime files ("Show - 26") still match S2E1.
+  const absolute = useMemo(() => {
+    if (!d?.seasons || season == null || episode == null) return undefined;
+    const before = d.seasons.filter((x) => x.number > 0 && x.number < season).reduce((n, x) => n + x.episodeCount, 0);
+    return before ? before + episode : undefined;
+  }, [d, season, episode]);
+  const req: PlaybackRequest | null = useMemo(() => (d ? { media: d, season, episode, absolute, audio } : null), [d, season, episode, absolute, audio]);
   const [events, setEvents] = useState<Record<string, ResolveEvent>>({});
   /** The ranked list at the moment the picker committed to a winner. */
   const [cands, setCands] = useState<StreamCandidate[] | null>(null);
@@ -61,7 +84,8 @@ export function Watch() {
       live = false;
       ctl.abort();
     };
-  }, [req && reqKey(req), settings.libraryPaths, settings.jellyfin, settings.disabledSources, retry, deep]); // eslint-disable-line react-hooks/exhaustive-deps
+    // Re-resolve when sources change in settings, the viewer asks to check more, or the catalog reloads.
+  }, [req && reqKey(req), settings.libraryPaths, settings.jellyfin, settings.disabledSources, retry, deep, attempt]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // AniList seasons are separate entries: know the next one so the last episode leads into it.
   const aniSeasons = useAsync(() => (key.startsWith("anilist:") ? animeSeasons(key).catch(() => [] as AnimeSeason[]) : Promise.resolve([] as AnimeSeason[])), [key]);
@@ -87,6 +111,9 @@ export function Watch() {
     return null;
   }, [d, season, episode, nextAniSeason, aniSeasons.data]);
 
+  // Carry the incoming navigation state (e.g. "opened from inside the app") forward, so Back
+  // keeps working the same way after an in-player episode change or sub/dub switch.
+  const forwardState = (extra: Record<string, unknown> = {}) => ({ ...(loc.state as object | null), ...extra });
   const href = (s?: number, e?: number, a?: Audio, srv?: string) =>
     `/watch/${encodeKey(key)}?${new URLSearchParams({
       ...(s != null ? { s: String(s) } : {}),
@@ -95,27 +122,38 @@ export function Watch() {
       ...(srv ? { srv } : {}),
     })}`;
   const goEp = useCallback(
-    (s: number | undefined, e: number) => nav(href(s, e, audio), { replace: true, state: { quick: true } }),
-    [key, nav, audio], // eslint-disable-line react-hooks/exhaustive-deps
+    (s: number | undefined, e: number) => nav(href(s, e, audio), { replace: true, state: forwardState({ quick: true }) }),
+    [key, nav, audio, loc.state], // eslint-disable-line react-hooks/exhaustive-deps
   );
   const goNext = useCallback(() => {
     if (!next) return;
     // Into the next AniList season: a different entry, same audio.
-    if (next.key) nav(`/watch/${encodeKey(next.key)}?${new URLSearchParams({ e: "1", ...(audio ? { a: audio } : {}) })}`, { replace: true, state: { quick: true } });
+    if (next.key) nav(`/watch/${encodeKey(next.key)}?${new URLSearchParams({ e: "1", ...(audio ? { a: audio } : {}) })}`, { replace: true, state: forwardState({ quick: true }) });
     else goEp(next.s, next.e);
-  }, [next, goEp, nav, audio]);
+  }, [next, goEp, nav, audio, loc.state]); // eslint-disable-line react-hooks/exhaustive-deps
   /** Flip sub/dub mid-episode: remember the choice for this show and resume at the same spot. */
   const switchAudio = (a: Audio) => {
     setAudioFor(key, a);
-    nav(href(season, episode, a), { replace: true, state: { quick: true } });
+    nav(href(season, episode, a), { replace: true, state: forwardState({ quick: true }) });
   };
 
   const onProgress = useCallback(
-    (position: number, duration: number) => d && saveProgress({ media: d, season, episode, audio, position, duration }),
-    [d, season, episode, audio],
+    (position: number, duration: number) => d && saveProgress({ media: d, season, episode, audio, position, duration }, next && { season: next.s, episode: next.e }),
+    [d, season, episode, audio, next],
   );
 
-  const back = () => nav(`/title/${encodeKey(key)}`, { viewTransition: true });
+  // Back returns to wherever Play was pressed. Opened from outside the app (or a reload), go to the
+  // title page and replace this entry, so Back there doesn't bounce into the player again.
+  const back = useCallback(() => {
+    if ((loc.state as { from?: string } | null)?.from === "app") nav(-1);
+    else nav(`/title/${encodeKey(key)}`, { replace: true, viewTransition: true });
+  }, [loc.state, nav, key]);
+  useEffect(() => {
+    if (go) return;
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && back();
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [go, back]);
   const epLabel = episode != null ? `${season != null ? `Season ${season} · ` : ""}Episode ${episode}` : undefined;
   const playable = cands?.filter((c) => c.probe?.ok);
 
@@ -184,8 +222,36 @@ export function Watch() {
         onEnded={() => settings.autoplayNext && goNext()}
         autoNext={settings.autoplayNext}
         onNext={next ? goNext : undefined}
+        nextLabel={next ? `${next.s != null ? `Season ${next.s} · ` : ""}Episode ${next.e}` : undefined}
+        autoplayNext={settings.autoplayNext}
+        onRetry={() => {
+          setGo(false);
+          reloadCatalog();
+        }}
         onBack={back}
       />
+    );
+  }
+
+  // Catalog unreachable (offline, server down): local files and Jellyfin still only need a
+  // title, which `d` already fell back to above, so this only shows when there's truly nothing.
+  if (!d && detail.error) {
+    return (
+      <div className="race-page">
+        <button className="back race-back" onClick={back}><Icon name="back" size={18} /> Back</button>
+        <div className="race2 pad">
+          <section className="race-hero">
+            <div className="title-type md">Can't reach the catalog</div>
+            <div className="resolve-empty">
+              <p>AbixCine couldn't load this title's details{navigator.onLine ? "" : " because you're offline"}. Files on this PC still play once it's in Continue watching or My List.</p>
+              <div className="acts">
+                <button className="btn play" onClick={reloadCatalog} autoFocus><Icon name="play" size={16} /> Try again</button>
+                <button className="btn glass" onClick={back}><Icon name="back" size={16} /> Back</button>
+              </div>
+            </div>
+          </section>
+        </div>
+      </div>
     );
   }
 
@@ -283,6 +349,9 @@ export function Watch() {
                     ? "Dubs arrive later than subs, and only a few servers carry them."
                     : "It may be too new to be online yet."}
               </p>
+              {enabled.some((p) => p.id === "local") && episode != null && (
+                <p className="muted hint">Looked for files named like “{d?.title} S{String(season ?? 1).padStart(2, "0")}E{String(episode).padStart(2, "0")}”, “{d?.title} - {String(absolute ?? episode).padStart(2, "0")}”, or “Season {season ?? 1}/{String(episode).padStart(2, "0")}.mkv”.</p>
+              )}
               <div className="acts">
                 {!enabled.length ? (
                   <button className="btn play" onClick={() => nav("/settings#sources", { viewTransition: true })}><Icon name="gear" size={16} /> Choose servers</button>

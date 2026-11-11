@@ -4,6 +4,9 @@ import { encodeKey } from "../lib/catalog";
 import { fmtRuntime } from "../lib/format";
 import { useFeatured, type Featured } from "../lib/useLogos";
 import { toggleList, useWatchlist } from "../lib/watchlist";
+import { playHref } from "../lib/play";
+import { setStageLight } from "../lib/light";
+import { useSettings } from "../lib/settings";
 import type { Media } from "../lib/types";
 import { Art } from "./Art";
 import { kindLabel } from "./Card";
@@ -54,20 +57,21 @@ export function Hero({ items, label, onActive }: { items: Media[]; label: string
   }, [ready]);
   const hold = paused || away;
 
-  useEffect(() => {
-    if (n < 2 || hold) return;
-    const t = setTimeout(() => setI((x) => (x + 1) % n), SLIDE_MS);
-    return () => clearTimeout(t);
-  }, [n, cur, hold]);
+  // The slide advances when its progress bar finishes (onAnimationEnd below), so pausing on hover,
+  // focus or visibility keeps bar and slide in step. Reduced motion: no autoplay at all (WCAG 2.2.2).
+  const still = useSettings().reduceMotion || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+  const advance = () => n > 1 && setI((x) => (x + 1) % n);
 
-  // Only the slide on screen and the one coming next carry an image:
-  // six full-size backdrops no longer download before the first paint.
-  // (Once a slide has been shown it stays mounted, so fading back out never drops its picture.)
+  // Only slides that have been on screen carry an image: the current one and both neighbours
+  // (so crossfades and either-direction nav still work), kept mounted once shown so a repeat
+  // loop never re-downloads or re-fades a picture.
   const mounted = useRef(new Set<string>());
-  for (const p of [picks[cur], picks[(cur + 1) % Math.max(1, n)]]) if (p) mounted.current.add(p.key);
+  for (const p of [picks[cur], picks[(cur + 1) % Math.max(1, n)], picks[(cur - 1 + n) % Math.max(1, n)]]) if (p) mounted.current.add(p.key);
 
   useEffect(() => {
-    if (m) onActive?.(m);
+    if (!m) return;
+    setStageLight(m);
+    onActive?.(m);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [m?.key, m?.backdrop]);
 
@@ -82,6 +86,8 @@ export function Hero({ items, label, onActive }: { items: Media[]; label: string
       ref={root}
       onMouseEnter={() => setPaused(true)}
       onMouseLeave={() => setPaused(false)}
+      onFocus={() => setPaused(true)}
+      onBlur={(e) => !e.currentTarget.contains(e.relatedTarget) && setPaused(false)}
       onKeyDown={(e) => {
         if (n < 2) return;
         if (e.key === "ArrowRight") setI((cur + 1) % n);
@@ -91,7 +97,7 @@ export function Hero({ items, label, onActive }: { items: Media[]; label: string
       <div className="hero-stage" style={{ viewTransitionName: "hero" }}>
         {picks.map((p, j) => (
           <div key={p.key} className={`hero-bg ${j === cur ? "on" : ""}`}>
-            {mounted.current.has(p.key) && <Art media={p} variant="backdrop" hd eager={j === cur} />}
+            {mounted.current.has(p.key) && <Art media={p} variant="backdrop" hd priority={j === cur} />}
           </div>
         ))}
       </div>
@@ -110,7 +116,7 @@ export function Hero({ items, label, onActive }: { items: Media[]; label: string
         </div>
         <p className="desc">{m.overview}</p>
         <div className="acts">
-          <button className="btn play" onClick={() => nav(`/watch/${encodeKey(m.key)}`, { viewTransition: true })}>
+          <button className="btn play" onClick={() => nav(playHref(m), { viewTransition: true, state: { from: "app" } })}>
             <Icon name="play" size={16} /> Play
           </button>
           <Link className="btn glass" to={`/title/${encodeKey(m.key)}`} viewTransition>
@@ -124,7 +130,9 @@ export function Hero({ items, label, onActive }: { items: Media[]; label: string
       <div className="heroNav pad">
         {picks.map((p, j) => (
           <button key={p.key} className={j === cur ? "on" : j < cur ? "done" : ""} onClick={() => setI(j)} aria-label={`Show ${p.title}`}>
-            {j === cur && <i key={cur} style={{ animationPlayState: hold ? "paused" : "running", animationDuration: `${SLIDE_MS}ms` }} />}
+            {j === cur && !still && (
+              <i key={cur} onAnimationEnd={advance} style={{ animationPlayState: hold ? "paused" : "running", animationDuration: `${SLIDE_MS}ms` }} />
+            )}
           </button>
         ))}
       </div>
@@ -134,7 +142,7 @@ export function Hero({ items, label, onActive }: { items: Media[]; label: string
           <div className="row3">
             {upNext.map((p) => (
               <button key={p.key} className="mini" onClick={() => setI(picks.indexOf(p))}>
-                <Art media={p} variant="backdrop" />
+                <Art media={p} variant="backdrop" size="sm" />
                 <span className="lt">{p.title}</span>
               </button>
             ))}

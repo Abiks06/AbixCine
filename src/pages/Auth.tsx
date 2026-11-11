@@ -1,12 +1,15 @@
 import { useEffect, useState } from "react";
 import { Icon } from "../components/Icon";
 import { LogoMark, Wordmark } from "../components/Logo";
-import { errorMessage, getApiBase, setApiBase, signIn, signUp } from "../lib/account";
+import { ApiError, continueAsGuest, errorMessage, getApiBase, hadAccount, isWaking, setApiBase, signIn, signUp, wakeServer } from "../lib/account";
 import { ANIME_FEEDS, loadAnimeFeed } from "../lib/anilist";
 
 /** Sign in / create account. A slow drifting poster wall sits behind the glass card. */
 export function Auth() {
-  const [mode, setMode] = useState<"in" | "up">("up");
+  // Returning users land on Sign in, first-timers on Sign up.
+  const [mode, setMode] = useState<"in" | "up">(() => (hadAccount() ? "in" : "up"));
+  /** Seconds spent waiting for a sleeping server, or null when not waiting. */
+  const [waking, setWaking] = useState<number | null>(null);
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -25,15 +28,28 @@ export function Auth() {
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErr(null);
+    if (!setApiBase(server)) {
+      setErr(errorMessage(new ApiError(400, "bad_server")));
+      return;
+    }
     setBusy(true);
-    setApiBase(server);
+    const go = () => (mode === "up" ? signUp(name, email, password) : signIn(email, password));
     try {
-      if (mode === "up") await signUp(name, email, password);
-      else await signIn(email, password);
+      await go();
     } catch (e) {
-      setErr(errorMessage(e));
+      if (!isWaking(e)) {
+        setErr(errorMessage(e));
+      } else {
+        // Free hosting sleeps when idle: wait for it, then try once more, showing the wait.
+        setWaking(0);
+        const up = await wakeServer(setWaking);
+        setWaking(null);
+        if (!up) setErr(errorMessage(e));
+        else await go().catch((e2) => setErr(errorMessage(e2)));
+      }
     } finally {
       setBusy(false);
+      setWaking(null);
     }
   };
 
@@ -60,10 +76,10 @@ export function Auth() {
         <h1>{mode === "up" ? "Create your account" : "Welcome back"}</h1>
         <p className="muted">{mode === "up" ? "Your progress, list and preferences follow you to every device." : "Pick up right where you left off."}</p>
 
-        <div className="auth-switch seg" role="tablist">
+        <div className="auth-switch seg" role="tablist" aria-label="Account">
           <span className="seg-thumb" style={{ transform: `translateX(${mode === "up" ? 0 : 100}%)` }} />
-          <button type="button" className={mode === "up" ? "on" : ""} onClick={() => setMode("up")}>Sign up</button>
-          <button type="button" className={mode === "in" ? "on" : ""} onClick={() => setMode("in")}>Sign in</button>
+          <button type="button" role="tab" aria-selected={mode === "up"} className={mode === "up" ? "on" : ""} onClick={() => setMode("up")}>Sign up</button>
+          <button type="button" role="tab" aria-selected={mode === "in"} className={mode === "in" ? "on" : ""} onClick={() => setMode("in")}>Sign in</button>
         </div>
 
         <div className={`auth-fields ${mode}`}>
@@ -83,11 +99,22 @@ export function Auth() {
           </label>
         </div>
 
-        {err && <div className="auth-err">{err}</div>}
+        {err && <div className="auth-err" role="alert">{err}</div>}
+        {waking != null && (
+          <div className="auth-wake" role="status">
+            <span className="mini-spin" /> Waking the AbixCine server… {waking}s
+            <small>Free hosting sleeps after 15 idle minutes. First sign-in of the day can take up to a minute.</small>
+          </div>
+        )}
 
         <button className="btn btn-ion wide" disabled={busy}>
           {busy ? <span className="mini-spin" /> : <>{mode === "up" ? "Create account" : "Sign in"} <Icon name="arrowR" size={16} /></>}
         </button>
+
+        <button type="button" className="btn btn-glass wide guest" onClick={continueAsGuest}>
+          Continue without an account
+        </button>
+        <p className="auth-fine">Your folders and Jellyfin work offline. Progress stays on this PC until you sign in.</p>
 
         <button type="button" className="link-btn" onClick={() => setShowServer((s) => !s)}>
           <Icon name="globe" size={13} /> Server: {server.replace(/^https?:\/\//, "")}

@@ -72,14 +72,17 @@ export const Card = memo(function Card({ media, index = 0, variant = "landscape"
         previewLight(media);
         warm(media.key);
       }}
-      onFocus={() => warm(media.key)}
+      onFocus={() => {
+        previewLight(media);
+        warm(media.key);
+      }}
       onMouseLeave={() => previewLight(null)}
+      onBlur={() => previewLight(null)}
       style={{ ["--i" as any]: Math.min(index, 12) }}
     >
       <div className="art-wrap">
-        <Art media={media} variant={port ? "poster" : "backdrop"} />
+        <Art media={media} variant={port ? "poster" : "backdrop"} size="md" />
         {!port && <div className="shade" />}
-        {!port && <div className={`lt ${extra ? "lift" : ""}`}>{media.title}</div>}
         {extra}
         {onRemove ? (
           <button

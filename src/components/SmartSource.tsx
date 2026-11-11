@@ -26,7 +26,7 @@ export function SmartSource({ req, what, onPlay }: { req: PlaybackRequest; what:
     setCands(null);
     setRanked([]);
     setEvents({});
-    resolveSources(req, (e) => live && setEvents((x) => ({ ...x, [e.providerId]: e })), { signal: ctl.signal, verifyBudget: 1, onUpdate: (r) => live && setRanked(r) }).then(
+    resolveSources(req, (e) => live && setEvents((x) => ({ ...x, [e.providerId]: e })), { signal: ctl.signal, verifyBudget: 1, record: false, onUpdate: (r) => live && setRanked(r) }).then(
       (c) => live && setCands(c),
     );
     return () => {

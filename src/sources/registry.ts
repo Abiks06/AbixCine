@@ -3,7 +3,7 @@ import { reqKey, type PlaybackRequest } from "../lib/types";
 import type { Settings } from "../lib/settings";
 import { animeDirectProvider } from "./anime-direct";
 import { jellyfinProvider } from "./jellyfin";
-import { getHealth, lastPick, lookupTimeout, recentlyFailed, recordLookupFailure, recordProbe, reliability } from "./health";
+import { badUrl, getHealth, lastPick, lookupTimeout, recentlyFailed, recordLookup, recordLookupFailure, recordProbe, reliability } from "./health";
 import { kisskhProvider } from "./kisskh";
 import { localProvider } from "./local";
 import { native, proxyUrl, sniff } from "./native";
@@ -80,7 +80,7 @@ function withTimeout<T>(p: Promise<T>, ms: number, ctl: AbortController): Promis
 }
 
 /** Highest RESOLUTION=WxH in a master playlist, or undefined. */
-function hlsMaxHeight(manifest: string) {
+export function hlsMaxHeight(manifest: string) {
   let best: number | undefined;
   for (const m of manifest.matchAll(/RESOLUTION=\d+x(\d+)/g)) best = Math.max(best ?? 0, Number(m[1]));
   return best;
@@ -261,9 +261,10 @@ async function probe(c: StreamCandidate): Promise<StreamCandidate> {
  *  - verified at all (an unverified server never beats one that proved it has the title);
  *  - plays in AbixCine's own player (direct/captured) rather than as a web page;
  *  - closeness to the preferred quality;
- *  - track record, last pick for this show, speed, provider priority.
+ *  - track record, last pick for this show, speed, provider priority;
+ *  - this exact file failed to play in the last day (e.g. a codec the player can't decode).
  */
-function score(c: StreamCandidate, preferred: number, priority: number, req: PlaybackRequest): StreamCandidate {
+export function score(c: StreamCandidate, preferred: number, priority: number, req: PlaybackRequest): StreamCandidate {
   if (!c.probe) return { ...c, score: -500 + priority, why: [] };
   if (!c.probe.ok) return { ...c, score: -1000 + priority, why: [] };
   const q = c.probe.quality ?? c.quality ?? 720;
@@ -278,6 +279,8 @@ function score(c: StreamCandidate, preferred: number, priority: number, req: Pla
   const own = c.via === "direct" || c.via === "sniffed" || c.providerId === "local" || c.providerId === "jellyfin" ? 25 : 0;
   // An anime request with a player that can't honour sub/dub only wins when nothing else answers.
   const audioMiss = req.audio && c.audio === "unknown" ? 18 : 0;
+  // This exact URL failed to play (not just this provider): a codec issue, a dead link.
+  const broken = badUrl(c.url) ? 40 : 0;
   const why: string[] = [];
   if (own && c.via !== "direct") why.push("ad-free");
   if (c.via === "direct") why.push("direct stream");
@@ -285,7 +288,8 @@ function score(c: StreamCandidate, preferred: number, priority: number, req: Pla
   if (memory) why.push("played this show before");
   if (rel > 0.8 && getHealth(c.providerId).ok > 3) why.push("reliable");
   if (shaky) why.push("failed recently");
-  return { ...c, why, score: own + qScore * 40 - latency * 20 + (rel - 0.5) * 20 + memory - shaky - audioMiss + priority * 0.5 };
+  if (broken) why.push("wouldn't play last time");
+  return { ...c, why, score: own + qScore * 40 - latency * 20 + (rel - 0.5) * 20 + memory - shaky - audioMiss - broken + priority * 0.5 };
 }
 
 const sortByScore = (a: StreamCandidate, b: StreamCandidate) => b.score! - a.score!;
@@ -301,6 +305,8 @@ export interface ResolveOptions {
    */
   verifyBudget?: number;
   signal?: AbortSignal;
+  /** Learn from this race (health stats). Off for previews, so a title visit + Play doesn't count twice. */
+  record?: boolean;
 }
 
 /** After the first verified stream appears, give the others this long to beat it. */
@@ -329,6 +335,9 @@ export function resolveSources(req: PlaybackRequest, onEvent?: (e: ResolveEvent)
   const prio = Object.fromEntries(PROVIDERS.map((p) => [p.id, p.priority]));
   const budget = opts.verifyBudget ?? 3;
   const seen = new Set<string>();
+  const record = opts.record !== false;
+  /** Probes count once per provider per race, so a provider returning 3 files doesn't get 3 votes. */
+  const probed = new Set<string>();
   let ranked: StreamCandidate[] = [];
   let settled = false;
   const ck = resultKey(req, s);
@@ -359,7 +368,10 @@ export function resolveSources(req: PlaybackRequest, onEvent?: (e: ResolveEvent)
     };
     const upsert = (c: StreamCandidate) => {
       if (opts.signal?.aborted) return;
-      if (c.probe) recordProbe(c);
+      if (c.probe && record && !probed.has(c.providerId)) {
+        probed.add(c.providerId);
+        recordProbe(c);
+      }
       const scored = score(c, s.preferredQuality, prio[c.providerId] ?? 0, req);
       const id = c.pageUrl ?? c.url;
       ranked = [...ranked.filter((x) => (x.pageUrl ?? x.url) !== id), scored].sort(sortByScore);
@@ -385,7 +397,7 @@ export function resolveSources(req: PlaybackRequest, onEvent?: (e: ResolveEvent)
         probe(c)
           .then((r) => {
             if (r.probe?.ok) verified++;
-            recordWin(r.providerId, kind, !!r.probe?.ok);
+            if (record) recordWin(r.providerId, kind, !!r.probe?.ok);
             upsert(r);
           })
           .finally(() => {
@@ -413,15 +425,20 @@ export function resolveSources(req: PlaybackRequest, onEvent?: (e: ResolveEvent)
     const runs = enabled.map(async (p) => {
       emit({ providerId: p.id, status: "searching" });
       const ctl = new AbortController();
-      opts.signal?.addEventListener("abort", () => ctl.abort());
+      const onAbort = () => ctl.abort();
+      opts.signal?.addEventListener("abort", onAbort, { once: true });
       let found: StreamCandidate[];
+      const t0 = performance.now();
       try {
         found = await withTimeout(p.find(req, s, ctl.signal), lookupTimeout(p.id, p.timeoutMs ?? PROVIDER_TIMEOUT), ctl);
+        if (record) recordLookup(p.id, performance.now() - t0);
       } catch (e: any) {
         const timeout = e?.message === "timeout";
-        if (!opts.signal?.aborted) recordLookupFailure(p.id);
+        if (!opts.signal?.aborted && record) recordLookupFailure(p.id);
         emit({ providerId: p.id, status: timeout ? "timeout" : "error", error: e?.message });
         return;
+      } finally {
+        opts.signal?.removeEventListener("abort", onAbort);
       }
       const fresh = found.filter((c) => !seen.has(c.url) && (seen.add(c.url), true));
       emit({ providerId: p.id, status: "done", count: fresh.length });

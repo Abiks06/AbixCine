@@ -73,5 +73,13 @@ export async function migrate() {
       data       jsonb NOT NULL DEFAULT '{}'::jsonb,
       updated_at timestamptz NOT NULL DEFAULT now()
     );
+
+    -- v2: token families, sign-out-everywhere, sync/housekeeping indexes
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version int NOT NULL DEFAULT 0;
+    ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS family_id uuid;
+    ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS replaced_at timestamptz;
+    CREATE INDEX IF NOT EXISTS refresh_tokens_family ON refresh_tokens (family_id);
+    CREATE INDEX IF NOT EXISTS refresh_tokens_expiry ON refresh_tokens (expires_at);
+    CREATE INDEX IF NOT EXISTS progress_user_updated ON progress (user_id, updated_at DESC);
   `);
 }

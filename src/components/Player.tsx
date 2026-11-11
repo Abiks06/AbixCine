@@ -1,4 +1,4 @@
-import Hls from "hls.js";
+import type Hls from "hls.js";
 import { isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -40,6 +40,11 @@ interface Props {
   onNext?: () => void;
   autoNext?: boolean;
   onBack: () => void;
+  /** Re-run the source search when every candidate has died. */
+  onRetry?: () => void;
+  /** Count down into the next episode when this one ends. */
+  autoplayNext?: boolean;
+  nextLabel?: string;
   audio?: Audio;
   onAudio?: (a: Audio) => void;
   episodes?: EpisodeNav;
@@ -190,6 +195,7 @@ export function Player({ candidates: given, onSourceResult, title, subtitle, sta
     clearTimeout(toastTimer.current);
     toastTimer.current = window.setTimeout(() => setToast(null), 2600);
   };
+  useEffect(() => () => clearTimeout(toastTimer.current), []);
 
   /* ---------------------------------------------------------------- playhead */
 
@@ -486,37 +492,52 @@ export function Player({ candidates: given, onSourceResult, title, subtitle, sta
       pickAudioTrack();
       v.play().catch(() => {});
     };
-    if (c.kind === "hls" && Hls.isSupported()) {
-      const hls = new Hls({ enableWorker: true, lowLatencyMode: false, maxBufferLength: 60, backBufferLength: 30 });
+    let cancelled = false;
+    const attachHls = (H: typeof Hls) => {
+      if (cancelled) return;
+      if (!H.isSupported()) {
+        v.src = c.url;
+        v.addEventListener("loadedmetadata", seekAndPlay, { once: true });
+        return;
+      }
+      const hls = new H({ enableWorker: true, lowLatencyMode: false, maxBufferLength: 60, backBufferLength: 30 });
       hlsRef.current = hls;
       hls.subtitleDisplay = false;
-      hls.on(Hls.Events.MANIFEST_PARSED, (_, d) => {
+      hls.on(H.Events.MANIFEST_PARSED, (_, d) => {
         setLevels(d.levels.map((l) => ({ height: l.height })));
         seekAndPlay();
       });
-      hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, pickAudioTrack);
-      hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, (_, d) => {
+      hls.on(H.Events.AUDIO_TRACKS_UPDATED, pickAudioTrack);
+      hls.on(H.Events.SUBTITLE_TRACKS_UPDATED, (_, d) => {
         setHlsSubs(
           (d.subtitleTracks ?? []).map((t, i) => ({ id: `hls-${i}`, label: t.name || t.lang || `Track ${i + 1}`, lang: t.lang ?? "und", kind: "hls", hlsIndex: i })),
         );
       });
       let recoveries = 0;
-      hls.on(Hls.Events.ERROR, (_, d) => {
+      hls.on(H.Events.ERROR, (_, d) => {
         if (!d.fatal) return;
-        // One recovery attempt for decoder hiccups; a second fatal error means move on.
-        if (d.type === Hls.ErrorTypes.MEDIA_ERROR && recoveries++ < 1) hls.recoverMediaError();
-        else failover(d.details);
+        // Media errors get two local repair attempts (the second also swaps the audio codec), then the next source.
+        if (d.type === H.ErrorTypes.MEDIA_ERROR && recoveries < 2) {
+          if (recoveries++ === 1) hls.swapAudioCodec();
+          hls.recoverMediaError();
+        } else failover(d.details);
       });
       hls.loadSource(c.url);
       hls.attachMedia(v);
+    };
+    // hls.js (~600 kB) is only parsed when a stream actually needs it; local files never load it.
+    if (c.kind === "hls") {
+      import("hls.js").then((m) => attachHls(m.default), () => failover("player failed to load"));
     } else {
       v.src = c.url;
       v.addEventListener("loadedmetadata", seekAndPlay, { once: true });
     }
     return () => {
+      cancelled = true;
+      v.removeEventListener("loadedmetadata", seekAndPlay);
+      if (v.currentTime > 1) resumeAt.current = v.currentTime;
       hlsRef.current?.destroy();
       hlsRef.current = null;
-      v.removeEventListener("loadedmetadata", seekAndPlay);
     };
   }, [cur?.url, failover]); // eslint-disable-line react-hooks/exhaustive-deps
 

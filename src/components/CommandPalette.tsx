@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { signOut } from "../lib/account";
+import { sized } from "./Art";
+import { getAuth, leaveGuest, signOut } from "../lib/account";
 import { encodeKey } from "../lib/catalog";
 import { matchParts, peekSearch, searchAll } from "../lib/search";
 import { rememberQuery, rememberTitle, useSearchHistory } from "../lib/history";
@@ -25,8 +26,6 @@ interface Item {
 
 const MAX_TITLES = 7;
 const CLOSE_MS = 130;
-/** Palette thumbnails are 40px wide: ask the CDN for its smallest poster, not the card-size one. */
-const thumb = (src: string) => src.replace("/t/p/w500/", "/t/p/w92/").replace("/t/p/w342/", "/t/p/w92/");
 
 /** Ctrl+K (or /): one box to jump anywhere, search everything, or run an action. */
 export function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void }) {
@@ -101,7 +100,9 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
       { id: "dub", group: "Actions", label: `Default anime audio: switch to ${s.animeAudio === "sub" ? "Dub" : "Sub"}`, icon: "cc", run: () => updateSettings({ animeAudio: s.animeAudio === "sub" ? "dub" : "sub" }) },
       { id: "autoplay", group: "Actions", label: `Autoplay next episode: turn ${s.autoplayNext ? "off" : "on"}`, icon: "next", run: () => updateSettings({ autoplayNext: !s.autoplayNext }) },
       { id: "motion", group: "Actions", label: `${s.reduceMotion ? "Enable" : "Reduce"} motion`, icon: "spark", run: () => updateSettings({ reduceMotion: !s.reduceMotion }) },
-      { id: "signout", group: "Actions", label: "Sign out", icon: "logout", run: () => signOut() },
+      getAuth().user
+        ? { id: "signout", group: "Actions", label: "Sign out", icon: "logout", run: () => signOut() }
+        : { id: "signin", group: "Actions", label: "Sign in to sync", icon: "user", run: () => leaveGuest() },
     ];
     const title = (m: Media, hint: string, remember: boolean): Item => ({
       id: `m:${m.key}`,
@@ -187,7 +188,7 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
                 {(i === 0 || items[i - 1].group !== it.group) && <div className="pal-sep">{it.group}</div>}
                 <button id={`pal-${i}`} role="option" aria-selected={i === sel} className={`pal-item ${i === sel ? "on" : ""}`} onMouseMove={() => i !== sel && setSel(i)} onClick={(e) => run(it, e.ctrlKey || e.metaKey)}>
                   {it.media ? (
-                    <span className="pal-thumb" style={it.media.poster ? { backgroundImage: `url(${thumb(it.media.poster)})` } : { ["--h" as any]: it.media.hue ?? 260 }} />
+                    <span className="pal-thumb" style={it.media.poster ? { backgroundImage: `url(${sized(it.media.poster, "w92")})` } : { ["--h" as any]: it.media.hue ?? 260 }} />
                   ) : (
                     <span className="pal-icon"><Icon name={it.icon!} size={16} /></span>
                   )}

@@ -1,32 +1,62 @@
 import { memo, useState } from "react";
 import type { Media } from "../lib/types";
 
-/** Poster or backdrop image that fades in, with a generated gradient fallback. */
-/**
- * TMDB serves several renditions; cards show at ~300px, so they don't need the 1280px backdrop
- * or the 500px poster. `hd` keeps full size for the hero, title page and player backdrops.
- */
-const sized = (src: string | undefined, hd: boolean) =>
-  !src || hd ? src : src.replace("/t/p/w1280/", "/t/p/w780/").replace("/t/p/w500/", "/t/p/w342/");
+/** sm: thumbnails · md: shelf cards · lg: full-bleed stages (hero, title page, player). */
+export type ArtSize = "xs" | "sm" | "md" | "lg";
 
-export const Art = memo(function Art({ media, variant = "poster", className = "", hd = false, eager = false }: { media: Media; variant?: "poster" | "backdrop"; className?: string; hd?: boolean; /** Above the fold (hero, title page): load now, ahead of card art. */ eager?: boolean }) {
-  const src = sized(variant === "poster" ? media.poster : media.backdrop ?? media.poster, hd);
+const TMDB = /^(https:\/\/image\.tmdb\.org\/t\/p\/)[a-z0-9]+(\/.+)$/;
+const SIZES: Record<"poster" | "backdrop", Record<ArtSize, string>> = {
+  poster: { xs: "w92", sm: "w185", md: "w342", lg: "w780" },
+  backdrop: { xs: "w300", sm: "w300", md: "w780", lg: "w1280" },
+};
+
+/** Ask TMDB for an image close to the size it's drawn at, instead of 4K for a 300px card. */
+export function sized(url: string | undefined, size: string) {
+  const m = url?.match(TMDB);
+  return m ? `${m[1]}${size}${m[2]}` : url;
+}
+
+/** Poster or backdrop image that fades in, with a generated gradient fallback. */
+export const Art = memo(function Art({
+  media,
+  variant = "poster",
+  size = "md",
+  hd,
+  priority = false,
+  eager = false,
+  className = "",
+}: {
+  media: Media;
+  variant?: "poster" | "backdrop";
+  size?: ArtSize;
+  hd?: boolean;
+  /** Above-the-fold stage image: load now, ahead of everything else. */
+  priority?: boolean;
+  eager?: boolean;
+  className?: string;
+}) {
+  const effectiveSize = size ?? (hd ? "lg" : "md");
+  const isHighPriority = priority || eager;
+  const raw = variant === "poster" ? media.poster : media.backdrop ?? media.poster;
+  const kind = variant === "poster" || !media.backdrop ? "poster" : "backdrop";
+  const src = sized(raw, SIZES[kind][effectiveSize]);
+  // Big stages get the original on large/high-DPI screens, w1280 elsewhere.
+  const srcSet = effectiveSize === "lg" && kind === "backdrop" && TMDB.test(raw ?? "") ? `${sized(raw, "w1280")} 1280w, ${sized(raw, "original")} 3840w` : undefined;
   const [loaded, setLoaded] = useState(false);
   const [failed, setFailed] = useState(false);
   const hue = media.hue ?? hash(media.key) % 360;
   return (
-    <div
-      className={`art art-${variant} ${className}`}
-      style={{ ["--h" as any]: hue }}
-    >
+    <div className={`art art-${variant} ${className}`} style={{ ["--h" as string]: hue }}>
       {src && !failed ? (
         <img
           src={src}
+          srcSet={srcSet}
+          sizes={srcSet ? "100vw" : undefined}
           alt=""
-          loading={eager ? "eager" : "lazy"}
+          loading={isHighPriority ? "eager" : "lazy"}
           decoding="async"
           // @ts-expect-error React 18 only knows the camelCase-less attribute
-          fetchpriority={eager ? "high" : "low"}
+          fetchpriority={isHighPriority ? "high" : "low"}
           draggable={false}
           className={loaded ? "in" : ""}
           onLoad={() => setLoaded(true)}

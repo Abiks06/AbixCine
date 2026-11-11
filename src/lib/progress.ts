@@ -11,6 +11,20 @@ export interface ProgressEntry {
   position: number;
   duration: number;
   updatedAt: number;
+  /** The previous episode finished; this entry points at the one after it, from the start. */
+  upNext?: boolean;
+  /** Watched to the end with nothing after it. */
+  finished?: boolean;
+}
+
+/**
+ * "Done" is 95% for films, but short episodes end with 90–120s of credits and preview,
+ * so anything under an hour counts once you're within two minutes of the end (and past 85%).
+ */
+export function isDone(position: number, duration: number) {
+  if (!(duration > 0)) return false;
+  const f = position / duration;
+  return f > 0.95 || (duration < 3600 && duration - position < 120 && f > 0.85);
 }
 
 const KEY = "abx.progress.v1";
@@ -40,10 +54,18 @@ const slim = (m: Media): Media => ({
   rating: m.rating, poster: m.poster, backdrop: m.backdrop, genres: [], hue: m.hue,
 });
 
-/** Progress is stored per title (latest episode wins), which is what "Continue watching" needs. */
-export function saveProgress(e: Omit<ProgressEntry, "updatedAt">) {
-  const done = e.duration > 0 && e.position / e.duration > 0.95;
-  const entry: ProgressEntry = { ...e, media: slim(e.media), position: done ? 0 : e.position, updatedAt: Date.now() };
+/**
+ * Progress is stored per title (latest episode wins), which is what "Continue watching" needs.
+ * Finishing an episode moves the entry on to `next`, so the show stays in Continue watching as "Up next".
+ */
+export function saveProgress(e: Omit<ProgressEntry, "updatedAt" | "upNext" | "finished">, next?: { season?: number; episode: number } | null) {
+  const done = isDone(e.position, e.duration);
+  const base = { ...e, media: slim(e.media), updatedAt: Date.now() };
+  const entry: ProgressEntry = !done
+    ? base
+    : next
+      ? { ...base, season: next.season, episode: next.episode, position: 0, upNext: true }
+      : { ...base, position: 0, finished: true };
   store = { ...store, [e.media.key]: entry };
   save();
   push(`/progress/${encodeURIComponent(e.media.key)}`, "PUT", entry);
@@ -70,6 +92,25 @@ export function restoreProgress(entry: ProgressEntry) {
   push(`/progress/${encodeURIComponent(entry.media.key)}`, "PUT", entry);
 }
 
+/** The raw entry for a title, whatever its episode (Title page "Resume" / "Up next" button). */
+export function getEntry(mediaKey: string): ProgressEntry | undefined {
+  const p = store[mediaKey];
+  return p && !p.finished ? p : undefined;
+}
+
+const subscribe = (cb: () => void) => {
+  listeners.add(cb);
+  return () => {
+    listeners.delete(cb);
+  };
+};
+
+export function useProgressEntry(mediaKey: string) {
+  const s = useSyncExternalStore(subscribe, () => store);
+  const p = s[mediaKey];
+  return p && !p.finished ? p : undefined;
+}
+
 registerSync({
   // Merge: newest entry per title wins, whichever device it came from.
   pull: () =>
@@ -92,15 +133,9 @@ registerSync({
 });
 
 export function useContinueWatching(): ProgressEntry[] {
-  const s = useSyncExternalStore(
-    (cb) => {
-      listeners.add(cb);
-      return () => listeners.delete(cb);
-    },
-    () => store,
-  );
+  const s = useSyncExternalStore(subscribe, () => store);
   return Object.values(s)
-    .filter((p) => p.position > 30)
+    .filter((p) => !p.finished && (p.position > 30 || p.upNext))
     .sort((a, b) => b.updatedAt - a.updatedAt)
     .slice(0, 20);
 }

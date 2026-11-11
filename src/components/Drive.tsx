@@ -20,7 +20,7 @@ export function DriveTile({ t, i = 0 }: { t: DriveTitle; i?: number }) {
   const body = (
     <>
       <div className="th">
-        {t.media ? <Art media={t.media} /> : <div className="th-blank"><Icon name="film" size={20} /></div>}
+        {t.media ? <Art media={t.media} size="sm" /> : <div className="th-blank"><Icon name="film" size={20} /></div>}
       </div>
       <div className="file-body">
         <div className="t">{name}</div>
@@ -77,8 +77,8 @@ export function DriveSection({ limit, rescan = 0 }: { limit?: number; rescan?: n
         </Link>
       ) : drive.loading && !drive.titles.length ? (
         <div className="drive">{Array.from({ length: limit ?? 6 }, (_, i) => <div key={i} className="file skeleton" />)}</div>
-      ) : drive.error ? (
-        <p className="muted">Couldn't scan: {drive.error}</p>
+      ) : drive.error || (drive.warning && !drive.titles.length) ? (
+        <p className="muted">Couldn't scan: {drive.error ?? drive.warning}</p>
       ) : shown.length === 0 ? (
         <p className="muted">No video files found in {where} yet.</p>
       ) : (

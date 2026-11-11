@@ -81,6 +81,8 @@ export interface PlaybackRequest {
   media: Media;
   season?: number;
   episode?: number;
+  /** Episode number counted across all seasons, for libraries that number anime absolutely ("Show - 26"). */
+  absolute?: number;
   /** Anime only: subtitled original audio or English dub. */
   audio?: "sub" | "dub";
 }
