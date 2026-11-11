@@ -23,6 +23,7 @@ export const jellyfinProvider: SourceProvider = {
   name: "Jellyfin server",
   category: "external",
   priority: 20, // external server: below local files by default
+  tier: 2,
   isEnabled: (s) => s.jellyfin.enabled && !!s.jellyfin.url && !!s.jellyfin.apiKey,
   async find(req: PlaybackRequest, s, signal) {
     const { url, apiKey } = s.jellyfin;

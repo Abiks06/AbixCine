@@ -15,6 +15,8 @@ import { reqKey, type PlaybackRequest } from "../lib/types";
 import { useAsync } from "../lib/useAsync";
 import { candLine, displayScore, manualCandidate, PROVIDERS, recordPlayback, resolveSources, type ResolveEvent } from "../sources/registry";
 import type { StreamCandidate } from "../sources/types";
+import { parsePlayerParams } from "../player/params";
+import { playerBus } from "../player/bus";
 
 export function Watch() {
   const key = decodeKey(useParams().key!);
@@ -26,6 +28,8 @@ export function Watch() {
   const episode = params.get("e") ? Number(params.get("e")) : undefined;
   const a = params.get("a");
   const audio: Audio | undefined = a === "sub" || a === "dub" ? a : undefined;
+  // Player options from the link (t, speed, provider, controls, autoplay, muted, sub, title).
+  const pp = useMemo(() => parsePlayerParams(params), [params]);
   const detail = useAsync(() => getDetail(key), [key]);
   // Offline / catalog down: local files and Jellyfin only need a title, so fall back to the copy
   // saved with progress or My List instead of spinning forever.
@@ -68,6 +72,7 @@ export function Watch() {
     resolveSources(req, (e) => live && setEvents((x) => ({ ...x, [e.providerId]: e })), {
       early: true,
       signal: ctl.signal,
+      prefer: pp.provider,
       onUpdate: (r) => live && setRanked(r),
     }).then((c) => live && setCands(c));
     return () => {
@@ -75,7 +80,7 @@ export function Watch() {
       ctl.abort();
     };
     // Re-resolve when sources change in settings.
-  }, [req && reqKey(req), settings.libraryPaths, settings.jellyfin, attempt]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [req && reqKey(req), settings.libraryPaths, settings.jellyfin, attempt, pp.provider]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const next = useMemo(() => {
     if (!d || episode == null) return null;
@@ -89,10 +94,16 @@ export function Watch() {
     return null;
   }, [d, season, episode]);
 
-  const href = (s?: number, e?: number, a?: Audio) => watchHref(key, s, e, a);
+  /**
+   * Link options that should survive moving to the next episode or flipping sub/dub: the viewer's
+   * current speed (read live from the player), plus provider/controls/muted/sub from the link.
+   * The start time and title override belong to this episode only.
+   */
+  const carry = () => ({ speed: playerBus.state()?.speed ?? pp.speed, provider: pp.provider, controls: pp.controls, muted: pp.muted, sub: pp.sub });
+  const href = (s?: number, e?: number, a?: Audio) => watchHref(key, s, e, a, carry());
   const goNext = useCallback(() => {
     if (next) nav(href(next.s, next.e, audio), { replace: true, state: loc.state });
-  }, [next, key, nav, audio, loc.state]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [next, key, nav, audio, loc.state, pp]); // eslint-disable-line react-hooks/exhaustive-deps
   /** Flip sub/dub mid-episode: remember the choice for this show and resume at the same spot. */
   const switchAudio = (a: Audio) => {
     setAudioFor(key, a);
@@ -142,7 +153,8 @@ export function Watch() {
         onSourceResult={onSourceResult}
         title={d.title}
         subtitle={epLabel}
-        startAt={getProgress(key, season, episode)?.position}
+        startAt={pp.start ?? getProgress(key, season, episode)?.position}
+        params={pp}
         audio={audio}
         onAudio={audio ? switchAudio : undefined}
         media={d}

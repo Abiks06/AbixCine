@@ -141,6 +141,25 @@ export function recentlyFailed(providerId: string) {
   return !!h.lastFail && Date.now() - h.lastFail < 10 * 60_000 && (!h.lastOk || h.lastOk < h.lastFail);
 }
 
+export type ProviderState = "healthy" | "degraded" | "down" | "new";
+
+/**
+ * One word for how a provider has been doing, for the player's status panel:
+ * - down: failed in the last 10 minutes and hasn't worked since;
+ * - new: not enough history to say;
+ * - degraded: answers, but fails often or slowly;
+ * - healthy: everything else.
+ */
+export function providerStatus(providerId: string): { state: ProviderState; reliability: number; latency?: number } {
+  const h = getHealth(providerId);
+  const rel = reliability(providerId);
+  const latency = h.latency == null ? undefined : Math.round(h.latency);
+  if (recentlyFailed(providerId)) return { state: "down", reliability: rel, latency };
+  if (h.ok + h.fail < 1) return { state: "new", reliability: rel, latency };
+  if (rel < 0.6 || (latency ?? 0) > 1500) return { state: "degraded", reliability: rel, latency };
+  return { state: "healthy", reliability: rel, latency };
+}
+
 /**
  * How long to wait for a provider's search: generous for new ones and right after a failure
  * (so a slow-but-healthy provider can recover), tighter for ones we know are quick.
