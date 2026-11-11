@@ -52,3 +52,5 @@ Tests: `cd server && npm test` (uses the embedded database unless `DATABASE_URL`
 ## Adding a source
 
 Implement `SourceProvider` (`src/sources/types.ts`) and add it to `PROVIDERS` in `src/sources/registry.ts`. Set `category: "external"` for anything that isn't on this PC.
+
+Watch links (`?t=12:34&speed=1.25&provider=jellyfin&controls=0`), the player command and event bus, tiers, health and fallback are documented in [docs/player-and-plugins.md](docs/player-and-plugins.md).

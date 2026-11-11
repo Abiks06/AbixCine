@@ -108,6 +108,7 @@ export const localProvider: SourceProvider = {
   name: "Local library",
   category: "local",
   priority: 30,
+  tier: 1,
   isEnabled: (s) => s.libraryPaths.length > 0,
   async find(req, s) {
     const files = await scanLibrary(s.libraryPaths);

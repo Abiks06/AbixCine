@@ -11,6 +11,27 @@ export const PROVIDERS: SourceProvider[] = [localProvider, jellyfinProvider, ...
 
 export { recordPlayback } from "./health";
 
+/**
+ * Fallback tiers, the way the player's source panel labels them. A tier says where a stream
+ * comes from, which is also roughly how much to trust it to keep playing: a file on this PC
+ * beats your server on the LAN, which beats a service over the internet. Direct links you
+ * paste are tier IV and never part of automatic fallback.
+ */
+export const TIERS = {
+  1: { roman: "I", name: "On this PC" },
+  2: { roman: "II", name: "Your server" },
+  3: { roman: "III", name: "Licensed service" },
+  4: { roman: "IV", name: "Direct link" },
+} as const;
+export type Tier = keyof typeof TIERS;
+
+export function tierOf(providerId: string): Tier {
+  if (providerId === "manual") return 4;
+  const p = PROVIDERS.find((x) => x.id === providerId);
+  if (!p) return 3;
+  return p.tier ?? (p.category === "local" ? 1 : 2);
+}
+
 const PROVIDER_TIMEOUT = 8000;
 const PROBE_TIMEOUT = 5000;
 
@@ -106,6 +127,21 @@ export interface ResolveOptions {
   signal?: AbortSignal;
   /** Learn from this race (health stats). Off for previews, so a title visit + Play doesn't count twice. */
   record?: boolean;
+  /**
+   * A provider id the viewer asked for (the `provider` link param). Its playable copies jump to
+   * the top, and an early pick waits a little longer for it. If it has nothing, ranking is as usual.
+   */
+  prefer?: string;
+}
+
+/** Big enough to beat any natural score difference, small enough that unreachable stays last. */
+const PREFER_BONUS = 100;
+
+/** score() plus the viewer's provider choice. */
+export function rank(c: StreamCandidate, preferred: number, priority: number, req: PlaybackRequest, prefer?: string): StreamCandidate {
+  const r = score(c, preferred, priority, req);
+  if (prefer && r.providerId === prefer && r.probe?.ok) return { ...r, score: r.score! + PREFER_BONUS, why: ["your pick", ...(r.why ?? [])] };
+  return r;
 }
 
 /** After a confident pick appears, give the others this long to beat it. */
@@ -152,6 +188,8 @@ export function resolveSources(req: PlaybackRequest, onEvent?: (e: ResolveEvent)
     const graceFor = (c: StreamCandidate) => {
       const q = c.probe?.quality ?? c.quality ?? 720;
       const waitingForPick = !!pick && pick.url !== c.url && pending.has(pick.providerId);
+      // The viewer named a provider: give it until the soft deadline before settling for another.
+      if (opts.prefer && c.providerId !== opts.prefer && pending.has(opts.prefer)) return SOFT_DEADLINE_MS;
       return waitingForPick || q < s.preferredQuality ? PATIENT_GRACE_MS : GRACE_MS;
     };
     const add = (c: StreamCandidate) => {
@@ -162,9 +200,13 @@ export function resolveSources(req: PlaybackRequest, onEvent?: (e: ResolveEvent)
       }
       raw = [...raw, c];
       // Re-score everyone: health may have changed since earlier candidates arrived.
-      ranked = raw.map((x) => score(x, s.preferredQuality, prio[x.providerId] ?? 0, req)).sort(sortByScore);
+      ranked = raw.map((x) => rank(x, s.preferredQuality, prio[x.providerId] ?? 0, req, opts.prefer)).sort(sortByScore);
       opts.onUpdate?.(ranked);
-      if (opts.early && !settled && !graceTimer && confident(c)) graceTimer = setTimeout(finish, graceFor(c));
+      if (opts.early && !settled && opts.prefer === c.providerId && c.probe?.ok) {
+        // The provider the viewer asked for has a playable copy: go now.
+        clearTimeout(graceTimer);
+        graceTimer = setTimeout(finish, GRACE_MS);
+      } else if (opts.early && !settled && !graceTimer && confident(c)) graceTimer = setTimeout(finish, graceFor(c));
     };
     const softTimer = setTimeout(() => opts.early && ranked.some((c) => c.probe?.ok) && finish(), SOFT_DEADLINE_MS);
 
@@ -209,7 +251,8 @@ export function manualCandidate(url: string): StreamCandidate {
 /** 0–100 for display: how good a pick this is (quality fit, speed, provider priority). */
 export function displayScore(c: StreamCandidate) {
   if (!c.probe?.ok || c.score == null) return 0;
-  return Math.max(1, Math.min(99, Math.round((c.score / 80) * 100)));
+  const raw = c.why?.[0] === "your pick" ? c.score - PREFER_BONUS : c.score;
+  return Math.max(1, Math.min(99, Math.round((raw / 80) * 100)));
 }
 
 /** "2160p · 2 ms · 98" style line for a candidate. */

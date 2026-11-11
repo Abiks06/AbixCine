@@ -509,6 +509,32 @@ a.file:hover { background: rgba(255, 255, 255, 0.07); transform: translateY(-2px
 .player .menu > button.on { background: linear-gradient(135deg, rgba(139, 108, 255, 0.22), rgba(34, 211, 238, 0.08)); }
 .player .menu small { font: 500 11px var(--f-mono); color: var(--fg3); }
 .src-name { font-weight: 600; }
+/* Source panel: fallback chain with tier + health */
+.player .menu.src-menu { width: 380px; max-height: min(70vh, 560px); overflow-y: auto; }
+.src-head { display: flex; align-items: center; justify-content: space-between; padding: 0 4px 4px; }
+.src-auto { display: inline-flex; align-items: center; gap: 7px; font: 500 11px var(--f-mono); color: var(--fg2); }
+.player .menu > button.src-row { grid-template-columns: 26px minmax(0, 1fr) auto; align-items: center; gap: 12px; }
+.src-ord { width: 26px; height: 26px; border-radius: 8px; display: grid; place-items: center; font: 600 11.5px var(--f-mono); color: var(--fg2); background: rgba(255, 255, 255, 0.06); border: 1px solid var(--line); }
+.src-row.on .src-ord { background: var(--ion); color: #fff; border-color: transparent; box-shadow: 0 0 18px -4px var(--v); }
+.src-row:disabled { opacity: 0.45; }
+.src-main { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.src-main .src-name { display: flex; align-items: center; gap: 8px; }
+.tier { font: 600 9.5px var(--f-mono); letter-spacing: 0.08em; padding: 2px 6px; border-radius: 6px; color: var(--fg2); border: 1px solid var(--line-2); }
+.src-side { display: flex; flex-direction: column; align-items: flex-end; gap: 3px; }
+.health { display: inline-flex; align-items: center; gap: 6px; font: 600 11px var(--f-ui); color: var(--fg2); }
+.health i { width: 7px; height: 7px; border-radius: 50%; background: var(--fg3); }
+.health.healthy i { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+.health.degraded i { background: var(--warn); box-shadow: 0 0 8px var(--warn); }
+.health.down i, .health.dead i { background: var(--bad); box-shadow: 0 0 8px var(--bad); }
+.health.new i { background: var(--c); box-shadow: 0 0 8px var(--c); }
+.src-log { display: flex; flex-direction: column; gap: 4px; padding: 8px 4px 2px; border-top: 1px solid var(--line); margin-top: 2px; }
+.src-log em { font-style: normal; color: var(--warn); }
+.src-foot { padding: 6px 4px 0; line-height: 1.4; font-family: var(--f-ui) !important; }
+.src-btn .dot.warn { background: var(--warn); box-shadow: 0 0 8px var(--warn); }
+/* controls=0: picture only. Panels, toasts and recovery cards still appear. */
+.player.no-controls .chrome { opacity: 0; pointer-events: none; }
+.player.no-controls .chrome * { pointer-events: none; }
+.player.no-controls { cursor: none; }
 .src-file { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .menu-sep { font: 600 10.5px var(--f-ui); letter-spacing: 0.14em; text-transform: uppercase; color: var(--fg3); padding: 4px 4px 0; }
 .menu-chips { display: flex; flex-wrap: wrap; gap: 4px; }

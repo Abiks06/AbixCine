@@ -32,6 +32,12 @@ export interface SourceProvider {
   category: "local" | "external";
   /** Higher wins ties. Local files beat network sources by default. */
   priority: number;
+  /**
+   * Fallback tier shown in the player's source panel (see TIERS in registry.ts):
+   * 1 on this PC, 2 your own server, 3 a licensed service or addon. Defaults from `category`.
+   * It is a label for people; the ranking itself comes from score().
+   */
+  tier?: 1 | 2 | 3;
   isEnabled(s: Settings): boolean;
   find(req: PlaybackRequest, s: Settings, signal: AbortSignal): Promise<StreamCandidate[]>;
 }
