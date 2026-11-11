@@ -1,13 +1,15 @@
 {
   "name": "abixcine",
   "private": true,
-  "version": "0.1.0",
+  "version": "1.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "version:bump": "node scripts/bump-version.mjs",
+    "package": "tauri build"
   },
   "dependencies": {
     "@fontsource-variable/geist": "^5.2.8",
@@ -15,6 +17,9 @@
     "@fontsource-variable/sora": "^5.2.8",
     "@tauri-apps/api": "^2.1.1",
     "@tauri-apps/plugin-dialog": "^2.0.1",
+    "@tauri-apps/plugin-process": "^2.4.0",
+    "@tauri-apps/plugin-updater": "^2.14.1",
+    "anime4k-webgpu": "^1.0.0",
     "hls.js": "^1.5.17",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",

@@ -1,12 +1,14 @@
 import { invoke, convertFileSrc, isTauri } from "@tauri-apps/api/core";
 import { normTitle } from "../lib/format";
 import type { PlaybackRequest } from "../lib/types";
-import type { SourceProvider, StreamCandidate } from "./types";
+import type { SourceProvider, StreamCandidate, SubtitleTrack } from "./types";
 
 export interface LibFile {
   path: string;
   name: string;
   size: number;
+  /** Sidecar .srt/.vtt files found next to the video. */
+  subs?: string[];
 }
 
 let index: { at: number; key: string; files: LibFile[] } | null = null;
@@ -47,6 +49,32 @@ function titleMatches(fileName: string, req: PlaybackRequest) {
     });
 }
 
+const LANGS: Record<string, [string, string]> = {
+  en: ["en", "English"], eng: ["en", "English"], english: ["en", "English"],
+  ja: ["ja", "Japanese"], jp: ["ja", "Japanese"], jpn: ["ja", "Japanese"], japanese: ["ja", "Japanese"],
+  fr: ["fr", "French"], fre: ["fr", "French"], fra: ["fr", "French"], french: ["fr", "French"],
+  es: ["es", "Spanish"], spa: ["es", "Spanish"], spanish: ["es", "Spanish"],
+  de: ["de", "German"], ger: ["de", "German"], deu: ["de", "German"], german: ["de", "German"],
+  pt: ["pt", "Portuguese"], por: ["pt", "Portuguese"], it: ["it", "Italian"], ita: ["it", "Italian"],
+  ar: ["ar", "Arabic"], ara: ["ar", "Arabic"], zh: ["zh", "Chinese"], chi: ["zh", "Chinese"],
+  ko: ["ko", "Korean"], kor: ["ko", "Korean"], ru: ["ru", "Russian"], rus: ["ru", "Russian"],
+  portuguese: ["pt", "Portuguese"], italian: ["it", "Italian"], arabic: ["ar", "Arabic"],
+  chinese: ["zh", "Chinese"], korean: ["ko", "Korean"], russian: ["ru", "Russian"],
+};
+
+/** "Show.S01E02.en.forced.srt" next to "Show.S01E02.mkv" -> English (forced). */
+export function sidecarTrack(subPath: string, videoName: string): SubtitleTrack {
+  const file = subPath.split(/[\\/]/).pop() ?? subPath;
+  const stem = file.slice(0, file.lastIndexOf("."));
+  // Only the part after the video's own name says anything about the track.
+  const rest = stem.toLowerCase().startsWith(videoName.toLowerCase()) ? stem.slice(videoName.length) : stem;
+  const tags = rest.toLowerCase().split(/[ ._-]+/).filter(Boolean);
+  const lang = tags.map((t) => LANGS[t]).find(Boolean);
+  const extra = tags.filter((t) => t === "forced" || t === "sdh" || t === "signs").map((t) => (t === "sdh" ? "SDH" : t));
+  const name = lang?.[1] ?? (rest.replace(/^[ ._-]+/, "") || "Subtitles");
+  return { lang: lang?.[0] ?? "und", label: extra.length ? `${name} (${extra.join(", ")})` : name, url: convertFileSrc(subPath) };
+}
+
 const DUB_RX = /\b(dub|dubbed|eng(lish)?[ ._-]?dub)\b/i;
 const DUAL_RX = /\b(dual[ ._-]?audio|multi[ ._-]?audio)\b/i;
 
@@ -84,6 +112,8 @@ export const localProvider: SourceProvider = {
         url: convertFileSrc(f.path),
         kind: f.path.toLowerCase().endsWith(".m3u8") ? "hls" : "file",
         quality: qualityOf(f.name),
+        audio: req.audio ? audio : undefined,
+        subtitles: f.subs?.map((p) => sidecarTrack(p, f.name)),
       });
     }
     return out;

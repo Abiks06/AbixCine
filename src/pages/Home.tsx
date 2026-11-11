@@ -12,7 +12,8 @@ import { useAuth } from "../lib/account";
 import { ANIME_FEEDS, loadAnimeFeed } from "../lib/anilist";
 import { encodeKey } from "../lib/catalog";
 import { useFreshness } from "../lib/fresh";
-import { useContinueWatching } from "../lib/progress";
+import { removeProgress, restoreProgress, useContinueWatching } from "../lib/progress";
+import { toast } from "../lib/toast";
 import { useSettings } from "../lib/settings";
 import { FEEDS, hasTmdb, loadFeed, TOP10 } from "../lib/tmdb";
 import type { Media } from "../lib/types";
@@ -24,6 +25,8 @@ export function Home() {
   const fresh = useFreshness();
   const feeds = useAsync(() => Promise.all([...FEEDS.home, TOP10.movie, TOP10.tv].map(loadFeed)), [s.tmdbKey, auth.tmdbProxy, fresh]);
   const anime = useAsync(() => loadAnimeFeed(ANIME_FEEDS[1], 1), [fresh]);
+  // The stage never sits empty: without the movie catalog, trending anime takes the hero.
+  const animeTrending = useAsync(() => loadAnimeFeed(ANIME_FEEDS[0], 0), [fresh]);
   const cont = useContinueWatching();
   const [active, setActive] = useState<Media>();
   const d = feeds.data;
@@ -33,12 +36,12 @@ export function Home() {
   return (
     <div className="page-flush">
       <Ambient media={active} />
-      <Hero items={d?.[0] ?? []} label="tonight" onActive={setActive} />
+      <Hero items={d?.[0]?.length ? d[0] : (animeTrending.data ?? []).filter((m) => m.backdrop)} label="tonight" onActive={setActive} />
       <div className="rows pad">
         {!hasTmdb() && (
           <Link to="/settings" className="notice" viewTransition>
             <Icon name="info" />
-            <span>You're seeing a demo catalog. Add a TMDB key in Settings, or set one on your AbixCine server, to load real movies and series.</span>
+            <span>Movies and series need the AbixCine server or your own TMDB key. Anime works either way. Open Settings to connect.</span>
             <Icon name="chevR" />
           </Link>
         )}
@@ -50,7 +53,22 @@ export function Home() {
                 const left = Math.max(1, Math.round((p.duration - p.position) / 60));
                 const where = [p.episode != null ? `${p.season != null ? `S${p.season} · ` : ""}E${p.episode}` : null, p.audio ? (p.audio === "dub" ? "Dub" : "Sub") : null, `${left}m left`].filter(Boolean).join(" · ");
                 const qs = new URLSearchParams({ ...(p.season != null ? { s: String(p.season) } : {}), ...(p.episode != null ? { e: String(p.episode) } : {}), ...(p.audio ? { a: p.audio } : {}) });
-                return <Card key={p.media.key} media={p.media} index={i} progress={(p.position / p.duration) * 100} sub={where} right={<span />} to={`/watch/${encodeKey(p.media.key)}?${qs}`} />;
+                return (
+                  <Card
+                    key={p.media.key}
+                    media={p.media}
+                    index={i}
+                    progress={(p.position / p.duration) * 100}
+                    sub={where}
+                    right={<span />}
+                    to={`/watch/${encodeKey(p.media.key)}?${qs}`}
+                    removeLabel="Remove from Continue watching"
+                    onRemove={() => {
+                      const gone = removeProgress(p.media.key);
+                      if (gone) toast(`Removed “${p.media.title}” from Continue watching`, { icon: "x", action: { label: "Undo", run: () => restoreProgress(gone) } });
+                    }}
+                  />
+                );
               })}
             </div>
           </section>

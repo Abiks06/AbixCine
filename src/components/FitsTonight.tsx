@@ -44,11 +44,12 @@ export function FitsTonight({ pool }: { pool: Media[] }) {
 
   useEffect(() => {
     let live = true;
-    pool.slice(0, 18).forEach((m) =>
-      getDetail(m.key)
-        .then((d) => live && d.runtime && setRuntimes((r) => ({ ...r, [m.key]: d.runtime! })))
-        .catch(() => {}),
-    );
+    // One state update for the whole pool instead of a re-render per title.
+    Promise.all(pool.slice(0, 18).map((m) => getDetail(m.key).then((d) => [m.key, d.runtime] as const).catch(() => [m.key, undefined] as const))).then((all) => {
+      if (!live) return;
+      const found = Object.fromEntries(all.filter(([, rt]) => rt)) as Record<string, number>;
+      if (Object.keys(found).length) setRuntimes((r) => ({ ...r, ...found }));
+    });
     return () => {
       live = false;
     };
@@ -83,17 +84,17 @@ export function FitsTonight({ pool }: { pool: Media[] }) {
         {fits.length === 0 && <div className="track-empty">Nothing short enough. Try a later finish.</div>}
         {fits.map((m, i) => {
           const rt = runtimes[m.key];
-          const pct = Math.min(100, (rt / Math.min(max, 180)) * 100);
           const end = clock(new Date(now.getTime() + rt * 60000));
           return (
             <Card
               key={m.key}
               media={m}
               index={i}
+              // An end time, not a bar: a bar on a poster reads as "half watched".
               extra={
-                <div className={`fitbar ${pct > 85 ? "tight" : ""}`}>
-                  <b><i style={{ width: `${pct}%` }} /></b>
-                  {m.kind === "movie" ? `ends ${end}` : `1 ep · ends ${end}`}
+                <div className="fit-end">
+                  <span className="fit-clock" aria-hidden />
+                  {m.kind === "movie" ? `Ends ${end}` : `One episode · ends ${end}`}
                 </div>
               }
               sub={

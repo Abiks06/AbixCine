@@ -24,7 +24,7 @@ export function Browse({ kind }: { kind: "movie" | "tv" }) {
   const [active, setActive] = useState<Media>();
   const d = data.data;
   return (
-    <div className="page page-flush">
+    <div className="page-flush">
       <Ambient media={active} />
       <Hero items={d?.[1] ?? []} label={kind === "movie" ? "Popular movie" : "Popular series"} onActive={setActive} />
       <div className="rows pad">
@@ -44,7 +44,7 @@ export function Anime() {
   const data = useAsync(() => Promise.all(ANIME_FEEDS.map(loadAnimeFeed)), [fresh]);
   const [active, setActive] = useState<Media>();
   return (
-    <div className="page page-flush">
+    <div className="page-flush">
       <Ambient media={active} />
       <Hero items={data.data?.[1] ?? []} label="This season" onActive={setActive} />
       <div className="rows pad">

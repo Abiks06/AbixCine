@@ -17,7 +17,11 @@ export interface Media {
   logo?: string;
   /** Dominant artwork color when the catalog gives one (AniList). Drives the stage light. */
   color?: string;
-  /** Used for generated artwork in demo mode. */
+  /** AniList entries: the matching MyAnimeList id, which some anime players key on. */
+  malId?: number;
+  /** Search results: how many seasons were folded into this entry. */
+  seasonCount?: number;
+  /** Fallback artwork hue when a title has no image. */
   hue?: number;
 }
 

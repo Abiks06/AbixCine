@@ -4,6 +4,7 @@ import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { signOut, useAuth } from "../lib/account";
 import { useSettings } from "../lib/settings";
+import { availableSources } from "../sources/embeds";
 import { Avatar } from "./Avatar";
 import { Icon } from "./Icon";
 import { LogoMark, Wordmark } from "./Logo";
@@ -25,12 +26,12 @@ export function TitleBar({ onOpenPalette }: { onOpenPalette: () => void }) {
   const [menu, setMenu] = useState(false);
   const w = isTauri() ? getCurrentWindow() : null;
 
-  const servers = s.jellyfin.enabled ? 1 : 0;
-  const folders = s.libraryPaths.length;
-  const ready = folders + servers > 0;
+  const online = availableSources.filter((x) => !s.disabledSources?.includes(x.id)).length;
+  const own = s.libraryPaths.length + (s.jellyfin.enabled ? 1 : 0);
+  const ready = online + own > 0;
   const status = ready
-    ? [folders ? (folders === 1 ? `${folderLabel(s.libraryPaths[0])} ready` : `${folders} folders ready`) : null, servers ? `${servers} server` : null].filter(Boolean).join(" · ")
-    : "Add a source";
+    ? [online ? `${online} server${online > 1 ? "s" : ""} online` : null, own ? `${own} of your own` : null].filter(Boolean).join(" · ")
+    : "All servers off";
 
   return (
     <header className="bar" data-tauri-drag-region onDoubleClick={(e) => e.target === e.currentTarget && w?.toggleMaximize()}>
@@ -44,7 +45,7 @@ export function TitleBar({ onOpenPalette }: { onOpenPalette: () => void }) {
         <kbd>Ctrl</kbd>
         <kbd>K</kbd>
       </button>
-      <Link to="/settings#sources" className={`status ${ready ? "" : "off"}`} title="Sources" viewTransition>
+      <Link to="/settings#sources" className={`status ${ready ? "" : "off"}`} title="Servers" viewTransition>
         <i className="dot" />
         <span>{status}</span>
       </Link>

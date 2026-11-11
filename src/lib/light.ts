@@ -96,8 +96,23 @@ async function colorsFor(m: Media): Promise<Pair> {
   return pair;
 }
 
-function apply(m: Media | undefined) {
+let previewToken = 0;
+const lightEl = () => document.querySelector<HTMLElement>(".light");
+
+function clearPreview() {
+  previewToken++;
+  const s = lightEl()?.style;
+  s?.removeProperty("--a1");
+  s?.removeProperty("--a2");
+}
+
+/** The title a page is "about" (hero slide, title page, player). Sets the app-wide colors. */
+export function setStageLight(m: Media | undefined) {
+  if (m?.key === base?.key && (m?.backdrop ?? m?.poster) === (base?.backdrop ?? base?.poster)) return;
+  base = m;
   const t = ++token;
+  // A card you clicked never gets its mouse-leave: don't let its preview outlive the page.
+  clearPreview();
   if (!m) return;
   colorsFor(m).then(([a1, a2]) => {
     if (t !== token) return;
@@ -107,13 +122,18 @@ function apply(m: Media | undefined) {
   });
 }
 
-/** The title a page is "about" (hero slide, title page, player). */
-export function setStageLight(m: Media | undefined) {
-  base = m;
-  apply(m);
-}
-
-/** Hovering a card borrows the light for a moment; leaving hands it back. */
+/**
+ * Hovering a card borrows the light for a moment; leaving hands it back.
+ * The preview is written on the backdrop layer alone. Writing it on :root (as before) made
+ * the browser restyle every element in the app each time the mouse crossed a card.
+ */
 export function previewLight(m: Media | null) {
-  apply(m ?? base);
+  if (!m) return clearPreview();
+  const t = ++previewToken;
+  colorsFor(m).then(([a1, a2]) => {
+    const s = lightEl()?.style;
+    if (t !== previewToken || !s) return;
+    s.setProperty("--a1", a1);
+    s.setProperty("--a2", a2);
+  });
 }

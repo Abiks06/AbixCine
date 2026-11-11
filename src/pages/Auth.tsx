@@ -1,8 +1,8 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Icon } from "../components/Icon";
 import { LogoMark, Wordmark } from "../components/Logo";
 import { errorMessage, getApiBase, setApiBase, signIn, signUp } from "../lib/account";
-import { demoList } from "../lib/demo";
+import { ANIME_FEEDS, loadAnimeFeed } from "../lib/anilist";
 
 /** Sign in / create account. A slow drifting poster wall sits behind the glass card. */
 export function Auth() {
@@ -14,6 +14,13 @@ export function Auth() {
   const [err, setErr] = useState<string | null>(null);
   const [server, setServer] = useState(getApiBase());
   const [showServer, setShowServer] = useState(false);
+  // Real artwork for the wall: AniList is public, so it works before sign-in.
+  const [posters, setPosters] = useState<string[]>([]);
+  useEffect(() => {
+    loadAnimeFeed(ANIME_FEEDS[0])
+      .then((list) => setPosters(list.map((m) => m.poster).filter((p): p is string => !!p)))
+      .catch(() => {});
+  }, []);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -30,14 +37,15 @@ export function Auth() {
     }
   };
 
-  const wall = demoList("movie", 99, 28);
+  // 28 tiles; until posters arrive (or offline) they're tinted glass in the brand hues.
+  const wall = Array.from({ length: 28 }, (_, i) => ({ poster: posters.length ? posters[i % posters.length] : undefined, hue: (i * 47) % 360 }));
   return (
     <div className="auth">
       <div className="auth-wall" aria-hidden>
         {[0, 1, 2, 3].map((col) => (
           <div key={col} className="auth-col" style={{ ["--d" as any]: `${col % 2 ? -1 : 1}`, ["--t" as any]: `${60 + col * 9}s` }}>
             {[...wall.slice(col * 7, col * 7 + 7), ...wall.slice(col * 7, col * 7 + 7)].map((m, i) => (
-              <div key={i} className="auth-tile" style={{ ["--h" as any]: m.hue }} />
+              <div key={i} className={`auth-tile ${m.poster ? "img" : ""}`} style={{ ["--h" as any]: m.hue, ...(m.poster ? { backgroundImage: `url(${m.poster})` } : {}) }} />
             ))}
           </div>
         ))}

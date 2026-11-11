@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "AbixCine",
-  "version": "0.1.0",
+  "version": "1.1.0",
   "identifier": "app.abixcine.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -20,23 +20,62 @@
         "decorations": false,
         "transparent": false,
         "backgroundColor": "#06070b",
-        "center": true
+        "center": true,
+        "label": "main",
+        "dragDropEnabled": false,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required"
       }
     ],
     "security": {
       "csp": null,
       "assetProtocol": {
         "enable": true,
-        "scope": ["**"]
+        "scope": [
+          "**"
+        ]
       }
     }
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis", "msi"],
-    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.ico"],
+    "targets": [
+      "nsis"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ],
     "windows": {
-      "webviewInstallMode": { "type": "downloadBootstrapper" }
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "displayLanguageSelector": false,
+        "installerIcon": "icons/icon.ico",
+        "startMenuFolder": "AbixCine"
+      }
+    },
+    "createUpdaterArtifacts": true,
+    "publisher": "AbixCine",
+    "copyright": "© 2026 Ayomide Abikoye",
+    "category": "Video",
+    "shortDescription": "Movies, series and anime in one cinematic player",
+    "longDescription": "AbixCine finds the fastest server for any movie, series or anime, with sub/dub switching, subtitles and Anime4K picture enhancement.",
+    "homepage": "https://github.com/Abiks06/AbixCine"
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDE4RDkyRjM1MEZGM0M2NTgKUldSWXh2TVBOUy9aR0ppNFRnQVdsUkJNU0FldmFiSmp2RVZCVHdBNHZmRHlCcmoyYWtaWXVjS2sK",
+      "endpoints": [
+        "https://github.com/Abiks06/AbixCine/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
     }
   }
 }

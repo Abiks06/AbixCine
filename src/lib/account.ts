@@ -44,6 +44,11 @@ const listeners = new Set<() => void>();
 let state: AuthState = load();
 
 function load(): AuthState {
+  // Dev-only design preview (vite dev server with ?preview): an in-memory guest, never saved
+  // and never sent anywhere. Production builds strip this branch.
+  if (import.meta.env.DEV && typeof location !== "undefined" && location.search.includes("preview")) {
+    return { user: { id: "preview", email: "preview@localhost", name: "Preview", avatarHue: 262, createdAt: "" }, accessToken: null, refreshToken: null, tmdbProxy: false, online: false };
+  }
   try {
     const raw = localStorage.getItem(KEY);
     if (raw) return { tmdbProxy: false, online: true, ...JSON.parse(raw) };
@@ -56,7 +61,7 @@ function load(): AuthState {
 function set(patch: Partial<AuthState>) {
   state = { ...state, ...patch };
   try {
-    localStorage.setItem(KEY, JSON.stringify(state));
+    if (state.user?.id !== "preview") localStorage.setItem(KEY, JSON.stringify(state));
   } catch {
     /* ignore */
   }

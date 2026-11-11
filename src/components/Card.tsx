@@ -1,6 +1,6 @@
-import type { MouseEvent, ReactNode } from "react";
+import { memo, type MouseEvent, type ReactNode } from "react";
 import { Link } from "react-router-dom";
-import { encodeKey } from "../lib/catalog";
+import { encodeKey, getDetail } from "../lib/catalog";
 import { previewLight } from "../lib/light";
 import type { Move } from "../lib/ranks";
 import { toggleList, useWatchlist } from "../lib/watchlist";
@@ -39,9 +39,26 @@ interface Props {
   label?: string;
   progress?: number;
   to?: string;
+  /** Shows a dismiss button on the artwork (Continue watching). */
+  onRemove?: () => void;
+  removeLabel?: string;
 }
 
-export function Card({ media, index = 0, variant = "landscape", rank, move, extra, sub, right, label, progress, to }: Props) {
+/** Hovering a card fetches its details in the background, so the title page opens instantly. */
+const warmed = new Set<string>();
+let warmTimer: ReturnType<typeof setTimeout> | undefined;
+function warm(key: string) {
+  if (warmed.has(key)) return;
+  clearTimeout(warmTimer);
+  // A short dwell, so sweeping the mouse across a row doesn't fire a request per card.
+  warmTimer = setTimeout(() => {
+    warmed.add(key);
+    getDetail(key).catch(() => warmed.delete(key));
+  }, 140);
+}
+
+/** Memoised: a shelf of cards shouldn't re-render because the hero above it changed slide. */
+export const Card = memo(function Card({ media, index = 0, variant = "landscape", rank, move, extra, sub, right, label, progress, to, onRemove, removeLabel }: Props) {
   const saved = useWatchlist().some((e) => e.media.key === media.key);
   const port = variant !== "landscape";
   const card = (
@@ -51,7 +68,11 @@ export function Card({ media, index = 0, variant = "landscape", rank, move, extr
       title={media.title}
       viewTransition
       onClick={tagForMorph}
-      onMouseEnter={() => previewLight(media)}
+      onMouseEnter={() => {
+        previewLight(media);
+        warm(media.key);
+      }}
+      onFocus={() => warm(media.key)}
       onMouseLeave={() => previewLight(null)}
       style={{ ["--i" as any]: Math.min(index, 12) }}
     >
@@ -60,7 +81,22 @@ export function Card({ media, index = 0, variant = "landscape", rank, move, extr
         {!port && <div className="shade" />}
         {!port && <div className={`lt ${extra ? "lift" : ""}`}>{media.title}</div>}
         {extra}
-        <span className="hoverplay"><Icon name="play" size={13} /></span>
+        {onRemove ? (
+          <button
+            className="dismiss"
+            aria-label={removeLabel ?? "Remove"}
+            title={removeLabel ?? "Remove"}
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              onRemove();
+            }}
+          >
+            <Icon name="x" size={13} />
+          </button>
+        ) : (
+          <span className="hoverplay"><Icon name="play" size={13} /></span>
+        )}
         <button
           className={`save ${saved ? "on" : ""}`}
           aria-label={saved ? "Remove from My List" : "Add to My List"}
@@ -96,7 +132,7 @@ export function Card({ media, index = 0, variant = "landscape", rank, move, extr
       {card}
     </div>
   );
-}
+});
 
 export function CardSkeleton({ variant = "landscape" }: { variant?: CardVariant }) {
   return (

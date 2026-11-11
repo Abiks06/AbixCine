@@ -16,7 +16,7 @@ const P: Record<string, string> = {
   mute: "M4 9v6h4l5 4V5L8 9zM17 9l5 6M22 9l-5 6",
   full: "M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5",
   unfull: "M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5",
-  next: "M5 5l10 7-10 7zM19 5v14",
+  next: "M5 5l10 7-10 7zM17.5 5H20v14h-2.5z",
   rew: "M11 18V6l-8.5 6zM21 18V6l-8.5 6z",
   fwd: "M13 6v12l8.5-6zM3 6v12l8.5-6z",
   layers: "M12 3l9 5-9 5-9-5zM3 13l9 5 9-5M3 17.5l9 5 9-5",
@@ -43,6 +43,8 @@ const P: Record<string, string> = {
   refresh: "M20 11a8 8 0 0 0-14.6-4.5L4 8M4 4v4h4M4 13a8 8 0 0 0 14.6 4.5L20 16M20 20v-4h-4",
   hd: "M3 5h18v14H3zM7 9v6M7 12h4M11 9v6M14 9v6h2a3 3 0 0 0 0-6z",
   cc: "M3 5h18v14H3zM10 10.5a2 2 0 1 0 0 3M17 10.5a2 2 0 1 0 0 3",
+  pip: "M3 5h18v14H3zM12 12h6v4h-6z",
+  keys: "M3 6h18v12H3zM7 10h.01M11 10h.01M15 10h.01M7 14h10",
 };
 
 const FILLED = new Set(["play", "pause", "star", "next", "rew", "fwd", "bookmarkOn"]);

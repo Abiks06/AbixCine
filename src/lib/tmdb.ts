@@ -1,5 +1,4 @@
 import { cached } from "./cache";
-import { demoDetail, demoList } from "./demo";
 import { api, getAuth } from "./account";
 import { getSettings } from "./settings";
 import type { Episode, Media, MediaDetail } from "./types";
@@ -91,8 +90,8 @@ export const FEEDS: Record<"home" | "movie" | "tv", Feed[]> = {
   ],
 };
 
-export async function loadFeed(f: Feed, i: number): Promise<Media[]> {
-  if (!hasTmdb()) return demoList(f.kind ?? (i % 2 ? "tv" : "movie"), i + 1);
+export async function loadFeed(f: Feed, _i?: number): Promise<Media[]> {
+  if (!hasTmdb()) return [];
   const params = liveParams(f);
   const ttl = (f.ttl ?? 180) * 60_000;
   return cached(`tmdb:${f.path}:${JSON.stringify(params ?? {})}`, ttl, async () => {
@@ -102,7 +101,7 @@ export async function loadFeed(f: Feed, i: number): Promise<Media[]> {
 }
 
 export async function searchTmdb(q: string): Promise<Media[]> {
-  if (!hasTmdb()) return demoList("movie", q.length + 3, 8).map((m) => ({ ...m, title: `${q} ${m.title}` }));
+  if (!hasTmdb()) return [];
   const r = await get("/search/multi", { query: q, include_adult: "false" });
   return list(r.results);
 }
@@ -113,7 +112,6 @@ const CREW_JOBS = ["Director", "Creator", "Screenplay", "Writer", "Story", "Nove
 const region = () => (navigator.language.split("-")[1] ?? "US").toUpperCase();
 
 export async function tmdbDetail(key: string): Promise<MediaDetail> {
-  if (key.startsWith("demo:")) return demoDetail(key);
   const [, kind, id] = key.split(":") as [string, "movie" | "tv", string];
   return cached(`tmdb:detail:v2:${kind}:${id}`, 3 * HOUR, async () => {
     const extra = kind === "movie" ? "release_dates" : "content_ratings";
@@ -189,9 +187,6 @@ export const TOP10 = {
 };
 
 export async function tmdbSeason(key: string, season: number): Promise<Episode[]> {
-  if (key.startsWith("demo:")) {
-    return Array.from({ length: 8 }, (_, i) => ({ season, number: i + 1, title: `Episode ${i + 1}`, overview: "Placeholder episode.", runtime: 45 }));
-  }
   const id = key.split(":")[2];
   return cached(`tmdb:season:${id}:${season}`, 2 * HOUR, async () => {
     const r = await get(`/tv/${id}/season/${season}`);

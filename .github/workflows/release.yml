@@ -1,0 +1,65 @@
+# Builds the signed Windows installer and publishes it as a GitHub release.
+# The release carries latest.json, which installed copies of AbixCine read to update themselves.
+#
+# Release a new version:  npm run version:bump -- 1.0.1  →  commit  →  git tag v1.0.1  →  git push --tags
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   TAURI_SIGNING_PRIVATE_KEY           contents of ~/.tauri/abixcine.key
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  contents of ~/.tauri/abixcine.key.password
+# Optional:
+#   VITE_TMDB_KEY                       bake a TMDB key into the build (otherwise the AbixCine server proxies TMDB)
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check versions match the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: node scripts/bump-version.mjs --check "${GITHUB_REF_NAME#v}"
+
+      - name: Build, sign and publish
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          VITE_TMDB_KEY: ${{ secrets.VITE_TMDB_KEY }}
+        with:
+          tagName: v__VERSION__
+          releaseName: AbixCine v__VERSION__
+          releaseBody: |
+            Download **AbixCine_*_x64-setup.exe** below and run it to install AbixCine on Windows 10 or 11.
+            Already installed? AbixCine updates itself: you'll see a prompt in the app.
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true

@@ -14,10 +14,14 @@ export interface Settings {
   animeAudio: Audio;
   /** Per-title override, so switching one show to dub doesn't change the rest. */
   audioByTitle: Record<string, Audio>;
+  /** IDs of disabled source providers (e.g. from availableSources). */
+  disabledSources: string[];
+  /** Extra servers (off unless switched on: they're often offline). */
+  enabledExtras: string[];
 }
 
 /** Settings that follow the account. Library folders and server credentials stay on this device. */
-const SYNCED: (keyof Settings)[] = ["preferredQuality", "autoplayNext", "reduceMotion", "animeAudio", "audioByTitle"];
+const SYNCED: (keyof Settings)[] = ["preferredQuality", "autoplayNext", "reduceMotion", "animeAudio", "audioByTitle", "disabledSources", "enabledExtras"];
 
 const DEFAULTS: Settings = {
   tmdbKey: import.meta.env.VITE_TMDB_KEY ?? "",
@@ -28,6 +32,8 @@ const DEFAULTS: Settings = {
   reduceMotion: false,
   animeAudio: "sub",
   audioByTitle: {},
+  disabledSources: [],
+  enabledExtras: [],
 };
 
 const KEY = "abx.settings.v1";
@@ -68,6 +74,21 @@ export function audioFor(mediaKey: string): Audio {
 }
 export function setAudioFor(mediaKey: string, a: Audio) {
   updateSettings({ audioByTitle: { ...current.audioByTitle, [mediaKey]: a } });
+}
+
+export function toggleSource(id: string, enabled: boolean, extra = false) {
+  if (extra) {
+    const list = current.enabledExtras ?? [];
+    updateSettings({ enabledExtras: enabled ? [...new Set([...list, id])] : list.filter((x) => x !== id) });
+    return;
+  }
+  const list = current.disabledSources ?? [];
+  const next = enabled ? list.filter((x) => x !== id) : [...new Set([...list, id])];
+  updateSettings({ disabledSources: next });
+}
+
+export function isSourceEnabled(id: string): boolean {
+  return !(current.disabledSources ?? []).includes(id);
 }
 
 registerSync({

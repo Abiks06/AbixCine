@@ -1,7 +1,36 @@
 import type { Settings } from "../lib/settings";
 import type { PlaybackRequest } from "../lib/types";
 
-export type StreamKind = "hls" | "file";
+export type StreamKind = "hls" | "file" | "embed";
+
+export interface VideoSource {
+  id: string;
+  name: string;
+  isFrench: boolean;
+  urls: {
+    movie: string;
+    tv: string;
+    /**
+     * Anime by AniList/MAL id with a real sub/dub switch. Placeholders: {anilist}, {mal},
+     * {episode}, {audio} ("sub" | "dub"), {dub} ("true" | "false").
+     */
+    anime?: string;
+  };
+  /** Query parameter the player reads as "start at N seconds", so resume and sub/dub flips keep the spot. */
+  startParam?: string;
+  /** Set false for players whose stream can't be captured (they then only run as a web player). */
+  sniff?: boolean;
+  /** Often offline: off unless switched on in Settings → Servers → Extra servers. */
+  extra?: boolean;
+}
+
+export interface SubtitleTrack {
+  /** BCP 47 / ISO 639 code when known ("en", "eng", "ja"). */
+  lang: string;
+  label: string;
+  /** WebVTT or SRT; SRT is converted on the fly. */
+  url: string;
+}
 
 /** One playable option a provider found for a request. */
 export interface StreamCandidate {
@@ -12,7 +41,23 @@ export interface StreamCandidate {
   kind: StreamKind;
   /** Vertical resolution if known (from filename, manifest, or server metadata). */
   quality?: number;
-  subtitles?: { lang: string; label: string; url: string }[];
+  subtitles?: SubtitleTrack[];
+  /**
+   * What audio this stream carries. "dual" means it has both and the player picks the track;
+   * "unknown" is an embed that can't be told which one to play.
+   */
+  audio?: "sub" | "dub" | "dual" | "unknown";
+  /** Embeds only: query parameter for a start time (see VideoSource.startParam). */
+  startParam?: string;
+  /**
+   * How AbixCine plays it. "direct": a stream URL from an API; "sniffed": captured from an
+   * embed page and played in AbixCine's own player; "embed": the page itself in a shielded frame.
+   */
+  via?: "direct" | "sniffed" | "embed";
+  /** The embed page a sniffed stream came from (also the web-player fallback). */
+  pageUrl?: string;
+  /** Intro/outro ranges in seconds, when the source knows them. */
+  skip?: { intro?: [number, number]; outro?: [number, number] };
   /** Filled in by the ranker. */
   probe?: { ok: boolean; latencyMs: number; quality?: number; error?: string };
   score?: number;
@@ -28,10 +73,13 @@ export interface StreamCandidate {
 export interface SourceProvider {
   id: string;
   name: string;
-  /** "local" sources are on this PC; "external" ones are servers you add later. */
-  category: "local" | "external";
+  /** "local" sources are on this PC; "external" ones are servers; "embed" are web streaming embeds. */
+  category: "local" | "external" | "embed";
   /** Higher wins ties. Local files beat network sources by default. */
   priority: number;
+  isFrench?: boolean;
+  /** Lookup timeout when the provider needs longer than the default (e.g. it captures a page itself). */
+  timeoutMs?: number;
   isEnabled(s: Settings): boolean;
   find(req: PlaybackRequest, s: Settings, signal: AbortSignal): Promise<StreamCandidate[]>;
 }

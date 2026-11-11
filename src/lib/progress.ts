@@ -46,7 +46,7 @@ export function saveProgress(e: Omit<ProgressEntry, "updatedAt">) {
   const entry: ProgressEntry = { ...e, media: slim(e.media), position: done ? 0 : e.position, updatedAt: Date.now() };
   store = { ...store, [e.media.key]: entry };
   save();
-  if (!e.media.key.startsWith("demo:")) push(`/progress/${encodeURIComponent(e.media.key)}`, "PUT", entry);
+  push(`/progress/${encodeURIComponent(e.media.key)}`, "PUT", entry);
 }
 
 export function getProgress(mediaKey: string, season?: number, episode?: number) {
@@ -56,10 +56,18 @@ export function getProgress(mediaKey: string, season?: number, episode?: number)
 }
 
 export function removeProgress(mediaKey: string) {
-  const { [mediaKey]: _, ...rest } = store;
+  const { [mediaKey]: gone, ...rest } = store;
   store = rest;
   save();
   push(`/progress/${encodeURIComponent(mediaKey)}`, "DELETE");
+  return gone;
+}
+
+/** Put back an entry removed by mistake (the Undo on the toast). */
+export function restoreProgress(entry: ProgressEntry) {
+  store = { ...store, [entry.media.key]: entry };
+  save();
+  push(`/progress/${encodeURIComponent(entry.media.key)}`, "PUT", entry);
 }
 
 registerSync({
