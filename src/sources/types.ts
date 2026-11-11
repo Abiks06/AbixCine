@@ -13,6 +13,15 @@ export interface StreamCandidate {
   /** Vertical resolution if known (from filename, manifest, or server metadata). */
   quality?: number;
   subtitles?: { lang: string; label: string; url: string }[];
+  /**
+   * What mpv should open instead of `url`, when that's better: the file path on disk, or a
+   * server's original (untranscoded) stream. `url` stays what the built-in player can handle.
+   */
+  nativeUrl?: string;
+  /** The built-in player can't decode this well (HEVC, DTS/TrueHD, 10-bit, AVI…): prefer mpv. */
+  needsMpv?: boolean;
+  /** Short codec summary for the source panel, e.g. "HEVC · DTS-HD 7.1". */
+  codec?: string;
   /** Filled in by the ranker. */
   probe?: { ok: boolean; latencyMs: number; quality?: number; error?: string };
   score?: number;

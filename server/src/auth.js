@@ -24,7 +24,7 @@ export const checkPassword = (pw, hash) => bcrypt.compare(pw, hash);
 const sha256 = (s) => crypto.createHash("sha256").update(s).digest("hex");
 
 export function publicUser(u) {
-  return { id: u.id, email: u.email, name: u.name, avatarHue: u.avatar_hue, createdAt: u.created_at };
+  return { id: u.id, email: u.email, name: u.name, avatarHue: u.avatar_hue, createdAt: u.created_at, emailVerified: !!u.email_verified_at, hasPassword: !!u.password_hash };
 }
 
 /**
@@ -97,6 +97,9 @@ export async function requireUser(req, reply) {
   req.userId = payload.sub;
 }
 
-/** Housekeeping: expired and long-revoked refresh tokens are dead weight. */
-export const pruneTokens = () =>
-  q(`DELETE FROM refresh_tokens WHERE expires_at < now() OR revoked_at < now() - interval '7 days'`);
+/** Housekeeping: expired and long-revoked refresh tokens, spent email codes and abandoned sign-ins are dead weight. */
+export const pruneTokens = async () => {
+  await q(`DELETE FROM refresh_tokens WHERE expires_at < now() OR revoked_at < now() - interval '7 days'`);
+  await q(`DELETE FROM email_codes WHERE expires_at < now() - interval '1 day'`);
+  await q(`DELETE FROM oauth_pending WHERE created_at < now() - interval '1 hour'`);
+};

@@ -18,9 +18,9 @@
         "minWidth": 960,
         "minHeight": 600,
         "decorations": false,
-        "transparent": false,
-        "backgroundColor": "#06070b",
-        "center": true
+        "transparent": true,
+        "center": true,
+        "label": "main"
       }
     ],
     "security": {
@@ -61,6 +61,20 @@
     "windows": {
       "webviewInstallMode": {
         "type": "downloadBootstrapper"
+      }
+    },
+    "publisher": "AbixCine",
+    "copyright": "AbixCine",
+    "shortDescription": "Movies, series and anime from your own library"
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "",
+      "endpoints": [
+        "https://github.com/Abiks06/AbixCine/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
       }
     }
   }

@@ -58,18 +58,43 @@ const slim = (m: Media): Media => ({
  * Progress is stored per title (latest episode wins), which is what "Continue watching" needs.
  * Finishing an episode moves the entry on to `next`, so the show stays in Continue watching as "Up next".
  */
-export function saveProgress(e: Omit<ProgressEntry, "updatedAt" | "upNext" | "finished">, next?: { season?: number; episode: number } | null) {
+export function saveProgress(e: Omit<ProgressEntry, "updatedAt" | "upNext" | "finished">, next?: { season?: number; episode: number; media?: Media } | null) {
   const done = isDone(e.position, e.duration);
   const base = { ...e, media: slim(e.media), updatedAt: Date.now() };
+  // The next episode lives in another entry (anime: season 2 is its own AniList title):
+  // this one is finished, and the next title shows up in Continue watching as "Up next".
+  const elsewhere = done && next?.media && next.media.key !== e.media.key ? next.media : null;
   const entry: ProgressEntry = !done
     ? base
-    : next
+    : next && !elsewhere
       ? { ...base, season: next.season, episode: next.episode, position: 0, upNext: true }
       : { ...base, position: 0, finished: true };
-  store = { ...store, [e.media.key]: entry };
-  save();
-  if (!e.media.key.startsWith("demo:")) push(`/progress/${encodeURIComponent(e.media.key)}`, "PUT", entry);
+  write(entry);
+  if (elsewhere && next) {
+    const existing = store[elsewhere.key];
+    if (!existing || existing.finished) write({ media: slim(elsewhere), season: next.season, episode: next.episode, audio: e.audio, position: 0, duration: 0, updatedAt: Date.now() + 1, upNext: true });
+  }
 }
+
+function write(entry: ProgressEntry) {
+  store = { ...store, [entry.media.key]: entry };
+  save();
+  if (!entry.media.key.startsWith("demo:")) push(`/progress/${encodeURIComponent(entry.media.key)}`, "PUT", entry);
+}
+
+/**
+ * A finished show got a new episode (or season): put it back in Continue watching as "Up next".
+ * Called by the new-episode alerts. Returns true if the entry changed.
+ */
+export function reviveFinished(mediaKey: string, next: { season?: number; episode: number }) {
+  const p = store[mediaKey];
+  if (!p || !p.finished) return false;
+  write({ ...p, season: next.season, episode: next.episode, position: 0, duration: 0, finished: false, upNext: true, updatedAt: Date.now() });
+  return true;
+}
+
+/** Every saved entry (finished ones too), for the alerts and history pages. */
+export const allProgress = () => store;
 
 export function getProgress(mediaKey: string, season?: number, episode?: number) {
   const p = store[mediaKey];

@@ -21,6 +21,8 @@ const P: Record<string, string> = {
   fwd: "M13 6v12l8.5-6zM3 6v12l8.5-6z",
   layers: "M12 3l9 5-9 5-9-5zM3 13l9 5 9-5M3 17.5l9 5 9-5",
   x: "M6 6l12 12M18 6L6 18",
+  bell: "M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.94 1.94 0 0 0 3.4 0",
+  download: "M12 3v12M7 10l5 5 5-5M5 21h14",
   min: "M5 12h14",
   max: "M5 5h14v14H5z",
   folder: "M3 6a1 1 0 0 1 1-1h5l2 2h9a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z",

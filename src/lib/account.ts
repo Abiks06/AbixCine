@@ -1,3 +1,4 @@
+import { isTauri } from "@tauri-apps/api/core";
 import { useSyncExternalStore } from "react";
 
 /**
@@ -10,6 +11,9 @@ export interface User {
   name: string;
   avatarHue: number;
   createdAt: string;
+  emailVerified?: boolean;
+  /** False for accounts made with Google/Discord until they set one. */
+  hasPassword?: boolean;
 }
 
 interface AuthState {
@@ -21,6 +25,10 @@ interface AuthState {
   online: boolean;
   /** Using the app without an account: everything stays on this PC, nothing syncs. */
   guest?: boolean;
+  /** The server can send email (reset codes, verification). */
+  mail?: boolean;
+  /** Sign-in providers the server has set up, e.g. ["google", "discord"]. */
+  oauth?: string[];
 }
 
 const KEY = "abx.auth.v1";
@@ -101,6 +109,14 @@ const MESSAGES: Record<string, string> = {
   password_too_long: "Use 128 characters or fewer.",
   bad_server: "The server address must start with https://",
   waking: "The AbixCine server is waking up. This takes up to a minute on free hosting.",
+  invalid_code: "That code is wrong or has expired. Ask for a new one.",
+  mail_disabled: "This server can't send email yet.",
+  denied: "Sign-in was cancelled.",
+  expired: "That sign-in took too long. Try again.",
+  no_email: "That account didn't share an email address.",
+  unverified_email: "Verify your email with that service first.",
+  provider_error: "The sign-in service didn't answer. Try again.",
+  provider_unavailable: "That sign-in option isn't set up on this server.",
   network: "Can't reach the AbixCine server. Check the server address or your connection.",
 };
 export const errorMessage = (e: unknown) =>
@@ -184,6 +200,63 @@ export async function signIn(email: string, password: string) {
   await finishAuth(await raw("/auth/login", { method: "POST", body: JSON.stringify({ email, password }) }));
 }
 
+// ---------- password reset, verification, Google/Discord ----------
+
+/** Email a 6-digit reset code (the server answers the same whether or not the account exists). */
+export async function forgotPassword(email: string) {
+  await raw("/auth/forgot", { method: "POST", body: JSON.stringify({ email }) });
+}
+
+/** Set a new password with the emailed code and sign in. Every other device is signed out. */
+export async function resetPassword(email: string, code: string, password: string) {
+  await finishAuth(await raw("/auth/reset", { method: "POST", body: JSON.stringify({ email, code: code.trim(), password }) }));
+}
+
+export async function sendVerification() {
+  await api("/auth/verify/send", { method: "POST" });
+}
+
+export async function verifyEmail(code: string) {
+  const r = await api("/auth/verify", { method: "POST", body: JSON.stringify({ code: code.trim() }) });
+  set({ user: r.user });
+}
+
+/** Change (or set, for Google/Discord accounts) the password. Other devices are signed out. */
+export async function changePassword(current: string, password: string) {
+  const r = await api("/auth/password", { method: "POST", body: JSON.stringify({ current, password }) });
+  set({ user: r.user, accessToken: r.accessToken, refreshToken: r.refreshToken });
+}
+
+async function openExternal(url: string) {
+  if (isTauri()) {
+    const { openUrl } = await import("@tauri-apps/plugin-opener");
+    await openUrl(url);
+  } else window.open(url, "_blank", "noopener");
+}
+
+/**
+ * "Continue with Google/Discord": opens the provider in the browser and waits (up to 10 minutes)
+ * for the server to finish the sign-in. Abort the signal to stop waiting.
+ */
+export async function signInWith(provider: "google" | "discord", signal?: AbortSignal) {
+  const start = await raw(`/auth/oauth/${provider}/start`, { method: "POST" });
+  await openExternal(start.url);
+  const t0 = Date.now();
+  while (Date.now() - t0 < 10 * 60_000) {
+    if (signal?.aborted) throw new ApiError(0, "denied");
+    await new Promise((r) => setTimeout(r, 2000));
+    let r: any;
+    try {
+      r = await raw("/auth/oauth/poll", { method: "POST", body: JSON.stringify({ state: start.state, poll: start.poll }) });
+    } catch (e) {
+      if (isWaking(e) || (e instanceof ApiError && e.status === 0)) continue; // keep waiting through hiccups
+      throw e;
+    }
+    if (r.accessToken) return finishAuth(r);
+  }
+  throw new ApiError(410, "expired");
+}
+
 /** Use AbixCine without an account. Local folders and Jellyfin work; progress stays on this PC. */
 export function continueAsGuest() {
   set({ guest: true });
@@ -232,7 +305,7 @@ export async function updateProfile(patch: { name?: string; avatarHue?: number }
 export async function checkServer() {
   try {
     const h = await raw("/health", {}, null, 10_000);
-    set({ tmdbProxy: !!h.tmdbProxy });
+    set({ tmdbProxy: !!h.tmdbProxy, mail: !!h.mail, oauth: Array.isArray(h.oauth) ? h.oauth : [] });
     return true;
   } catch {
     return false;

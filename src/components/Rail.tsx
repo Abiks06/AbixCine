@@ -9,6 +9,7 @@ const NAV = [
   { to: "/anime", label: "Anime", icon: "spark" },
   { to: "/library", label: "Your drive", icon: "drive" },
   { to: "/list", label: "My List", icon: "bookmark" },
+  { to: "/history", label: "History", icon: "clock" },
 ];
 
 /** Floating glass rail. A lit pill springs to the active section; labels slide out on hover. */

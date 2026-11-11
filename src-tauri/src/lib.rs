@@ -3,6 +3,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use tauri::Manager;
 
+mod mpv;
+
 #[derive(Serialize)]
 struct LibFile {
     path: String,
@@ -10,7 +12,7 @@ struct LibFile {
     size: u64,
 }
 
-const VIDEO_EXTS: &[&str] = &["mp4", "m4v", "webm", "mkv", "mov", "ts", "m3u8"];
+const VIDEO_EXTS: &[&str] = &["mp4", "m4v", "webm", "mkv", "mov", "ts", "m3u8", "avi", "wmv", "flv", "mpg", "mpeg", "m2ts", "mts", "vob", "ogv", "rmvb", "3gp"];
 const MAX_DEPTH: u32 = 8;
 /// Stop listing past this many files; a library bigger than this is almost certainly a wrong folder.
 const MAX_FILES: usize = 50_000;
@@ -85,6 +87,7 @@ struct ScanError {
 #[tauri::command]
 async fn scan_library(app: tauri::AppHandle, paths: Vec<String>) -> Result<ScanResult, String> {
     let scope = app.asset_protocol_scope();
+    let mpv_state = app.state::<mpv::MpvState>();
     let mut roots = Vec::new();
     let mut errors = Vec::new();
     for p in paths {
@@ -98,6 +101,8 @@ async fn scan_library(app: tauri::AppHandle, paths: Vec<String>) -> Result<ScanR
             Err(e) => errors.push(ScanError { path: p, message: e.to_string() }),
         }
     }
+    // mpv may only open files inside the folders the user chose (see mpv.rs).
+    mpv_state.set_roots(roots.clone());
     let files = tauri::async_runtime::spawn_blocking(move || {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
@@ -111,11 +116,48 @@ async fn scan_library(app: tauri::AppHandle, paths: Vec<String>) -> Result<ScanR
     Ok(ScanResult { files, errors })
 }
 
+/// True when this build can install updates: it was built with an updater public key (release
+/// builds from CI). Local dev builds have none, so the UI only offers to open the download page.
+#[tauri::command]
+fn updater_ready(app: tauri::AppHandle) -> bool {
+    app.config()
+        .plugins
+        .0
+        .get("updater")
+        .and_then(|u| u.get("pubkey"))
+        .and_then(|k| k.as_str())
+        .map(|k| !k.trim().is_empty())
+        .unwrap_or(false)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![scan_library])
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_opener::init())
+        .manage(mpv::MpvState::default())
+        .setup(|app| {
+            if let Some(main) = app.get_webview_window("main") {
+                mpv::keep_taskbar_button(&main);
+            }
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() == "main" {
+                mpv::on_main_event(window.app_handle(), event);
+            }
+        })
+        .invoke_handler(tauri::generate_handler![
+            scan_library,
+            updater_ready,
+            mpv::mpv_probe,
+            mpv::mpv_start,
+            mpv::mpv_command,
+            mpv::mpv_stop
+        ])
         .run(tauri::generate_context!())
         .expect("error while running AbixCine");
 }

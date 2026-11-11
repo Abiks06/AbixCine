@@ -7,7 +7,10 @@ import { Card, kindLabel } from "../components/Card";
 import { Icon } from "../components/Icon";
 import { SmartSource } from "../components/SmartSource";
 import { TitleArt } from "../components/TitleArt";
-import { decodeKey, getDetail } from "../lib/catalog";
+import { decodeKey, encodeKey, getDetail } from "../lib/catalog";
+import { animeSeasons } from "../lib/anilist";
+import { epKey, setWatched, useTitleHistory } from "../lib/history";
+import { tmdbToAnilist } from "../lib/idmap";
 import { fmtAgo, fmtDate, fmtMoney, fmtRuntime, languageName } from "../lib/format";
 import { getProgress, useProgressEntry } from "../lib/progress";
 import { watchHref } from "../lib/play";
@@ -31,6 +34,23 @@ export function Title() {
   const saved = useWatchlist().some((e) => e.media.key === key);
   const [tab, setTab] = useState<Tab>("episodes");
   const [swap, setSwap] = useState(false);
+  const hist = useTitleHistory(key);
+  const chain = useAsync(() => animeSeasons(key).catch(() => []), [key]);
+
+  // One place per anime: a TMDB copy of a show AniList has goes to the AniList entry (Sub/Dub,
+  // AniSkip, season chain), unless you already have progress on the TMDB copy.
+  useEffect(() => {
+    if (!d || d.kind !== "anime" || !key.startsWith("tmdb:tv:") || progress) return;
+    let live = true;
+    const id = Number(key.split(":")[2]);
+    tmdbToAnilist("tv", [id]).then((m) => {
+      const first = m[id]?.[0];
+      if (live && first?.anilist) nav(`/title/${encodeKey(`anilist:${first.anilist}`)}`, { replace: true });
+    });
+    return () => {
+      live = false;
+    };
+  }, [d?.key]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (d?.seasons?.length) setSeason(progress?.season ?? d.seasons[0].number);
@@ -124,10 +144,36 @@ export function Title() {
           <SmartSource req={req} what={what} />
         </div>
 
+        {chain.data && chain.data.length > 1 && (
+          <div className="franchise" aria-label="Seasons">
+            <span className="menu-sep">Watch order</span>
+            <div className="franchise-row">
+              {chain.data.map((c, i) => (
+                <button key={c.key} className={`fr ${c.key === key ? "on" : ""} ${c.unreleased ? "soon" : ""}`} onClick={() => c.key !== key && nav(`/title/${encodeKey(c.key)}`, { viewTransition: true })}>
+                  {c.poster && <img src={c.poster} alt="" loading="lazy" />}
+                  <span className="fr-txt">
+                    <b>{i + 1}. {c.title}</b>
+                    <small>{[c.year, c.episodes ? `${c.episodes} eps` : null, c.unreleased ? "Coming soon" : null].filter(Boolean).join(" · ")}</small>
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
         <div className="tabs" role="tablist">
           {tabs.map(([id, label]) => (
             <button key={id} role="tab" aria-selected={curTab === id} className={curTab === id ? "on" : ""} onClick={() => setTab(id)}>{label}</button>
           ))}
+          {curTab === "episodes" && epList.length > 0 && (() => {
+            const s = isTmdbSeries ? season : undefined;
+            const all = epList.every((e) => hist[epKey(s, e.number)]?.watched);
+            return (
+              <button className="chip mark-all" onClick={() => setWatched(d, epList.map((e) => ({ season: s, episode: e.number, duration: (e.runtime ?? d.runtime ?? 0) * 60 })), !all)}>
+                <Icon name="check" size={13} /> {all ? "Mark unwatched" : isTmdbSeries ? "Mark season watched" : "Mark all watched"}
+              </button>
+            );
+          })()}
           {curTab === "episodes" && isTmdbSeries && d.seasons && d.seasons.length > 1 && (
             <div className="season-pick">
               {d.seasons.map((s) => (
@@ -141,9 +187,10 @@ export function Title() {
           <div className={`eps swap ${swap ? "out" : ""}`} key={`${season}-${audio}`}>
             {epList.map((e, i) => {
               const s = isTmdbSeries ? season : undefined;
-              const p = getProgress(key, s, e.number);
+              const rec = hist[epKey(s, e.number)];
+              const p = rec ?? getProgress(key, s, e.number);
               const isCur = progress?.episode === e.number && (progress?.season ?? undefined) === s;
-              const watched = p && p.duration > 0 && p.position / p.duration > 0.92;
+              const watched = rec ? rec.watched : !!(p && p.duration > 0 && p.position / p.duration > 0.92);
               const still = e.still ?? d.related[i % Math.max(1, d.related.length)]?.backdrop ?? d.backdrop;
               return (
                 <button key={e.number} className={`ep ${isCur ? "cur" : ""}`} style={{ ["--i" as any]: Math.min(i, 14) }} onClick={() => watch(s, e.number)}>
@@ -151,6 +198,25 @@ export function Title() {
                     {still ? <img src={still} alt="" loading="lazy" /> : <Art media={d} variant="backdrop" size="sm" />}
                     {p && p.duration > 0 && <div className="w" style={{ width: `${watched ? 100 : (p.position / p.duration) * 100}%` }} />}
                     <span className="hoverplay"><Icon name="play" size={12} /></span>
+                    <span
+                      role="button"
+                      tabIndex={0}
+                      className={`ep-mark ${watched ? "on" : ""}`}
+                      aria-label={watched ? "Mark as not watched" : "Mark as watched"}
+                      title={watched ? "Mark as not watched" : "Mark as watched"}
+                      onClick={(ev) => {
+                        ev.stopPropagation();
+                        setWatched(d, [{ season: s, episode: e.number, duration: (e.runtime ?? d.runtime ?? 0) * 60 }], !watched);
+                      }}
+                      onKeyDown={(ev) => {
+                        if (ev.key !== "Enter" && ev.key !== " ") return;
+                        ev.preventDefault();
+                        ev.stopPropagation();
+                        setWatched(d, [{ season: s, episode: e.number, duration: (e.runtime ?? d.runtime ?? 0) * 60 }], !watched);
+                      }}
+                    >
+                      <Icon name="check" size={12} />
+                    </span>
                   </div>
                   <div className="ep-txt">
                     <div className="n">

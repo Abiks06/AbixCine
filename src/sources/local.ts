@@ -1,6 +1,6 @@
 import { invoke, convertFileSrc, isTauri } from "@tauri-apps/api/core";
 import { normTitle } from "../lib/format";
-import type { PlaybackRequest } from "../lib/types";
+import type { MediaIds, PlaybackRequest } from "../lib/types";
 import type { SourceProvider, StreamCandidate } from "./types";
 
 export interface LibFile {
@@ -30,7 +30,7 @@ export async function scanLibrary(paths: string[], force = false): Promise<LibFi
 }
 
 /** Strip a real video extension only ("Dune.2021" is a stem, not "Dune" + ".2021"). */
-export const stripExt = (name: string) => name.replace(/\.(mkv|mp4|m4v|webm|mov|ts|m3u8|avi)$/i, "");
+export const stripExt = (name: string) => name.replace(/\.(mkv|mp4|m4v|webm|mov|ts|m3u8|avi|wmv|flv|mpg|mpeg|m2ts|mts|vob|ogv|rmvb|3gp)$/i, "");
 
 const QUALITY_RX = /(2160|1080|720|576|480)p|\b4k\b/i;
 export function qualityOf(name: string) {
@@ -68,14 +68,57 @@ export function parseEpisode(name: string, path = ""): EpisodeInfo {
 }
 
 /** Title appears in the file/folder names as whole words ("Up" doesn't match "Upgrade" or "Backup"). */
-export function titleMatches(hay: string, req: Pick<PlaybackRequest, "media">) {
+export function titleMatches(hay: string, req: Pick<PlaybackRequest, "media" | "altTitles">) {
   const f = ` ${normTitle(hay)} `;
-  return [req.media.title, req.media.originalTitle]
+  return [req.media.title, req.media.originalTitle, ...(req.altTitles ?? [])]
     .filter(Boolean)
     .some((t) => {
       const n = normTitle(t!);
       return n.length > 1 && f.includes(` ${n} `);
     });
+}
+
+/**
+ * ID tags in file or folder names, the Jellyfin/Plex/Kodi way: "Dune (2021) {tmdb-438631}",
+ * "[imdbid-tt1160419]", "{tvdb-121361}", "[anilist-16498]".
+ */
+export function idTags(hay: string): MediaIds {
+  const out: MediaIds = {};
+  for (const m of hay.matchAll(/[[{(](tmdb|imdb|tvdb|anilist|mal)(?:id)?[-= ]((?:tt)?\d+)[\]})]/gi)) {
+    const k = m[1].toLowerCase();
+    if (k === "imdb") out.imdb = m[2].startsWith("tt") ? m[2] : `tt${m[2]}`;
+    else if (k === "tmdb") out.tmdb = Number(m[2]);
+    else if (k === "tvdb") out.tvdb = Number(m[2]);
+    else if (k === "anilist") out.anilist = Number(m[2]);
+    else out.mal = Number(m[2]);
+  }
+  return out;
+}
+
+/**
+ * Compare IDs from a file (or a media server) with the title's: "match" when any shared ID agrees,
+ * "mismatch" when a shared ID disagrees (and none agrees), "unknown" when they share no ID type.
+ * An ID beats a title: "match" plays even if the names differ, "mismatch" never plays.
+ */
+export function idVerdict(found: MediaIds, want: MediaIds | undefined): "match" | "mismatch" | "unknown" {
+  if (!want) return "unknown";
+  let shared = false;
+  for (const k of ["tmdb", "imdb", "tvdb", "anilist", "mal"] as const) {
+    const a = found[k];
+    const b = want[k];
+    if (a == null || b == null) continue;
+    if (k === "tmdb" && found.tmdbKind && want.tmdbKind && found.tmdbKind !== want.tmdbKind) continue;
+    shared = true;
+    if (String(a).toLowerCase() === String(b).toLowerCase()) return "match";
+  }
+  return shared ? "mismatch" : "unknown";
+}
+
+/** Files WebView2's player can't decode (or decodes badly), judged from release naming: hand these to mpv. */
+const MPV_RX = /\b(hevc|[xh][ ._-]?265|10[ ._-]?bit|hi10p?|av1|dts(?:-?(?:hd|x|ma))?|truehd|atmos|e?ac-?3|ddp?(?:[ ._]?[57][ ._]1)?|dd[57][ ._]1|flac|pcm|lpcm|remux|hdr(?:10\+?)?|dovi|dv|dolby[ ._-]?vision|vc-?1|mpeg-?2|xvid|divx)\b/i;
+export function needsMpvByName(path: string) {
+  if (/\.(avi|wmv|flv|mpg|mpeg|vob|m2ts|ts|rmvb|3gp)$/i.test(path)) return true;
+  return MPV_RX.test(path.split(/[\\/]/).slice(-2).join(" "));
 }
 
 /** Does this file hold the requested episode? Handles multi-episode files and anime absolute numbering. */
@@ -116,7 +159,9 @@ export const localProvider: SourceProvider = {
     for (const f of files) {
       // Match against the file name plus its parent folders, since many libraries are "Show/Season 1/01.mkv".
       const hay = f.path.split(/[\\/]/).slice(-3).join(" ");
-      if (!titleMatches(hay, req)) continue;
+      // An ID tag in the name settles it either way; otherwise the title has to match.
+      const verdict = idVerdict(idTags(hay), req.ids);
+      if (verdict === "mismatch" || (verdict === "unknown" && !titleMatches(hay, req))) continue;
       const ep = parseEpisode(f.name, f.path);
       if (req.episode != null) {
         if (!episodeMatches(ep, req)) continue;
@@ -124,7 +169,7 @@ export const localProvider: SourceProvider = {
         // A film request never plays an episode file, nor a same-named film from another year (Dune 1984 vs 2021).
         if (ep.episode != null) continue;
         const y = fileYear(hay);
-        if (y && req.media.year && Math.abs(y - req.media.year) > 1) continue;
+        if (verdict !== "match" && y && req.media.year && Math.abs(y - req.media.year) > 1) continue;
       }
       // One anime entry, two audio tracks: keep files that carry the audio the user picked.
       const audio = audioOf(hay);
@@ -134,6 +179,8 @@ export const localProvider: SourceProvider = {
         providerName: "Local library",
         label: f.name + (req.audio ? (audio === "dual" ? " · dual audio" : ` · ${audio}`) : ""),
         url: convertFileSrc(f.path),
+        nativeUrl: f.path,
+        needsMpv: needsMpvByName(f.path),
         kind: f.path.toLowerCase().endsWith(".m3u8") ? "hls" : "file",
         quality: qualityOf(f.name),
       });

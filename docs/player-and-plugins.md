@@ -105,6 +105,16 @@ Rules for a provider:
 - Honour `signal`: the race aborts slow lookups.
 - Don't throw for "not found"; return `[]`. Throw for real errors so health tracking counts them.
 - Put subtitles in `subtitles: [{ lang, label, url }]` as WebVTT; the player adds them as tracks.
+- Set `nativeUrl` to the original file or direct stream when `url` is a transcode. mpv plays
+  `nativeUrl`; the built-in player plays `url`. Set `needsMpv` when only mpv can play it.
+- Match by id when you can: `req.ids` carries TMDB, IMDb, TVDB, AniList and MAL ids. If your server
+  knows the item's ids, drop results whose ids disagree (`idVerdict` in `src/sources/local.ts`).
+
+**Players.** `engineFor()` in `src/player/mpv.ts` picks per stream: the built-in player for HLS
+and web-safe files, mpv for MKV/HEVC/AV1/surround or `needsMpv`. If the built-in player fails to
+decode, gets no picture, or no sound, the player retries the same stream in mpv at the same
+time. mpv runs as a separate process driven over JSON IPC; Rust only accepts a short list of
+commands, and only plays http(s) URLs or files inside your library folders.
 
 **What happens on Play.** Every enabled provider is asked at once. Each result is probed (HLS
 manifest read, or a 2-byte range request for files) and scored on quality fit, speed, the
@@ -124,6 +134,7 @@ and not worked since) or `new`.
 ## 4. Tests
 
 `npm test` runs Vitest. `src/__tests__/player.test.ts` covers link parsing, the bus, provider
-preference, tiers and health. To try the race and fallback in a browser without real sources,
+preference, tiers and health; `features.test.ts` covers ID matching, Jellyfin stream choice,
+mpv engine choice, AniSkip, history merging, episode alerts and update versions. To try the race and fallback in a browser without real sources,
 build with `VITE_MOCK_SOURCES=1` and serve a test video at `VITE_MOCK_MEDIA`
 (see `src/sources/mock.ts`).

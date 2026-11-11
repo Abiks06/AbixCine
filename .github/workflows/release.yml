@@ -1,0 +1,111 @@
+# Signed Windows builds, published as GitHub Releases. The app's updater reads latest.json from
+# the newest release, so pushing a tag like v0.2.0 is all it takes to ship an update.
+#
+# One-time setup (see docs/releases.md):
+#   secrets   TAURI_SIGNING_PRIVATE_KEY, TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+#   variable  TAURI_UPDATER_PUBKEY (the matching public key)
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v0.2.0). It must already exist."
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Check the signing setup
+        shell: bash
+        env:
+          PUBKEY: ${{ vars.TAURI_UPDATER_PUBKEY }}
+          HAS_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+        run: |
+          if [ -z "$PUBKEY" ] || [ "$HAS_KEY" != "true" ]; then
+            echo "::error::Add the TAURI_SIGNING_PRIVATE_KEY secret and the TAURI_UPDATER_PUBKEY variable first (docs/releases.md)."
+            exit 1
+          fi
+
+      - name: Check the tag matches the app version
+        shell: bash
+        run: |
+          v=$(node -p "require('./package.json').version")
+          if [ "v$v" != "$TAG" ]; then
+            echo "::error::Tag $TAG doesn't match package.json version $v. Run: npm run release -- ${TAG#v}"
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      - name: Bundle mpv
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $rel = Invoke-RestMethod -Headers @{ Authorization = "Bearer $env:GH_TOKEN" } https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest
+          $asset = $rel.assets | Where-Object { $_.name -match '^mpv-x86_64-\d{8}-git-[0-9a-f]+\.7z$' } | Select-Object -First 1
+          if (-not $asset) { throw "No mpv build found in $($rel.tag_name)" }
+          Invoke-WebRequest $asset.browser_download_url -OutFile mpv.7z
+          New-Item -ItemType Directory -Force src-tauri/resources/mpv | Out-Null
+          7z x mpv.7z -osrc-tauri/resources/mpv mpv.exe *.dll -y
+          if (-not (Test-Path src-tauri/resources/mpv/mpv.exe)) { throw "mpv.exe missing from $($asset.name)" }
+          @"
+          mpv ($($asset.name)) is free software under the GNU GPL v2 or later.
+          Source: https://github.com/mpv-player/mpv  Build scripts: https://github.com/shinchiro/mpv-winbuild-cmake
+          AbixCine runs it as a separate program.
+          "@ | Set-Content src-tauri/resources/mpv/README.txt
+
+      - name: Release config
+        shell: bash
+        env:
+          PUBKEY: ${{ vars.TAURI_UPDATER_PUBKEY }}
+        run: |
+          node -e '
+            const c = { bundle: { createUpdaterArtifacts: true, resources: { "resources/mpv/*": "mpv/" } }, plugins: { updater: { pubkey: process.env.PUBKEY } } };
+            require("fs").writeFileSync("src-tauri/tauri.release.conf.json", JSON.stringify(c, null, 2));
+          '
+          node scripts/release-notes.mjs "${TAG#v}" > release-notes.md
+          cat release-notes.md
+
+      - name: Build, sign and publish
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ env.TAG }}
+          releaseName: AbixCine ${{ env.TAG }}
+          releaseBodyPath: release-notes.md
+          releaseDraft: false
+          prerelease: ${{ contains(env.TAG, '-') }}
+          includeUpdaterJson: true
+          args: --config src-tauri/tauri.release.conf.json

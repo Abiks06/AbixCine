@@ -1,7 +1,8 @@
 import { cached } from "./cache";
 import { demoDetail, demoList } from "./demo";
 import { stripHtml } from "./format";
-import type { Media, MediaDetail } from "./types";
+import { animeIds } from "./idmap";
+import type { FranchiseEntry, Media, MediaDetail } from "./types";
 
 // AniList's public GraphQL API needs no key (rate limit ~90 req/min).
 const API = "https://graphql.anilist.co";
@@ -82,12 +83,91 @@ const titleCase = (s: string) => s.replace(/_/g, " ").toLowerCase().replace(/^\w
 const isoDate = (d?: { year?: number; month?: number; day?: number }) =>
   d?.year ? `${d.year}-${String(d.month ?? 1).padStart(2, "0")}-${String(d.day ?? 1).padStart(2, "0")}` : undefined;
 
+/** Formats that count as a "season" of a show (films, OVAs and specials are side stories). */
+const SEASON_FORMATS = new Set(["TV", "TV_SHORT", "ONA"]);
+const REL_FIELDS = `id type format status episodes seasonYear title { romaji english } coverImage { extraLarge }`;
+
+function toEntry(n: any): FranchiseEntry {
+  return {
+    key: `anilist:${n.id}`,
+    title: n.title?.english || n.title?.romaji,
+    year: n.seasonYear ?? undefined,
+    format: n.format ?? undefined,
+    episodes: n.episodes ?? undefined,
+    status: n.status ?? undefined,
+    poster: n.coverImage?.extraLarge,
+    unreleased: n.status === "NOT_YET_RELEASED" || n.status === "CANCELLED",
+  };
+}
+
+/** The previous and next season among an entry's relations (ignoring films, recaps and spin-offs). */
+export function relatedSeasons(edges: any[]): { prequel?: FranchiseEntry; sequel?: FranchiseEntry } {
+  const pick = (type: string) => edges.find((e) => e.relationType === type && e.node?.type === "ANIME" && SEASON_FORMATS.has(e.node.format))?.node;
+  const p = pick("PREQUEL");
+  const n = pick("SEQUEL");
+  return { prequel: p ? toEntry(p) : undefined, sequel: n ? toEntry(n) : undefined };
+}
+
+/**
+ * The whole season chain an entry belongs to, first season first: walks PREQUEL links back and
+ * SEQUEL links forward (8 hops each way at most, one cached request per hop).
+ */
+export async function animeSeasons(key: string): Promise<FranchiseEntry[]> {
+  if (!key.startsWith("anilist:")) return [];
+  const id = Number(key.split(":")[1]);
+  return cached(`anilist:chain:v1:${id}`, 24 * HOUR, async () => {
+    const hop = (n: number) =>
+      cached(`anilist:rel:v1:${n}`, 24 * HOUR, async () => {
+        const d = await gql(`query($id:Int){ Media(id:$id,type:ANIME){ ${REL_FIELDS} relations { edges { relationType(version:2) node { ${REL_FIELDS} } } } } }`, { id: n });
+        return { self: toEntry(d.Media), ...relatedSeasons(d.Media.relations?.edges ?? []) };
+      });
+    const me = await hop(id);
+    const before: FranchiseEntry[] = [];
+    const after: FranchiseEntry[] = [];
+    const seen = new Set([me.self.key]);
+    let p = me.prequel;
+    for (let i = 0; p && i < 8 && !seen.has(p.key); i++) {
+      seen.add(p.key);
+      before.unshift(p);
+      p = (await hop(Number(p.key.split(":")[1]))).prequel;
+    }
+    let n = me.sequel;
+    for (let i = 0; n && i < 8 && !seen.has(n.key); i++) {
+      seen.add(n.key);
+      after.push(n);
+      n = (await hop(Number(n.key.split(":")[1]))).sequel;
+    }
+    return [...before, me.self, ...after];
+  });
+}
+
+/**
+ * Where an AniList entry sits in its show, for matching files organised by season: the season
+ * number (TVDB's, when the ID map knows it, else its place in the chain) and how many episodes
+ * came before it (for libraries that number episodes straight through).
+ */
+export async function seasonPlacement(key: string): Promise<{ season: number; before: number; rootTitles: string[] } | null> {
+  if (!key.startsWith("anilist:")) return null;
+  try {
+    const [chain, map] = await Promise.all([animeSeasons(key), animeIds(Number(key.split(":")[1]))]);
+    const i = chain.findIndex((c) => c.key === key);
+    if (i < 0) return null;
+    const tvdbSeason = map?.season?.tvdb;
+    const season = tvdbSeason && tvdbSeason > 0 ? tvdbSeason : i + 1;
+    const before = chain.slice(0, i).reduce((n, c) => n + (c.episodes ?? 0), 0);
+    return { season, before, rootTitles: chain[0] ? [chain[0].title] : [] };
+  } catch {
+    return null;
+  }
+}
+
 export async function anilistDetail(key: string): Promise<MediaDetail> {
   if (key.startsWith("demo:")) return demoDetail(key);
   const id = Number(key.split(":")[1]);
-  return cached(`anilist:detail:v2:${id}`, 3 * HOUR, async () => {
+  return cached(`anilist:detail:v3:${id}`, 3 * HOUR, async () => {
     const d = await gql(
-      `query($id:Int){ Media(id:$id,type:ANIME){ ${FIELDS} duration nextAiringEpisode { episode airingAt }
+      `query($id:Int){ Media(id:$id,type:ANIME){ ${FIELDS} idMal synonyms duration nextAiringEpisode { episode airingAt }
+        relations { edges { relationType(version:2) node { ${REL_FIELDS} } } }
         trailer { id site }
         source season seasonYear startDate { year month day } endDate { year month day } popularity
         studios(isMain:true){ nodes { name } }
@@ -97,8 +177,21 @@ export async function anilistDetail(key: string): Promise<MediaDetail> {
       { id },
     );
     const m = d.Media;
+    const rel = relatedSeasons(m.relations?.edges ?? []);
+    const map = await animeIds(id);
     return {
       ...toMedia(m),
+      ids: {
+        anilist: id,
+        mal: m.idMal ?? map?.mal ?? undefined,
+        tmdb: map?.tmdbTv ?? map?.tmdbMovie ?? undefined,
+        tmdbKind: map?.tmdbTv ? "tv" : map?.tmdbMovie ? "movie" : undefined,
+        tvdb: map?.tvdb ?? undefined,
+        imdb: map?.imdb ?? undefined,
+      },
+      altTitles: [m.title.english, m.title.romaji, ...(m.synonyms ?? [])].filter((t: unknown): t is string => typeof t === "string" && /^[\x20-\u024f]+$/.test(t)).slice(0, 8),
+      prequel: rel.prequel,
+      sequel: rel.sequel,
       runtime: m.duration,
       status: m.status,
       episodeCount: m.episodes ?? (m.nextAiringEpisode ? m.nextAiringEpisode.episode - 1 : undefined),

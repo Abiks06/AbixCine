@@ -69,6 +69,8 @@ export interface PlayerState {
   qualities: number[];
   /** -1 for automatic. */
   quality: number;
+  /** Which engine is drawing: the built-in player or mpv. */
+  engine?: "html" | "mpv";
 }
 
 export interface PlayerEventMap {

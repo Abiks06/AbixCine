@@ -14,10 +14,30 @@ export interface Settings {
   animeAudio: Audio;
   /** Per-title override, so switching one show to dub doesn't change the rest. */
   audioByTitle: Record<string, Audio>;
+  /**
+   * Playback engine. auto: the built-in player, switching to mpv for files it can't decode
+   * (HEVC, DTS, TrueHD, 10-bit…) or when it fails. mpv: always mpv. builtin: never mpv.
+   */
+  engine: "auto" | "mpv" | "builtin";
+  /** A specific mpv.exe; empty = the bundled copy or one that's installed. */
+  mpvPath: string;
+  /** Draw mpv inside the AbixCine window, or in mpv's own window. */
+  mpvWindow: "embedded" | "separate";
+  mpvHwdec: boolean;
+  /** Jump over openings/recaps automatically instead of showing a Skip button. */
+  autoSkipIntro: boolean;
+  /** Alert me when shows in My List / Continue watching get a new episode or season. */
+  notifyEpisodes: boolean;
+  /** Also show those alerts as Windows notifications. */
+  notifyDesktop: boolean;
+  /** Download updates in the background, install on next restart. */
+  autoUpdate: boolean;
+  /** An update the viewer chose to skip. */
+  skipVersion: string;
 }
 
 /** Settings that follow the account. Library folders and server credentials stay on this device. */
-const SYNCED: (keyof Settings)[] = ["preferredQuality", "autoplayNext", "reduceMotion", "animeAudio", "audioByTitle"];
+const SYNCED: (keyof Settings)[] = ["preferredQuality", "autoplayNext", "reduceMotion", "animeAudio", "audioByTitle", "autoSkipIntro", "notifyEpisodes"];
 
 const DEFAULTS: Settings = {
   tmdbKey: import.meta.env.VITE_TMDB_KEY ?? "",
@@ -28,6 +48,15 @@ const DEFAULTS: Settings = {
   reduceMotion: false,
   animeAudio: "sub",
   audioByTitle: {},
+  engine: "auto",
+  mpvPath: "",
+  mpvWindow: "embedded",
+  mpvHwdec: true,
+  autoSkipIntro: false,
+  notifyEpisodes: true,
+  notifyDesktop: true,
+  autoUpdate: true,
+  skipVersion: "",
 };
 
 const KEY = "abx.settings.v1";

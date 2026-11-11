@@ -115,7 +115,7 @@ const region = () => (navigator.language.split("-")[1] ?? "US").toUpperCase();
 export async function tmdbDetail(key: string): Promise<MediaDetail> {
   if (key.startsWith("demo:")) return demoDetail(key);
   const [, kind, id] = key.split(":") as [string, "movie" | "tv", string];
-  return cached(`tmdb:detail:v2:${kind}:${id}`, 3 * HOUR, async () => {
+  return cached(`tmdb:detail:v3:${kind}:${id}`, 3 * HOUR, async () => {
     const extra = kind === "movie" ? "release_dates" : "content_ratings";
     const r = await get(`/${kind}/${id}`, {
       append_to_response: `videos,credits,recommendations,similar,images,external_ids,${extra}`,
@@ -171,6 +171,12 @@ export async function tmdbDetail(key: string): Promise<MediaDetail> {
       networks: (r.networks ?? []).slice(0, 3).map((n: any) => n.name),
       countries: (r.production_countries ?? []).map((c: any) => c.name),
       imdbId: r.imdb_id ?? r.external_ids?.imdb_id ?? undefined,
+      ids: {
+        tmdb: Number(id),
+        tmdbKind: kind,
+        imdb: r.imdb_id ?? r.external_ids?.imdb_id ?? undefined,
+        tvdb: r.external_ids?.tvdb_id ?? undefined,
+      },
       homepage: r.homepage || undefined,
       voteCount: r.vote_count,
       collection: r.belongs_to_collection?.name,
