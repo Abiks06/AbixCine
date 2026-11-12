@@ -1,7 +1,16 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PlaybackRequest } from "../lib/types";
+import { recordPlayback, resetHealth } from "./health";
 import { candLine, clearResolveCache, initialCandidateIndex, PROVIDERS, resolveSources, score } from "./registry";
+import type { Sniffed } from "./native";
 import type { SourceProvider, StreamCandidate } from "./types";
+
+const { mockSniff } = vi.hoisted(() => ({ mockSniff: vi.fn() }));
+vi.mock("./native", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./native")>()),
+  native: true,
+  sniff: mockSniff,
+}));
 
 const request = (key: string): PlaybackRequest => ({
   media: { key, kind: "movie", title: "Test", overview: "", genres: [] },
@@ -15,6 +24,18 @@ const candidate = (providerId: string): StreamCandidate => ({
   pageUrl: `https://${providerId}.example/stream`,
   kind: "embed",
   via: "embed",
+});
+
+beforeEach(() => {
+  mockSniff.mockReset();
+  mockSniff.mockResolvedValue({
+    url: "https://media.example/master.m3u8",
+    kind: "hls",
+    headers: {},
+    subtitles: [],
+    verified: true,
+    quality: 1080,
+  });
 });
 
 afterEach(() => clearResolveCache());
@@ -129,6 +150,86 @@ describe("source ranking", () => {
     } finally {
       vi.useRealTimers();
       vi.unstubAllGlobals();
+      PROVIDERS.splice(0, PROVIDERS.length, ...original);
+    }
+  });
+
+  it("keeps checking later embeds when earlier captures don't find a stream", async () => {
+    const original = [...PROVIDERS];
+    const ids = ["first", "second", "third", "fourth", "fifth", "sixth", "seventh"];
+    const providers: SourceProvider[] = ids.map((id, i) => ({
+      id,
+      name: id,
+      category: "embed",
+      priority: 20 - i,
+      isEnabled: () => true,
+      find: async () => [candidate(id)],
+    }));
+    const last = candidate("seventh");
+    mockSniff.mockImplementation(async (url: string) => url === last.url ? {
+      url: "https://media.example/master.m3u8",
+      kind: "hls",
+      headers: {},
+      subtitles: [],
+      verified: true,
+      quality: 1080,
+    } : null);
+    PROVIDERS.splice(0, PROVIDERS.length, ...providers);
+
+    try {
+      const result = await resolveSources(request("test:later-embed"), undefined, { verifyBudget: 2, record: false });
+
+      expect(result.find((c) => c.providerId === "seventh")?.probe?.ok).toBe(true);
+    } finally {
+      PROVIDERS.splice(0, PROVIDERS.length, ...original);
+    }
+  });
+
+  it("tries the last working source first among queued embeds", async () => {
+    const original = [...PROVIDERS];
+    const req = request("test:last-picked-source");
+    const active = new Set(["first", "second", "third"]);
+    const pending: Record<string, (result: Sniffed | null) => void> = {};
+    const stream: Sniffed = {
+      url: "https://media.example/master.m3u8",
+      kind: "hls",
+      headers: {},
+      subtitles: [],
+      verified: true,
+      quality: 1080,
+    };
+    const providers: SourceProvider[] = ["first", "second", "third", "fourth", "fifth"].map((id, i) => ({
+      id,
+      name: id,
+      category: "embed",
+      priority: 20 - i,
+      isEnabled: () => true,
+      find: async () => [candidate(id)],
+    }));
+    mockSniff.mockImplementation((url: string) => {
+      const id = new URL(url).hostname.split(".")[0];
+      if (active.has(id)) return new Promise<Sniffed | null>((resolve) => { pending[id] = resolve; });
+      return Promise.resolve(id === "fifth" ? stream : null);
+    });
+    PROVIDERS.splice(0, PROVIDERS.length, ...providers);
+    resetHealth();
+    recordPlayback(req, candidate("fifth"), true);
+
+    try {
+      const race = resolveSources(req, undefined, { verifyBudget: 1, record: false });
+      await vi.waitFor(() => expect(mockSniff).toHaveBeenCalledTimes(3));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      pending.first(null);
+      await vi.waitFor(() => expect(mockSniff).toHaveBeenCalledTimes(4));
+
+      expect(new URL(mockSniff.mock.calls[3][0]).hostname).toBe("fifth.example");
+
+      pending.second(null);
+      pending.third(null);
+      const result = await race;
+      expect(result.find((c) => c.providerId === "fifth")?.probe?.ok).toBe(true);
+    } finally {
+      resetHealth();
       PROVIDERS.splice(0, PROVIDERS.length, ...original);
     }
   });

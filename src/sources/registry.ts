@@ -404,18 +404,18 @@ export function resolveSources(req: PlaybackRequest, onEvent?: (e: ResolveEvent)
     // Embed verification queue: highest priority first, a few at a time, until the budget is met.
     const queue: StreamCandidate[] = [];
     let verified = 0;
-    let attempts = 0;
     let running = 0;
     let lookupsDone = false;
     const MAX_PARALLEL = 3;
     const kind = req.media.kind;
-    const rank = (c: StreamCandidate) => learnedRank(c.providerId, kind, prio[c.providerId] ?? 0);
+    const previousPick = lastPick(req)?.providerId;
+    const rank = (c: StreamCandidate) =>
+      learnedRank(c.providerId, kind, prio[c.providerId] ?? 0) + (c.providerId === previousPick ? 20 : 0);
     const pump = () => {
-      while (running < MAX_PARALLEL && queue.length && verified < budget && attempts < budget + 4) {
+      while (running < MAX_PARALLEL && queue.length && verified < budget) {
         queue.sort((a, b) => rank(b) - rank(a));
         const c = queue.shift()!;
         running++;
-        attempts++;
         probe(c)
           .then((r) => {
             if (r.probe?.ok) verified++;
@@ -431,7 +431,7 @@ export function resolveSources(req: PlaybackRequest, onEvent?: (e: ResolveEvent)
     };
     const maybeDone = () => {
       if (!lookupsDone || running) return;
-      if (queue.length && verified < budget && attempts < budget + 4) return;
+      if (queue.length && verified < budget) return;
       // Whatever wasn't checked stays listed as standby (probe undefined).
       for (const c of queue.splice(0)) upsert(c);
       if (!opts.signal?.aborted && ranked.some((c) => c.probe?.ok)) {
