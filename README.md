@@ -7,7 +7,7 @@ A Windows desktop app for movies, series and anime. Tauri 2 (Rust) shell, React 
 - **Accounts from day one.** Sign up / sign in; watch progress, My List and playback preferences sync to your account. Library folders stay on each PC.
 - **Catalog.** TMDB for movies and series (through your AbixCine server, or your own key), AniList for anime. Cached so browsing is instant.
 - **Anime is one entry.** Each show has a Sub/Dub switch on its page, in the player, and as a default in Settings. Files tagged `Dub` / `Dual Audio` are matched to Dub.
-- **Sources.** Local folders first. External servers (Jellyfin today) are an optional add-on, and new ones plug in through `src/sources/`. Every source is queried in parallel, probed for speed and resolution, ranked, and the player fails over to the next if one drops.
+- **Sources.** Local folders first. Unsupported local audio/container formats are prepared with the bundled LGPL FFmpeg tools and cached for playback; no separate FFmpeg install is required. External servers (Jellyfin today) are an optional add-on, and new ones plug in through `src/sources/`. Every source is queried in parallel, probed for speed and resolution, ranked, and the player fails over to the next if one drops.
 - **Design.** Floating pill nav, launch intro, page morphs (View Transitions), ambient color from the featured artwork, Top 10 shelves that rise in as you scroll, cinematic loading screen, undoable toasts.
 - **Search.** Ctrl+K or `/` opens the command palette from anywhere (Ctrl+Enter plays a result straight away). Both catalogs are searched at once, a typo is forgiven ("jujutu kaisen"), and a trailing year narrows it ("Dune 2021").
 - **Player.** Press `?` for every shortcut: 0–9 to jump, Shift+arrows for 30s, mouse wheel for volume, `<` `>` for speed, `P` for picture-in-picture. Hardware media keys work, and intro/credits are marked on the timeline when the server knows them.
@@ -26,6 +26,11 @@ npm run local          # http://localhost:8787
 npm install
 npm run tauri dev
 ```
+
+The Tauri dev and release commands prepare a pinned, checksum-verified LGPL FFmpeg build in
+`src-tauri/resources/ffmpeg`. Local files that need audio/container compatibility are converted
+to cached MP4 copies on first play; the original video stream is copied and audio is converted to AAC.
+The installer includes FFmpeg and its license notice, so end users do not need to install it separately.
 
 Optional: put `TMDB_KEY=...` in `server/.env` so everyone signed in gets the real catalog without their own key.
 

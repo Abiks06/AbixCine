@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "AbixCine",
-  "version": "1.2.2",
+  "version": "1.3.0",
   "identifier": "app.abixcine.desktop",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "npm run prepare:ffmpeg && npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run prepare:ffmpeg && npm run build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -51,6 +51,7 @@
   },
   "bundle": {
     "active": true,
+    "resources": ["resources/ffmpeg"],
     "targets": [
       "nsis"
     ],

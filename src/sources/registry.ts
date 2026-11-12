@@ -88,16 +88,15 @@ export function hlsMaxHeight(manifest: string) {
 
 /**
  * Turn an embed into a direct stream by capturing what its page plays. Success is the proof
- * the title is really there; failure means it isn't (or the player wouldn't start), and the
- * embed stays only as an unverified web-player fallback.
+ * the title is really there. A failed capture is ambiguous, so keep the page available as an
+ * unverified web-player fallback.
  */
 export async function verifyEmbed(c: StreamCandidate): Promise<StreamCandidate> {
   const t0 = performance.now();
   const page = c.pageUrl ?? c.url;
   const got = await sniff(page, SNIFF_TIMEOUT).catch(() => null);
   const latencyMs = Math.round(performance.now() - t0);
-  // Nothing captured: the server may not have it, or its player wouldn't start. We can't tell which.
-  if (!got) return { ...c, probe: { ok: false, latencyMs, error: "no stream" } };
+  if (!got) return c;
   const direct: StreamCandidate = {
     ...c,
     url: proxyUrl(got.url, got.headers),
@@ -302,6 +301,20 @@ export function score(c: StreamCandidate, preferred: number, priority: number, r
 
 const sortByScore = (a: StreamCandidate, b: StreamCandidate) => b.score! - a.score!;
 
+function transientProbeFailure(c: StreamCandidate) {
+  const error = c.probe?.error ?? "";
+  return /^(timeout|AbortError)$/i.test(error)
+    || /^HTTP (408|429|5\d\d)$/.test(error)
+    || /failed to fetch|networkerror|connection reset/i.test(error);
+}
+
+export function initialCandidateIndex(candidates: StreamCandidate[], preferred?: string) {
+  const selected = preferred
+    ? candidates.findIndex((c) => c.url === preferred || c.pageUrl === preferred || c.providerId === preferred)
+    : -1;
+  return selected >= 0 ? selected : Math.max(0, candidates.findIndex((c) => c.probe?.ok !== false));
+}
+
 export interface ResolveOptions {
   /** Called with the full ranked list each time a probe lands (including after the promise resolved). */
   onUpdate?: (ranked: StreamCandidate[]) => void;
@@ -317,19 +330,19 @@ export interface ResolveOptions {
   record?: boolean;
 }
 
-/** After the first verified stream appears, give the others this long to beat it. */
-const GRACE_MS = 900;
+/** Briefly let near-simultaneous results compete before starting the first verified stream. */
+const GRACE_MS = 250;
 
 /**
  * Finished races, kept briefly so the title page's check and the player share one round of
  * lookups and captures instead of doing the work twice.
  */
-const RESULT_TTL = 120_000;
+const RESULT_TTL = 30_000;
 const results = new Map<string, { at: number; ranked: StreamCandidate[]; events: ResolveEvent[]; budget: number }>();
 const resultKey = (req: PlaybackRequest, s: Settings) =>
   `${reqKey(req)}|${JSON.stringify([s.libraryPaths, s.jellyfin.enabled && s.jellyfin.url, s.disabledSources, s.enabledExtras, s.preferredQuality])}`;
 
-/** Forget cached races (after a source is toggled or a playback failure was recorded). */
+/** Forget cached races after a source is toggled or playback resolves against a captured URL. */
 export const clearResolveCache = () => results.clear();
 
 /**
@@ -377,7 +390,7 @@ export function resolveSources(req: PlaybackRequest, onEvent?: (e: ResolveEvent)
     };
     const upsert = (c: StreamCandidate) => {
       if (opts.signal?.aborted) return;
-      if (c.probe && record && !probed.has(c.providerId)) {
+      if (c.probe && !transientProbeFailure(c) && record && !probed.has(c.providerId)) {
         probed.add(c.providerId);
         recordProbe(c);
       }
@@ -406,7 +419,7 @@ export function resolveSources(req: PlaybackRequest, onEvent?: (e: ResolveEvent)
         probe(c)
           .then((r) => {
             if (r.probe?.ok) verified++;
-            if (record) recordWin(r.providerId, kind, !!r.probe?.ok);
+            if (record && r.probe && !transientProbeFailure(r)) recordWin(r.providerId, kind, !!r.probe.ok);
             upsert(r);
           })
           .finally(() => {
@@ -443,7 +456,7 @@ export function resolveSources(req: PlaybackRequest, onEvent?: (e: ResolveEvent)
         if (record) recordLookup(p.id, performance.now() - t0);
       } catch (e: any) {
         const timeout = e?.message === "timeout";
-        if (!opts.signal?.aborted && record) recordLookupFailure(p.id);
+        if (!opts.signal?.aborted && record && !timeout) recordLookupFailure(p.id);
         emit({ providerId: p.id, status: timeout ? "timeout" : "error", error: e?.message });
         return;
       } finally {
@@ -455,11 +468,11 @@ export function resolveSources(req: PlaybackRequest, onEvent?: (e: ResolveEvent)
         .map((c) => ({ ...c, lookupMs }));
       emit({ providerId: p.id, status: "done", count: fresh.length });
       const embeds = fresh.filter((c) => c.kind === "embed");
-      await Promise.all(fresh.filter((c) => c.kind !== "embed").map((c) => probe(c).then(upsert)));
       if (embeds.length) {
         queue.push(...embeds);
         pump();
       }
+      await Promise.all(fresh.filter((c) => c.kind !== "embed").map((c) => probe(c).then(upsert)));
     });
     Promise.all(runs).then(() => {
       lookupsDone = true;
@@ -489,8 +502,12 @@ export function displayScore(c: StreamCandidate) {
 
 /** "1080p · 2.1 s" style line for a candidate. */
 export function candLine(c: StreamCandidate) {
-  if (!c.probe) return "not checked yet";
-  if (!c.probe.ok) return c.probe.error === "no stream" || c.probe.error === "not found" ? "no stream found" : c.probe.error === "timeout" ? "timed out" : "found, won't play";
+  if (!c.probe) return "not verified";
+  if (!c.probe.ok) {
+    if (c.probe.error === "no stream" || c.probe.error === "not found") return "no stream found";
+    if (c.probe.error === "timeout") return "timed out";
+    return c.probe.error?.slice(0, 72) ?? "couldn't verify";
+  }
   const q = c.probe.quality ?? c.quality;
   const ms = c.probe.latencyMs;
   return [q ? `${q}p` : null, ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${ms} ms`].filter(Boolean).join(" · ");

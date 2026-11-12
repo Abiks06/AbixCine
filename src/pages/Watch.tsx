@@ -62,6 +62,7 @@ export function Watch() {
   const [ranked, setRanked] = useState<StreamCandidate[]>([]);
   const [manual, setManual] = useState("");
   const [go, setGo] = useState(false);
+  const [allowUnverified, setAllowUnverified] = useState(false);
   const [retry, setRetry] = useState(0);
   /** Verify every server, not just the first few (after "check the other servers"). */
   const [deep, setDeep] = useState(false);
@@ -74,6 +75,7 @@ export function Watch() {
     setRanked([]);
     setEvents({});
     setGo(false);
+    setAllowUnverified(false);
     resolveSources(req, (e) => live && setEvents((x) => ({ ...x, [e.providerId]: e })), {
       early: true,
       verifyBudget: deep ? 99 : 2,
@@ -177,13 +179,13 @@ export function Watch() {
     recordPlayback(req, c, ok);
     // What the player saw is the strongest signal for the learned server order.
     recordWin(c.providerId, req.media.kind, ok);
-    if (!ok) clearResolveCache();
+    clearResolveCache();
   }, [req]);
 
   // Hold the race result on screen for a beat so you see which server won, then play.
   useEffect(() => {
     if (!cands?.some((c) => c.probe?.ok)) return;
-    const t = setTimeout(() => setGo(true), settings.reduceMotion || quick || preferred ? 0 : 750);
+    const t = setTimeout(() => setGo(true), settings.reduceMotion || quick || preferred ? 0 : 150);
     return () => clearTimeout(t);
   }, [cands]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -205,11 +207,12 @@ export function Watch() {
     };
   }, [d, key, season, episode, next, goEp]);
 
-  if (go && playerCands && playerCands.some((c) => c.probe?.ok) && d) {
+  if (go && playerCands && (playerCands.some((c) => c.probe?.ok) || allowUnverified) && d) {
     return (
       <Player
         key={reqKey(req!)}
         candidates={playerCands}
+        initialSource={picked}
         onSourceResult={onSourceResult}
         title={d.title}
         subtitle={epLabel}
@@ -269,11 +272,14 @@ export function Watch() {
   /** Start right away from a server the viewer clicked on the race screen. */
   const playFrom = (c: StreamCandidate) => {
     setPicked(c.url);
+    setAllowUnverified(!c.probe?.ok);
     setCands((x) => x ?? ranked);
     setGo(true);
   };
   const failed = !!cands && !best;
   const standby = ranked.filter((c) => !c.probe).length;
+  const rejected = ranked.filter((c) => c.probe?.ok === false).length;
+  const failedLookups = Object.values(events).filter((e) => e.status === "timeout" || e.status === "error").length;
   const webPlayers = ranked.filter((c) => c.pageUrl);
   /** Last resort: play the embed pages themselves, behind the ad shield. */
   const useWebPlayers = () => {
@@ -338,15 +344,19 @@ export function Watch() {
                 {!enabled.length
                   ? "Every server is switched off."
                   : standby
-                  ? `The servers checked so far don't have this ${episode != null ? "episode" : "title"}${audio ? ` in ${audio === "dub" ? "English dub" : "sub"}` : ""}.`
-                  : `No server has this ${episode != null ? "episode" : "title"}${audio ? ` in ${audio === "dub" ? "English dub" : "sub"}` : ""} right now.`}
+                  ? `Some servers couldn't be checked for this ${episode != null ? "episode" : "title"}${audio ? ` in ${audio === "dub" ? "English dub" : "sub"}` : ""}.`
+                  : rejected || failedLookups
+                    ? `AbixCine couldn't verify a playable stream for this ${episode != null ? "episode" : "title"}${audio ? ` in ${audio === "dub" ? "English dub" : "sub"}` : ""}.`
+                    : `No source returned a stream for this ${episode != null ? "episode" : "title"} this time${audio ? ` in ${audio === "dub" ? "English dub" : "sub"}` : ""}.`}
               </h3>
               <p>
                 {!enabled.length
                   ? "Turn some back on in Settings, add a media folder, or paste a direct link below."
                   : standby
-                  ? `${standby} more server${standby > 1 ? "s are" : " is"} on standby. Checking them takes a few seconds each.`
-                  : audio === "dub"
+                    ? `${standby} source${standby > 1 ? "s are" : " is"} unverified. You can check them or try one directly.`
+                    : rejected || failedLookups
+                      ? "A source lookup or preflight check can fail temporarily, or reject a stream the player can still open. Retry, or try a listed source directly."
+                      : audio === "dub"
                     ? "Dubs arrive later than subs, and only a few servers carry them."
                     : "It may be too new to be online yet."}
               </p>
@@ -402,8 +412,8 @@ export function Watch() {
               if (top) return [{ id: p.id, name: p.name, c: top, state: "failed", why: candLine(top) }];
               // Answered with nothing. Embed servers always apply; direct ones (HiAnime, KissKH)
               // only cover some titles, so they're hidden when they don't.
-              if (e?.status === "done") return p.category === "embed" ? [{ id: p.id, name: p.name, state: "failed", why: "doesn't have it" }] : [];
-              if (e?.status === "timeout" || e?.status === "error") return [{ id: p.id, name: p.name, state: "failed", why: e.status === "timeout" ? "didn't answer" : "error" }];
+              if (e?.status === "done") return p.category === "embed" ? [{ id: p.id, name: p.name, state: "failed", why: "no matching stream returned" }] : [];
+              if (e?.status === "timeout" || e?.status === "error") return [{ id: p.id, name: p.name, state: "failed", why: e.status === "timeout" ? "lookup timed out" : e.error ? `lookup failed: ${e.error}` : "lookup failed" }];
               return [];
             });
             const ready = rows.filter((r) => r.state === "ready").sort((x, y) => (y.c!.score ?? 0) - (x.c!.score ?? 0));
@@ -445,21 +455,21 @@ export function Watch() {
                   </div>
                 )}
                 {standby.map((r) => (
-                  <div key={r.id} className="rrow standby">
+                  <button key={r.id} className="rrow standby" onClick={() => r.c && playFrom(r.c)} title={`Try ${r.name} without a preflight check`}>
                     <span className="rdot" />
                     <span className="rname">{r.name}</span>
-                    <span className="rmeta"><span>on standby</span></span>
-                  </div>
+                    <span className="rmeta"><span>unverified · try anyway</span></span>
+                  </button>
                 ))}
                 {failed.length > 0 && (
                   <details className="rfailed" open={ready.length === 0 && checking.length === 0}>
                     <summary className="rgroup-h">Couldn't use · {failed.length}</summary>
                     {failed.map((r) => (
-                      <div key={r.id} className="rrow failed">
+                      <button key={r.id} className="rrow failed" onClick={() => r.c && playFrom(r.c)} title={`Try ${r.name} despite the failed preflight check`}>
                         <span className="rdot" />
                         <span className="rname">{r.name}</span>
-                        <span className="rmeta"><span>{r.why}</span></span>
-                      </div>
+                        <span className="rmeta"><span>{r.why} · try anyway</span></span>
+                      </button>
                     ))}
                   </details>
                 )}

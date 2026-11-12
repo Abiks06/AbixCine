@@ -1,5 +1,5 @@
 import type Hls from "hls.js";
-import { isTauri } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { fmtTime } from "../lib/format";
@@ -8,7 +8,7 @@ import { decodeSubtitle, langBase, loadSubPref, loadSubtitle, preferredAudioTrac
 import type { Audio } from "../lib/settings";
 import type { Episode } from "../lib/types";
 import type { StreamCandidate } from "../sources/types";
-import { verifyEmbed } from "../sources/registry";
+import { initialCandidateIndex, verifyEmbed } from "../sources/registry";
 import { AudioToggle } from "./AudioToggle";
 import { Icon } from "./Icon";
 
@@ -30,6 +30,7 @@ export interface EpisodeNav {
 
 interface Props {
   candidates: StreamCandidate[];
+  initialSource?: string;
   /** Told when a source starts playing or dies, so the picker learns. */
   onSourceResult?: (c: StreamCandidate, ok: boolean) => void;
   title: string;
@@ -56,10 +57,11 @@ interface SubTrack {
   id: string;
   label: string;
   lang: string;
-  /** "hls": a rendition in the manifest, switched through hls.js. "file": a <track> we loaded. */
-  kind: "hls" | "file";
+  /** HLS rendition, sidecar track, or embedded track exposed by the media element. */
+  kind: "hls" | "file" | "native";
   hlsIndex?: number;
   src?: string;
+  nativeTrack?: TextTrack;
 }
 
 type Sheet = "servers" | "episodes" | "audio" | "picture";
@@ -141,7 +143,7 @@ function loadEnhance(): EnhanceMode {
   }
 }
 
-export function Player({ candidates: given, onSourceResult, title, subtitle, startAt, onProgress, onEnded, onNext, autoNext, onBack, audio, onAudio, originalLanguage, episodes, media }: Props) {
+export function Player({ candidates: given, initialSource, onSourceResult, title, subtitle, startAt, onProgress, onEnded, onNext, autoNext, onBack, audio, onAudio, originalLanguage, episodes, media }: Props) {
   const wrap = useRef<HTMLDivElement>(null);
   const video = useRef<HTMLVideoElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
@@ -152,7 +154,7 @@ export function Player({ candidates: given, onSourceResult, title, subtitle, sta
   const [patched, setPatched] = useState<Record<string, StreamCandidate>>({});
   const candidates = useMemo(() => given.map((c) => patched[c.pageUrl ?? c.url] ?? c), [given, patched]);
   const [checking, setChecking] = useState<string | null>(null);
-  const [idx, setIdx] = useState(() => Math.max(0, candidates.findIndex((c) => c.probe?.ok !== false)));
+  const [idx, setIdx] = useState(() => initialCandidateIndex(candidates, initialSource));
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(0);
   const [dur, setDur] = useState(0);
@@ -165,6 +167,7 @@ export function Player({ candidates: given, onSourceResult, title, subtitle, sta
   const [muted, setMuted] = useState(false);
   const [speed, setSpeed] = useState(1);
   const [waiting, setWaiting] = useState(true);
+  const [preparingLocal, setPreparingLocal] = useState(false);
   const [idle, setIdle] = useState(false);
   const [sheet, setSheet] = useState<Sheet | null>(null);
   const [toast, setToast] = useState<string | null>(null);
@@ -263,10 +266,11 @@ export function Player({ candidates: given, onSourceResult, title, subtitle, sta
     });
   const [hlsSubs, setHlsSubs] = useState<SubTrack[]>([]);
   const [fileSubs, setFileSubs] = useState<SubTrack[]>([]);
+  const [nativeSubs, setNativeSubs] = useState<SubTrack[]>([]);
   const [addedSubs, setAddedSubs] = useState<SubTrack[]>([]);
   const addedSubsRef = useRef(addedSubs);
   addedSubsRef.current = addedSubs;
-  const subTracks = useMemo(() => [...hlsSubs, ...fileSubs, ...addedSubs], [hlsSubs, fileSubs, addedSubs]);
+  const subTracks = useMemo(() => [...hlsSubs, ...nativeSubs, ...fileSubs, ...addedSubs], [hlsSubs, nativeSubs, fileSubs, addedSubs]);
   const subTracksRef = useRef(subTracks);
   subTracksRef.current = subTracks;
   const [selectedSub, setSelectedSub] = useState<string | null>(null);
@@ -289,6 +293,11 @@ export function Player({ candidates: given, onSourceResult, title, subtitle, sta
     const t = id ? subTracksRef.current.find((x) => x.id === id) : undefined;
     trackEls.current.forEach((el, tid) => {
       el.track.mode = t?.kind === "file" && tid === id ? "hidden" : "disabled";
+    });
+    subTracksRef.current.forEach((track) => {
+      if (track.kind === "native" && track.nativeTrack) {
+        track.nativeTrack.mode = t?.kind === "native" && track.id === id ? "hidden" : "disabled";
+      }
     });
     const hls = hlsRef.current;
     if (hls) {
@@ -457,20 +466,95 @@ export function Player({ candidates: given, onSourceResult, title, subtitle, sta
       }
       return;
     }
-    const tracks = (video.current as any)?.audioTracks;
+    const tracks = (video.current as (HTMLVideoElement & { audioTracks?: ArrayLike<{ language?: string; enabled: boolean }> }) | null)?.audioTracks;
     if (tracks && tracks.length > 1) {
-      const found = preferredAudioTrackIndex(Array.from(tracks, (track: any) => ({ lang: track.language })), audio, originalLanguage);
-      if (found >= 0) for (let i = 0; i < tracks.length; i++) tracks[i].enabled = i === found;
+      const found = preferredAudioTrackIndex(Array.from(tracks, (track) => ({ lang: track.language })), audio, originalLanguage);
+      if (found >= 0) {
+        for (let i = 0; i < tracks.length; i++) tracks[i].enabled = i === found;
+        setSelectedAudioTrack(found);
+      } else {
+        setSelectedAudioTrack(Array.from(tracks).findIndex((track) => track.enabled));
+      }
     }
   };
   const chooseAudioTrack = (id: number) => {
     const hls = hlsRef.current;
-    if (!hls || !hls.audioTracks[id]) return;
-    manualAudio.current = true;
-    hls.audioTrack = id;
+    if (hls?.audioTracks[id]) {
+      manualAudio.current = true;
+      hls.audioTrack = id;
+    } else {
+      const tracks = (video.current as (HTMLVideoElement & { audioTracks?: ArrayLike<{ enabled: boolean }> }) | null)?.audioTracks;
+      if (!tracks?.[id]) return;
+      manualAudio.current = true;
+      for (let i = 0; i < tracks.length; i++) tracks[i].enabled = i === id;
+    }
     setSelectedAudioTrack(id);
     flash(`Audio: ${audioTracks.find((t) => t.id === id)?.label ?? `Track ${id + 1}`}`);
   };
+
+  // WebViews that expose embedded tracks can switch them directly; HLS tracks are handled above.
+  useEffect(() => {
+    const v = video.current;
+    if (!v || cur?.kind !== "file") return;
+
+    type NativeAudioTrack = { label?: string; language?: string; enabled: boolean };
+    type NativeAudioTrackList = ArrayLike<NativeAudioTrack> & EventTarget;
+    const nativeVideo = v as HTMLVideoElement & { audioTracks?: NativeAudioTrackList };
+    let audioList: NativeAudioTrackList | undefined;
+
+    const refreshAudio = () => {
+      const next = nativeVideo.audioTracks;
+      if (next !== audioList) {
+        audioList?.removeEventListener("addtrack", refreshAudio);
+        audioList?.removeEventListener("removetrack", refreshAudio);
+        audioList?.removeEventListener("change", refreshAudio);
+        audioList = next;
+        audioList?.addEventListener("addtrack", refreshAudio);
+        audioList?.addEventListener("removetrack", refreshAudio);
+        audioList?.addEventListener("change", refreshAudio);
+      }
+      const tracks = Array.from(audioList ?? []);
+      setAudioTracks(tracks.map((track, i) => ({
+        id: i,
+        label: track.label || track.language || `Track ${i + 1}`,
+        lang: track.language || "und",
+      })));
+      const enabled = tracks.findIndex((track) => track.enabled);
+      setSelectedAudioTrack(enabled);
+      if (!manualAudio.current && tracks.length > 1) pickAudioTrack();
+    };
+
+    const refreshSubtitles = () => {
+      const sidecars = new Set(Array.from(trackEls.current.values(), (el) => el.track));
+      const tracks = Array.from(v.textTracks)
+        .map((track, i) => ({ track, i }))
+        .filter(({ track }) => (track.kind === "subtitles" || track.kind === "captions") && !sidecars.has(track))
+        .map(({ track, i }) => ({
+          id: `native-sub-${i}`,
+          label: track.label || track.language || `Track ${i + 1}`,
+          lang: track.language || "und",
+          kind: "native" as const,
+          nativeTrack: track,
+        }));
+      setNativeSubs(tracks);
+    };
+
+    v.addEventListener("loadedmetadata", refreshAudio);
+    v.textTracks.addEventListener("addtrack", refreshSubtitles);
+    v.textTracks.addEventListener("removetrack", refreshSubtitles);
+    v.textTracks.addEventListener("change", refreshSubtitles);
+    refreshAudio();
+    refreshSubtitles();
+    return () => {
+      v.removeEventListener("loadedmetadata", refreshAudio);
+      v.textTracks.removeEventListener("addtrack", refreshSubtitles);
+      v.textTracks.removeEventListener("removetrack", refreshSubtitles);
+      v.textTracks.removeEventListener("change", refreshSubtitles);
+      audioList?.removeEventListener("addtrack", refreshAudio);
+      audioList?.removeEventListener("removetrack", refreshAudio);
+      audioList?.removeEventListener("change", refreshAudio);
+    };
+  }, [cur?.url]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* --------------------------------------------------------------- watchdog */
 
@@ -492,18 +576,20 @@ export function Player({ candidates: given, onSourceResult, title, subtitle, sta
     }, started.current ? STALL_TIMEOUT : START_TIMEOUT);
   };
   useEffect(() => {
-    if (!cur || cur.kind === "embed") return;
+    if (!cur || cur.kind === "embed" || preparingLocal) return;
     started.current = false;
     armStall();
     return clearStall;
-  }, [cur?.url]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [cur?.url, preparingLocal]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* ---------------------------------------------------------- attach source */
 
   useEffect(() => {
     const c = curRef.current;
     if (!c) return;
+    setPreparingLocal(false);
     setHlsSubs([]);
+    setNativeSubs([]);
     setAudioTracks([]);
     setSelectedAudioTrack(-1);
     manualAudio.current = false;
@@ -533,6 +619,11 @@ export function Player({ candidates: given, onSourceResult, title, subtitle, sta
       v.play().catch(() => {});
     };
     let cancelled = false;
+    const loadFile = (url: string) => {
+      if (cancelled) return;
+      v.src = url;
+      v.addEventListener("loadedmetadata", seekAndPlay, { once: true });
+    };
     const attachHls = (H: typeof Hls) => {
       if (cancelled) return;
       if (!H.isSupported()) {
@@ -578,8 +669,21 @@ export function Player({ candidates: given, onSourceResult, title, subtitle, sta
     if (c.kind === "hls") {
       import("hls.js").then((m) => attachHls(m.default), () => failover("player failed to load"));
     } else {
-      v.src = c.url;
-      v.addEventListener("loadedmetadata", seekAndPlay, { once: true });
+      if (c.localPath) {
+        setPreparingLocal(true);
+        invoke<string>("prepare_local_media", { path: c.localPath })
+          .then((path) => {
+            setPreparingLocal(false);
+            loadFile(convertFileSrc(path));
+          })
+          .catch((error: unknown) => {
+            setPreparingLocal(false);
+            setWaiting(false);
+            if (!cancelled) failover(`audio conversion failed: ${error instanceof Error ? error.message : String(error)}`);
+          });
+      } else {
+        loadFile(c.url);
+      }
     }
     return () => {
       cancelled = true;
@@ -1063,7 +1167,7 @@ export function Player({ candidates: given, onSourceResult, title, subtitle, sta
         {waiting && (
           <div className="pload" aria-label="Loading">
             <span className="pload-ring" />
-            <span className="pload-txt">{started.current ? "Buffering" : `Connecting to ${cur?.providerName ?? "server"}`}</span>
+            <span className="pload-txt">{preparingLocal ? "Preparing local audio" : started.current ? "Buffering" : `Connecting to ${cur?.providerName ?? "server"}`}</span>
           </div>
         )}
       </div>
@@ -1241,7 +1345,7 @@ export function Player({ candidates: given, onSourceResult, title, subtitle, sta
                   </div>
                 </div>
               )}
-              {audioTracks.length > 1 && (
+              {audioTracks.length > 0 && (
                 <div className="ps-block">
                   <div className="ps-label">Audio tracks</div>
                   <div className="opt-list">
@@ -1253,6 +1357,9 @@ export function Player({ candidates: given, onSourceResult, title, subtitle, sta
                     ))}
                   </div>
                 </div>
+              )}
+              {!isEmbed && cur?.kind === "file" && audioTracks.length === 0 && (
+                <p className="ps-note">Audio is selected by the media engine for this file. If it is silent, its audio codec may not be supported.</p>
               )}
               <div className="ps-block">
                 <div className="ps-label">Subtitles {!isEmbed && <kbd>C</kbd>}</div>

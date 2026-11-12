@@ -161,6 +161,7 @@ export const localProvider: SourceProvider = {
         label: f.name + (req.audio ? (audio === "dual" ? " · dual audio" : ` · ${audio}`) : ""),
         url: convertFileSrc(f.path),
         kind: f.path.toLowerCase().endsWith(".m3u8") ? "hls" : "file",
+        ...(f.path.toLowerCase().endsWith(".m3u8") ? {} : { localPath: f.path }),
         quality: qualityOf(f.name),
         audio: req.audio ? audio : undefined,
         subtitles: f.subs?.map((p) => sidecarTrack(p, f.name)),

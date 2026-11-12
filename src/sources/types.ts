@@ -41,6 +41,8 @@ export interface StreamCandidate {
   kind: StreamKind;
   /** Vertical resolution if known (from filename, manifest, or server metadata). */
   quality?: number;
+  /** Absolute path for a library file; desktop playback normalizes unsupported audio codecs. */
+  localPath?: string;
   subtitles?: SubtitleTrack[];
   /**
    * What audio this stream carries. "dual" means it has both and the player picks the track;

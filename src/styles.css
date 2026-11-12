@@ -969,6 +969,8 @@ details.rfailed { display: flex; flex-direction: column; gap: 6px; }
 .rrow.standby { grid-template-columns: 14px 1fr auto; background: transparent; border-style: dashed; }
 .rrow.standby .rdot { background: transparent; box-shadow: inset 0 0 0 1.5px rgba(255, 255, 255, 0.35); }
 .rrow.standby .rname { color: var(--fg2); }
+.rrow.standby, .rrow.failed { cursor: pointer; transition: background var(--fast), border-color var(--fast), opacity var(--fast); }
+.rrow.standby:hover, .rrow.failed:hover { background: rgba(255, 255, 255, 0.06); border-color: var(--line-2); opacity: 1; }
 .rrow.failed { grid-template-columns: 14px 1fr auto; background: transparent; opacity: 0.6; }
 .rrow.failed .rname { color: var(--fg2); font-weight: 500; }
 .race-grid-wrap { max-height: min(82vh, 720px); }

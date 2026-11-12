@@ -4,7 +4,11 @@ mod stream;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use tauri::Manager;
+
+static LIBRARY_ROOTS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+static MEDIA_PREPARE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Serialize)]
 struct LibFile {
@@ -121,18 +125,25 @@ struct ScanError {
 async fn scan_library(app: tauri::AppHandle, paths: Vec<String>) -> Result<ScanResult, String> {
     let scope = app.asset_protocol_scope();
     let mut roots = Vec::new();
+    let mut allowed_roots = Vec::new();
     let mut errors = Vec::new();
     for p in paths {
         let dir = PathBuf::from(&p);
         match std::fs::metadata(&dir) {
             Ok(m) if m.is_dir() => {
-                scope.allow_directory(&dir, true).map_err(|e| e.to_string())?;
-                roots.push(dir);
+                let canonical = std::fs::canonicalize(&dir).map_err(|e| e.to_string())?;
+                scope.allow_directory(&canonical, true).map_err(|e| e.to_string())?;
+                allowed_roots.push(canonical.clone());
+                roots.push(canonical);
             }
             Ok(_) => errors.push(ScanError { path: p, message: "not a folder".into() }),
             Err(e) => errors.push(ScanError { path: p, message: e.to_string() }),
         }
     }
+    *LIBRARY_ROOTS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .map_err(|e| e.to_string())? = allowed_roots;
     let files = tauri::async_runtime::spawn_blocking(move || {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
@@ -144,6 +155,207 @@ async fn scan_library(app: tauri::AppHandle, paths: Vec<String>) -> Result<ScanR
     .await
     .map_err(|e| e.to_string())?;
     Ok(ScanResult { files, errors })
+}
+
+fn ffmpeg_tool(app: &tauri::AppHandle, name: &str) -> Result<PathBuf, String> {
+    let dir = if cfg!(debug_assertions) {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources").join("ffmpeg")
+    } else {
+        app.path()
+            .resource_dir()
+            .map_err(|e| e.to_string())?
+            .join("ffmpeg")
+    };
+    let path = dir.join(name);
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err(format!("Bundled media tool is missing: {name}"))
+    }
+}
+
+fn media_needs_audio_conversion(path: &Path, probe: &serde_json::Value) -> bool {
+    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let audio_codecs: Vec<&str> = probe
+        .get("streams")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|s| s.get("codec_type").and_then(serde_json::Value::as_str) == Some("audio"))
+        .filter_map(|s| s.get("codec_name").and_then(serde_json::Value::as_str))
+        .collect();
+    match extension.as_str() {
+        "mp4" | "m4v" | "mov" => audio_codecs.iter().any(|c| !["aac", "mp3"].contains(c)),
+        "webm" => audio_codecs.iter().any(|c| !["opus", "vorbis"].contains(c)),
+        _ => true,
+    }
+}
+
+fn compatible_subtitle_indices(probe: &serde_json::Value) -> Vec<u64> {
+    probe
+        .get("streams")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|s| s.get("codec_type").and_then(serde_json::Value::as_str) == Some("subtitle"))
+        .filter(|s| {
+            s.get("codec_name")
+                .and_then(serde_json::Value::as_str)
+                .map(|codec| ["subrip", "ass", "ssa", "webvtt", "mov_text"].contains(&codec))
+                .unwrap_or(false)
+        })
+        .filter_map(|s| s.get("index").and_then(serde_json::Value::as_u64))
+        .collect()
+}
+
+#[cfg(test)]
+mod local_media_tests {
+    use super::*;
+
+    fn probe(streams: &[(&str, &str)]) -> serde_json::Value {
+        serde_json::json!({
+            "streams": streams.iter().enumerate().map(|(index, (kind, codec))| {
+                serde_json::json!({"index": index, "codec_type": kind, "codec_name": codec})
+            }).collect::<Vec<_>>()
+        })
+    }
+
+    #[test]
+    fn converts_audio_codecs_not_supported_by_the_webview_container() {
+        assert!(media_needs_audio_conversion(
+            Path::new("Film.mp4"),
+            &probe(&[("video", "h264"), ("audio", "ac3")]),
+        ));
+        assert!(media_needs_audio_conversion(
+            Path::new("Film.mkv"),
+            &probe(&[("video", "h264"), ("audio", "aac")]),
+        ));
+    }
+
+    #[test]
+    fn leaves_supported_mp4_and_webm_audio_alone() {
+        assert!(!media_needs_audio_conversion(
+            Path::new("Film.mp4"),
+            &probe(&[("video", "h264"), ("audio", "aac")]),
+        ));
+        assert!(!media_needs_audio_conversion(
+            Path::new("Clip.webm"),
+            &probe(&[("video", "vp9"), ("audio", "opus")]),
+        ));
+    }
+
+    #[test]
+    fn keeps_text_subtitle_streams_and_skips_bitmap_subtitles() {
+        let streams = serde_json::json!({
+            "streams": [
+                {"index": 2, "codec_type": "subtitle", "codec_name": "subrip"},
+                {"index": 3, "codec_type": "subtitle", "codec_name": "hdmv_pgs_subtitle"},
+                {"index": 4, "codec_type": "subtitle", "codec_name": "ass"}
+            ]
+        });
+        assert_eq!(compatible_subtitle_indices(&streams), vec![2, 4]);
+    }
+}
+
+fn prepare_local_media_file(
+    path: PathBuf,
+    cache_dir: PathBuf,
+    ffmpeg: PathBuf,
+    ffprobe: PathBuf,
+) -> Result<String, String> {
+    let canonical = std::fs::canonicalize(&path).map_err(|e| e.to_string())?;
+    let allowed_roots = LIBRARY_ROOTS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .map_err(|e| e.to_string())?;
+    if !canonical.is_file() || !allowed_roots.iter().any(|root| canonical.starts_with(root)) {
+        return Err("The requested file is not inside a selected library folder".into());
+    }
+    drop(allowed_roots);
+    let extension = canonical.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    if !ext_in(&canonical, VIDEO_EXTS) || extension == "m3u8" {
+        return Err("The requested file is not a supported local video".into());
+    }
+
+    let probe = std::process::Command::new(ffprobe)
+        .args(["-v", "error", "-show_entries", "stream=index,codec_type,codec_name", "-of", "json"])
+        .arg(&canonical)
+        .output()
+        .map_err(|e| format!("Could not inspect local media: {e}"))?;
+    if !probe.status.success() {
+        return Err(format!("Could not inspect local media: {}", String::from_utf8_lossy(&probe.stderr)));
+    }
+    let probe: serde_json::Value = serde_json::from_slice(&probe.stdout).map_err(|e| e.to_string())?;
+    if !media_needs_audio_conversion(&canonical, &probe) {
+        return Ok(canonical.to_string_lossy().into_owned());
+    }
+    let subtitle_indices = compatible_subtitle_indices(&probe);
+
+    let metadata = std::fs::metadata(&canonical).map_err(|e| e.to_string())?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|time| time.as_nanos())
+        .unwrap_or_default();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    use std::hash::{Hash, Hasher};
+    canonical.hash(&mut hasher);
+    metadata.len().hash(&mut hasher);
+    modified.hash(&mut hasher);
+    "abixcine-local-mp4-aac-v1".hash(&mut hasher);
+    let output = cache_dir.join(format!("{:016x}.mp4", hasher.finish()));
+    if output.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+        return Ok(output.to_string_lossy().into_owned());
+    }
+
+    let partial = output.with_extension("partial.mp4");
+    let _ = std::fs::remove_file(&partial);
+    let mut command = std::process::Command::new(ffmpeg);
+    command
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i"])
+        .arg(&canonical)
+        .args(["-map", "0:v:0", "-map", "0:a?"]);
+    for index in &subtitle_indices {
+        command.arg("-map").arg(format!("0:{index}"));
+    }
+    command.args(["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-map_metadata", "0", "-dn"]);
+    if !subtitle_indices.is_empty() {
+        command.args(["-c:s", "mov_text"]);
+    }
+    let result = command
+        .args(["-movflags", "+faststart", "-f", "mp4"])
+        .arg(&partial)
+        .output()
+        .map_err(|e| format!("Could not convert local audio: {e}"))?;
+    if !result.status.success() || !partial.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+        let _ = std::fs::remove_file(&partial);
+        let detail = String::from_utf8_lossy(&result.stderr);
+        let detail = detail.chars().rev().take(900).collect::<String>().chars().rev().collect::<String>();
+        return Err(format!("Could not convert local audio: {detail}"));
+    }
+    std::fs::rename(&partial, &output).map_err(|e| {
+        let _ = std::fs::remove_file(&partial);
+        e.to_string()
+    })?;
+    Ok(output.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+async fn prepare_local_media(app: tauri::AppHandle, path: String) -> Result<String, String> {
+    let path = PathBuf::from(path);
+    let cache_dir = app.path().app_cache_dir().map_err(|e| e.to_string())?.join("local-media");
+    std::fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
+    let scope = app.asset_protocol_scope();
+    scope.allow_directory(&cache_dir, true).map_err(|e| e.to_string())?;
+    let ffmpeg = ffmpeg_tool(&app, "ffmpeg.exe")?;
+    let ffprobe = ffmpeg_tool(&app, "ffprobe.exe")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = MEDIA_PREPARE_LOCK.lock().map_err(|e| e.to_string())?;
+        prepare_local_media_file(path, cache_dir, ffmpeg, ffprobe)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[cfg(debug_assertions)]
@@ -288,7 +500,7 @@ pub fn run() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![scan_library, stream::http_fetch, shield::sniff_media, shield::shield_stats])
+        .invoke_handler(tauri::generate_handler![scan_library, prepare_local_media, stream::http_fetch, shield::sniff_media, shield::shield_stats])
         .run(tauri::generate_context!())
         .expect("error while running AbixCine");
 }
