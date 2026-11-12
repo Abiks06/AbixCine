@@ -49,8 +49,18 @@ export function langBase(lang?: string): string {
 /** Audio-track languages that mean "sub" (original Japanese) or "dub" (English). */
 export const audioLangs = (a: "sub" | "dub") => (a === "dub" ? ["en"] : ["ja"]);
 
+/** Prefer the requested anime track, otherwise the title's original-language track. */
+export function preferredAudioTrackIndex(
+  tracks: { lang?: string }[],
+  audio?: "sub" | "dub",
+  originalLanguage?: string,
+): number {
+  const langs = audio ? audioLangs(audio) : originalLanguage ? [langBase(originalLanguage)] : [];
+  return tracks.findIndex((track) => langs.includes(langBase(track.lang)));
+}
+
 /** Decode bytes as UTF-8, falling back to Windows-1252 (common for older SRT files). */
-function decode(buf: ArrayBuffer) {
+export function decodeSubtitle(buf: ArrayBuffer) {
   try {
     return new TextDecoder("utf-8", { fatal: true }).decode(buf);
   } catch {
@@ -76,6 +86,6 @@ export function toVtt(text: string): string {
 export async function loadSubtitle(url: string, signal: AbortSignal): Promise<string> {
   const res = await fetch(url, { signal });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const vtt = toVtt(decode(await res.arrayBuffer()));
+  const vtt = toVtt(decodeSubtitle(await res.arrayBuffer()));
   return URL.createObjectURL(new Blob([vtt], { type: "text/vtt" }));
 }

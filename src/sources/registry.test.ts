@@ -28,6 +28,17 @@ describe("source ranking", () => {
     expect(fast.score).toBeGreaterThan(slow.score!);
   });
 
+  it("ranks a known French source lower for a non-French original", () => {
+    const req = request("test:french-source");
+    Object.assign(req.media, { originalLanguage: "en" });
+    const probe = { ok: true, latencyMs: 200, quality: 1080 };
+    const french = score({ ...candidate("french"), label: "Frembed · French", probe }, 1080, 15, req);
+    const neutral = score({ ...candidate("neutral"), label: "VidFast", probe }, 1080, 15, req);
+
+    expect(french.score).toBeLessThan(neutral.score!);
+    expect(french.why).toContain("French source for non-French title");
+  });
+
   it("checks more standby embeds when the requested verification budget increases", async () => {
     const original = [...PROVIDERS];
     const providers: SourceProvider[] = ["first", "second", "third", "fourth", "fifth"].map((id, i) => ({

@@ -27,7 +27,7 @@ export { recordPlayback } from "./health";
 const PROVIDER_TIMEOUT = 8000;
 const PROBE_TIMEOUT = 6000;
 /** Capturing a stream from an embed page: load, start, catch the playlist. Most succeed in 4–10 s. */
-const SNIFF_TIMEOUT = 15_000;
+const SNIFF_TIMEOUT = 10_000;
 
 /**
  * Which servers have worked lately, per kind of title (movie / tv / anime). Servers are tried
@@ -278,6 +278,12 @@ export function score(c: StreamCandidate, preferred: number, priority: number, r
   const memory = pick ? (pick.providerId === c.providerId ? 8 : 0) : 0;
   const shaky = recentlyFailed(c.providerId) ? 12 : 0;
   const own = c.via === "direct" || c.via === "sniffed" || c.providerId === "local" || c.providerId === "jellyfin" ? 25 : 0;
+  const provider = PROVIDERS.find((p) => p.id === c.providerId);
+  const originalLanguage = "originalLanguage" in req.media && typeof req.media.originalLanguage === "string"
+    ? req.media.originalLanguage.toLowerCase().split(/[-_]/)[0]
+    : undefined;
+  const frenchOnly = (provider?.isFrench || /· french/i.test(c.label)) && originalLanguage && !["fr", "fra", "fre"].includes(originalLanguage);
+  const languageMiss = frenchOnly ? 28 : 0;
   // An anime request with a player that can't honour sub/dub only wins when nothing else answers.
   const audioMiss = req.audio && c.audio === "unknown" ? 18 : 0;
   // This exact URL failed to play (not just this provider): a codec issue, a dead link.
@@ -287,10 +293,11 @@ export function score(c: StreamCandidate, preferred: number, priority: number, r
   if (c.via === "direct") why.push("direct stream");
   if (req.audio && (c.audio === req.audio || c.audio === "dual")) why.push(req.audio === "dub" ? "English dub" : "subtitled");
   if (memory) why.push("played this show before");
+  if (languageMiss) why.push("French source for non-French title");
   if (rel > 0.8 && getHealth(c.providerId).ok > 3) why.push("reliable");
   if (shaky) why.push("failed recently");
   if (broken) why.push("wouldn't play last time");
-  return { ...c, why, score: own + qScore * 40 - latency * 20 + (rel - 0.5) * 20 + memory - shaky - audioMiss - broken + priority * 0.5 };
+  return { ...c, why, score: own + qScore * 40 - latency * 20 + (rel - 0.5) * 20 + memory - shaky - languageMiss - audioMiss - broken + priority * 0.5 };
 }
 
 const sortByScore = (a: StreamCandidate, b: StreamCandidate) => b.score! - a.score!;

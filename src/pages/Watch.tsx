@@ -216,6 +216,7 @@ export function Watch() {
         startAt={getProgress(key, season, episode)?.position}
         audio={audio}
         onAudio={isAnime || audio ? switchAudio : undefined}
+        originalLanguage={d.originalLanguage}
         episodes={episodes}
         media={d}
         onProgress={onProgress}
