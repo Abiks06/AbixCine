@@ -86,7 +86,7 @@ export const Row = memo(function Row({
         {children ??
           (loading
             ? Array.from({ length: 8 }, (_, i) => <CardSkeleton key={i} variant={ranked ? "rank" : variant} />)
-            : list!.map((m, i) => (
+            : (list ?? []).map((m, i) => (
                 <Card key={m.key} media={m} index={i} variant={ranked ? "rank" : variant} rank={ranked ? i + 1 : undefined} move={moves?.[m.key]} />
               )))}
       </div>

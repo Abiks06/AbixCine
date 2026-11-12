@@ -62,32 +62,57 @@ try {
   /* ignore */
 }
 
-export async function cached<T>(key: string, ttlMs: number, fetcher: () => Promise<T>): Promise<T> {
-  const now = Date.now();
+function readEntry(key: string) {
   let hit = mem.get(key);
   if (!hit) {
     try {
       const raw = localStorage.getItem(PREFIX + key);
       if (raw) {
-        hit = JSON.parse(raw);
-        mem.set(key, hit!);
+        const parsed: unknown = JSON.parse(raw);
+        if (parsed && typeof parsed === "object" && "at" in parsed && typeof parsed.at === "number" && Number.isFinite(parsed.at) && "value" in parsed) {
+          hit = { at: parsed.at, value: parsed.value };
+          mem.set(key, hit);
+        }
       }
     } catch {
       /* ignore */
     }
   }
+  return hit;
+}
+
+function writeEntry<T>(key: string, value: T, at = Date.now()): void {
+  const entry = { at, value };
+  mem.delete(key);
+  mem.set(key, entry);
+  if (mem.size > MAX_MEM) {
+    const oldest = mem.keys().next();
+    if (!oldest.done) mem.delete(oldest.value);
+  }
+  persist(key, entry);
+}
+
+export function peekCache<T>(key: string, ttlMs: number): T | undefined {
+  const now = Date.now();
+  const hit = readEntry(key);
+  return hit && now - hit.at < ttlMs ? (hit.value as T) : undefined;
+}
+
+export function seedCache<T>(key: string, value: T, at = Date.now()): void {
+  writeEntry(key, value, at);
+}
+
+export async function cached<T>(key: string, ttlMs: number, fetcher: () => Promise<T>): Promise<T> {
+  const now = Date.now();
+  const hit = readEntry(key);
   const fresh = hit && now - hit.at < ttlMs;
-  if (fresh) return hit!.value as T;
+  if (fresh) return hit.value as T;
 
   const run = () => {
     if (inflight.has(key)) return inflight.get(key) as Promise<T>;
     const p = fetcher()
       .then((value) => {
-        const entry = { at: Date.now(), value };
-        mem.delete(key);
-        mem.set(key, entry);
-        if (mem.size > MAX_MEM) mem.delete(mem.keys().next().value!);
-        persist(key, entry);
+        writeEntry(key, value);
         return value;
       })
       .finally(() => inflight.delete(key));
@@ -97,11 +122,19 @@ export async function cached<T>(key: string, ttlMs: number, fetcher: () => Promi
 
   if (hit) {
     // Stale: fetch fresh so what you see is current, but never leave you staring at a spinner.
-    // If the network is slow or down, fall back to the last good copy.
+    // If the network is slow or down, fall back to the last good copy without leaking an unhandled rejection.
+    const staleValue = hit.value as T;
+    const bg = run();
+    bg.catch(() => {});
+    let timer = 0;
     return Promise.race([
-      run(),
-      new Promise<T>((resolve) => setTimeout(() => resolve(hit!.value as T), STALE_WAIT_MS)),
-    ]).catch(() => hit!.value as T);
+      bg,
+      new Promise<T>((resolve) => {
+        timer = window.setTimeout(() => resolve(staleValue), STALE_WAIT_MS);
+      }),
+    ])
+      .catch(() => staleValue)
+      .finally(() => clearTimeout(timer));
   }
   return run();
 }

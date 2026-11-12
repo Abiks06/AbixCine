@@ -52,12 +52,17 @@ export function Search() {
     let live = true;
     setBusy(true);
     const t = setTimeout(async () => {
-      const r = await searchAll(term);
-      if (!live) return;
-      setResults(r);
-      setBusy(false);
-      // Settled on a query that found something: remember it.
-      if (r.length) rememberQuery(term);
+      try {
+        const r = await searchAll(term);
+        if (!live) return;
+        setResults(r);
+        // Settled on a query that found something: remember it.
+        if (r.length) rememberQuery(term);
+      } catch {
+        if (live) setResults([]);
+      } finally {
+        if (live) setBusy(false);
+      }
     }, 240);
     return () => {
       live = false;

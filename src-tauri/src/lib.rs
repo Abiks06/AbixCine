@@ -131,8 +131,17 @@ async fn scan_library(app: tauri::AppHandle, paths: Vec<String>) -> Result<ScanR
         let dir = PathBuf::from(&p);
         match std::fs::metadata(&dir) {
             Ok(m) if m.is_dir() => {
-                let canonical = std::fs::canonicalize(&dir).map_err(|e| e.to_string())?;
-                scope.allow_directory(&canonical, true).map_err(|e| e.to_string())?;
+                let canonical = match std::fs::canonicalize(&dir) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        errors.push(ScanError { path: p, message: e.to_string() });
+                        continue;
+                    }
+                };
+                if let Err(e) = scope.allow_directory(&canonical, true) {
+                    errors.push(ScanError { path: p, message: e.to_string() });
+                    continue;
+                }
                 allowed_roots.push(canonical.clone());
                 roots.push(canonical);
             }
@@ -260,7 +269,7 @@ mod local_media_tests {
 fn prepare_local_media_file(
     path: PathBuf,
     cache_dir: PathBuf,
-    ffmpeg: PathBuf,
+    ffmpeg: Result<PathBuf, String>,
     ffprobe: PathBuf,
 ) -> Result<String, String> {
     let canonical = std::fs::canonicalize(&path).map_err(|e| e.to_string())?;
@@ -289,6 +298,7 @@ fn prepare_local_media_file(
     if !media_needs_audio_conversion(&canonical, &probe) {
         return Ok(canonical.to_string_lossy().into_owned());
     }
+    let ffmpeg = ffmpeg?;
     let subtitle_indices = compatible_subtitle_indices(&probe);
 
     let metadata = std::fs::metadata(&canonical).map_err(|e| e.to_string())?;
@@ -348,7 +358,7 @@ async fn prepare_local_media(app: tauri::AppHandle, path: String) -> Result<Stri
     std::fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
     let scope = app.asset_protocol_scope();
     scope.allow_directory(&cache_dir, true).map_err(|e| e.to_string())?;
-    let ffmpeg = ffmpeg_tool(&app, "ffmpeg.exe")?;
+    let ffmpeg = ffmpeg_tool(&app, "ffmpeg.exe");
     let ffprobe = ffmpeg_tool(&app, "ffprobe.exe")?;
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = MEDIA_PREPARE_LOCK.lock().map_err(|e| e.to_string())?;
@@ -446,7 +456,7 @@ pub fn run() {
                             .map(|u| {
                                 let (h, u) = (h.clone(), u.to_string());
                                 tauri::async_runtime::spawn(async move {
-                                    let r = shield::sniff_media(h, u.clone(), Some(12_000)).await.ok().flatten();
+                                    let r = shield::sniff_media(h, u.clone(), Some(12_000), None).await.ok().flatten();
                                     (u, r.is_some())
                                 })
                             })
@@ -461,7 +471,7 @@ pub fn run() {
                     }
                     for u in list.split('|') {
                         let t = std::time::Instant::now();
-                        let r = shield::sniff_media(h.clone(), u.to_string(), Some(16_000)).await;
+                        let r = shield::sniff_media(h.clone(), u.to_string(), Some(16_000), None).await;
                         let found = r.ok().flatten();
                         println!("SNIFF {} {}ms {:?}", u, t.elapsed().as_millis(), found.as_ref().map(|s| (s.kind, &s.url[..s.url.len().min(80)])));
                         // Push the stream through the real proxy: playlist, then one nested hop, then bytes.
@@ -486,7 +496,7 @@ pub fn run() {
                     }
                     // The webview itself must be able to read the proxy scheme (that's what hls.js does).
                     if let (Some(w), Ok(u)) = (h.get_webview_window("main"), std::env::var("ABX_WEBVIEW_TEST")) {
-                        if let Ok(Some(s)) = shield::sniff_media(h.clone(), u, Some(16_000)).await {
+                        if let Ok(Some(s)) = shield::sniff_media(h.clone(), u, Some(16_000), None).await {
                             let p = stream::proxy_path(&s.url, &s.headers);
                             let js = format!("fetch('http://abxs.localhost{p}').then(r=>r.text().then(t=>history.replaceState(null,'','#WV-'+r.status+'-'+t.length+'-'+encodeURIComponent(t.slice(0,7))))).catch(e=>history.replaceState(null,'','#WVERR-'+encodeURIComponent(String(e))))");
                             let _ = w.eval(&js);
@@ -500,7 +510,7 @@ pub fn run() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![scan_library, prepare_local_media, stream::http_fetch, shield::sniff_media, shield::shield_stats])
+        .invoke_handler(tauri::generate_handler![scan_library, prepare_local_media, stream::http_fetch, shield::sniff_media, shield::cancel_sniff, shield::shield_stats])
         .run(tauri::generate_context!())
         .expect("error while running AbixCine");
 }

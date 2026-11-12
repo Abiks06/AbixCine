@@ -22,8 +22,15 @@ function fromHue(h: number): Pair {
   return [`hsl(${h} 50% 30%)`, `hsl(${(h + 45) % 360} 50% 20%)`];
 }
 
-function hexToHsl(hex: string): [number, number, number] {
-  const n = parseInt(hex.replace("#", ""), 16);
+function hexToHsl(hex: string): [number, number, number] | null {
+  const clean = hex.trim().replace(/^#/, "");
+  const full = /^[0-9a-f]{3}$/i.test(clean)
+    ? clean.replace(/./g, (c) => c + c)
+    : /^[0-9a-f]{6}$/i.test(clean)
+      ? clean
+      : null;
+  if (!full) return null;
+  const n = parseInt(full, 16);
   return rgbToHsl((n >> 16) & 255, (n >> 8) & 255, n & 255);
 }
 
@@ -56,7 +63,8 @@ function sample(src: string): Promise<Pair> {
         const c = document.createElement("canvas");
         c.width = 32;
         c.height = 18;
-        const x = c.getContext("2d", { willReadFrequently: true })!;
+        const x = c.getContext("2d", { willReadFrequently: true });
+        if (!x) return reject(new Error("no-2d-context"));
         x.drawImage(img, 0, 0, 32, 18);
         const px = x.getImageData(0, 0, 32, 18).data;
         const buckets = Array.from({ length: 12 }, () => ({ w: 0, h: 0, s: 0 }));
@@ -91,8 +99,8 @@ async function colorsFor(m: Media): Promise<Pair> {
   const hit = cache.get(id);
   if (hit) return hit;
   let pair: Pair;
-  if (m.color) {
-    const hsl = hexToHsl(m.color);
+  const hsl = m.color ? hexToHsl(m.color) : null;
+  if (hsl) {
     pair = [tone(hsl, 42), tone([(hsl[0] + 40) % 360, hsl[1], 0.5], 24)];
   } else if (src) {
     pair = await sample(src).catch(() => fromHue(m.hue ?? hashHue(m.key)));

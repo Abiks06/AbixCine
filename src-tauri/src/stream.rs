@@ -24,21 +24,35 @@ const RANGE_CHUNK: u64 = 6 * 1024 * 1024;
 
 /// Playlists fetched while verifying a capture, kept briefly so the player's first request is
 /// answered instantly (the slow part on a new host is the connection, which is now warm too).
-static PLAYLISTS: std::sync::Mutex<Option<HashMap<String, (std::time::Instant, Vec<u8>)>>> = std::sync::Mutex::new(None);
+static PLAYLISTS: std::sync::Mutex<Option<HashMap<String, (std::time::Instant, String, Vec<u8>)>>> = std::sync::Mutex::new(None);
 const PLAYLIST_TTL: Duration = Duration::from_secs(25);
 
-fn cached_playlist(url: &str) -> Option<Vec<u8>> {
+fn cached_playlist(url: &str) -> Option<(String, Vec<u8>)> {
     let g = PLAYLISTS.lock().ok()?;
-    let (at, body) = g.as_ref()?.get(url)?;
-    (at.elapsed() < PLAYLIST_TTL).then(|| body.clone())
+    let (at, final_url, body) = g.as_ref()?.get(url)?;
+    (at.elapsed() < PLAYLIST_TTL).then(|| (final_url.clone(), body.clone()))
 }
 
-fn cache_playlist(url: &str, body: &[u8]) {
+fn cache_playlist(url: &str, final_url: &str, body: &[u8]) {
     if let Ok(mut g) = PLAYLISTS.lock() {
         let map = g.get_or_insert_with(HashMap::new);
-        map.retain(|_, (at, _)| at.elapsed() < PLAYLIST_TTL);
-        map.insert(url.to_string(), (std::time::Instant::now(), body.to_vec()));
+        map.retain(|_, (at, _, _)| at.elapsed() < PLAYLIST_TTL);
+        map.insert(url.to_string(), (std::time::Instant::now(), final_url.to_string(), body.to_vec()));
     }
+}
+
+fn is_valid_m3u8_body(text: &str) -> bool {
+    let trimmed = text.trim_start_matches('\u{feff}').trim();
+    if !trimmed.starts_with("#EXTM3U") {
+        return false;
+    }
+    let lower = trimmed[..trimmed.len().min(2048)].to_ascii_lowercase();
+    if lower.contains("<!doctype") || lower.contains("<html") || lower.contains("<script") || lower.contains("cf-browser-verification") || lower.contains("captcha") {
+        return false;
+    }
+    let has_tag = trimmed.contains("#EXT-X-STREAM-INF") || trimmed.contains("#EXTINF");
+    let has_uri = trimmed.lines().map(str::trim).any(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('<'));
+    has_tag && has_uri
 }
 
 /// Fetch and check a captured HLS playlist from Rust: Some(top resolution or 0) when it's a real
@@ -54,12 +68,13 @@ pub async fn verify_playlist(url: &str, h: &Hdrs) -> Option<u32> {
         if !res.status().is_success() {
             return None;
         }
+        let final_url = res.url().to_string();
         let body = res.bytes().await.ok()?;
         let text = String::from_utf8_lossy(&body);
-        if !text.contains("#EXTM3U") || !(text.contains("#EXT-X-STREAM-INF") || text.contains("#EXTINF")) {
+        if !is_valid_m3u8_body(&text) {
             return None;
         }
-        cache_playlist(url, &body);
+        cache_playlist(url, &final_url, &body);
         let top = text
             .match_indices("RESOLUTION=")
             .filter_map(|(i, _)| text[i + 11..].split(|c: char| c == ',' || c == '\n').next())
@@ -99,11 +114,22 @@ pub struct Hdrs {
     pub ua: Option<String>,
 }
 
+fn origin_of(uri: &str) -> Option<String> {
+    let u = url::Url::parse(uri).ok()?;
+    let host = u.host_str()?;
+    match u.port() {
+        Some(port) => Some(format!("{}://{}:{}", u.scheme(), host, port)),
+        None => Some(format!("{}://{}", u.scheme(), host)),
+    }
+}
+
 fn apply(mut rb: reqwest::RequestBuilder, h: &Hdrs) -> reqwest::RequestBuilder {
-    if let Some(r) = h.referer.as_deref().filter(|s| !s.is_empty()) {
+    let referer = h.referer.as_deref().filter(|s| !s.is_empty());
+    if let Some(r) = referer {
         rb = rb.header(header::REFERER, r);
     }
-    if let Some(o) = h.origin.as_deref().filter(|s| !s.is_empty()) {
+    let derived_origin = referer.and_then(origin_of);
+    if let Some(o) = h.origin.as_deref().filter(|s| !s.is_empty()).or(derived_origin.as_deref()) {
         rb = rb.header(header::ORIGIN, o);
     }
     rb.header(header::USER_AGENT, h.ua.as_deref().filter(|s| !s.is_empty()).unwrap_or(UA))
@@ -118,6 +144,41 @@ pub fn proxy_path(url: &str, h: &Hdrs) -> String {
 fn proxied(base: &str, url: &str, h: &Hdrs) -> String {
     let hj = serde_json::to_vec(h).unwrap_or_default();
     format!("{base}/p?u={}&h={}", B64.encode(url), B64.encode(hj))
+}
+
+fn xml_unescape(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    s.replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Proxy a DASH attribute URL while preserving any unexpanded `$...$` template identifiers
+/// (`$Number$`, `$Time$`, `$RepresentationID$`, `$Bandwidth$`) outside Base64 so the client
+/// DASH player can substitute them at runtime, and XML-escaping `&` as `&amp;`.
+fn proxied_mpd_attr(base: &str, effective_base: &url::Url, val: &str, h: &Hdrs) -> String {
+    let unescaped = xml_unescape(val.trim());
+    let Some(dollar_idx) = unescaped.find('$') else {
+        return xml_escape(&proxied(base, &resolve(effective_base, &unescaped), h));
+    };
+    let (base_str, tail) = match unescaped[..dollar_idx].rfind('/') {
+        Some(slash_idx) => (resolve(effective_base, &unescaped[..=slash_idx]), &unescaped[slash_idx + 1..]),
+        None => (effective_base.to_string(), unescaped.as_str()),
+    };
+    let hj = serde_json::to_vec(h).unwrap_or_default();
+    let tail_escaped = tail.replace('&', "%26").replace('#', "%23");
+    xml_escape(&format!("{base}/p?u={}&h={}&t={tail_escaped}", B64.encode(base_str), B64.encode(hj)))
 }
 
 fn resolve(base_url: &url::Url, reference: &str) -> String {
@@ -135,20 +196,24 @@ fn rewrite_playlist(text: &str, playlist_url: &str, h: &Hdrs, base: &str) -> Str
             continue;
         }
         if l.starts_with('#') {
-            // URI="..." attributes: keys, media renditions, I-frame playlists, maps.
-            if let Some(i) = l.find("URI=\"") {
+            // URI="..." attributes: keys, media renditions, I-frame playlists, maps (may appear more than once per line).
+            let mut rest = l;
+            while let Some(i) = rest.find("URI=\"") {
                 let start = i + 5;
-                if let Some(len) = l[start..].find('"') {
-                    let uri = &l[start..start + len];
+                out.push_str(&rest[..start]);
+                let after_prefix = &rest[start..];
+                if let Some(len) = after_prefix.find('"') {
+                    let uri = &after_prefix[..len];
                     let p = proxied(base, &resolve(&pu, uri), h);
-                    out.push_str(&l[..start]);
                     out.push_str(&p);
-                    out.push_str(&l[start + len..]);
-                    out.push('\n');
-                    continue;
+                    out.push('"');
+                    rest = &after_prefix[len + 1..];
+                } else {
+                    rest = after_prefix;
+                    break;
                 }
             }
-            out.push_str(l);
+            out.push_str(rest);
         } else {
             out.push_str(&proxied(base, &resolve(&pu, l), h));
         }
@@ -157,11 +222,165 @@ fn rewrite_playlist(text: &str, playlist_url: &str, h: &Hdrs, base: &str) -> Str
     out
 }
 
+fn rewrite_mpd_tag_attrs(tag_str: &str, effective_base: &url::Url, h: &Hdrs, base: &str) -> String {
+    let mut current = tag_str.to_string();
+    for attr in ["initialization=\"", "media=\"", "sourceURL=\""] {
+        if !current.contains(attr) {
+            continue;
+        }
+        let mut next_out = String::with_capacity(current.len() + 256);
+        let mut scan = current.as_str();
+        while let Some(pos) = scan.find(attr) {
+            let start = pos + attr.len();
+            next_out.push_str(&scan[..start]);
+            let after_attr = &scan[start..];
+            if let Some(end) = after_attr.find('"') {
+                let val = after_attr[..end].trim();
+                if !val.is_empty() && !val.starts_with("http://abxs.localhost") && !val.starts_with("abxs://localhost") {
+                    next_out.push_str(&proxied_mpd_attr(base, effective_base, val, h));
+                } else {
+                    next_out.push_str(val);
+                }
+                next_out.push('"');
+                scan = &after_attr[end + 1..];
+            } else {
+                scan = after_attr;
+                break;
+            }
+        }
+        next_out.push_str(scan);
+        current = next_out;
+    }
+    current
+}
+
+fn tag_matches(tag_str: &str, prefix: &str) -> bool {
+    let Some(after) = tag_str.strip_prefix(prefix) else { return false };
+    matches!(after.as_bytes().first(), Some(b'>' | b'/' | b' ' | b'\t' | b'\r' | b'\n'))
+}
+
+/// Point `<BaseURL>` elements and segment attributes (`initialization`, `media`, `sourceURL`) in a
+/// DASH `.mpd` manifest back at the proxy, resolving relative URLs against `manifest_url` with proper
+/// `<MPD>` / `<Period>` / `<AdaptationSet>` / `<Representation>` hierarchy scoping and preserving
+/// unexpanded `<SegmentTemplate>` tokens (`$Number$`, `$Time$`, `$RepresentationID$`, `$Bandwidth$`).
+fn rewrite_mpd(text: &str, manifest_url: &str, h: &Hdrs, base: &str) -> String {
+    let Ok(root_base) = url::Url::parse(manifest_url) else {
+        return text.to_string();
+    };
+    struct MpdScope {
+        tag: &'static str,
+        parent_base: url::Url,
+        active_base: url::Url,
+        has_base_url: bool,
+    }
+    let mut stack = vec![MpdScope {
+        tag: "MPD",
+        parent_base: root_base.clone(),
+        active_base: root_base,
+        has_base_url: false,
+    }];
+    let mut out = String::with_capacity(text.len() + 1024);
+    let mut rest = text;
+
+    while let Some(lt) = rest.find('<') {
+        out.push_str(&rest[..lt]);
+        rest = &rest[lt..];
+
+        if rest.starts_with("<!--") {
+            if let Some(end) = rest.find("-->") {
+                out.push_str(&rest[..end + 3]);
+                rest = &rest[end + 3..];
+                continue;
+            }
+        }
+        if rest.starts_with("<![CDATA[") {
+            if let Some(end) = rest.find("]]>") {
+                out.push_str(&rest[..end + 3]);
+                rest = &rest[end + 3..];
+                continue;
+            }
+        }
+
+        let Some(gt) = rest.find('>') else {
+            out.push_str(rest);
+            return out;
+        };
+        let tag_str = &rest[..=gt];
+
+        // Closing scope tags: pop matching hierarchy level.
+        for scope_tag in ["Period", "AdaptationSet", "Representation"] {
+            if let Some(after) = tag_str.strip_prefix("</").and_then(|s| s.strip_prefix(scope_tag)) {
+                if after.trim_end_matches('>').trim().is_empty() && tag_str.ends_with('>') {
+                    if stack.len() > 1 && stack.last().map(|s| s.tag) == Some(scope_tag) {
+                        stack.pop();
+                    }
+                }
+            }
+        }
+
+        // `<BaseURL>` or `<BaseURL ...>` elements.
+        if tag_matches(tag_str, "<BaseURL") {
+            out.push_str(tag_str);
+            rest = &rest[gt + 1..];
+            if tag_str.ends_with("/>") {
+                continue;
+            }
+            if let Some(close) = rest.find("</BaseURL>") {
+                let inner = rest[..close].trim();
+                if !inner.is_empty() && !inner.starts_with("http://abxs.localhost") && !inner.starts_with("abxs://localhost") {
+                    let unescaped = xml_unescape(inner);
+                    let scope = stack.last_mut().unwrap();
+                    let resolved = resolve(&scope.parent_base, &unescaped);
+                    if !scope.has_base_url {
+                        if let Ok(next_base) = url::Url::parse(&resolved) {
+                            scope.active_base = next_base;
+                            scope.has_base_url = true;
+                        }
+                    }
+                    out.push_str(&xml_escape(&proxied(base, &resolved, h)));
+                } else {
+                    out.push_str(inner);
+                }
+                out.push_str("</BaseURL>");
+                rest = &rest[close + "</BaseURL>".len()..];
+            }
+            continue;
+        }
+
+        // Opening scope tags: push child scope inheriting current active_base.
+        for scope_tag in ["Period", "AdaptationSet", "Representation"] {
+            let open_prefix = match scope_tag {
+                "Period" => "<Period",
+                "AdaptationSet" => "<AdaptationSet",
+                _ => "<Representation",
+            };
+            if tag_matches(tag_str, open_prefix) && !tag_str.ends_with("/>") {
+                let cur = stack.last().unwrap().active_base.clone();
+                stack.push(MpdScope {
+                    tag: scope_tag,
+                    parent_base: cur.clone(),
+                    active_base: cur,
+                    has_base_url: false,
+                });
+                break;
+            }
+        }
+
+        let effective_base = &stack.last().unwrap().active_base;
+        out.push_str(&rewrite_mpd_tag_attrs(tag_str, effective_base, h, base));
+        rest = &rest[gt + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn cors(b: tauri::http::response::Builder) -> tauri::http::response::Builder {
     b.header("Access-Control-Allow-Origin", "*")
         .header("Access-Control-Allow-Headers", "*")
         .header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
         .header("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges")
+        .header("Cross-Origin-Resource-Policy", "cross-origin")
+        .header("Timing-Allow-Origin", "*")
 }
 
 fn fail(code: StatusCode, msg: &str) -> Response<Vec<u8>> {
@@ -175,20 +394,32 @@ fn query(uri: &tauri::http::Uri) -> HashMap<String, String> {
     uri.query()
         .unwrap_or("")
         .split('&')
-        .filter_map(|kv| kv.split_once('='))
+        .filter_map(|kv| kv.strip_prefix("amp;").unwrap_or(kv).split_once('='))
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect()
 }
+
+const MPD_SNIFF_WINDOW: usize = 8192;
 
 pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
     if req.method() == tauri::http::Method::OPTIONS {
         return cors(Response::builder().status(StatusCode::NO_CONTENT)).body(Vec::new()).unwrap();
     }
     let q = query(req.uri());
-    let Some(target) = q.get("u").and_then(|u| B64.decode(u).ok()).and_then(|b| String::from_utf8(b).ok()) else {
+    let Some(raw_target) = q.get("u").and_then(|u| B64.decode(u).ok()).and_then(|b| String::from_utf8(b).ok()) else {
         let raw = q.get("u").cloned().unwrap_or_default();
         let why = B64.decode(&raw).err().map(|e| e.to_string()).unwrap_or_else(|| "not utf-8".into());
         return fail(StatusCode::BAD_REQUEST, &format!("missing url (len {} uri len {}: {why})", raw.len(), req.uri().to_string().len()));
+    };
+    let target = match q.get("t").filter(|t| !t.is_empty()) {
+        Some(t) => {
+            let unescaped = t.replace("%26", "&").replace("%23", "#");
+            url::Url::parse(&raw_target)
+                .ok()
+                .map(|b| resolve(&b, &unescaped))
+                .unwrap_or_else(|| format!("{raw_target}{unescaped}"))
+        }
+        None => raw_target,
     };
     let h: Hdrs = q
         .get("h")
@@ -201,8 +432,19 @@ pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
     let base = PROXY_BASE;
 
     let looks_playlist = target.contains(".m3u8");
-    if let Some(body) = cached_playlist(&target) {
-        let out = rewrite_playlist(&String::from_utf8_lossy(&body), &target, &h, base);
+    let looks_dash = target.contains(".mpd");
+    if let Some((final_url, body)) = cached_playlist(&target) {
+        let text = String::from_utf8_lossy(&body);
+        let head = &text[..text.len().min(MPD_SNIFF_WINDOW)];
+        if looks_dash || head.contains("<MPD") {
+            let out = rewrite_mpd(&text, &final_url, &h, base);
+            return cors(Response::builder().status(200))
+                .header(header::CONTENT_TYPE, "application/dash+xml")
+                .header(header::CACHE_CONTROL, "no-cache")
+                .body(out.into_bytes())
+                .unwrap();
+        }
+        let out = rewrite_playlist(&text, &final_url, &h, base);
         return cors(Response::builder().status(200))
             .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
             .header(header::CACHE_CONTROL, "no-cache")
@@ -212,7 +454,7 @@ pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
     let mut rb = apply(client().get(&target), &h);
     if let Some(r) = req.headers().get(header::RANGE).and_then(|v| v.to_str().ok()) {
         let capped = match r.strip_prefix("bytes=").and_then(|s| s.strip_suffix('-')).and_then(|s| s.parse::<u64>().ok()) {
-            Some(start) if !looks_playlist => format!("bytes={}-{}", start, start + RANGE_CHUNK - 1),
+            Some(start) if !looks_playlist && !looks_dash => format!("bytes={}-{}", start, start + RANGE_CHUNK - 1),
             _ => r.to_string(),
         };
         rb = rb.header(header::RANGE, capped);
@@ -242,12 +484,27 @@ pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
         || ctype.contains("mpegurl")
         || body.starts_with(b"#EXTM3U")
         || body.get(..3) == Some(b"\xEF\xBB\xBF") && body[3..].starts_with(b"#EXTM3U");
+    let is_dash = looks_dash
+        || ctype.contains("dash+xml")
+        || {
+            let head = String::from_utf8_lossy(&body[..body.len().min(MPD_SNIFF_WINDOW)]);
+            head.contains("<MPD")
+        };
     let mut b = cors(Response::builder().status(status.as_u16()));
     if is_playlist && status.is_success() {
         let text = String::from_utf8_lossy(&body);
         let out = rewrite_playlist(&text, &final_url, &h, base);
         return b
             .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .body(out.into_bytes())
+            .unwrap();
+    }
+    if is_dash && status.is_success() {
+        let text = String::from_utf8_lossy(&body);
+        let out = rewrite_mpd(&text, &final_url, &h, base);
+        return b
+            .header(header::CONTENT_TYPE, "application/dash+xml")
             .header(header::CACHE_CONTROL, "no-cache")
             .body(out.into_bytes())
             .unwrap();
@@ -315,14 +572,72 @@ mod tests {
 
     #[test]
     fn rewrites_relative_and_attribute_uris() {
-        let pl = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXTINF:4,\nseg1.ts\nhttps://cdn.x/seg2.ts\n";
+        let pl = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXT-X-CUSTOM:URI=\"a.bin\",FALLBACK,URI=\"b.bin\"\n#EXTINF:4,\nseg1.ts\nhttps://cdn.x/seg2.ts\n";
         let h = Hdrs { referer: Some("https://e.x/".into()), ..Default::default() };
         let out = rewrite_playlist(pl, "https://cdn.x/v/1080/index.m3u8", &h, "http://abxs.localhost");
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines[1].starts_with("#EXT-X-KEY:METHOD=AES-128,URI=\"http://abxs.localhost/p?u="));
-        let seg = lines[3].split("u=").nth(1).unwrap().split('&').next().unwrap();
+        assert_eq!(lines[2].matches("http://abxs.localhost/p?u=").count(), 2);
+        let seg = lines[4].split("u=").nth(1).unwrap().split('&').next().unwrap();
         assert_eq!(String::from_utf8(B64.decode(seg).unwrap()).unwrap(), "https://cdn.x/v/1080/seg1.ts");
-        assert!(lines[4].starts_with("http://abxs.localhost/p?u="));
+        assert!(lines[5].starts_with("http://abxs.localhost/p?u="));
+    }
+
+    #[test]
+    fn rewrites_dash_mpd_urls() {
+        let mpd = r#"<?xml version="1.0"?><MPD><Period><BaseURL>tracks/</BaseURL><AdaptationSet><SegmentTemplate initialization="init.m4s" media="seg1.m4s"/></AdaptationSet></Period></MPD>"#;
+        let h = Hdrs { referer: Some("https://e.x/".into()), ..Default::default() };
+        let out = rewrite_mpd(mpd, "https://cdn.x/dash/manifest.mpd", &h, "http://abxs.localhost");
+        assert!(out.contains("<BaseURL>http://abxs.localhost/p?u="));
+        assert!(out.contains("initialization=\"http://abxs.localhost/p?u="));
+        assert!(out.contains("media=\"http://abxs.localhost/p?u="));
+        // XML must escape `&` as `&amp;` and never emit bare `&h=`.
+        assert!(!out.contains("&h="));
+        assert!(out.contains("&amp;h="));
+    }
+
+    #[test]
+    fn rewrites_dash_mpd_scoped_base_urls_and_segment_templates() {
+        let mpd = r#"<?xml version="1.0"?>
+<MPD>
+  <Period id="p1">
+    <BaseURL serviceLocation="cdn1">tracks/</BaseURL>
+    <AdaptationSet mimeType="video/mp4">
+      <BaseURL>video/</BaseURL>
+      <SegmentTemplate initialization="init-$RepresentationID$.m4s" media="chunk-$RepresentationID$-$Number%05d$.m4s"/>
+    </AdaptationSet>
+    <AdaptationSet mimeType="audio/mp4">
+      <BaseURL serviceLocation="audio">audio/</BaseURL>
+      <SegmentTemplate initialization="init-audio.m4s?tok=1&amp;v=2" media="seg-$Time$.m4s"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+        let h = Hdrs { referer: Some("https://e.x/".into()), ..Default::default() };
+        let out = rewrite_mpd(mpd, "https://cdn.x/dash/manifest.mpd", &h, "http://abxs.localhost");
+
+        // `<BaseURL serviceLocation="cdn1">` with attributes must be rewritten with XML-escaped `&amp;h=`.
+        assert!(out.contains("<BaseURL serviceLocation=\"cdn1\">http://abxs.localhost/p?u="));
+        assert!(!out.contains("&h="));
+        assert!(!out.contains("&t="));
+        // Template tokens must remain unencoded in `&amp;t=` rather than hidden inside Base64 `?u=`.
+        assert!(out.contains("&amp;t=init-$RepresentationID$.m4s\""));
+        assert!(out.contains("&amp;t=chunk-$RepresentationID$-$Number%05d$.m4s\""));
+        assert!(out.contains("&amp;t=seg-$Time$.m4s\""));
+
+        // Verify sibling AdaptationSet `<BaseURL>audio/</BaseURL>` resolved against `tracks/` (not `tracks/video/`)
+        // and unescaped `&amp;` before Base64 encoding.
+        let audio_init_u = out
+            .split("<BaseURL serviceLocation=\"audio\">")
+            .nth(1)
+            .unwrap()
+            .split("initialization=\"http://abxs.localhost/p?u=")
+            .nth(1)
+            .unwrap()
+            .split("&amp;")
+            .next()
+            .unwrap();
+        let decoded_audio_init = String::from_utf8(B64.decode(audio_init_u).unwrap()).unwrap();
+        assert_eq!(decoded_audio_init, "https://cdn.x/dash/tracks/audio/init-audio.m4s?tok=1&v=2");
     }
 
     #[test]

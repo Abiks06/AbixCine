@@ -1,8 +1,30 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PlaybackRequest } from "../lib/types";
-import { recordPlayback, resetHealth } from "./health";
-import { candLine, clearResolveCache, initialCandidateIndex, PROVIDERS, resolveSources, score } from "./registry";
-import type { Sniffed } from "./native";
+import { getEntry, saveProgress } from "../lib/progress";
+import { getSettings } from "../lib/settings";
+import {
+  CIRCUIT_STREAK_THRESHOLD,
+  isCircuitOpen,
+  lastPick,
+  recordLookupFailure,
+  recordPlayback,
+  recordProbe,
+  resetHealth,
+  serverHealthScore,
+} from "./health";
+import {
+  availableSources,
+  candLine,
+  clearResolveCache,
+  initialCandidateIndex,
+  probeHedged,
+  PROVIDERS,
+  quickCheck,
+  resolveSources,
+  score,
+  validateManifest,
+} from "./registry";
+import { isUrlTokenExpired, normalizeHeaders, proxyUrl, unwrapProxyUrl, type Sniffed } from "./native";
 import type { SourceProvider, StreamCandidate } from "./types";
 
 const { mockSniff } = vi.hoisted(() => ({ mockSniff: vi.fn() }));
@@ -38,7 +60,10 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => clearResolveCache());
+afterEach(() => {
+  clearResolveCache();
+  resetHealth();
+});
 
 describe("source ranking", () => {
   it("starts from the explicitly chosen source even when its preflight failed", () => {
@@ -180,6 +205,8 @@ describe("source ranking", () => {
       const result = await resolveSources(request("test:later-embed"), undefined, { verifyBudget: 2, record: false });
 
       expect(result.find((c) => c.providerId === "seventh")?.probe?.ok).toBe(true);
+      // Failed embeds are explicitly marked probe.ok === false instead of left as standby
+      expect(result.find((c) => c.providerId === "first")?.probe?.ok).toBe(false);
     } finally {
       PROVIDERS.splice(0, PROVIDERS.length, ...original);
     }
@@ -232,5 +259,168 @@ describe("source ranking", () => {
       resetHealth();
       PROVIDERS.splice(0, PROVIDERS.length, ...original);
     }
+  });
+});
+
+describe("true stream readiness validation", () => {
+  it("rejects HTTP 200 HTML error / Cloudflare captcha pages and empty playlists", () => {
+    expect(validateManifest("<!DOCTYPE html><html><body>Attention Required! | Cloudflare</body></html>", "https://cdn.example/master.m3u8").ok).toBe(false);
+    expect(validateManifest("#EXTM3U\n#EXT-X-VERSION:3\n", "https://cdn.example/master.m3u8").ok).toBe(false);
+    expect(validateManifest("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=1920x1080\n", "https://cdn.example/master.m3u8").ok).toBe(false);
+    expect(validateManifest("#EXTM3U\n#EXTINF:6.0,\nerror.ts", "https://cdn.example/master.m3u8").ok).toBe(false);
+  });
+
+  it("validates genuine HLS master/media playlists and DASH .mpd manifests", () => {
+    const hlsMaster = validateManifest(
+      "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=4500000,RESOLUTION=1920x1080\n1080p/index.m3u8\n",
+      "https://cdn.example/master.m3u8",
+    );
+    expect(hlsMaster.ok).toBe(true);
+    expect(hlsMaster.quality).toBe(1080);
+    expect(hlsMaster.hasVariants).toBe(true);
+
+    const dashMpd = validateManifest(
+      `<?xml version="1.0"?><MPD><Period><AdaptationSet><Representation height="720"><SegmentTemplate media="seg-$Number$.m4s"/></Representation></AdaptationSet></Period></MPD>`,
+      "https://cdn.example/manifest.mpd",
+      "application/dash+xml",
+    );
+    expect(dashMpd.ok).toBe(true);
+    expect(dashMpd.kind).toBe("dash");
+    expect(dashMpd.quality).toBe(720);
+  });
+
+  it("detects expired token timestamps on raw and proxied stream URLs", async () => {
+    const now = Date.now();
+    const pastSec = Math.floor((now - 60_000) / 1000);
+    const futureSec = Math.floor((now + 3600_000) / 1000);
+
+    const expiredRaw = `https://cdn.example/hls/master.m3u8?token=abc&expires=${pastSec}`;
+    const validRaw = `https://cdn.example/hls/master.m3u8?token=abc&expires=${futureSec}`;
+    const expiredProxied = proxyUrl(expiredRaw, { referer: "https://vidfast.vc/" });
+
+    expect(isUrlTokenExpired(expiredRaw, now)).toBe(true);
+    expect(isUrlTokenExpired(expiredProxied, now)).toBe(true);
+    expect(isUrlTokenExpired(validRaw, now)).toBe(false);
+
+    const check = await quickCheck({
+      ...candidate("vidfast"),
+      url: expiredProxied,
+      kind: "hls",
+      via: "sniffed",
+    });
+    expect(check.ok).toBe(false);
+    expect(check.error).toBe("token expired");
+  });
+});
+
+describe("header, proxy & watch-history hygiene", () => {
+  it("configures all 14 embed servers with normalized Referer, Origin, and User-Agent headers", () => {
+    expect(availableSources).toHaveLength(14);
+    const s = getSettings();
+    for (const src of availableSources) {
+      expect(src.headers?.referer).toMatch(/^https:\/\/[^/]+\/$/);
+      expect(src.headers?.origin).toMatch(/^https:\/\/[^/]+$/);
+      expect(src.headers?.ua).toContain("Mozilla/5.0");
+      const provider = PROVIDERS.find((p) => p.id === src.id);
+      expect(provider?.isEnabled(s)).toBe(true);
+    }
+  });
+
+  it("prevents double-proxying and derives Origin from Referer automatically", () => {
+    const h = normalizeHeaders({ referer: "https://vidlink.pro/movie/603" });
+    expect(h.origin).toBe("https://vidlink.pro");
+    expect(h.ua).toContain("Mozilla/5.0");
+
+    const once = proxyUrl("https://cdn.example/master.m3u8", { referer: "https://vidlink.pro/" });
+    const twice = proxyUrl(once, { origin: "https://vidlink.pro" });
+    const unwrapped = unwrapProxyUrl(twice);
+    expect(unwrapped.proxied).toBe(true);
+    expect(unwrapped.url).toBe("https://cdn.example/master.m3u8");
+    expect(unwrapped.headers.referer).toBe("https://vidlink.pro/");
+    expect(unwrapped.headers.origin).toBe("https://vidlink.pro");
+  });
+
+  it("clears stale provider picks when a previously watched show's provider fails on a new URL", () => {
+    const req1: PlaybackRequest = {
+      media: { key: "tmdb:tv:1399", kind: "tv", title: "Show", overview: "", genres: [] },
+      season: 1,
+      episode: 1,
+    };
+    const req2: PlaybackRequest = { ...req1, episode: 2 };
+    recordPlayback(req1, { ...candidate("vidfast"), url: "https://cdn.example/ep1-token1.m3u8" }, true);
+    expect(lastPick(req2)?.providerId).toBe("vidfast");
+
+    // When vidfast fails on episode 2 with a different URL, the stale show-level pick is cleared
+    recordPlayback(req2, { ...candidate("vidfast"), url: "https://cdn.example/ep2-token2.m3u8" }, false);
+    expect(lastPick(req2)).toBeUndefined();
+  });
+
+  it("preserves malId and originalLanguage in watch-history progress entries", () => {
+    saveProgress({
+      media: {
+        key: "anilist:21",
+        kind: "anime",
+        title: "One Piece",
+        overview: "Long overview",
+        genres: ["Action"],
+        malId: 21,
+        ...({ originalLanguage: "ja" } as any),
+      },
+      episode: 5,
+      position: 120,
+      duration: 1400,
+    });
+    const entry = getEntry("anilist:21");
+    expect(entry?.media.malId).toBe(21);
+    expect((entry?.media as any)?.originalLanguage).toBe("ja");
+  });
+});
+
+describe("hedged probing & circuit breaker", () => {
+  it("trips the circuit breaker after consecutive failures and recovers on success without breaking manual selection", () => {
+    for (let i = 0; i < CIRCUIT_STREAK_THRESHOLD; i++) {
+      recordLookupFailure("dead-srv", 8000);
+    }
+    expect(isCircuitOpen("dead-srv")).toBe(true);
+    expect(serverHealthScore("dead-srv", 15)).toBeLessThan(serverHealthScore("healthy-srv", 15) - 30);
+
+    // Manual selection in the UI still works even when circuit is open
+    const cands = [
+      { ...candidate("healthy-srv"), probe: { ok: true, latencyMs: 100 } },
+      { ...candidate("dead-srv"), probe: { ok: false, latencyMs: 8000, error: "timeout" } },
+    ];
+    expect(initialCandidateIndex(cands, "dead-srv")).toBe(1);
+
+    // A single successful probe closes the circuit breaker immediately
+    recordProbe({ ...candidate("dead-srv"), probe: { ok: true, latencyMs: 250 } });
+    expect(isCircuitOpen("dead-srv")).toBe(false);
+  });
+
+  it("cancels losing concurrent probes immediately via AbortController once a winner resolves", async () => {
+    const aborted: string[] = [];
+    mockSniff.mockImplementation((url: string, _timeout?: number, signal?: AbortSignal) => {
+      const id = new URL(url).hostname.split(".")[0];
+      if (id === "winner") {
+        return Promise.resolve({
+          url: "https://media.example/master.m3u8",
+          kind: "hls",
+          headers: {},
+          subtitles: [],
+          verified: true,
+          quality: 1080,
+        });
+      }
+      return new Promise<Sniffed | null>((resolve) => {
+        signal?.addEventListener("abort", () => {
+          aborted.push(id);
+          resolve(null);
+        }, { once: true });
+      });
+    });
+
+    const batch = [candidate("slow1"), candidate("winner"), candidate("slow2")];
+    const out = await probeHedged(batch, { concurrency: 3, maxWinners: 1 });
+    expect(out.find((c) => c.providerId === "winner")?.probe?.ok).toBe(true);
+    expect(aborted).toEqual(expect.arrayContaining(["slow1", "slow2"]));
   });
 });

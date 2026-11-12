@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { sized } from "./Art";
 import { getAuth, leaveGuest, signOut } from "../lib/account";
 import { encodeKey } from "../lib/catalog";
+import { playHref } from "../lib/play";
 import { matchParts, peekSearch, searchAll } from "../lib/search";
 import { rememberQuery, rememberTitle, useSearchHistory } from "../lib/history";
 import { getSettings, updateSettings } from "../lib/settings";
@@ -70,11 +71,17 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
     setBusy(true);
     const t = setTimeout(
       () =>
-        searchAll(term).then((r) => {
-          if (!live) return;
-          setResults(r);
-          setBusy(false);
-        }),
+        searchAll(term)
+          .then((r) => {
+            if (!live) return;
+            setResults(r);
+            setBusy(false);
+          })
+          .catch(() => {
+            if (!live) return;
+            setResults([]);
+            setBusy(false);
+          }),
       180,
     );
     return () => {
@@ -118,7 +125,7 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
       play: () => {
         if (remember) rememberQuery(term);
         rememberTitle(m);
-        nav(`/watch/${encodeKey(m.key)}`, { viewTransition: true });
+        nav(playHref(m), { viewTransition: true });
       },
     });
     // Empty box: recent searches (fill the box) and titles you opened from search.
@@ -169,6 +176,10 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
             aria-activedescendant={cur ? `pal-${sel}` : undefined}
             onChange={(e) => setQ(e.target.value)}
             onKeyDown={(e) => {
+              if (!items.length) {
+                if (e.key === "Escape") { e.preventDefault(); q ? setQ("") : onClose(); }
+                return;
+              }
               const last = items.length - 1;
               if (e.key === "ArrowDown") { e.preventDefault(); setSel((s) => (s >= last ? 0 : s + 1)); }
               else if (e.key === "ArrowUp") { e.preventDefault(); setSel((s) => (s <= 0 ? last : s - 1)); }
@@ -190,7 +201,7 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
                   {it.media ? (
                     <span className="pal-thumb" style={it.media.poster ? { backgroundImage: `url(${sized(it.media.poster, "w92")})` } : { ["--h" as any]: it.media.hue ?? 260 }} />
                   ) : (
-                    <span className="pal-icon"><Icon name={it.icon!} size={16} /></span>
+                    <span className="pal-icon"><Icon name={it.icon ?? "arrowR"} size={16} /></span>
                   )}
                   <span className="pal-label">{parts ? <>{parts[0]}<mark>{parts[1]}</mark>{parts[2]}</> : it.label}</span>
                   {it.hint && <span className="pal-hint">{it.hint}</span>}

@@ -20,7 +20,12 @@ export function SmartSource({ req, what, onPlay }: { req: PlaybackRequest; what:
   const [all, setAll] = useState(false);
 
   useEffect(() => {
-    if (!enabled.length) return;
+    if (!enabled.length) {
+      setCands(null);
+      setRanked([]);
+      setEvents({});
+      return;
+    }
     let live = true;
     const ctl = new AbortController();
     setCands(null);
@@ -84,8 +89,8 @@ export function SmartSource({ req, what, onPlay }: { req: PlaybackRequest; what:
               <button
                 key={p.id}
                 className={`sm-row ${st} ${best && top?.url === best.url ? "win" : ""}`}
-                disabled={st !== "ok"}
-                onClick={() => onPlay(top!.url)}
+                disabled={st !== "ok" || !top}
+                onClick={() => top && onPlay(top.providerId)}
                 style={{ ["--i" as any]: i }}
                 title={st === "ok" ? `Play from ${p.name}` : undefined}
               >

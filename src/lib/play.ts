@@ -15,16 +15,27 @@ const isAnime = (m: Pick<Media, "key" | "kind">) => m.key.startsWith("anilist:")
  * What a bare "Play" on a title should start: the saved resume / up-next point, else the first
  * episode of a series, else the film. Anime always carries the viewer's sub/dub choice.
  */
-export function playTarget(m: Pick<Media, "key" | "kind">): { s?: number; e?: number; a?: Audio } {
-  const p = getEntry(m.key);
-  const a = isAnime(m) ? p?.audio ?? audioFor(m.key) : undefined;
-  if (p) return { s: p.season, e: p.episode, a };
-  if (m.key.startsWith("tmdb:tv:")) return { s: 1, e: 1, a };
-  if (m.key.startsWith("anilist:")) return { e: 1, a };
+export function playTarget(
+  m: Pick<Media, "key" | "kind"> & { canonicalKey?: string },
+): { s?: number; e?: number; a?: Audio } {
+  const canonical = m.canonicalKey ?? m.key;
+  const p = getEntry(canonical, [m.key]);
+  const a = isAnime(m) ? p?.audio ?? audioFor(canonical, [m.key]) : undefined;
+  const isTv = m.key.startsWith("tmdb:tv:") || m.kind === "tv";
+  const isAni = isAnime(m) && m.kind !== "movie";
+  if (p) {
+    return {
+      s: p.season ?? (isTv ? 1 : undefined),
+      e: p.episode ?? (isTv || isAni ? 1 : undefined),
+      a,
+    };
+  }
+  if (isTv) return { s: 1, e: 1, a };
+  if (isAni) return { e: 1, a };
   return { a };
 }
 
-export function playHref(m: Pick<Media, "key" | "kind">) {
+export function playHref(m: Pick<Media, "key" | "kind"> & { canonicalKey?: string }) {
   const t = playTarget(m);
-  return watchHref(m.key, t.s, t.e, t.a);
+  return watchHref(m.canonicalKey ?? m.key, t.s, t.e, t.a);
 }

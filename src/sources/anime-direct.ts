@@ -1,6 +1,6 @@
 import { cached } from "../lib/cache";
 import type { PlaybackRequest } from "../lib/types";
-import { httpFetch, native, proxyUrl, type StreamHeaders } from "./native";
+import { DEFAULT_UA, httpFetch, native, normalizeHeaders, proxyUrl, type StreamHeaders } from "./native";
 import type { SourceProvider, StreamCandidate, SubtitleTrack } from "./types";
 
 /**
@@ -13,12 +13,34 @@ import type { SourceProvider, StreamCandidate, SubtitleTrack } from "./types";
 
 const HOST = "https://zokoanime.video";
 const KEY = new TextEncoder().encode("otaku-embed-v1");
-const STREAM_HEADERS: StreamHeaders = { referer: `${HOST}/`, origin: HOST };
+const STREAM_HEADERS: StreamHeaders = normalizeHeaders({ referer: `${HOST}/`, origin: HOST, ua: DEFAULT_UA }, HOST);
 
-function decodeConfig(blob: string): any {
-  const raw = Uint8Array.from(atob(blob), (c) => c.charCodeAt(0));
-  const out = raw.map((b, i) => b ^ KEY[i % KEY.length]);
-  return JSON.parse(new TextDecoder().decode(out));
+interface DecodedRange {
+  start: number;
+  end: number;
+}
+
+interface DecodedSubtitle {
+  src?: string;
+  lang?: string;
+  label?: string;
+}
+
+interface DecodedConfig {
+  src?: string;
+  subtitles?: DecodedSubtitle[];
+  skip?: { intro?: DecodedRange; outro?: DecodedRange };
+}
+
+function decodeConfig(blob: string): DecodedConfig | null {
+  try {
+    const raw = Uint8Array.from(atob(blob), (c) => c.charCodeAt(0));
+    const out = raw.map((b, i) => b ^ KEY[i % KEY.length]);
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(out));
+    return parsed && typeof parsed === "object" ? (parsed as DecodedConfig) : null;
+  } catch {
+    return null;
+  }
 }
 
 const ANILIST = "https://graphql.anilist.co";
@@ -33,20 +55,28 @@ export async function malIdFor(req: PlaybackRequest): Promise<number | null> {
   const season = req.season ?? 1;
   const base = req.media.originalTitle || req.media.title;
   const q = season > 1 ? `${req.media.title} season ${season}` : base;
-  return cached(`mal:${req.media.key}:s${season}`, 7 * 24 * 3600_000, async () => {
-    const res = await fetch(ANILIST, {
-      method: "POST",
-      headers: { "content-type": "application/json", accept: "application/json" },
-      body: JSON.stringify({
-        query: `query($q:String){ Page(perPage:6){ media(type:ANIME,search:$q,sort:SEARCH_MATCH){ idMal format seasonYear } } }`,
-        variables: { q },
-      }),
+  try {
+    return await cached(`mal:${req.media.key}:s${season}`, 7 * 24 * 3600_000, async () => {
+      const res = await fetch(ANILIST, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({
+          query: `query($q:String){ Page(perPage:6){ media(type:ANIME,search:$q,sort:SEARCH_MATCH){ idMal format seasonYear } } }`,
+          variables: { q },
+        }),
+      });
+      if (!res.ok) throw new Error(`AniList ${res.status}`);
+      const list: { idMal: number | null; format: string; seasonYear?: number }[] = (await res.json())?.data?.Page?.media ?? [];
+      const tv = list.filter((m) => m.idMal && m.format !== "MOVIE" && m.format !== "MUSIC");
+      const mediaYear = req.media.year;
+      const byYear = season === 1 && mediaYear != null ? tv.find((m) => m.seasonYear && Math.abs(m.seasonYear - mediaYear) <= 1) : undefined;
+      const idMal = (byYear ?? tv[0])?.idMal ?? null;
+      if (!idMal) throw new Error("no MAL match");
+      return idMal;
     });
-    const list: { idMal: number | null; format: string; seasonYear?: number }[] = (await res.json())?.data?.Page?.media ?? [];
-    const tv = list.filter((m) => m.idMal && m.format !== "MOVIE" && m.format !== "MUSIC");
-    const byYear = season === 1 && req.media.year ? tv.find((m) => m.seasonYear && Math.abs(m.seasonYear - req.media.year!) <= 1) : undefined;
-    return (byYear ?? tv[0])?.idMal ?? null;
-  });
+  } catch {
+    return null;
+  }
 }
 
 export const animeDirectProvider: SourceProvider = {
@@ -56,40 +86,41 @@ export const animeDirectProvider: SourceProvider = {
   priority: 26,
   timeoutMs: 12_000,
   isEnabled: (s) => native && !s.disabledSources?.includes("hianime"),
-  async find(req: PlaybackRequest): Promise<StreamCandidate[]> {
+  async find(req: PlaybackRequest, _s, signal): Promise<StreamCandidate[]> {
     const isAnime = req.media.kind === "anime" || req.media.key.startsWith("anilist:");
-    if (!isAnime) return [];
+    if (!isAnime || signal.aborted) return [];
     const mal = await malIdFor(req);
-    if (!mal) return [];
-    const ep = req.episode ?? 1;
+    if (!mal || signal.aborted) return [];
+    const ep = req.courEpisode ?? req.episode ?? 1;
     const audio = req.audio ?? "sub";
     const page = `${HOST}/stream/mal/${mal}/${ep}/${audio}`;
-    const t0 = performance.now();
-    const res = await httpFetch(page, { Referer: "https://hianime.at/" });
+    const res = await httpFetch(page, { Referer: "https://hianime.at/", Origin: "https://hianime.at", "User-Agent": DEFAULT_UA });
+    if (res.status < 200 || res.status >= 300) return [];
     const blob = res.body.match(/window\.__P="([^"]*)"/)?.[1];
     if (!blob) return [];
     const cfg = decodeConfig(blob);
-    const src: string | undefined = cfg?.src;
+    const src = typeof cfg?.src === "string" ? cfg.src : undefined;
     if (!src) return [];
-    const subtitles: SubtitleTrack[] = (cfg.subtitles ?? [])
-      .filter((s: any) => s?.src)
+    const subtitles: SubtitleTrack[] = (Array.isArray(cfg?.subtitles) ? cfg.subtitles : [])
+      .filter((s): s is DecodedSubtitle & { src: string } => typeof s?.src === "string" && s.src.length > 0)
       // The player mislabels every track's lang as "en"; the label is the reliable part.
-      .map((s: any) => ({ lang: String(s.label ?? s.lang ?? "und"), label: String(s.label ?? "Subtitles").replace(/\s*\(-.*\)$/, ""), url: proxyUrl(s.src, STREAM_HEADERS) }));
-    const sk = cfg.skip ?? {};
-    const range = (r: any): [number, number] | undefined => (r && r.end > r.start ? [r.start, r.end] : undefined);
+      .map((s) => ({ lang: String(s.label ?? s.lang ?? "und"), label: String(s.label ?? "Subtitles").replace(/\s*\(-.*\)$/, ""), url: proxyUrl(s.src, STREAM_HEADERS, HOST) }));
+    const sk = cfg?.skip ?? {};
+    const range = (r?: DecodedRange): [number, number] | undefined =>
+      r && typeof r.start === "number" && typeof r.end === "number" && r.end > r.start ? [r.start, r.end] : undefined;
     return [
       {
         providerId: "hianime",
         providerName: "HiAnime",
         label: `Episode ${ep} · ${audio === "dub" ? "English dub" : "Japanese · subtitled"}`,
-        url: proxyUrl(src, STREAM_HEADERS),
+        url: proxyUrl(src, STREAM_HEADERS, HOST),
+        pageUrl: page,
+        headers: STREAM_HEADERS,
         kind: "hls",
         via: "direct",
         audio,
         subtitles,
         skip: { intro: range(sk.intro), outro: range(sk.outro) },
-        // Already fetched and decoded: that's the reachability check.
-        probe: { ok: true, latencyMs: Math.round(performance.now() - t0) },
       },
     ];
   },

@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState, lazy, Suspense } from "react";
+import { Component, type ErrorInfo, type ReactNode, useEffect, useLayoutEffect, useRef, useState, lazy, Suspense } from "react";
 import { isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { createHashRouter, Outlet, RouterProvider, useLocation, useNavigationType } from "react-router-dom";
@@ -21,6 +21,49 @@ import { Title } from "./pages/Title";
 
 // The player pulls in hls.js (~600 kB), so load it only when you press play.
 const Watch = lazy(() => import("./pages/Watch").then((m) => ({ default: m.Watch })));
+
+class RouteErrorBoundary extends Component<{ resetKey: string; children: ReactNode }, { error: Error | null }> {
+  state: { error: Error | null } = { error: null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+
+  componentDidUpdate(prevProps: { resetKey: string }) {
+    if (prevProps.resetKey !== this.props.resetKey && this.state.error) {
+      this.setState({ error: null });
+    }
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error("AbixCine route error:", error, info);
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="page empty">
+          <p>Something went wrong on this screen ({this.state.error.message || "unexpected error"}).</p>
+          <div style={{ display: "flex", gap: 10, justifyContent: "center", marginTop: 12 }}>
+            <button className="btn play sm" onClick={() => this.setState({ error: null })}>
+              Try again
+            </button>
+            <button
+              className="btn glass sm"
+              onClick={() => {
+                this.setState({ error: null });
+                window.location.hash = "#/";
+              }}
+            >
+              Back to Home
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 void bootAccount();
 const SKIP_SPLASH = getSettings().reduceMotion || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
@@ -100,7 +143,9 @@ function Shell() {
           {!watching && <TitleBar onOpenPalette={() => setPalette(true)} />}
           {!watching && <Rail />}
           <main ref={main} className="main" onScroll={onScroll}>
-            <Outlet />
+            <RouteErrorBoundary resetKey={loc.pathname}>
+              <Outlet />
+            </RouteErrorBoundary>
           </main>
           <CommandPalette open={palette} onClose={() => setPalette(false)} />
           {!watching && <UpdateToast />}

@@ -19,10 +19,48 @@ export interface Media {
   color?: string;
   /** AniList entries: the matching MyAnimeList id, which some anime players key on. */
   malId?: number;
+  /** AniList entry id when resolved or mapped. */
+  anilistId?: number;
+  /** TMDB entry id when resolved or mapped. */
+  tmdbId?: number;
   /** Search results: how many seasons were folded into this entry. */
   seasonCount?: number;
   /** Fallback artwork hue when a title has no image. */
   hue?: number;
+  /** ISO 639-1 original language code (e.g. "en", "ja", "ko"). */
+  originalLanguage?: string;
+}
+
+/** A single cour or split part within a canonical anime season. */
+export interface SeasonCour {
+  /** Underlying catalog key for this cour/part (e.g. "anilist:154587"). */
+  key: string;
+  anilistId?: number;
+  malId?: number;
+  title: string;
+  /** 1-based inclusive start episode within the parent canonical season. */
+  startEpisode: number;
+  /** 1-based inclusive end episode within the parent canonical season. */
+  endEpisode: number;
+  episodeCount: number;
+  year?: number;
+}
+
+/** Canonical season representation unified across TMDB and AniList. */
+export interface CanonicalSeason {
+  /** 1-based season number for mainline seasons; 0 (or negative/special index) for Specials. */
+  number: number;
+  name: string;
+  episodeCount: number;
+  year?: number;
+  airDate?: string;
+  status?: "aired" | "airing" | "upcoming" | "special";
+  /** Primary catalog key for this season (e.g. "anilist:154587" or "tmdb:tv:1399"). */
+  key?: string;
+  anilistId?: number;
+  malId?: number;
+  /** Ordered cours/parts folded into this canonical season (multi-cour anime). */
+  cours?: SeasonCour[];
 }
 
 export interface Episode {
@@ -34,12 +72,25 @@ export interface Episode {
   runtime?: number;
   airDate?: string;
   rating?: number;
+  /** For multi-cour anime: the specific cour's catalog key, MAL id, and cour-relative episode number. */
+  sourceKey?: string;
+  malId?: number;
+  courEpisode?: number;
 }
 
 export interface MediaDetail extends Media {
   runtime?: number;
   tagline?: string;
-  seasons?: { number: number; name: string; episodeCount: number }[];
+  /** Playable mainline seasons (number > 0 and episodeCount > 0), with split cours folded. */
+  seasons?: CanonicalSeason[];
+  /** Season 0 Specials, OVAs, and spin-off shorts separated from mainline seasons. */
+  specials?: CanonicalSeason[];
+  /** Announced / TBA / unaired seasons with 0 aired episodes, excluded from the primary selector. */
+  upcomingSeasons?: CanonicalSeason[];
+  /** Root/franchise canonical key when multiple AniList entries belong to one series. */
+  canonicalKey?: string;
+  /** Which canonical season number corresponds to the specific entry key that was opened. */
+  initialSeason?: number;
   /** Absolute episode count (anime). */
   episodeCount?: number;
   trailerYouTubeId?: string;
@@ -81,6 +132,8 @@ export interface PlaybackRequest {
   media: Media;
   season?: number;
   episode?: number;
+  /** Cour-relative episode number when an anime season folds multiple AniList cours/parts. */
+  courEpisode?: number;
   /** Episode number counted across all seasons, for libraries that number anime absolutely ("Show - 26"). */
   absolute?: number;
   /** Anime only: subtitled original audio or English dub. */

@@ -1,0 +1,28 @@
+# Streaming, Playback & Resolution Architecture
+
+## 1. Stream Resolver Interfaces & Lifecycle
+- **`ManifestValidation` (`src/sources/types.ts`, `src/sources/registry.ts`):** Validates `.m3u8` (`#EXTM3U` + variant/segment URIs, `EXT-X-ERROR` rejection) and `.mpd` (`<MPD` + `<Period`/`<AdaptationSet`/`<SegmentTemplate`) bodies, rejecting HTML/Cloudflare challenge pages and expired tokens (`isUrlTokenExpired`).
+- **`HedgedProbeOptions` & `probeHedged<T>` (`src/sources/registry.ts`):** Bounded concurrent server probing (`concurrency`, `hedgeDelayMs`, `maxWinners`). Each batch arms an `AbortController` that immediately cancels in-flight losers once `maxWinners` playable candidates win, and cleans up caller `AbortSignal` listeners on completion.
+- **Header & Proxy Hygiene (`src/sources/native.ts`):** `normalizeHeaders()` auto-derives `Origin` from `Referer` and sets `DEFAULT_UA`; `proxyUrl()` prevents double-proxying (`unwrapProxyUrl()`); `isUrlTokenExpired()` checks query/path expiry epochs before replay.
+- **Cooperative Native Sniffing & Local Proxy (`src/sources/native.ts`, `src-tauri/src/shield.rs`, `src-tauri/src/stream.rs`):** `sniff()` passes a per-request `cancelId` to `sniff_media` and invokes `cancel_sniff` on `AbortSignal` abort, immediately destroying the hidden WebView2 window and releasing its `Semaphore(4)` permit. `stream.rs` rewrites all `URI="..."` attributes per HLS tag line as well as `<BaseURL>` and segment attributes (`initialization`, `media`, `sourceURL`) in DASH `.mpd` manifests against the post-redirect `final_url`.
+- **Canonical Multi-Cour & Multi-Season Playback (`src/lib/normalizer.ts`, `src/pages/Title.tsx`, `src/pages/Watch.tsx`, `src/sources/embeds.ts`, `src/sources/anime-direct.ts`):** Both `Title.tsx` and `Watch.tsx` route through `resolvePlaybackRequest`, `resolveNextEpisode`, and `getSeasonEpisodes`. Native anime providers (`embeds.ts`, `anime-direct.ts`) use `req.courEpisode ?? req.episode` with the cour's `anilistId`/`malId`, while TMDB/Jellyfin/Local providers use canonical `req.season` and `req.episode`. `resolveTmdbId` scores candidates by `kind`, normalized title, and `year` with a bounded 200-entry LRU cache and per-caller `AbortSignal` isolation.
+- **WebGPU / WebGL2 Upscaler (`src/lib/enhance.ts`):** Locks timestamp query readback (`reading = true`) synchronously at `device.queue.submit()` to prevent overlapping `qset`/`qbuf`/`rbuf` writes under `MAX_INFLIGHT = 2`, and destroys intermediate `Anime4KPipeline` output textures/buffers on `setup()` rebuilds and `stop()`.
+
+## 2. Server Health Scoring & Circuit Breaker (`src/sources/health.ts`)
+- **State (`ProviderHealth`):** Tracks `ok`, `fail`, `latencyMs` / `latency` (EMA: $0.7 \cdot \text{prev} + 0.3 \cdot \text{ms}$), `lookupMs`, `streak` (consecutive failures/timeouts), `circuitUntil`, and show-level `picks` (`abx.picks.v1` in `src/sources/health.ts`), alongside per-kind `wins` (`abx.wins.v1` in `src/sources/registry.ts`).
+- **Circuit Breaker:** At `streak >= 3` (`CIRCUIT_STREAK_THRESHOLD`), trips an exponential cooldown ($2\text{m} \cdot 2^{\min(4, \text{streak}-3)}$, max $30\text{m}$). Open circuits subtract `45` from `serverHealthScore` so healthy servers probe first while manual server switching remains available.
+- **Composite Score (`serverHealthScore`):** Combines Laplace-smoothed reliability, latency bonus ($\max(-8, 12 - \text{rtt}/400)$ where $\text{rtt} = \text{latencyMs} + \text{lookupMs}$), recent failure penalty (`-12`), and circuit-breaker penalty (`-45`). Any playback failure clears stale show-level `picks[key]` for that provider regardless of ephemeral URL rotation.
+
+## 3. Modified File Paths
+- `src/sources/types.ts` — `StreamKind` (`"dash"`), `ManifestValidation`, `HedgedProbeOptions`, candidate `headers`.
+- `src/sources/native.ts` — `normalizeHeaders`, `unwrapProxyUrl`, `isUrlTokenExpired`, `cancelId` & `cancel_sniff` in `sniff`.
+- `src/sources/embeds.ts` — Explicit per-server `Referer`/`Origin` headers across all 14 servers; year/kind-scored, LRU-bounded, abort-safe `resolveTmdbId`; `req.courEpisode ?? req.episode` in `buildAnimeUrl`.
+- `src/sources/anime-direct.ts` & `src/sources/kisskh.ts` — Unverified capture rejection, transient-safe caches, header normalization, `req.courEpisode ?? req.episode`.
+- `src/sources/jellyfin.ts` — Concurrent episode lookup (`Promise.all`).
+- `src/sources/health.ts` — `latencyMs`/`latency`, `streak`, `circuitUntil`, `isCircuitOpen`, `serverHealthScore`, `isStaleStreamUrl`, pick invalidation.
+- `src/sources/registry.ts` — `validateManifest`, `probeHedged`, `AbortSignal` propagation & listener cleanup, abortable `fetchRetry`, strict `verifyEmbed` failure recording.
+- `src/sources/registry.test.ts`, `src/__tests__/matching.test.ts`, `src/lib/enhance.test.ts` — Unit test suites for manifest validation, token expiry, hedged cancellation, circuit breaker, multi-cour/season handoff, and WebGPU enhancer lifecycle.
+- `src/lib/normalizer.ts` & `src/lib/catalog.ts` — `resolvePlaybackRequest` cour-direct mapping and `resolveNextEpisode`.
+- `src/lib/enhance.ts` — Synchronous timestamp query lock under `MAX_INFLIGHT = 2` and `destroyChain` GPU texture teardown.
+- `src/pages/Watch.tsx`, `src/pages/Title.tsx`, `src/components/Player.tsx`, `src/pages/Auth.tsx`, `src/lib/account.ts` — Unified canonical playback resolution, abort-safe player failover/switching, and abort-safe server wake polling.
+- `src-tauri/src/stream.rs`, `src-tauri/src/shield.rs`, `src-tauri/src/lib.rs` — Post-redirect playlist base URLs, multi-URI HLS tag rewriting, DASH `.mpd` manifest rewriting, and `cancel_sniff` WebView2 teardown.

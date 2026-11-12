@@ -49,7 +49,7 @@ function textScore(t: string, nq: string) {
 function relevance(m: Media, q: string, position: number) {
   const { text: stripped, year } = parseQuery(q);
   const forms = [...new Set([normTitle(q), normTitle(stripped)])];
-  const titles = [m.title, m.originalTitle].filter(Boolean).map((t) => normTitle(t!));
+  const titles = [m.title, m.originalTitle].filter((t): t is string => Boolean(t)).map((t) => normTitle(t));
   let text = 0;
   for (const t of titles) for (const f of forms) text = Math.max(text, textScore(t, f));
   const wantsMovie = /\b(movie|film)\b/i.test(q);
@@ -117,7 +117,10 @@ export function searchAll(term: string): Promise<Media[]> {
       // Don't remember an empty answer: it may just be a catalog that was briefly unreachable.
       if (value.length) {
         memo.set(id, { at: Date.now(), value });
-        if (memo.size > MAX) memo.delete(memo.keys().next().value!);
+        if (memo.size > MAX) {
+          const oldest = memo.keys().next();
+          if (!oldest.done) memo.delete(oldest.value);
+        }
       }
       return value;
     })

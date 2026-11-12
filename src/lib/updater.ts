@@ -43,8 +43,8 @@ export async function checkForUpdates(quiet = false) {
     }
     pending = u;
     set({ status: "available", version: u.version, notes: u.body ?? undefined, date: u.date ?? undefined });
-  } catch (e: any) {
-    set(quiet ? { status: "idle" } : { status: "error", message: String(e?.message ?? e) });
+  } catch (e: unknown) {
+    set(quiet ? { status: "idle" } : { status: "error", message: e instanceof Error ? e.message : String(e) });
   }
 }
 
@@ -65,8 +65,8 @@ export async function installUpdate() {
     });
     const { relaunch } = await import("@tauri-apps/plugin-process");
     await relaunch();
-  } catch (e: any) {
-    set({ status: "error", message: String(e?.message ?? e) });
+  } catch (e: unknown) {
+    set({ status: "error", message: e instanceof Error ? e.message : String(e) });
   }
 }
 

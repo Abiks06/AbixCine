@@ -73,9 +73,9 @@ export function parseEpisode(name: string, path = ""): EpisodeInfo {
 export function titleMatches(hay: string, req: Pick<PlaybackRequest, "media">) {
   const f = ` ${normTitle(hay)} `;
   return [req.media.title, req.media.originalTitle]
-    .filter(Boolean)
+    .filter((t): t is string => Boolean(t))
     .some((t) => {
-      const n = normTitle(t!);
+      const n = normTitle(t);
       return n.length > 1 && f.includes(` ${n} `);
     });
 }
@@ -108,8 +108,9 @@ export function sidecarTrack(subPath: string, videoName: string): SubtitleTrack 
 
 /** Does this file hold the requested episode? Handles multi-episode files and anime absolute numbering. */
 export function episodeMatches(ep: EpisodeInfo, req: Pick<PlaybackRequest, "season" | "episode" | "absolute">) {
-  if (req.episode == null || ep.episode == null) return false;
-  const inFile = (n: number) => n >= ep.episode! && n <= (ep.last ?? ep.episode!);
+  const epNum = ep.episode;
+  if (req.episode == null || epNum == null) return false;
+  const inFile = (n: number) => n >= epNum && n <= (ep.last ?? epNum);
   if (ep.season != null && req.season != null) return ep.season === req.season && inFile(req.episode);
   // File has no season ("Show - 26.mkv"): it's absolute numbering, or season 1.
   if (ep.season == null && req.season != null && req.season > 1) return req.absolute != null && inFile(req.absolute);

@@ -5,7 +5,34 @@ import type { SourceProvider, StreamCandidate, SubtitleTrack } from "./types";
  * Jellyfin (or Emby, same API shape) media server. Uses an API key created in
  * Dashboard > API Keys. Streams come back as HLS so the server transcodes to whatever the device can play.
  */
-async function jf<T = any>(base: string, key: string, path: string, params: Record<string, string>, signal: AbortSignal) {
+interface JellyfinMediaStream {
+  Type?: string;
+  Language?: string;
+  Index?: number;
+  IsTextSubtitleStream?: boolean;
+  DisplayTitle?: string;
+  Title?: string;
+}
+
+interface JellyfinMediaSource {
+  Id?: string;
+  MediaStreams?: JellyfinMediaStream[];
+}
+
+interface JellyfinItem {
+  Id: string;
+  Name: string;
+  ProductionYear?: number;
+  Height?: number;
+  IndexNumber?: number;
+  MediaSources?: JellyfinMediaSource[];
+}
+
+interface JellyfinItemsResponse {
+  Items?: JellyfinItem[];
+}
+
+async function jf<T = JellyfinItemsResponse>(base: string, key: string, path: string, params: Record<string, string>, signal: AbortSignal) {
   const u = new URL(base.replace(/\/$/, "") + path);
   for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
   const res = await fetch(u, { headers: { "X-Emby-Token": key }, signal });
@@ -27,10 +54,10 @@ const SUB_LANGS = ["jpn", "ja"];
  * (Jellyfin converts SRT/ASS on the fly; image subtitles like PGS can't be shown in a browser).
  * Returns null when the item clearly lacks the requested audio.
  */
-function tracksFor(base: string, key: string, item: any, want?: "sub" | "dub") {
+function tracksFor(base: string, key: string, item: JellyfinItem, want?: "sub" | "dub") {
   const b = base.replace(/\/$/, "");
   const src = item.MediaSources?.[0];
-  const streams: any[] = src?.MediaStreams ?? [];
+  const streams: JellyfinMediaStream[] = src?.MediaStreams ?? [];
   const sourceId: string = src?.Id ?? item.Id;
   const audios = streams.filter((st) => st.Type === "Audio");
   let audioIndex: number | undefined;
@@ -46,7 +73,7 @@ function tracksFor(base: string, key: string, item: any, want?: "sub" | "dub") {
     else audio = "unknown";
   }
   const subtitles: SubtitleTrack[] = streams
-    .filter((st) => st.Type === "Subtitle" && (st.IsTextSubtitleStream ?? true))
+    .filter((st) => st.Type === "Subtitle" && (st.IsTextSubtitleStream ?? true) && st.Index != null)
     .map((st) => ({
       lang: String(st.Language ?? "und"),
       label: st.DisplayTitle || st.Title || st.Language || `Track ${st.Index}`,
@@ -71,35 +98,41 @@ export const jellyfinProvider: SourceProvider = {
       Fields: "ProductionYear,MediaSources,Width,Height",
       Limit: "5",
     }, signal);
-    let items: any[] = found.Items ?? [];
-    if (req.media.year) {
-      const near = items.filter((i) => !i.ProductionYear || Math.abs(i.ProductionYear - req.media.year!) <= 1);
+    let items: JellyfinItem[] = found.Items ?? [];
+    const mediaYear = req.media.year;
+    if (mediaYear != null) {
+      const near = items.filter((i) => !i.ProductionYear || Math.abs(i.ProductionYear - mediaYear) <= 1);
       if (near.length) items = near;
     }
-    const out: StreamCandidate[] = [];
-    for (const item of items.slice(0, 2)) {
-      let target = item;
-      if (!isMovie && req.episode != null) {
-        const eps = await jf(url, apiKey, `/Shows/${item.Id}/Episodes`, {
-          ...(req.season != null ? { season: String(req.season) } : {}),
-          Fields: "MediaSources,Width,Height",
-        }, signal);
-        target = (eps.Items ?? []).find((e: any) => e.IndexNumber === req.episode);
-        if (!target) continue;
-      }
-      const t = tracksFor(url, apiKey, target, req.audio);
-      if (!t) continue;
-      out.push({
-        providerId: "jellyfin",
-        providerName: "Jellyfin server",
-        label: target.Name + (target.Height ? ` · ${target.Height}p` : "") + (t.audio === "dual" ? " · dual audio" : ""),
-        url: streamUrl(url, apiKey, target.Id, t.sourceId, t.audioIndex),
-        kind: "hls",
-        quality: target.Height || undefined,
-        audio: t.audio,
-        subtitles: t.subtitles,
-      });
-    }
-    return out;
+    const resolved = await Promise.all(
+      items.slice(0, 2).map(async (item): Promise<StreamCandidate | null> => {
+        try {
+          let target: JellyfinItem | undefined = item;
+          if (!isMovie && req.episode != null) {
+            const eps = await jf(url, apiKey, `/Shows/${item.Id}/Episodes`, {
+              ...(req.season != null ? { season: String(req.season) } : {}),
+              Fields: "MediaSources,Width,Height",
+            }, signal);
+            target = (eps.Items ?? []).find((e) => e.IndexNumber === req.episode);
+            if (!target) return null;
+          }
+          const t = tracksFor(url, apiKey, target, req.audio);
+          if (!t) return null;
+          return {
+            providerId: "jellyfin",
+            providerName: "Jellyfin server",
+            label: target.Name + (target.Height ? ` · ${target.Height}p` : "") + (t.audio === "dual" ? " · dual audio" : ""),
+            url: streamUrl(url, apiKey, target.Id, t.sourceId, t.audioIndex),
+            kind: "hls",
+            quality: target.Height || undefined,
+            audio: t.audio,
+            subtitles: t.subtitles,
+          };
+        } catch {
+          return null;
+        }
+      }),
+    );
+    return resolved.filter((c): c is StreamCandidate => c !== null);
   },
 };

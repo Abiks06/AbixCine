@@ -27,40 +27,66 @@ export function Settings() {
   const [, setHealthTick] = useState(0);
   const upd = useUpdate();
   const [version, setVersion] = useState("");
-  useEffect(() => void appVersion().then(setVersion), []);
+  const mountedRef = useRef(true);
+  const jfCtlRef = useRef<AbortController | null>(null);
+  useEffect(() => {
+    mountedRef.current = true;
+    void appVersion().then((v) => mountedRef.current && setVersion(v));
+    return () => {
+      mountedRef.current = false;
+      jfCtlRef.current?.abort();
+    };
+  }, []);
 
   useEffect(() => {
     if (loc.hash === "#sources") sourcesRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   }, [loc.hash]);
 
   const addFolder = async () => {
-    const dir = await open({ directory: true, multiple: false, title: "Add a media folder" });
-    if (typeof dir === "string" && !s.libraryPaths.includes(dir)) {
-      const paths = [...s.libraryPaths, dir];
-      updateSettings({ libraryPaths: paths });
-      rescan(paths);
+    try {
+      const dir = await open({ directory: true, multiple: false, title: "Add a media folder" });
+      if (!mountedRef.current) return;
+      if (typeof dir === "string" && !s.libraryPaths.includes(dir)) {
+        const paths = [...s.libraryPaths, dir];
+        updateSettings({ libraryPaths: paths });
+        rescan(paths);
+      }
+    } catch (e: unknown) {
+      if (mountedRef.current) setScan(`Couldn't open folder picker: ${e instanceof Error ? e.message : String(e)}`);
     }
   };
   const rescan = async (paths = s.libraryPaths) => {
     setScan("Scanning…");
     try {
       const files = await scanLibrary(paths, true);
-      setScan(`${files.length} video files indexed`);
-    } catch (e: any) {
-      setScan(`Scan failed: ${e?.message ?? e}`);
+      if (mountedRef.current) setScan(`${files.length} video files indexed`);
+    } catch (e: unknown) {
+      if (mountedRef.current) setScan(`Scan failed: ${e instanceof Error ? e.message : String(e)}`);
     }
   };
   const testJellyfin = async () => {
+    const snap = jf;
+    const base = snap.url.trim().replace(/\/$/, "");
+    if (!/^https?:\/\//i.test(base)) {
+      setJfTest("Enter an http:// or https:// server address.");
+      return;
+    }
+    jfCtlRef.current?.abort();
+    const ctl = new AbortController();
+    jfCtlRef.current = ctl;
     setJfTest("Testing…");
     try {
-      const r = await fetch(jf.url.replace(/\/$/, "") + "/System/Info", { headers: { "X-Emby-Token": jf.apiKey } });
+      const r = await fetch(base + "/System/Info", { headers: { "X-Emby-Token": snap.apiKey }, signal: ctl.signal });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const j = await r.json();
+      if (!mountedRef.current || ctl.signal.aborted) return;
       setJfTest(`Connected to ${j.ServerName} (v${j.Version})`);
-      updateSettings({ jellyfin: { ...jf, enabled: true } });
-      setJf({ ...jf, enabled: true });
-    } catch (e: any) {
-      setJfTest(`Couldn't connect: ${e?.message ?? e}`);
+      const next = { ...snap, url: base, enabled: true };
+      updateSettings({ jellyfin: next });
+      setJf(next);
+    } catch (e: unknown) {
+      if (!mountedRef.current || ctl.signal.aborted) return;
+      setJfTest(`Couldn't connect: ${e instanceof Error ? e.message : String(e)}`);
     }
   };
 
@@ -84,7 +110,7 @@ export function Settings() {
         <section className="panel">
           <h2>Account</h2>
           <div className="account-row">
-            <button className="avatar-cycle" title="Change color" onClick={() => updateProfile({ avatarHue: (user.avatarHue + 47) % 360 }).catch((e) => setProfileMsg(errorMessage(e)))}>
+            <button className="avatar-cycle" title="Change color" onClick={() => updateProfile({ avatarHue: (user.avatarHue + 47) % 360 }).catch((e) => mountedRef.current && setProfileMsg(errorMessage(e)))}>
               <Avatar user={user} size={56} />
             </button>
             <div className="account-info">
@@ -92,8 +118,8 @@ export function Settings() {
                 <input value={name} onChange={(e) => setName(e.target.value)} aria-label="Display name" />
                 <button
                   className="btn btn-glass sm"
-                  disabled={!name.trim() || name === user.name}
-                  onClick={() => updateProfile({ name }).then(() => setProfileMsg("Saved"), (e) => setProfileMsg(errorMessage(e)))}
+                  disabled={!name.trim() || name.trim() === user.name}
+                  onClick={() => updateProfile({ name: name.trim() }).then(() => mountedRef.current && setProfileMsg("Saved"), (e) => mountedRef.current && setProfileMsg(errorMessage(e)))}
                 >
                   Save
                 </button>
@@ -126,13 +152,13 @@ export function Settings() {
           <div className="field-row" style={{ marginBottom: "12px" }}>
             <button
               className="btn btn-glass sm"
-              onClick={() => updateSettings({ disabledSources: [] })}
+              onClick={() => updateSettings({ disabledSources: [], enabledExtras: availableSources.filter((x) => x.extra).map((x) => x.id) })}
             >
               Enable all
             </button>
             <button
               className="btn btn-glass sm"
-              onClick={() => updateSettings({ disabledSources: availableSources.map((x) => x.id) })}
+              onClick={() => updateSettings({ disabledSources: [...DIRECT_SOURCES.map((x) => x.id), ...availableSources.map((x) => x.id)], enabledExtras: [] })}
             >
               Disable all
             </button>
@@ -165,12 +191,11 @@ export function Settings() {
             })}
           </div>
           <p className="muted extras-note">
-            Extra servers are off by default: in testing they were offline or never handed over a stream, and checking
-            them only slows the search down. Turn any on if it works where you are.
+            Additional servers: automatically ranked by latency and reliability, with slow or unreachable hosts deprioritized by the circuit breaker.
           </p>
           <div className="source-grid">
             {availableSources.filter((src) => src.extra).map((src) => {
-              const on = !!s.enabledExtras?.includes(src.id);
+              const on = !s.disabledSources?.includes(src.id) && (s.enabledExtras == null || s.enabledExtras.includes(src.id));
               return (
                 <label key={src.id} className={`source-chip-toggle ${on ? "active" : ""}`}>
                   <input type="checkbox" checked={on} onChange={(e) => toggleSource(src.id, e.target.checked, true)} />
@@ -190,7 +215,7 @@ export function Settings() {
           {s.libraryPaths.map((p) => (
             <div key={p} className="path-row">
               <code>{p}</code>
-              <button className="icon-btn" aria-label="Remove folder" onClick={() => updateSettings({ libraryPaths: s.libraryPaths.filter((x) => x !== p) })}><Icon name="x" size={14} /></button>
+              <button className="icon-btn" aria-label="Remove folder" onClick={() => { setScan(null); updateSettings({ libraryPaths: s.libraryPaths.filter((x) => x !== p) }); }}><Icon name="x" size={14} /></button>
             </div>
           ))}
           <div className="field-row">

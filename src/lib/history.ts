@@ -20,7 +20,10 @@ const listeners = new Set<() => void>();
 function load(): History {
   try {
     const h = JSON.parse(localStorage.getItem(KEY) ?? "");
-    return { queries: h.queries ?? [], titles: h.titles ?? [] };
+    return {
+      queries: Array.isArray(h?.queries) ? h.queries : [],
+      titles: Array.isArray(h?.titles) ? h.titles : [],
+    };
   } catch {
     return { queries: [], titles: [] };
   }

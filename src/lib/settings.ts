@@ -16,12 +16,14 @@ export interface Settings {
   audioByTitle: Record<string, Audio>;
   /** IDs of disabled source providers (e.g. from availableSources). */
   disabledSources: string[];
-  /** Extra servers (off unless switched on: they're often offline). */
+  /** Extra servers (all enabled by default; circuit breaker manages health automatically). */
   enabledExtras: string[];
 }
 
 /** Settings that follow the account. Library folders and server credentials stay on this device. */
 const SYNCED: (keyof Settings)[] = ["preferredQuality", "autoplayNext", "reduceMotion", "animeAudio", "audioByTitle", "disabledSources", "enabledExtras"];
+
+const EXTRA_IDS = ["vidsrccc", "vidsrcto", "2embed", "multiembed", "embedsu", "vidsrcrip", "frembed"];
 
 const DEFAULTS: Settings = {
   tmdbKey: import.meta.env.VITE_TMDB_KEY ?? "",
@@ -33,16 +35,45 @@ const DEFAULTS: Settings = {
   animeAudio: "sub",
   audioByTitle: {},
   disabledSources: [],
-  enabledExtras: [],
+  enabledExtras: EXTRA_IDS,
 };
 
 const KEY = "abx.settings.v1";
 const listeners = new Set<() => void>();
 
+function normalizeSourceToggles(
+  partial: Partial<Settings>,
+  base: Settings,
+): Pick<Settings, "disabledSources" | "enabledExtras"> {
+  const disabled = new Set(partial.disabledSources ?? base.disabledSources ?? []);
+  if (Array.isArray(partial.enabledExtras)) {
+    if (partial.disabledSources == null) {
+      for (const id of EXTRA_IDS) {
+        if (partial.enabledExtras.includes(id)) disabled.delete(id);
+        else disabled.add(id);
+      }
+    } else {
+      for (const id of EXTRA_IDS) {
+        if (!partial.enabledExtras.includes(id)) disabled.add(id);
+      }
+    }
+  }
+  const disabledSources = [...disabled];
+  const enabledExtras = EXTRA_IDS.filter((id) => !disabled.has(id));
+  return { disabledSources, enabledExtras };
+}
+
 function load(): Settings {
   try {
     const raw = localStorage.getItem(KEY);
-    if (raw) return { ...DEFAULTS, ...JSON.parse(raw) };
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<Settings>;
+      return {
+        ...DEFAULTS,
+        ...parsed,
+        ...normalizeSourceToggles(parsed, DEFAULTS),
+      };
+    }
   } catch {
     /* storage unavailable: fall back to defaults */
   }
@@ -54,7 +85,11 @@ let current = load();
 export const getSettings = () => current;
 
 function apply(patch: Partial<Settings>) {
-  current = { ...current, ...patch };
+  const toggles =
+    patch.disabledSources !== undefined || patch.enabledExtras !== undefined
+      ? normalizeSourceToggles(patch, current)
+      : {};
+  current = { ...current, ...patch, ...toggles };
   try {
     localStorage.setItem(KEY, JSON.stringify(current));
   } catch {
@@ -69,26 +104,39 @@ export function updateSettings(patch: Partial<Settings>) {
   if (Object.keys(synced).length) push("/settings", "PUT", synced);
 }
 
-export function audioFor(mediaKey: string): Audio {
-  return current.audioByTitle[mediaKey] ?? current.animeAudio;
+export function audioFor(mediaKey: string, fallbackKeys?: (string | undefined)[]): Audio {
+  if (current.audioByTitle[mediaKey]) return current.audioByTitle[mediaKey];
+  if (fallbackKeys) {
+    for (const k of fallbackKeys) {
+      if (k && current.audioByTitle[k]) return current.audioByTitle[k];
+    }
+  }
+  return current.animeAudio;
 }
-export function setAudioFor(mediaKey: string, a: Audio) {
-  updateSettings({ audioByTitle: { ...current.audioByTitle, [mediaKey]: a } });
+export function setAudioFor(mediaKey: string, a: Audio, aliasKeys?: (string | undefined)[]) {
+  const next: Record<string, Audio> = { ...current.audioByTitle, [mediaKey]: a };
+  if (aliasKeys) {
+    for (const k of aliasKeys) {
+      if (k) next[k] = a;
+    }
+  }
+  updateSettings({ audioByTitle: next });
 }
 
 export function toggleSource(id: string, enabled: boolean, extra = false) {
+  const disabled = current.disabledSources ?? [];
+  const nextDisabled = enabled ? disabled.filter((x) => x !== id) : [...new Set([...disabled, id])];
   if (extra) {
     const list = current.enabledExtras ?? [];
-    updateSettings({ enabledExtras: enabled ? [...new Set([...list, id])] : list.filter((x) => x !== id) });
+    const nextExtras = enabled ? [...new Set([...list, id])] : list.filter((x) => x !== id);
+    updateSettings({ disabledSources: nextDisabled, enabledExtras: nextExtras });
     return;
   }
-  const list = current.disabledSources ?? [];
-  const next = enabled ? list.filter((x) => x !== id) : [...new Set([...list, id])];
-  updateSettings({ disabledSources: next });
+  updateSettings({ disabledSources: nextDisabled });
 }
 
 export function isSourceEnabled(id: string): boolean {
-  return !(current.disabledSources ?? []).includes(id);
+  return !(current.disabledSources ?? []).includes(id) && (!EXTRA_IDS.includes(id) || (current.enabledExtras ?? EXTRA_IDS).includes(id));
 }
 
 registerSync({

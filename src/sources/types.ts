@@ -1,7 +1,28 @@
 import type { Settings } from "../lib/settings";
 import type { PlaybackRequest } from "../lib/types";
+import type { StreamHeaders } from "./native";
 
-export type StreamKind = "hls" | "file" | "embed";
+export type StreamKind = "hls" | "dash" | "file" | "embed";
+
+export interface ManifestValidation {
+  ok: boolean;
+  kind?: "hls" | "dash";
+  quality?: number;
+  hasVariants?: boolean;
+  segmentCount?: number;
+  error?: string;
+}
+
+export interface HedgedProbeOptions {
+  /** Max concurrent probes per batch (default 3). */
+  concurrency?: number;
+  /** Ms before launching hedged backup probes when initial batch is slow (default 2500). */
+  hedgeDelayMs?: number;
+  /** Stop and cancel losing probes once this many valid streams win (default 1). */
+  maxWinners?: number;
+  signal?: AbortSignal;
+  onCandidate?: (c: StreamCandidate) => void;
+}
 
 export interface VideoSource {
   id: string;
@@ -16,6 +37,8 @@ export interface VideoSource {
      */
     anime?: string;
   };
+  /** Default Referer / Origin / User-Agent headers expected by this server's CDN. */
+  headers?: StreamHeaders;
   /** Query parameter the player reads as "start at N seconds", so resume and sub/dub flips keep the spot. */
   startParam?: string;
   /** Set false for players whose stream can't be captured (they then only run as a web player). */
@@ -58,6 +81,8 @@ export interface StreamCandidate {
   via?: "direct" | "sniffed" | "embed";
   /** The embed page a sniffed stream came from (also the web-player fallback). */
   pageUrl?: string;
+  /** Normalized Referer/Origin/User-Agent headers associated with this stream. */
+  headers?: StreamHeaders;
   /** Intro/outro ranges in seconds, when the source knows them. */
   skip?: { intro?: [number, number]; outro?: [number, number] };
   /** Filled in by the ranker. */

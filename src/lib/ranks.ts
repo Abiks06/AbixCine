@@ -15,7 +15,8 @@ export function rankMoves(chart: string, items: Media[]): Record<string, Move> |
   const k = `abx.ranks.${chart}`;
   let st: Store = {};
   try {
-    st = JSON.parse(localStorage.getItem(k) ?? "{}");
+    const parsed = JSON.parse(localStorage.getItem(k) ?? "{}");
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) st = parsed as Store;
   } catch {
     /* ignore */
   }

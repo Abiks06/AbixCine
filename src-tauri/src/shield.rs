@@ -296,6 +296,17 @@ mod win {
                     if host_of(&uri).is_none_or(|h| is_blocked_host(&h)) {
                         return Ok(());
                     }
+                    let status = args
+                        .Response()
+                        .ok()
+                        .and_then(|r| {
+                            let mut c = 0i32;
+                            r.StatusCode(&mut c).ok().map(|_| c)
+                        })
+                        .unwrap_or(200);
+                    if status >= 400 {
+                        return Ok(());
+                    }
                     let ctype = args
                         .Response()
                         .and_then(|r| r.Headers())
@@ -309,11 +320,13 @@ mod win {
                     let path = uri.split('?').next().unwrap_or("").to_ascii_lowercase();
                     #[cfg(debug_assertions)]
                     if std::env::var_os("ABX_SNIFF_DEBUG").is_some() {
-                        let status = args.Response().ok().and_then(|r| { let mut c = 0i32; r.StatusCode(&mut c).ok().map(|_| c) }).unwrap_or(0);
-                        println!("  RESP {status} [{ctype}] {}", &uri[..uri.len().min(160)]);
+                        let preview: String = uri.chars().take(160).collect();
+                        println!("  RESP {status} [{ctype}] {preview}");
                     }
-                    let kind = if ctype.contains("mpegurl") || path.ends_with(".m3u8") {
+                    let kind = if ctype.contains("mpegurl") || path.ends_with(".m3u8") || uri.to_ascii_lowercase().contains(".m3u8") {
                         Some("hls")
+                    } else if ctype.contains("dash+xml") || path.ends_with(".mpd") {
+                        Some("dash")
                     } else if ctype.starts_with("video/mp4") || path.ends_with(".mp4") {
                         Some("mp4")
                     } else {
@@ -385,20 +398,92 @@ const NUDGE_JS: &str = r#"
 
 fn sem() -> &'static tokio::sync::Semaphore {
     static S: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
-    S.get_or_init(|| tokio::sync::Semaphore::new(3))
+    S.get_or_init(|| tokio::sync::Semaphore::new(4))
+}
+
+struct SniffCancelEntry {
+    label: Option<String>,
+    tx: tokio::sync::watch::Sender<bool>,
+}
+
+fn cancel_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, SniffCancelEntry>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, SniffCancelEntry>>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Immediately cancel an in-flight `sniff_media` task and destroy its hidden WebView2 window.
+#[tauri::command]
+pub fn cancel_sniff(app: AppHandle, cancel_id: String) {
+    let entry = cancel_map().lock().ok().and_then(|mut m| m.remove(&cancel_id));
+    if let Some(entry) = entry {
+        let _ = entry.tx.send(true);
+        if let Some(label) = entry.label {
+            if let Some(w) = app.get_webview_window(&label) {
+                let _ = w.destroy();
+            }
+        }
+    } else if let Ok(mut m) = cancel_map().lock() {
+        let (tx, _rx) = tokio::sync::watch::channel(true);
+        m.insert(cancel_id, SniffCancelEntry { label: None, tx });
+    }
 }
 
 /// Load `url` off-screen and return the stream it plays, or None if nothing turned up in time.
 #[tauri::command]
-pub async fn sniff_media(app: AppHandle, url: String, timeout_ms: Option<u64>) -> Result<Option<Sniffed>, String> {
+pub async fn sniff_media(
+    app: AppHandle,
+    url: String,
+    timeout_ms: Option<u64>,
+    cancel_id: Option<String>,
+) -> Result<Option<Sniffed>, String> {
     use std::sync::atomic::AtomicUsize;
     static N: AtomicUsize = AtomicUsize::new(0);
     let label = format!("sniff-{}", N.fetch_add(1, Ordering::Relaxed));
+
+    let mut cancel_rx = if let Some(ref cid) = cancel_id {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let already_cancelled = if let Ok(mut m) = cancel_map().lock() {
+            if let Some(existing) = m.remove(cid) {
+                *existing.tx.borrow()
+            } else {
+                m.insert(cid.clone(), SniffCancelEntry { label: Some(label.clone()), tx });
+                false
+            }
+        } else {
+            false
+        };
+        if already_cancelled {
+            return Ok(None);
+        }
+        Some(rx)
+    } else {
+        None
+    };
+
     let budget = std::time::Duration::from_millis(timeout_ms.unwrap_or(14_000) + 6_000);
-    // Hard ceiling: whatever a page does, a check never runs past its budget, and its window goes.
-    match tokio::time::timeout(budget, sniff_inner(app.clone(), url, timeout_ms, label.clone())).await {
-        Ok(r) => r,
-        Err(_) => {
+    let fut = tokio::time::timeout(budget, sniff_inner(app.clone(), url, timeout_ms, label.clone()));
+
+    let res = match cancel_rx.as_mut() {
+        Some(rx) => {
+            tokio::select! {
+                r = fut => r.ok(),
+                _ = rx.changed() => None,
+            }
+        }
+        None => fut.await.ok(),
+    };
+
+    if let Some(ref cid) = cancel_id {
+        if let Ok(mut m) = cancel_map().lock() {
+            m.remove(cid);
+        }
+    }
+
+    // Hard ceiling or cancellation: whatever a page does, its window is destroyed on exit.
+    match res {
+        Some(r) => r,
+        None => {
             if let Some(w) = app.get_webview_window(&label) {
                 let _ = w.destroy();
             }
@@ -453,7 +538,7 @@ async fn sniff_inner(app: AppHandle, url: String, timeout_ms: Option<u64>, label
     let _ = ready_rx.await;
     dbg("shield ready");
     drop(tx);
-    let _ = win.navigate(target);
+    let _ = win.navigate(target.clone());
 
     // Many players only fetch their stream after a real click on "play". Script clicks don't
     // count as a user gesture and can't reach cross-origin or script-written frames, so send
@@ -480,24 +565,40 @@ async fn sniff_inner(app: AppHandle, url: String, timeout_ms: Option<u64>, label
         });
     }
 
+    let page_origin = target.host_str().map(|h| match target.port() {
+        Some(p) => format!("{}://{}:{}", target.scheme(), h, p),
+        None => format!("{}://{}", target.scheme(), h),
+    });
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.unwrap_or(14_000));
-    let mut found: Option<Sniffed> = None;
+    let mut candidates: Vec<Sniffed> = Vec::new();
     let mut subs: Vec<String> = Vec::new();
     loop {
         // Once a stream is found, linger briefly for a master playlist or subtitle tracks.
-        let until = match &found {
+        let until = match candidates.first() {
             Some(_) => (tokio::time::Instant::now() + std::time::Duration::from_millis(900)).min(deadline),
             None => deadline,
         };
         match tokio::time::timeout_at(until, rx.recv()).await {
-            Ok(Some(Found::Media(m))) => {
-                let better = match &found {
-                    None => true,
-                    // A master playlist beats a variant; HLS beats MP4.
-                    Some(f) => (f.kind == "mp4" && m.kind == "hls") || (!f.url.contains("master") && m.url.contains("master")),
-                };
-                if better {
-                    found = Some(m);
+            Ok(Some(Found::Media(mut m))) => {
+                if m.headers.referer.as_deref().unwrap_or("").is_empty() {
+                    if let Some(ref orig) = page_origin {
+                        m.headers.referer = Some(format!("{orig}/"));
+                    }
+                }
+                if m.headers.origin.as_deref().unwrap_or("").is_empty() {
+                    m.headers.origin = m
+                        .headers
+                        .referer
+                        .as_deref()
+                        .and_then(|r| url::Url::parse(r).ok())
+                        .and_then(|u| u.host_str().map(|h| match u.port() {
+                            Some(p) => format!("{}://{}:{}", u.scheme(), h, p),
+                            None => format!("{}://{}", u.scheme(), h),
+                        }))
+                        .or_else(|| page_origin.clone());
+                }
+                if !candidates.iter().any(|c| c.url == m.url) {
+                    candidates.push(m);
                 }
             }
             Ok(Some(Found::Subtitle(s))) => {
@@ -515,18 +616,39 @@ async fn sniff_inner(app: AppHandle, url: String, timeout_ms: Option<u64>, label
         let _ = w.destroy();
         dbg("destroyed");
     }
-    let Some(mut f) = found else { return Ok(None) };
-    f.subtitles = subs;
-    // Check the playlist right here, from Rust: it warms the connection to the video host and
-    // leaves the playlist cached for the player's first request.
-    if f.kind == "hls" {
-        match crate::stream::verify_playlist(&f.url, &f.headers).await {
-            Some(q) => {
-                f.verified = Some(true);
-                f.quality = (q > 0).then_some(q);
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    // Prefer HLS master playlists over variant playlists, and HLS/DASH over progressive MP4.
+    candidates.sort_by_key(|m| {
+        let rank_kind = match m.kind {
+            "hls" if m.url.contains("master") => 0,
+            "hls" => 1,
+            "dash" => 2,
+            _ => 3,
+        };
+        rank_kind
+    });
+    let mut fallback: Option<Sniffed> = None;
+    for mut f in candidates {
+        f.subtitles = subs.clone();
+        if f.kind == "hls" {
+            match crate::stream::verify_playlist(&f.url, &f.headers).await {
+                Some(q) => {
+                    f.verified = Some(true);
+                    f.quality = (q > 0).then_some(q);
+                    return Ok(Some(f));
+                }
+                None => {
+                    f.verified = Some(false);
+                    if fallback.is_none() {
+                        fallback = Some(f);
+                    }
+                }
             }
-            None => f.verified = Some(false),
+        } else {
+            return Ok(Some(f));
         }
     }
-    Ok(Some(f))
+    Ok(fallback)
 }

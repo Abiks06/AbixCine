@@ -3,12 +3,13 @@ import { convertFileSrc, invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { fmtTime } from "../lib/format";
-import { ENHANCE_MODES, startEnhancer, webgpuAvailable, type EnhanceMode, type Enhancer, type EnhancerStats } from "../lib/enhance";
+import { ENHANCE_MODES, startEnhancer, upscalerAvailable, type EnhanceMode, type Enhancer, type EnhancerStats } from "../lib/enhance";
 import { decodeSubtitle, langBase, loadSubPref, loadSubtitle, preferredAudioTrackIndex, saveSubPref, toVtt, type CueSize, type SubPref } from "../lib/subtitles";
 import type { Audio } from "../lib/settings";
 import type { Episode } from "../lib/types";
 import type { StreamCandidate } from "../sources/types";
-import { initialCandidateIndex, verifyEmbed } from "../sources/registry";
+import { isUrlTokenExpired } from "../sources/native";
+import { initialCandidateIndex, probeHedged, verifyEmbed } from "../sources/registry";
 import { AudioToggle } from "./AudioToggle";
 import { Icon } from "./Icon";
 
@@ -43,8 +44,6 @@ interface Props {
   onBack: () => void;
   /** Re-run the source search when every candidate has died. */
   onRetry?: () => void;
-  /** Count down into the next episode when this one ends. */
-  autoplayNext?: boolean;
   nextLabel?: string;
   audio?: Audio;
   onAudio?: (a: Audio) => void;
@@ -115,7 +114,7 @@ function withStart(url: string, param: string | undefined, at: number) {
  * { timestamp, duration }, or { event: "time", time, duration }. Read any of them.
  */
 function readEmbedMessage(raw: unknown): { time?: number; duration?: number; ended?: boolean } | null {
-  let d: any = raw;
+  let d: unknown = raw;
   if (typeof d === "string") {
     try {
       d = JSON.parse(d);
@@ -124,8 +123,9 @@ function readEmbedMessage(raw: unknown): { time?: number; duration?: number; end
     }
   }
   if (!d || typeof d !== "object") return null;
-  const p = d.data && typeof d.data === "object" ? d.data : d;
-  const ev = String(p.event ?? d.event ?? p.type ?? "").toLowerCase();
+  const obj = d as Record<string, unknown>;
+  const p = obj.data && typeof obj.data === "object" ? (obj.data as Record<string, unknown>) : obj;
+  const ev = String(p.event ?? obj.event ?? p.type ?? "").toLowerCase();
   const num = (...v: unknown[]) => v.map(Number).find((n) => Number.isFinite(n) && n >= 0);
   const time = num(p.currentTime, p.time, p.timestamp);
   const duration = num(p.duration);
@@ -143,7 +143,7 @@ function loadEnhance(): EnhanceMode {
   }
 }
 
-export function Player({ candidates: given, initialSource, onSourceResult, title, subtitle, startAt, onProgress, onEnded, onNext, autoNext, onBack, audio, onAudio, originalLanguage, episodes, media }: Props) {
+export function Player({ candidates: given, initialSource, onSourceResult, title, subtitle, startAt, onProgress, onEnded, onNext, autoNext, nextLabel, onBack, audio, onAudio, originalLanguage, episodes, media }: Props) {
   const wrap = useRef<HTMLDivElement>(null);
   const video = useRef<HTMLVideoElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
@@ -174,6 +174,8 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
   const [isFull, setIsFull] = useState(false);
   const [levels, setLevels] = useState<{ height: number }[]>([]);
   const [level, setLevel] = useState(-1);
+  const [activeLevel, setActiveLevel] = useState(-1);
+  const [videoHeight, setVideoHeight] = useState<number | undefined>(undefined);
   const [hover, setHover] = useState<{ x: number; t: number; w: number } | null>(null);
   /** The ±seconds badge that appears on the side you skipped towards; repeated presses add up. */
   const [bump, setBump] = useState<{ total: number; n: number } | null>(null);
@@ -194,12 +196,25 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
   curRef.current = cur;
 
   const toastTimer = useRef<number>();
+  const mountedRef = useRef(true);
+  const verifyCtlRef = useRef<AbortController | null>(null);
+  const verifyGenRef = useRef(0);
   const flash = (msg: string) => {
+    if (!mountedRef.current) return;
     setToast(msg);
     clearTimeout(toastTimer.current);
     toastTimer.current = window.setTimeout(() => setToast(null), 2600);
   };
-  useEffect(() => () => clearTimeout(toastTimer.current), []);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      verifyCtlRef.current?.abort();
+      verifyCtlRef.current = null;
+      clearTimeout(toastTimer.current);
+      clearTimeout(bumpTimer.current);
+    };
+  }, []);
 
   /* ---------------------------------------------------------------- playhead */
 
@@ -236,6 +251,38 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
       let next = list.findIndex((c, j) => j > i && usable(c, j));
       if (next === -1) next = list.findIndex(usable);
       if (next === -1) {
+        const standbys = list.filter((c, j) => j !== i && !c.probe && c.kind === "embed");
+        if (standbys.length > 0) {
+          verifyCtlRef.current?.abort();
+          const ctl = new AbortController();
+          verifyCtlRef.current = ctl;
+          const gen = ++verifyGenRef.current;
+          flash(`Checking backup servers (${why})…`);
+          void probeHedged(standbys.slice(0, 6), {
+            concurrency: 3,
+            maxWinners: 1,
+            signal: ctl.signal,
+            onCandidate: (r) => {
+              if (!mountedRef.current || ctl.signal.aborted || gen !== verifyGenRef.current) return;
+              setPatched((p) => ({ ...p, [r.pageUrl ?? r.url]: r }));
+            },
+          }).then((checked) => {
+            if (!mountedRef.current || ctl.signal.aborted || gen !== verifyGenRef.current) return;
+            const winner = checked.find((r) => r.probe?.ok);
+            if (winner) {
+              const wid = winner.pageUrl ?? winner.url;
+              const targetIdx = candsRef.current.findIndex((x) => (x.pageUrl ?? x.url) === wid);
+              if (targetIdx >= 0) {
+                flash(`Switched to ${winner.providerName} (${why})`);
+                setIdx(targetIdx);
+              }
+            } else {
+              flash(`Playback failed: ${why}`);
+              setSheet("servers");
+            }
+          });
+          return i;
+        }
         flash(`Playback failed: ${why}`);
         setSheet("servers");
         return i;
@@ -302,7 +349,7 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     const hls = hlsRef.current;
     if (hls) {
       hls.subtitleDisplay = false;
-      hls.subtitleTrack = t?.kind === "hls" ? t.hlsIndex! : -1;
+      hls.subtitleTrack = t?.kind === "hls" && t.hlsIndex != null ? t.hlsIndex : -1;
     }
     setSelectedSub(t ? t.id : null);
   }, []);
@@ -334,12 +381,12 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     }
     if (manualSub.current) return;
     const wantOn = pref.on ?? audio === "sub";
-    applySub(wantOn && subTracks.length ? preferredTrack(subTracks)!.id : null);
+    applySub(wantOn && subTracks.length ? preferredTrack(subTracks)?.id ?? null : null);
   }, [subTracks]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const toggleSub = () => {
     if (!subTracks.length) return flash("No subtitles for this server");
-    chooseSub(selectedSub ? null : preferredTrack(subTracks)!.id);
+    chooseSub(selectedSub ? null : preferredTrack(subTracks)?.id ?? null);
   };
 
   const addSubtitle = async (file?: File) => {
@@ -390,7 +437,14 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     Promise.all(
       list.map((s, i) =>
         loadSubtitle(s.url, ctl.signal)
-          .then((src) => (blobs.push(src), { id: `file-${i}`, label: s.label || s.lang || `Track ${i + 1}`, lang: s.lang, kind: "file" as const, src }))
+          .then((src) => {
+            if (ctl.signal.aborted) {
+              URL.revokeObjectURL(src);
+              return null;
+            }
+            blobs.push(src);
+            return { id: `file-${i}`, label: s.label || s.lang || `Track ${i + 1}`, lang: s.lang, kind: "file" as const, src };
+          })
           .catch(() => null),
       ),
     ).then((tracks) => {
@@ -422,10 +476,10 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
       const cues = bound?.activeCues;
       if (!cues) return;
       for (let i = 0; i < cues.length; i++) {
-        const c = cues[i] as VTTCue;
+        const c = cues[i] as VTTCue | (TextTrackCue & { text?: string });
         const line = document.createElement("span");
         line.className = "cue";
-        line.append(typeof c.getCueAsHTML === "function" ? c.getCueAsHTML() : document.createTextNode((c as any).text ?? ""));
+        line.append("getCueAsHTML" in c && typeof c.getCueAsHTML === "function" ? c.getCueAsHTML() : document.createTextNode(c.text ?? ""));
         box.append(line);
       }
     };
@@ -584,6 +638,8 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
 
   /* ---------------------------------------------------------- attach source */
 
+  const refreshedUrlsRef = useRef(new Set<string>());
+
   useEffect(() => {
     const c = curRef.current;
     if (!c) return;
@@ -599,6 +655,8 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     setOffset(0);
     setLevels([]);
     setLevel(-1);
+    setActiveLevel(-1);
+    setVideoHeight(undefined);
     setTime(0);
     setDur(0);
     hlsRef.current?.destroy();
@@ -612,6 +670,12 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     const v = video.current;
     if (!v) return;
     setWaiting(true);
+    // Reset any previous stream immediately so the upscaler never reads stale readyState/dimensions
+    // while hls.js or local media preparation loads asynchronously, and enforce anonymous CORS.
+    v.pause();
+    v.removeAttribute("src");
+    v.crossOrigin = "anonymous";
+    v.load();
 
     const seekAndPlay = () => {
       if (resumeAt.current > 0 && resumeAt.current < (v.duration || Infinity) - 5) v.currentTime = resumeAt.current;
@@ -621,22 +685,35 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     let cancelled = false;
     const loadFile = (url: string) => {
       if (cancelled) return;
+      v.crossOrigin = "anonymous";
       v.src = url;
       v.addEventListener("loadedmetadata", seekAndPlay, { once: true });
     };
-    const attachHls = (H: typeof Hls) => {
+    const attachHls = (H: typeof Hls, streamUrl: string) => {
       if (cancelled) return;
+      v.crossOrigin = "anonymous";
       if (!H.isSupported()) {
-        v.src = c.url;
+        v.src = streamUrl;
         v.addEventListener("loadedmetadata", seekAndPlay, { once: true });
         return;
       }
-      const hls = new H({ enableWorker: true, lowLatencyMode: false, maxBufferLength: 60, backBufferLength: 30 });
+      const hls = new H({
+        enableWorker: true,
+        lowLatencyMode: false,
+        maxBufferLength: 60,
+        backBufferLength: 30,
+        xhrSetup: (xhr) => {
+          xhr.withCredentials = false;
+        },
+      });
       hlsRef.current = hls;
       hls.subtitleDisplay = false;
       hls.on(H.Events.MANIFEST_PARSED, (_, d) => {
         setLevels(d.levels.map((l) => ({ height: l.height })));
         seekAndPlay();
+      });
+      hls.on(H.Events.LEVEL_SWITCHED, (_, d) => {
+        setActiveLevel(d.level);
       });
       hls.on(H.Events.AUDIO_TRACKS_UPDATED, (_, d) => {
         setAudioTracks((d.audioTracks ?? []).map((t, i) => ({
@@ -662,29 +739,62 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
           hls.recoverMediaError();
         } else failover(d.details);
       });
-      hls.loadSource(c.url);
+      hls.loadSource(streamUrl);
       hls.attachMedia(v);
     };
-    // hls.js (~600 kB) is only parsed when a stream actually needs it; local files never load it.
-    if (c.kind === "hls") {
-      import("hls.js").then((m) => attachHls(m.default), () => failover("player failed to load"));
-    } else {
-      if (c.localPath) {
+    const attachStream = (target: StreamCandidate) => {
+      // hls.js (~600 kB) is only parsed when a stream actually needs it; local files never load it.
+      if (target.kind === "hls") {
+        import("hls.js").then((m) => attachHls(m.default, target.url), () => !cancelled && failover("player failed to load"));
+      } else if (target.localPath) {
         setPreparingLocal(true);
-        invoke<string>("prepare_local_media", { path: c.localPath })
+        invoke<string>("prepare_local_media", { path: target.localPath })
           .then((path) => {
+            if (cancelled) return;
             setPreparingLocal(false);
             loadFile(convertFileSrc(path));
           })
           .catch((error: unknown) => {
+            if (cancelled) return;
             setPreparingLocal(false);
             setWaiting(false);
-            if (!cancelled) failover(`audio conversion failed: ${error instanceof Error ? error.message : String(error)}`);
+            failover(`audio conversion failed: ${error instanceof Error ? error.message : String(error)}`);
           });
       } else {
-        loadFile(c.url);
+        loadFile(target.url);
       }
+    };
+    // Re-validate and refresh stale/expired stream URLs before playback.
+    const candidateId = c.pageUrl ?? c.url;
+    if (c.pageUrl && isUrlTokenExpired(c.url) && !refreshedUrlsRef.current.has(candidateId)) {
+      refreshedUrlsRef.current.add(candidateId);
+      const refreshCtl = new AbortController();
+      void verifyEmbed(c, refreshCtl.signal)
+        .then((refreshed) => {
+          if (cancelled || refreshCtl.signal.aborted || !mountedRef.current) return;
+          setPatched((p) => ({ ...p, [candidateId]: refreshed }));
+          if (!refreshed.probe?.ok) {
+            failover(refreshed.probe?.error ?? "expired stream");
+            return;
+          }
+          if (refreshed.url === c.url) {
+            attachStream(refreshed);
+          }
+        })
+        .catch((err: unknown) => {
+          if (cancelled || refreshCtl.signal.aborted || !mountedRef.current) return;
+          failover(err instanceof Error ? err.message : "expired stream refresh failed");
+        });
+      return () => {
+        cancelled = true;
+        refreshCtl.abort();
+        v.removeEventListener("loadedmetadata", seekAndPlay);
+        if (v.currentTime > 1) resumeAt.current = v.currentTime;
+        hlsRef.current?.destroy();
+        hlsRef.current = null;
+      };
     }
+    attachStream(c);
     return () => {
       cancelled = true;
       v.removeEventListener("loadedmetadata", seekAndPlay);
@@ -727,10 +837,12 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
 
   const [enhance, setEnhance] = useState<EnhanceMode>(loadEnhance);
   const [enhancing, setEnhancing] = useState<"idle" | "starting" | "on" | "error">("idle");
+  const [enhError, setEnhError] = useState<string | null>(null);
   const [enhStats, setEnhStats] = useState<EnhancerStats | null>(null);
   /** Embeds get a CSS colour/contrast lift instead: their pixels are cross-origin. */
   const [vivid, setVivid] = useState(() => localStorage.getItem("abx.vivid") === "1");
   const pickEnhance = (m: EnhanceMode) => {
+    setEnhError(null);
     setEnhance(m);
     try { localStorage.setItem(ENHANCE_KEY, m); } catch { /* ignore */ }
   };
@@ -740,46 +852,68 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
 
   useEffect(() => {
     const v = video.current, c = canvas.current;
-    if (enhance === "off" || isEmbed || !v || !c) {
+    if (enhance === "off" || isEmbed || preparingLocal || !v || !c) {
       setEnhancing("idle");
+      setEnhError(null);
+      setEnhStats(null);
       return;
     }
+    const ac = new AbortController();
     let stopped = false;
     let eng: Enhancer | null = null;
     setEnhancing("starting");
+    setEnhError(null);
     startEnhancer(v, c, enhance, {
+      signal: ac.signal,
       // The governor stepped down because the GPU couldn't keep up: say so, and stop if it reached "off".
       onDowngrade: (to, why) => {
+        if (stopped) return;
         if (to === "off") {
           eng?.stop();
           eng = null;
-          setEnhancing("idle");
+          setEnhancing("error");
+          setEnhError("GPU couldn't keep up at this resolution — switched to native video");
           setEnhStats(null);
           flash("Enhancement turned off: this GPU can't keep up at this size");
           return;
         }
         flash(`Enhancement eased to ${ENHANCE_MODES.find((m) => m.id === to)?.name} (${why})`);
       },
+      // Hardware context loss, uncaptured shader error, or CORS taint: fall back to native <video>.
+      onFallback: (why) => {
+        if (stopped) return;
+        eng?.stop();
+        eng = null;
+        setEnhancing("error");
+        setEnhError(why);
+        setEnhStats(null);
+        flash(why);
+      },
     })
       .then((e) => {
-        if (stopped) return e.stop();
+        if (stopped || ac.signal.aborted) return e.stop();
         eng = e;
         setEnhancing("on");
+        setEnhStats(e.stats());
       })
       .catch((err) => {
-        if (stopped) return;
+        if (stopped || ac.signal.aborted) return;
+        const msg = err?.message ?? String(err);
         setEnhancing("error");
-        flash(`Enhancement unavailable: ${err?.message ?? err}`);
+        setEnhError(msg);
+        setEnhStats(null);
+        flash(`Enhancement fallback (native video): ${msg}`);
       });
     // Live stats for the Picture panel (GPU time per frame, chain, skipped frames).
     const statTimer = window.setInterval(() => eng && setEnhStats(eng.stats()), 1000);
     return () => {
       stopped = true;
+      ac.abort();
       clearInterval(statTimer);
       eng?.stop();
       setEnhStats(null);
     };
-  }, [enhance, cur?.url, isEmbed]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [enhance, cur?.url, isEmbed, preparingLocal]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* ------------------------------------------------------------- the rest */
 
@@ -897,19 +1031,40 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
 
   const switchTo = async (i: number) => {
     if (i === idx) return;
+    verifyCtlRef.current?.abort();
+    verifyCtlRef.current = null;
+    const gen = ++verifyGenRef.current;
     let c = candidates[i];
+    if (!c) return;
+    const id = c.pageUrl ?? c.url;
     // A standby server hasn't been checked yet: capture its stream first, play only if it has the title.
     if (!c.probe && c.kind === "embed") {
-      const id = c.pageUrl ?? c.url;
+      const ctl = new AbortController();
+      verifyCtlRef.current = ctl;
       setChecking(id);
-      const r = await verifyEmbed(c);
+      let r: StreamCandidate;
+      try {
+        r = await verifyEmbed(c, ctl.signal);
+      } catch (err) {
+        if (!mountedRef.current || ctl.signal.aborted || gen !== verifyGenRef.current) return;
+        setChecking(null);
+        flash(`Couldn't verify ${c.providerName}: ${err instanceof Error ? err.message : "check failed"}`);
+        return;
+      }
+      if (!mountedRef.current || ctl.signal.aborted || gen !== verifyGenRef.current) return;
       setChecking(null);
       setPatched((p) => ({ ...p, [id]: r }));
       if (!r.probe?.ok) return flash(`${c.providerName} doesn't have this one`);
       c = r;
+    } else {
+      setChecking(null);
     }
+    if (!mountedRef.current || gen !== verifyGenRef.current) return;
+    const targetIdx = candsRef.current.findIndex((x) => (x.pageUrl ?? x.url) === id);
+    const nextIdx = targetIdx >= 0 ? targetIdx : i;
+    if (nextIdx >= candsRef.current.length || nextIdx === idx) return;
     saveNow();
-    setIdx(i);
+    setIdx(nextIdx);
     flash(`Now playing from ${c.providerName}${resumeAt.current > 5 ? ` at ${fmtTime(resumeAt.current)}` : ""}`);
   };
   /** "Not playing right?": move to the next server that isn't known to be missing the title. */
@@ -932,61 +1087,63 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
   const [upNextDismissed, setUpNextDismissed] = useState(false);
   const showUpNext = !!onNext && !upNextDismissed && remaining <= UP_NEXT_AT && remaining > 0.5 && clock.duration > 120;
 
-  // Keyboard shortcuts.
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      const el = e.target as HTMLElement | null;
-      if (el?.tagName === "INPUT" || el?.tagName === "TEXTAREA") return;
-      // Ctrl+K and friends belong to the app, not the player (Ctrl+K used to pause as well).
-      if (e.ctrlKey || e.metaKey || e.altKey) return;
-      poke();
-      // Letters work with Caps Lock on.
-      const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
-      if (keysOpen && k !== "?") {
-        setKeysOpen(false);
-        if (k === "Escape") return;
-      }
-      if (k >= "0" && k <= "9" && k.length === 1) {
+  // Keyboard shortcuts (bound once via ref so timeupdate ticks don't re-bind the window listener).
+  const onKeyRef = useRef<(e: KeyboardEvent) => void>();
+  onKeyRef.current = (e: KeyboardEvent) => {
+    const el = e.target as HTMLElement | null;
+    if (el?.tagName === "INPUT" || el?.tagName === "TEXTAREA") return;
+    // Ctrl+K and friends belong to the app, not the player (Ctrl+K used to pause as well).
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    poke();
+    // Letters work with Caps Lock on.
+    const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+    if (keysOpen && k !== "?") {
+      setKeysOpen(false);
+      if (k === "Escape") return;
+    }
+    if (k >= "0" && k <= "9" && k.length === 1) {
+      const v = video.current;
+      if (v?.duration) seekTo((Number(k) / 10) * v.duration);
+      return;
+    }
+    switch (k) {
+      case " ": case "k": e.preventDefault(); toggle(); break;
+      case "ArrowLeft": seek(e.shiftKey ? -30 : -5); break;
+      case "ArrowRight": seek(e.shiftKey ? 30 : 5); break;
+      case "j": seek(-10); break;
+      case "l": seek(10); break;
+      case "ArrowUp": e.preventDefault(); changeVol(0.1); break;
+      case "ArrowDown": e.preventDefault(); changeVol(-0.1); break;
+      case "m": setMuted((x) => !x); break;
+      case "c": toggleSub(); break;
+      case "s": setSheet((x) => (x === "servers" ? null : "servers")); break;
+      case "e": if (episodes) setSheet((x) => (x === "episodes" ? null : "episodes")); break;
+      case "[": if (selectedSub?.startsWith("file")) nudge(-0.5); break;
+      case "]": if (selectedSub?.startsWith("file")) nudge(0.5); break;
+      case "<": changeSpeed(-1); break;
+      case ">": changeSpeed(1); break;
+      case ",": case ".": {
+        // Frame step, the way editors do it: only while paused.
         const v = video.current;
-        if (v?.duration) seekTo((Number(k) / 10) * v.duration);
-        return;
+        if (v && v.paused && !isEmbed) seekTo(v.currentTime + (k === "." ? 1 : -1) / 24);
+        break;
       }
-      switch (k) {
-        case " ": case "k": e.preventDefault(); toggle(); break;
-        case "ArrowLeft": seek(e.shiftKey ? -30 : -5); break;
-        case "ArrowRight": seek(e.shiftKey ? 30 : 5); break;
-        case "j": seek(-10); break;
-        case "l": seek(10); break;
-        case "ArrowUp": e.preventDefault(); changeVol(0.1); break;
-        case "ArrowDown": e.preventDefault(); changeVol(-0.1); break;
-        case "m": setMuted((x) => !x); break;
-        case "c": toggleSub(); break;
-        case "s": setSheet((x) => (x === "servers" ? null : "servers")); break;
-        case "e": if (episodes) setSheet((x) => (x === "episodes" ? null : "episodes")); break;
-        case "[": if (selectedSub?.startsWith("file")) nudge(-0.5); break;
-        case "]": if (selectedSub?.startsWith("file")) nudge(0.5); break;
-        case "<": changeSpeed(-1); break;
-        case ">": changeSpeed(1); break;
-        case ",": case ".": {
-          // Frame step, the way editors do it: only while paused.
-          const v = video.current;
-          if (v && v.paused && !isEmbed) seekTo(v.currentTime + (k === "." ? 1 : -1) / 24);
-          break;
-        }
-        case "f": toggleFull(); break;
-        case "p": void togglePip(); break;
-        case "n": onNext?.(); break;
-        case "?": setKeysOpen((x) => !x); break;
-        case "Escape":
-          if (sheet) setSheet(null);
-          else if (isFull) void setFull(false);
-          else leave();
-          break;
-      }
-    };
+      case "f": toggleFull(); break;
+      case "p": void togglePip(); break;
+      case "n": onNext?.(); break;
+      case "?": setKeysOpen((x) => !x); break;
+      case "Escape":
+        if (sheet) setSheet(null);
+        else if (isFull) void setFull(false);
+        else leave();
+        break;
+    }
+  };
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => onKeyRef.current?.(e);
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  });
+  }, []);
 
   // Hardware media keys, headset buttons and the Windows media flyout.
   const nextRef = useRef(onNext);
@@ -1032,7 +1189,8 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
   const scrubRef = useRef<HTMLDivElement>(null);
   const [dragging, setDragging] = useState(false);
   const atX = (clientX: number) => {
-    const r = scrubRef.current!.getBoundingClientRect();
+    const r = scrubRef.current?.getBoundingClientRect();
+    if (!r || r.width <= 0) return { x: 0, t: 0, w: 0 };
     const f = Math.max(0, Math.min(1, (clientX - r.left) / r.width));
     return { x: f * r.width, t: f * dur, w: r.width };
   };
@@ -1062,15 +1220,15 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
   const hide = idle && playing && !sheet && !showUpNext && !dragging;
   const embedHide = isEmbed && idle && !sheet;
   const q = cur?.probe?.quality ?? cur?.quality;
-  const curLevel = level >= 0 ? levels[level]?.height : undefined;
-  const shownQ = curLevel ?? q;
+  const curLevel = level >= 0 ? levels[level]?.height : activeLevel >= 0 ? levels[activeLevel]?.height : undefined;
+  const shownQ = curLevel ?? videoHeight ?? q;
   const selTrack = subTracks.find((t) => t.id === selectedSub);
   const playable = candidates.filter((c) => c.probe?.ok).length;
   // Intro / credits skip, when the source knows where they are.
   const sk = cur?.skip;
   const inIntro = !!sk?.intro && time >= sk.intro[0] && time < sk.intro[1] - 1.5;
   const inOutro = !!sk?.outro && time >= sk.outro[0] && time < sk.outro[1] - 1.5;
-  const enhMode = ENHANCE_MODES.find((m) => m.id === enhance)!;
+  const enhMode = ENHANCE_MODES.find((m) => m.id === enhance) ?? ENHANCE_MODES[0];
   const openSheet = (s: Sheet) => setSheet((x) => (x === s ? null : s));
 
   return (
@@ -1134,6 +1292,8 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
                 if (!dragging) setTime(v.currentTime);
                 setBuffered(bufferedAhead(v));
               }}
+              onLoadedMetadata={(e) => setVideoHeight(e.currentTarget.videoHeight || undefined)}
+              onResize={(e) => setVideoHeight(e.currentTarget.videoHeight || undefined)}
               onProgress={(e) => setBuffered(bufferedAhead(e.currentTarget))}
               onDurationChange={(e) => setDur(e.currentTarget.duration)}
               onEnded={() => { const v = video.current; if (v) onProgress?.(v.duration, v.duration); onEnded?.(); }}
@@ -1160,7 +1320,7 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
                 />
               ))}
             </video>
-            <canvas ref={canvas} className={`enhance-canvas ${enhancing === "on" ? "on" : ""}`} aria-hidden />
+            <canvas key={`${enhance}:${cur?.url ?? ""}`} ref={canvas} className={`enhance-canvas ${enhancing === "on" ? "on" : ""}`} aria-hidden />
             <div ref={cueBox} className="cues" aria-live="polite" />
           </>
         )}
@@ -1275,10 +1435,18 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
                 <button className={`pbtn icon ${selectedSub ? "lit" : ""} ${sheet === "audio" ? "on" : ""}`} onClick={() => openSheet("audio")} title="Audio & subtitles (C toggles)" aria-label="Subtitles">
                   <Icon name="cc" size={20} />
                 </button>
-                <button className={`pbtn chipbtn ${sheet === "picture" ? "on" : ""}`} onClick={() => openSheet("picture")} title="Picture & playback">
+                <button
+                  className={`pbtn chipbtn ${sheet === "picture" ? "on" : ""}`}
+                  onClick={() => openSheet("picture")}
+                  title={enhancing === "error" && enhError ? `Native fallback: ${enhError}` : "Picture & playback"}
+                >
                   {shownQ ? <span className={`q ${shownQ >= 2160 ? "" : "hd"}`}>{shownQ >= 2160 ? "4K" : shownQ >= 720 ? "HD" : "SD"}</span> : null}
-                  {enhance !== "off" && <span className={`enh-dot ${enhancing}`} title={enhMode.name} />}
-                  <span>{shownQ ? `${shownQ}p` : "Auto"}{speed !== 1 ? ` · ${speed}×` : ""}</span>
+                  {enhance !== "off" && <span className={`enh-dot ${enhancing}`} title={enhancing === "error" ? enhError ?? "Native playback fallback" : enhMode.name} />}
+                  <span>
+                    {shownQ ? `${shownQ}p` : "Auto"}
+                    {enhance !== "off" && enhancing === "error" ? " · Native" : ""}
+                    {speed !== 1 ? ` · ${speed}×` : ""}
+                  </span>
                 </button>
                 {pipOk && <button className="pbtn icon" onClick={() => void togglePip()} aria-label="Picture-in-picture" title="Picture-in-picture (P)"><Icon name="pip" size={20} /></button>}
                 <button className="pbtn icon" onClick={toggleFull} aria-label="Fullscreen" title="Fullscreen (F)"><Icon name={isFull ? "unfull" : "full"} size={20} /></button>
@@ -1294,7 +1462,8 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
           onClick={(e) => {
             e.stopPropagation();
             const v = video.current;
-            if (v) v.currentTime = inIntro ? sk!.intro![1] : sk!.outro![1];
+            const target = inIntro ? sk?.intro?.[1] : sk?.outro?.[1];
+            if (v && target != null) v.currentTime = target;
           }}
         >
           {inIntro ? "Skip intro" : "Skip credits"} <Icon name="next" size={16} />
@@ -1303,7 +1472,7 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
 
       {showUpNext && (
         <UpNext
-          label={episodes?.nextLabel ?? "Next episode"}
+          label={episodes?.nextLabel ?? nextLabel ?? "Next episode"}
           still={media?.backdrop}
           seconds={Math.ceil(remaining)}
           auto={!!autoNext}
@@ -1421,25 +1590,32 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
                     </button>
                     <p className="ps-note">Anime4K upscaling runs on streams AbixCine decodes itself: your files, Jellyfin and direct links. Online servers play inside their own sealed player, so only the colour lift applies here.</p>
                   </>
-                ) : !webgpuAvailable() ? (
-                  <p className="ps-note">Your graphics driver doesn't expose WebGPU, which Anime4K needs. Updating the GPU driver usually fixes this.</p>
+                ) : !upscalerAvailable() ? (
+                  <p className="ps-note">Your graphics driver doesn't expose WebGPU or WebGL2 shaders, which picture enhancement needs. Playing native video.</p>
                 ) : (
-                  <div className="opt-list">
-                    {ENHANCE_MODES.map((m) => (
-                      <button key={m.id} className={`opt big ${enhance === m.id ? "on" : ""}`} onClick={() => pickEnhance(m.id)}>
-                        <span>{m.name}{m.heavy && <em className="heavy">GPU heavy</em>}</span>
-                        <small>
-                          {enhance === m.id && enhancing === "starting"
-                            ? "Compiling shaders…"
-                            : enhance === m.id && enhancing === "error"
-                              ? "Couldn't start on this stream"
-                              : enhance === m.id && enhStats
-                                ? `${enhStats.mode !== m.id ? `Eased to ${ENHANCE_MODES.find((x) => x.id === enhStats.mode)?.name} · ` : ""}${enhStats.chain} · ${enhStats.gpuMs} ms per frame${enhStats.skipped ? ` · ${enhStats.skipped} frames skipped` : ""}`
-                                : m.hint}
-                        </small>
-                      </button>
-                    ))}
-                  </div>
+                  <>
+                    {enhancing === "error" && (
+                      <div className="ps-note" role="status">
+                        <strong>Playing native video</strong> — {enhError ?? "GPU enhancement unavailable for this stream."}
+                      </div>
+                    )}
+                    <div className="opt-list">
+                      {ENHANCE_MODES.map((m) => (
+                        <button key={m.id} className={`opt big ${enhance === m.id ? "on" : ""}`} onClick={() => pickEnhance(m.id)}>
+                          <span>{m.name}{m.heavy && <em className="heavy">GPU heavy</em>}</span>
+                          <small>
+                            {enhance === m.id && enhancing === "starting"
+                              ? "Compiling shaders…"
+                              : enhance === m.id && enhancing === "error"
+                                ? `Fallback to native video (${enhError ?? "unavailable on this stream"})`
+                                : enhance === m.id && enhStats
+                                  ? `${enhStats.mode !== m.id ? `Eased to ${ENHANCE_MODES.find((x) => x.id === enhStats.mode)?.name} · ` : ""}${enhStats.chain} · ${enhStats.gpuMs} ms per frame${enhStats.skipped ? ` · ${enhStats.skipped} frames skipped` : ""}`
+                                  : m.hint}
+                          </small>
+                        </button>
+                      ))}
+                    </div>
+                  </>
                 )}
               </div>
               {!isEmbed && (
@@ -1454,8 +1630,8 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
                 <div className="ps-block">
                   <div className="ps-label">Quality</div>
                   <div className="seg3 wrap">
-                    <button className={level === -1 ? "on" : ""} onClick={() => { hlsRef.current!.currentLevel = -1; setLevel(-1); }}>Auto</button>
-                    {levels.map((l, i) => <button key={i} className={level === i ? "on" : ""} onClick={() => { hlsRef.current!.currentLevel = i; setLevel(i); }}>{l.height}p</button>)}
+                    <button className={level === -1 ? "on" : ""} onClick={() => { if (hlsRef.current) { hlsRef.current.currentLevel = -1; setLevel(-1); } }}>Auto</button>
+                    {levels.map((l, i) => <button key={i} className={level === i ? "on" : ""} onClick={() => { if (hlsRef.current) { hlsRef.current.currentLevel = i; setLevel(i); } }}>{l.height}p</button>)}
                   </div>
                 </div>
               )}
@@ -1502,7 +1678,7 @@ const ServerList = memo(function ServerList({ candidates, idx, checking, onPick 
   const ok = candidates.filter((c) => c.probe?.ok);
   const standby = candidates.filter((c) => !c.probe);
   const missing = candidates.filter((c) => c.probe && !c.probe.ok);
-  const best = ok.reduce((m, c) => Math.min(m, c.probe!.latencyMs), Infinity);
+  const best = ok.reduce((m, c) => Math.min(m, c.probe?.latencyMs ?? Infinity), Infinity);
   const row = (c: StreamCandidate) => {
     const i = candidates.indexOf(c);
     const state = c.probe?.ok ? "ok" : c.probe ? "off" : "standby";
@@ -1552,20 +1728,29 @@ const ServerList = memo(function ServerList({ candidates, idx, checking, onPick 
 const PAGE = 50;
 
 const EpisodeSheet = memo(function EpisodeSheet({ nav, onPick }: { nav: EpisodeNav; onPick: (s: number | undefined, e: number) => void }) {
-  const [season, setSeason] = useState(nav.season);
+  const validSeasons = useMemo(() => (nav.seasons ?? []).filter((s) => s.episodeCount > 0), [nav.seasons]);
+  const initialSeason = useMemo(() => {
+    if (!validSeasons.length) return nav.season;
+    if (nav.season != null && validSeasons.some((s) => s.number === nav.season)) return nav.season;
+    return validSeasons[0].number;
+  }, [validSeasons, nav.season]);
+
+  const [season, setSeason] = useState(initialSeason);
   const [eps, setEps] = useState<Episode[] | null>(null);
   const curRef = useRef<HTMLButtonElement>(null);
   const total = nav.count ?? 0;
+  const safeNavEp = Number.isFinite(nav.episode) && nav.episode >= 1 ? Math.floor(nav.episode) : 1;
   // Long-running anime (1000+ episodes) is paged in blocks of 50 around the current one.
-  const [page, setPage] = useState(() => Math.floor((nav.episode - 1) / PAGE));
+  const [page, setPage] = useState(() => Math.max(0, Math.floor((safeNavEp - 1) / PAGE)));
   const [known, setKnown] = useState<Map<number, Episode>>(new Map());
   useEffect(() => {
+    if (season != null || !nav.loadAll) return;
     let live = true;
-    nav.loadAll?.().then((list) => live && setKnown(new Map(list.map((e) => [e.number, e])))).catch(() => {});
+    nav.loadAll().then((list) => live && setKnown(new Map(list.map((e) => [e.number, e])))).catch(() => {});
     return () => {
       live = false;
     };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [season, nav.loadAll]);
 
   useEffect(() => {
     if (season == null || !nav.loadSeason) return setEps(null);
@@ -1575,41 +1760,51 @@ const EpisodeSheet = memo(function EpisodeSheet({ nav, onPick }: { nav: EpisodeN
     return () => {
       live = false;
     };
-  }, [season]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [season, nav.loadSeason]);
   useEffect(() => {
     curRef.current?.scrollIntoView({ block: "center" });
   }, [eps, page]);
 
-  const list: Episode[] =
+  const fullList: Episode[] =
     season != null
       ? eps ?? []
-      : Array.from({ length: Math.min(PAGE, Math.max(0, total - page * PAGE)) }, (_, i) => known.get(page * PAGE + i + 1) ?? { season: 0, number: page * PAGE + i + 1, title: `Episode ${page * PAGE + i + 1}` });
-  const pages = Math.ceil(total / PAGE);
+      : Array.from({ length: Math.max(0, total) }, (_, i) => known.get(i + 1) ?? { season: 0, number: i + 1, title: `Episode ${i + 1}` });
+  const pages = Math.max(1, Math.ceil(fullList.length / PAGE));
+  const safePage = Math.max(0, Math.min(page, pages - 1));
+  const list = fullList.length > PAGE ? fullList.slice(safePage * PAGE, (safePage + 1) * PAGE) : fullList;
 
   return (
     <div className="ps-section">
-      {nav.seasons && nav.seasons.length > 1 && (
+      {validSeasons.length > 1 && (
         <div className="season-strip">
-          {nav.seasons.map((s) => (
-            <button key={s.number} className={s.number === season ? "on" : ""} onClick={() => setSeason(s.number)}>
-              {s.name.length <= 10 ? s.name : `S${s.number}`}
+          {validSeasons.map((s) => (
+            <button
+              key={s.number}
+              className={s.number === season ? "on" : ""}
+              onClick={() => {
+                setSeason(s.number);
+                setPage(0);
+              }}
+            >
+              {s.number === 0 ? "Specials" : s.name.length <= 10 ? s.name : `S${s.number}`}
             </button>
           ))}
         </div>
       )}
-      {season == null && pages > 1 && (
+      {pages > 1 && (
         <div className="season-strip">
           {Array.from({ length: pages }, (_, p) => (
-            <button key={p} className={p === page ? "on" : ""} onClick={() => setPage(p)}>
-              {p * PAGE + 1}–{Math.min(total, (p + 1) * PAGE)}
+            <button key={p} className={p === safePage ? "on" : ""} onClick={() => setPage(p)}>
+              {p * PAGE + 1}–{Math.min(fullList.length, (p + 1) * PAGE)}
             </button>
           ))}
         </div>
       )}
       <div className="ep-list">
         {season != null && !eps && Array.from({ length: 5 }, (_, i) => <div key={i} className="ep-row skeleton" />)}
+        {season != null && eps && list.length === 0 && <p className="ps-note">No episodes available for this season.</p>}
         {list.map((e, i) => {
-          const isCur = e.number === nav.episode && (season ?? undefined) === nav.season;
+          const isCur = e.number === safeNavEp && (season ?? undefined) === nav.season;
           const still = e.still ?? nav.fallbackStill;
           return (
             <button

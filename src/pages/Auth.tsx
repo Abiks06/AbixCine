@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Icon } from "../components/Icon";
 import { LogoMark, Wordmark } from "../components/Logo";
 import { ApiError, continueAsGuest, errorMessage, getApiBase, hadAccount, isWaking, setApiBase, signIn, signUp, wakeServer } from "../lib/account";
@@ -19,10 +19,21 @@ export function Auth() {
   const [showServer, setShowServer] = useState(false);
   // Real artwork for the wall: AniList is public, so it works before sign-in.
   const [posters, setPosters] = useState<string[]>([]);
+  const mountedRef = useRef(true);
+  const wakeCtlRef = useRef<AbortController | null>(null);
+
   useEffect(() => {
+    mountedRef.current = true;
     loadAnimeFeed(ANIME_FEEDS[0])
-      .then((list) => setPosters(list.map((m) => m.poster).filter((p): p is string => !!p)))
+      .then((list) => {
+        if (mountedRef.current) setPosters(list.map((m) => m.poster).filter((p): p is string => !!p));
+      })
       .catch(() => {});
+    return () => {
+      mountedRef.current = false;
+      wakeCtlRef.current?.abort();
+      wakeCtlRef.current = null;
+    };
   }, []);
 
   const submit = async (e: React.FormEvent) => {
@@ -32,24 +43,31 @@ export function Auth() {
       setErr(errorMessage(new ApiError(400, "bad_server")));
       return;
     }
+    wakeCtlRef.current?.abort();
+    const ctl = new AbortController();
+    wakeCtlRef.current = ctl;
     setBusy(true);
     const go = () => (mode === "up" ? signUp(name, email, password) : signIn(email, password));
     try {
       await go();
     } catch (e) {
+      if (!mountedRef.current || ctl.signal.aborted) return;
       if (!isWaking(e)) {
         setErr(errorMessage(e));
       } else {
         // Free hosting sleeps when idle: wait for it, then try once more, showing the wait.
         setWaking(0);
-        const up = await wakeServer(setWaking);
+        const up = await wakeServer((s) => mountedRef.current && !ctl.signal.aborted && setWaking(s), 90_000, ctl.signal);
+        if (!mountedRef.current || ctl.signal.aborted) return;
         setWaking(null);
         if (!up) setErr(errorMessage(e));
-        else await go().catch((e2) => setErr(errorMessage(e2)));
+        else await go().catch((e2) => mountedRef.current && !ctl.signal.aborted && setErr(errorMessage(e2)));
       }
     } finally {
-      setBusy(false);
-      setWaking(null);
+      if (mountedRef.current && !ctl.signal.aborted) {
+        setBusy(false);
+        setWaking(null);
+      }
     }
   };
 

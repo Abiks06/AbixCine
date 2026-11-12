@@ -32,7 +32,7 @@ function cutoffs(now: Date) {
  */
 export function FitsTonight({ pool }: { pool: Media[] }) {
   const [now, setNow] = useState(() => new Date());
-  const opts = useMemo(() => cutoffs(now), [now.getHours()]); // eslint-disable-line react-hooks/exhaustive-deps
+  const opts = useMemo(() => cutoffs(now), [now.getHours() * 60 + now.getMinutes()]); // eslint-disable-line react-hooks/exhaustive-deps
   const [sel, setSel] = useState(0);
   const [runtimes, setRuntimes] = useState<Record<string, number>>({});
   const keys = pool.map((m) => m.key).join("|");

@@ -33,13 +33,14 @@ export function DriveTile({ t, i = 0 }: { t: DriveTitle; i?: number }) {
       </div>
     </>
   );
-  return t.media ? (
+  const matchedMedia = t.media;
+  return matchedMedia ? (
     <Link
-      to={`/title/${encodeKey(t.media.key)}`}
+      to={`/title/${encodeKey(matchedMedia.key)}`}
       className="file"
       style={{ ["--i" as any]: i }}
       viewTransition
-      onMouseEnter={() => previewLight(t.media!)}
+      onMouseEnter={() => previewLight(matchedMedia)}
       onMouseLeave={() => previewLight(null)}
     >
       {body}

@@ -115,9 +115,19 @@ export const errorMessage = (e: unknown) =>
 export const isWaking = (e: unknown) => e instanceof ApiError && (e.code === "waking" || e.code === "timeout");
 
 async function raw(path: string, init: RequestInit = {}, token?: string | null, timeoutMs = 15_000) {
+  const callerSignal = init.signal;
+  if (callerSignal?.aborted) {
+    throw new ApiError(0, "aborted");
+  }
   let res: Response;
+  let timedOut = false;
   const ctl = new AbortController();
-  const t = setTimeout(() => ctl.abort(), timeoutMs);
+  const onCallerAbort = () => ctl.abort();
+  callerSignal?.addEventListener("abort", onCallerAbort, { once: true });
+  const t = setTimeout(() => {
+    timedOut = true;
+    ctl.abort();
+  }, timeoutMs);
   try {
     res = await fetch(getApiBase() + path, {
       ...init,
@@ -129,10 +139,14 @@ async function raw(path: string, init: RequestInit = {}, token?: string | null, 
       },
     });
   } catch {
+    if (callerSignal?.aborted) {
+      throw new ApiError(0, "aborted");
+    }
     if (state.online) set({ online: false });
-    throw new ApiError(0, ctl.signal.aborted ? "timeout" : "network");
+    throw new ApiError(0, timedOut ? "timeout" : "network");
   } finally {
     clearTimeout(t);
+    callerSignal?.removeEventListener("abort", onCallerAbort);
   }
   if (!state.online) set({ online: true });
   if (res.status === 502 || res.status === 503 || res.status === 504) throw new ApiError(res.status, "waking");
@@ -215,8 +229,19 @@ export async function wakeServer(onTick?: (secs: number) => void, maxMs = 90_000
   const t0 = Date.now();
   while (Date.now() - t0 < maxMs && !signal?.aborted) {
     onTick?.(Math.round((Date.now() - t0) / 1000));
-    if (await checkServer()) return true;
-    await new Promise((r) => setTimeout(r, 3000));
+    if (await checkServer(signal)) return !signal?.aborted;
+    if (signal?.aborted) return false;
+    await new Promise<void>((resolve) => {
+      const onAbort = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      }, 3000);
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
   }
   return false;
 }
@@ -234,9 +259,10 @@ export async function updateProfile(patch: { name?: string; avatarHue?: number }
   set({ user: r.user });
 }
 
-export async function checkServer() {
+export async function checkServer(signal?: AbortSignal) {
+  if (signal?.aborted) return false;
   try {
-    const h = await raw("/health", {}, null, 10_000);
+    const h = await raw("/health", { signal }, null, 10_000);
     set({ tmdbProxy: !!h.tmdbProxy });
     return true;
   } catch {
@@ -255,7 +281,21 @@ export const registerSync = (h: SyncHook) => syncHooks.push(h);
 let syncCache: Promise<any> | null = null;
 /** One /sync request shared by all stores that pull at the same moment. */
 export function fetchSync() {
-  syncCache ??= api("/sync").finally(() => setTimeout(() => (syncCache = null), 2000));
+  if (!syncCache) {
+    const p = api("/sync").then(
+      (res) => {
+        setTimeout(() => {
+          if (syncCache === p) syncCache = null;
+        }, 2000);
+        return res;
+      },
+      (err) => {
+        if (syncCache === p) syncCache = null;
+        throw err;
+      },
+    );
+    syncCache = p;
+  }
   return syncCache;
 }
 
@@ -286,13 +326,17 @@ const retryable = (e: unknown) => e instanceof ApiError && (e.status === 0 || e.
 /** Write to the server; if it can't be reached, keep the latest write per path and retry later. */
 export function push(path: string, method: "PUT" | "DELETE", body?: unknown) {
   if (!state.user) return;
-  const o = readOutbox();
-  if (o[path]) {
-    delete o[path];
-    writeOutbox(o);
-  }
-  api(path, { method, body: body ? JSON.stringify(body) : undefined }).catch((e) => {
-    if (retryable(e)) writeOutbox({ ...readOutbox(), [path]: { method, body, at: Date.now() } });
+  const at = Date.now();
+  writeOutbox({ ...readOutbox(), [path]: { method, body, at } });
+  const settle = () => {
+    const o = readOutbox();
+    if (o[path]?.at === at) {
+      delete o[path];
+      writeOutbox(o);
+    }
+  };
+  api(path, { method, body: body ? JSON.stringify(body) : undefined }).then(settle, (e) => {
+    if (!retryable(e)) settle();
   });
 }
 

@@ -42,8 +42,10 @@ export const Art = memo(function Art({
   const src = sized(raw, SIZES[kind][effectiveSize]);
   // Big stages get the original on large/high-DPI screens, w1280 elsewhere.
   const srcSet = effectiveSize === "lg" && kind === "backdrop" && TMDB.test(raw ?? "") ? `${sized(raw, "w1280")} 1280w, ${sized(raw, "original")} 3840w` : undefined;
-  const [loaded, setLoaded] = useState(false);
-  const [failed, setFailed] = useState(false);
+  const [loadedSrc, setLoadedSrc] = useState<string | undefined>();
+  const [failedSrc, setFailedSrc] = useState<string | undefined>();
+  const loaded = loadedSrc === src;
+  const failed = failedSrc === src;
   const hue = media.hue ?? hash(media.key) % 360;
   return (
     <div className={`art art-${variant} ${className}`} style={{ ["--h" as string]: hue }}>
@@ -59,8 +61,8 @@ export const Art = memo(function Art({
           fetchpriority={isHighPriority ? "high" : "low"}
           draggable={false}
           className={loaded ? "in" : ""}
-          onLoad={() => setLoaded(true)}
-          onError={() => setFailed(true)}
+          onLoad={() => setLoadedSrc(src)}
+          onError={() => setFailedSrc(src)}
         />
       ) : (
         <div className="art-fallback"><span>{media.title}</span></div>

@@ -5,41 +5,63 @@ import { Art } from "../components/Art";
 import { Icon } from "../components/Icon";
 import { Ambient } from "../components/Ambient";
 import { TitleArt } from "../components/TitleArt";
-import { decodeKey, encodeKey, getDetail } from "../lib/catalog";
+import {
+  clampSeason,
+  decodeKey,
+  encodeKey,
+  getDetail,
+  getSeasonEpisodes,
+  parseSeasonEpisodeParams,
+  resolveNextEpisode,
+  resolvePlaybackRequest,
+} from "../lib/catalog";
 import type { MediaDetail } from "../lib/types";
 import { getEntry, getProgress, saveProgress } from "../lib/progress";
 import { useWatchlist } from "../lib/watchlist";
 import { audioFor, setAudioFor, useSettings, type Audio } from "../lib/settings";
-import { tmdbSeason } from "../lib/tmdb";
-import { animeEpisodes, animeSeasons, type AnimeSeason } from "../lib/anilist";
+import { animeEpisodes } from "../lib/anilist";
 import { reqKey, type PlaybackRequest } from "../lib/types";
 import { useAsync } from "../lib/useAsync";
+import { isUrlTokenExpired } from "../sources/native";
 import { candLine, clearResolveCache, recordWin, manualCandidate, PROVIDERS, recordPlayback, resolveSources, type ResolveEvent } from "../sources/registry";
 import type { StreamCandidate } from "../sources/types";
 
 export function Watch() {
-  const key = decodeKey(useParams().key!);
+  const key = decodeKey(useParams().key ?? "");
   const [params] = useSearchParams();
   const nav = useNavigate();
   const loc = useLocation();
   /** Set when the player flipped sub/dub or moved episode: skip the race showcase. */
   const quick = !!(loc.state as { quick?: boolean } | null)?.quick;
   const settings = useSettings();
-  const season = params.get("s") ? Number(params.get("s")) : undefined;
-  const episode = params.get("e") ? Number(params.get("e")) : undefined;
-  const audioParam = (params.get("a") as Audio | null) ?? undefined;
-  /** A server the viewer chose on the title page or the race screen. */
-  const preferred = params.get("srv") ?? undefined;
+  const { season: rawSeason, episode: rawEpisode } = parseSeasonEpisodeParams(params);
+  const rawAudio = params.get("a");
+  const audioParam: Audio | undefined = rawAudio === "sub" || rawAudio === "dub" ? rawAudio : undefined;
+  /** A server the viewer chose on the title page or the race screen (ignore if it's an expired stream URL). */
+  const rawPreferred = params.get("srv") ?? undefined;
+  const preferred = rawPreferred && !isUrlTokenExpired(rawPreferred) ? rawPreferred : undefined;
   const detail = useAsync(() => getDetail(key), [key]);
   // Offline / catalog down: local files and Jellyfin only need a title, so fall back to the copy
   // saved with progress or My List instead of spinning forever.
   const list = useWatchlist();
+  const canonicalKey = detail.data?.canonicalKey ?? detail.data?.key ?? key;
+  const courKeys = useMemo(
+    () =>
+      detail.data
+        ? [...(detail.data.seasons ?? []), ...(detail.data.specials ?? [])].flatMap((s) => [
+            s.key,
+            ...(s.cours?.map((c) => c.key) ?? []),
+          ])
+        : [],
+    [detail.data],
+  );
+  const savedEntry = getEntry(canonicalKey, [key, detail.data?.key, ...courKeys]);
   const d: MediaDetail | undefined = useMemo(() => {
     if (detail.data) return detail.data;
     if (!detail.error) return undefined;
-    const m = getEntry(key)?.media ?? list.find((w) => w.media.key === key)?.media;
+    const m = savedEntry?.media ?? list.find((w) => w.media.key === key || w.media.key === canonicalKey)?.media;
     return m ? { ...m, cast: [], crew: [], related: [] } : undefined;
-  }, [detail.data, detail.error, key, list]);
+  }, [detail.data, detail.error, key, canonicalKey, list, savedEntry]);
   const [attempt, setAttempt] = useState(0);
   const reloadCatalog = useCallback(() => {
     if (detail.error) detail.reload();
@@ -47,14 +69,24 @@ export function Watch() {
   }, [detail]);
 
   const isAnime = key.startsWith("anilist:") || d?.kind === "anime";
-  const audio = audioParam ?? (isAnime ? audioFor(key) : undefined);
-  // Seasons before this one, so absolute-numbered anime files ("Show - 26") still match S2E1.
-  const absolute = useMemo(() => {
-    if (!d?.seasons || season == null || episode == null) return undefined;
-    const before = d.seasons.filter((x) => x.number > 0 && x.number < season).reduce((n, x) => n + x.episodeCount, 0);
-    return before ? before + episode : undefined;
-  }, [d, season, episode]);
-  const req: PlaybackRequest | null = useMemo(() => (d ? { media: d, season, episode, absolute, audio } : null), [d, season, episode, absolute, audio]);
+  const isSeries = key.startsWith("tmdb:tv:") || d?.kind === "tv";
+  const isEpisodicAnime = isAnime && d?.kind !== "movie";
+  const hasCanonicalSeasons = !!d?.seasons?.length || !!d?.specials?.length;
+  const prelimSeason = rawSeason ?? (isSeries || hasCanonicalSeasons ? (savedEntry?.season ?? d?.initialSeason ?? 1) : undefined);
+  const prelimEpisode = rawEpisode ?? (isSeries || isEpisodicAnime ? (savedEntry?.episode ?? 1) : undefined);
+  const audio = audioParam ?? (isAnime ? audioFor(canonicalKey, [key, d?.key, ...courKeys]) : undefined);
+  const requestedSeason = rawSeason ?? (rawEpisode == null ? savedEntry?.season : undefined);
+  const resolvedReq = useMemo(
+    () => (d ? resolvePlaybackRequest(d, requestedSeason, prelimEpisode, audio) : null),
+    [d, requestedSeason, prelimEpisode, audio],
+  );
+  const season = resolvedReq ? resolvedReq.season : prelimSeason;
+  const episode = resolvedReq ? resolvedReq.episode : prelimEpisode;
+  const absolute = resolvedReq?.absolute;
+  const req: PlaybackRequest | null = useMemo(
+    () => resolvedReq ?? (d ? { media: d, season, episode, absolute, audio } : null),
+    [resolvedReq, d, season, episode, absolute, audio],
+  );
   const [events, setEvents] = useState<Record<string, ResolveEvent>>({});
   /** The ranked list at the moment the picker committed to a winner. */
   const [cands, setCands] = useState<StreamCandidate[] | null>(null);
@@ -78,7 +110,7 @@ export function Watch() {
     setAllowUnverified(false);
     resolveSources(req, (e) => live && setEvents((x) => ({ ...x, [e.providerId]: e })), {
       early: true,
-      verifyBudget: deep ? 99 : 2,
+      verifyBudget: deep ? 99 : 3,
       signal: ctl.signal,
       onUpdate: (r) => live && setRanked(r),
     }).then((c) => live && setCands(c));
@@ -89,67 +121,56 @@ export function Watch() {
     // Re-resolve when sources change in settings, the viewer asks to check more, or the catalog reloads.
   }, [req && reqKey(req), settings.libraryPaths, settings.jellyfin, settings.disabledSources, settings.enabledExtras, retry, deep, attempt]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // AniList seasons are separate entries: know the next one so the last episode leads into it.
-  const aniSeasons = useAsync(() => (key.startsWith("anilist:") ? animeSeasons(key).catch(() => [] as AnimeSeason[]) : Promise.resolve([] as AnimeSeason[])), [key]);
-  const nextAniSeason = useMemo(() => {
-    const list = aniSeasons.data ?? [];
-    const i = list.findIndex((x) => x.key === key);
-    return i >= 0 ? list[i + 1] : undefined;
-  }, [aniSeasons.data, key]);
-
-  const next = useMemo((): { s?: number; e: number; key?: string; label?: string } | null => {
-    if (!d || episode == null) return null;
-    if (d.seasons && season != null) {
-      const cur = d.seasons.find((s) => s.number === season);
-      if (cur && episode < cur.episodeCount) return { s: season, e: episode + 1 };
-      const ns = d.seasons.find((s) => s.number === season + 1);
-      return ns ? { s: ns.number, e: 1 } : null;
-    }
-    if (d.episodeCount && episode < d.episodeCount) return { s: undefined, e: episode + 1 };
-    if (nextAniSeason && (!d.episodeCount || episode >= d.episodeCount)) {
-      const n = (aniSeasons.data ?? []).indexOf(nextAniSeason) + 1;
-      return { e: 1, key: nextAniSeason.key, label: `Season ${n} · Episode 1` };
-    }
-    return null;
-  }, [d, season, episode, nextAniSeason, aniSeasons.data]);
+  const next = useMemo(() => resolveNextEpisode(d, season, episode, audio), [d, season, episode, audio]);
 
   // Carry the incoming navigation state (e.g. "opened from inside the app") forward, so Back
   // keeps working the same way after an in-player episode change or sub/dub switch.
   const forwardState = (extra: Record<string, unknown> = {}) => ({ ...(loc.state as object | null), ...extra });
-  const href = (s?: number, e?: number, a?: Audio, srv?: string) =>
-    `/watch/${encodeKey(key)}?${new URLSearchParams({
-      ...(s != null ? { s: String(s) } : {}),
-      ...(e != null ? { e: String(e) } : {}),
-      ...(a ? { a } : {}),
-      ...(srv ? { srv } : {}),
-    })}`;
+  const href = useCallback(
+    (s?: number, e?: number, a?: Audio, srv?: string) => {
+      const resolved = d ? resolvePlaybackRequest(d, s, e, a ?? audio) : null;
+      const targetKey = resolved?.media.key ?? key;
+      const clampedS = resolved ? resolved.season : (clampSeason(d, s)?.number ?? s);
+      const clampedE = resolved?.episode ?? e;
+      return `/watch/${encodeKey(targetKey)}?${new URLSearchParams({
+        ...(clampedS != null ? { s: String(clampedS) } : {}),
+        ...(clampedE != null ? { e: String(clampedE) } : {}),
+        ...(a ? { a } : {}),
+        ...(srv ? { srv } : {}),
+      })}`;
+    },
+    [d, key, audio],
+  );
   const goEp = useCallback(
     (s: number | undefined, e: number) => nav(href(s, e, audio), { replace: true, state: forwardState({ quick: true }) }),
-    [key, nav, audio, loc.state], // eslint-disable-line react-hooks/exhaustive-deps
+    [href, nav, audio, loc.state], // eslint-disable-line react-hooks/exhaustive-deps
   );
   const goNext = useCallback(() => {
     if (!next) return;
-    // Into the next AniList season: a different entry, same audio.
-    if (next.key) nav(`/watch/${encodeKey(next.key)}?${new URLSearchParams({ e: "1", ...(audio ? { a: audio } : {}) })}`, { replace: true, state: forwardState({ quick: true }) });
-    else goEp(next.s, next.e);
-  }, [next, goEp, nav, audio, loc.state]); // eslint-disable-line react-hooks/exhaustive-deps
+    nav(href(next.s, next.e, audio), { replace: true, state: forwardState({ quick: true }) });
+  }, [next, href, nav, audio, loc.state]); // eslint-disable-line react-hooks/exhaustive-deps
   /** Flip sub/dub mid-episode: remember the choice for this show and resume at the same spot. */
   const switchAudio = (a: Audio) => {
-    setAudioFor(key, a);
+    setAudioFor(canonicalKey, a, [key, d?.key]);
     nav(href(season, episode, a), { replace: true, state: forwardState({ quick: true }) });
   };
 
   const onProgress = useCallback(
-    (position: number, duration: number) => d && saveProgress({ media: d, season, episode, audio, position, duration }, next && { season: next.s, episode: next.e }),
-    [d, season, episode, audio, next],
+    (position: number, duration: number) =>
+      d &&
+      saveProgress(
+        { media: { ...d, key: canonicalKey, canonicalKey }, season, episode, audio, position, duration },
+        next && { season: next.s, episode: next.e },
+      ),
+    [d, canonicalKey, season, episode, audio, next],
   );
 
   // Back returns to wherever Play was pressed. Opened from outside the app (or a reload), go to the
   // title page and replace this entry, so Back there doesn't bounce into the player again.
   const back = useCallback(() => {
     if ((loc.state as { from?: string } | null)?.from === "app") nav(-1);
-    else nav(`/title/${encodeKey(key)}`, { replace: true, viewTransition: true });
-  }, [loc.state, nav, key]);
+    else nav(`/title/${encodeKey(canonicalKey)}`, { replace: true, viewTransition: true });
+  }, [loc.state, nav, canonicalKey]);
   useEffect(() => {
     if (go) return;
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && back();
@@ -192,31 +213,42 @@ export function Watch() {
   // Episode list for the in-player drawer.
   const episodes: EpisodeNav | undefined = useMemo(() => {
     if (!d || episode == null) return undefined;
-    const tmdbSeries = key.startsWith("tmdb:") && !!d.seasons?.length;
+    const playableSeasons = [...(d.seasons ?? []), ...(d.specials ?? [])].filter((s) => s.episodeCount > 0);
+    const activeSeasonObj = playableSeasons.find((s) => s.number === season);
     const nextLabel = next ? next.label ?? `${next.s != null ? `S${next.s} · ` : ""}Episode ${next.e}` : undefined;
     return {
-      seasons: tmdbSeries ? d.seasons : undefined,
+      seasons: playableSeasons.length ? playableSeasons : undefined,
       season,
       episode,
-      count: tmdbSeries ? undefined : d.episodeCount,
-      loadSeason: tmdbSeries ? (s: number) => tmdbSeason(key, s) : undefined,
-      loadAll: key.startsWith("anilist:") ? () => animeEpisodes(key) : undefined,
+      count: activeSeasonObj?.episodeCount ?? d.episodeCount,
+      loadSeason: playableSeasons.length ? (s: number) => getSeasonEpisodes(d, s) : undefined,
+      loadAll: !playableSeasons.length && key.startsWith("anilist:") ? () => animeEpisodes(key) : undefined,
       go: goEp,
       fallbackStill: d.backdrop,
       nextLabel,
     };
   }, [d, key, season, episode, next, goEp]);
 
-  if (go && playerCands && (playerCands.some((c) => c.probe?.ok) || allowUnverified) && d) {
+  if (go && playerCands && (playerCands.some((c) => c.probe?.ok) || allowUnverified) && d && req) {
     return (
       <Player
-        key={reqKey(req!)}
+        key={reqKey(req)}
         candidates={playerCands}
         initialSource={picked}
         onSourceResult={onSourceResult}
         title={d.title}
         subtitle={epLabel}
-        startAt={getProgress(key, season, episode)?.position}
+        startAt={
+          getProgress(canonicalKey, season, episode, [key, d.key, ...courKeys])?.position ??
+          (savedEntry && savedEntry.season == null && savedEntry.episode != null
+            ? (() => {
+                const cour = [...(d.seasons ?? []), ...(d.specials ?? [])]
+                  .find((s) => s.number === season)
+                  ?.cours?.find((c) => c.key === savedEntry.media.key);
+                return cour && cour.startEpisode + savedEntry.episode - 1 === episode ? savedEntry.position : undefined;
+              })()
+            : undefined)
+        }
         audio={audio}
         onAudio={isAnime || audio ? switchAudio : undefined}
         originalLanguage={d.originalLanguage}
@@ -226,8 +258,7 @@ export function Watch() {
         onEnded={() => settings.autoplayNext && goNext()}
         autoNext={settings.autoplayNext}
         onNext={next ? goNext : undefined}
-        nextLabel={next ? `${next.s != null ? `Season ${next.s} · ` : ""}Episode ${next.e}` : undefined}
-        autoplayNext={settings.autoplayNext}
+        nextLabel={next ? (next.label ?? `${next.s != null ? `Season ${next.s} · ` : ""}Episode ${next.e}`) : undefined}
         onRetry={() => {
           setGo(false);
           reloadCatalog();
@@ -276,6 +307,7 @@ export function Watch() {
     setCands((x) => x ?? ranked);
     setGo(true);
   };
+  const firstReady = ranked.find((c) => c.probe?.ok);
   const failed = !!cands && !best;
   const standby = ranked.filter((c) => !c.probe).length;
   const rejected = ranked.filter((c) => c.probe?.ok === false).length;
@@ -324,7 +356,7 @@ export function Watch() {
                   </div>
                   <div className="rsub">
                     {best
-                      ? `${best.probe?.quality ?? best.quality ? `${best.probe?.quality ?? best.quality}p · ` : ""}${best.probe?.latencyMs ?? 0} ms${playable!.length > 1 ? ` · ${playable!.length - 1} backup${playable!.length > 2 ? "s" : ""} ready` : ""}`
+                      ? `${best.probe?.quality ?? best.quality ? `${best.probe?.quality ?? best.quality}p · ` : ""}${best.probe?.latencyMs ?? 0} ms${playable && playable.length > 1 ? ` · ${playable.length - 1} backup${playable.length > 2 ? "s" : ""} ready` : ""}`
                       : enabled.length
                         ? `Checking ${enabled.length} servers at once · ${readyCount} ready so far`
                         : "Turn servers back on in Settings."}
@@ -333,8 +365,8 @@ export function Watch() {
               </div>
               <div className="race-acts">
                 {best && <button className="btn play" onClick={() => setGo(true)}><Icon name="play" size={16} /> Play now</button>}
-                {!best && readyCount > 0 && (
-                  <button className="btn play" onClick={() => playFrom(ranked.find((c) => c.probe?.ok)!)}><Icon name="play" size={16} /> Play the first ready one</button>
+                {!best && firstReady && (
+                  <button className="btn play" onClick={() => playFrom(firstReady)}><Icon name="play" size={16} /> Play the first ready one</button>
                 )}
               </div>
             </>
@@ -416,7 +448,9 @@ export function Watch() {
               if (e?.status === "timeout" || e?.status === "error") return [{ id: p.id, name: p.name, state: "failed", why: e.status === "timeout" ? "lookup timed out" : e.error ? `lookup failed: ${e.error}` : "lookup failed" }];
               return [];
             });
-            const ready = rows.filter((r) => r.state === "ready").sort((x, y) => (y.c!.score ?? 0) - (x.c!.score ?? 0));
+            const ready = rows
+              .filter((r): r is Row & { c: StreamCandidate } => r.state === "ready" && !!r.c)
+              .sort((x, y) => (y.c.score ?? 0) - (x.c.score ?? 0));
             const checking = rows.filter((r) => r.state === "checking");
             const standby = rows.filter((r) => r.state === "standby");
             const failed = rows.filter((r) => r.state === "failed");
@@ -425,16 +459,16 @@ export function Watch() {
               <div className="rlist">
                 {ready.length > 0 && <div className="rgroup-h">Ready to play · {ready.length}</div>}
                 {ready.map((r, i) => {
-                  const q = r.c!.probe?.quality ?? r.c!.quality;
-                  const win = !!best && r.c!.url === best.url;
+                  const q = r.c.probe?.quality ?? r.c.quality;
+                  const win = !!best && r.c.url === best.url;
                   return (
-                    <button key={r.id} className={`rrow ready ${win ? "win" : ""}`} style={{ ["--i" as any]: i }} onClick={() => playFrom(r.c!)} title={`Play from ${r.name}`}>
+                    <button key={r.id} className={`rrow ready ${win ? "win" : ""}`} style={{ ["--i" as any]: i }} onClick={() => playFrom(r.c)} title={`Play from ${r.name}`}>
                       <span className="rdot" />
                       <span className="rname">{r.name}{win && <em className="rt-pick">PICK</em>}</span>
                       <span className="rmeta">
                         {q ? <b>{q >= 2160 ? "4K" : `${q}p`}</b> : null}
                         {tag(r.c) && <b>{tag(r.c)}</b>}
-                        <span>{r.c!.via === "direct" ? "direct" : "ad-free"} · {candLine(r.c!).split(" · ").pop()}</span>
+                        <span>{r.c.via === "direct" ? "direct" : "ad-free"} · {candLine(r.c).split(" · ").pop()}</span>
                       </span>
                       <span className="rt-play"><Icon name="play" size={12} /></span>
                     </button>

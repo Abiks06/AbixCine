@@ -1,4 +1,4 @@
-import { useSyncExternalStore } from "react";
+import { useMemo, useSyncExternalStore } from "react";
 import { fetchSync, push, registerSync } from "./account";
 import type { Audio } from "./settings";
 import type { Media } from "./types";
@@ -48,33 +48,65 @@ function save() {
   listeners.forEach((l) => l());
 }
 
-/** Keep only what the UI needs to redraw a card, so synced rows stay small. */
-const slim = (m: Media): Media => ({
-  key: m.key, kind: m.kind, title: m.title, originalTitle: m.originalTitle, overview: "", year: m.year,
-  rating: m.rating, poster: m.poster, backdrop: m.backdrop, genres: [], hue: m.hue,
+/** Keep what the UI and stream resolvers need (including malId and originalLanguage), so synced rows stay small without breaking resume. */
+const slim = (m: Media & { canonicalKey?: string }): Media => ({
+  key: m.canonicalKey ?? m.key,
+  kind: m.kind,
+  title: m.title,
+  originalTitle: m.originalTitle,
+  overview: "",
+  year: m.year,
+  rating: m.rating,
+  poster: m.poster,
+  backdrop: m.backdrop,
+  genres: [],
+  hue: m.hue,
+  ...(m.malId ? { malId: m.malId } : {}),
+  ...(m.originalLanguage ? { originalLanguage: m.originalLanguage } : {}),
 });
 
 /**
  * Progress is stored per title (latest episode wins), which is what "Continue watching" needs.
  * Finishing an episode moves the entry on to `next`, so the show stays in Continue watching as "Up next".
  */
-export function saveProgress(e: Omit<ProgressEntry, "updatedAt" | "upNext" | "finished">, next?: { season?: number; episode: number } | null) {
+export function saveProgress(
+  e: Omit<ProgressEntry, "updatedAt" | "upNext" | "finished"> & { media: Media & { canonicalKey?: string } },
+  next?: { season?: number; episode: number } | null,
+) {
+  const canonicalKey = e.media.canonicalKey ?? e.media.key;
   const done = isDone(e.position, e.duration);
-  const base = { ...e, media: slim(e.media), updatedAt: Date.now() };
+  const isSeries = canonicalKey.startsWith("tmdb:tv:") || e.media.kind === "tv";
+  const isEpisodicAnime = (canonicalKey.startsWith("anilist:") || e.media.kind === "anime") && e.media.kind !== "movie";
+  const base = {
+    ...e,
+    ...(isSeries && e.season == null ? { season: 1 } : {}),
+    ...((isSeries || isEpisodicAnime) && e.episode == null ? { episode: 1 } : {}),
+    media: slim(e.media),
+    updatedAt: Date.now(),
+  };
   const entry: ProgressEntry = !done
     ? base
     : next
-      ? { ...base, season: next.season, episode: next.episode, position: 0, upNext: true }
+      ? { ...base, season: next.season ?? base.season, episode: next.episode, position: 0, upNext: true }
       : { ...base, position: 0, finished: true };
-  store = { ...store, [e.media.key]: entry };
+  if (e.media.key !== canonicalKey && e.media.key in store) {
+    const { [e.media.key]: _, ...rest } = store;
+    store = { ...rest, [canonicalKey]: entry };
+  } else {
+    store = { ...store, [canonicalKey]: entry };
+  }
   save();
-  push(`/progress/${encodeURIComponent(e.media.key)}`, "PUT", entry);
+  push(`/progress/${encodeURIComponent(canonicalKey)}`, "PUT", entry);
 }
 
-export function getProgress(mediaKey: string, season?: number, episode?: number) {
-  const p = store[mediaKey];
-  if (!p || p.season !== season || p.episode !== episode) return undefined;
-  return p;
+export function getProgress(mediaKey: string, season?: number, episode?: number, fallbackKeys?: (string | undefined)[]) {
+  const keys = [mediaKey, ...(fallbackKeys ?? [])];
+  for (const k of keys) {
+    if (!k) continue;
+    const p = store[k];
+    if (p && p.season === season && p.episode === episode) return p;
+  }
+  return undefined;
 }
 
 export function removeProgress(mediaKey: string) {
@@ -93,9 +125,14 @@ export function restoreProgress(entry: ProgressEntry) {
 }
 
 /** The raw entry for a title, whatever its episode (Title page "Resume" / "Up next" button). */
-export function getEntry(mediaKey: string): ProgressEntry | undefined {
-  const p = store[mediaKey];
-  return p && !p.finished ? p : undefined;
+export function getEntry(mediaKey: string, fallbackKeys?: (string | undefined)[]): ProgressEntry | undefined {
+  const keys = [mediaKey, ...(fallbackKeys ?? [])];
+  for (const k of keys) {
+    if (!k) continue;
+    const p = store[k];
+    if (p && !p.finished) return p;
+  }
+  return undefined;
 }
 
 const subscribe = (cb: () => void) => {
@@ -134,8 +171,12 @@ registerSync({
 
 export function useContinueWatching(): ProgressEntry[] {
   const s = useSyncExternalStore(subscribe, () => store);
-  return Object.values(s)
-    .filter((p) => !p.finished && (p.position > 30 || p.upNext))
-    .sort((a, b) => b.updatedAt - a.updatedAt)
-    .slice(0, 20);
+  return useMemo(
+    () =>
+      Object.values(s)
+        .filter((p) => !p.finished && (p.position > 30 || p.upNext))
+        .sort((a, b) => b.updatedAt - a.updatedAt)
+        .slice(0, 20),
+    [s],
+  );
 }

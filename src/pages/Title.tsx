@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { AudioToggle } from "../components/AudioToggle";
 import { Ambient } from "../components/Ambient";
 import { Art } from "../components/Art";
@@ -7,107 +7,191 @@ import { Card, kindLabel } from "../components/Card";
 import { Icon } from "../components/Icon";
 import { SmartSource } from "../components/SmartSource";
 import { TitleArt } from "../components/TitleArt";
-import { decodeKey, encodeKey, getDetail } from "../lib/catalog";
+import {
+  clampEpisode,
+  clampSeason,
+  decodeKey,
+  encodeKey,
+  getDetail,
+  getSeasonEpisodes,
+  parseSeasonEpisodeParams,
+  resolvePlaybackRequest,
+} from "../lib/catalog";
 import { fmtAgo, fmtDate, fmtMoney, fmtRuntime, languageName } from "../lib/format";
 import { getProgress, useContinueWatching } from "../lib/progress";
 import { audioFor, setAudioFor, useSettings } from "../lib/settings";
-import { tmdbSeason } from "../lib/tmdb";
-import { animeEpisodes, animeSeasons, type AnimeSeason } from "../lib/anilist";
-import type { Episode } from "../lib/types";
+import type { CanonicalSeason, Episode } from "../lib/types";
 import { useAsync } from "../lib/useAsync";
 import { toggleList, useWatchlist } from "../lib/watchlist";
 
 type Tab = "episodes" | "cast" | "details" | "more";
 
 export function Title() {
-  const key = decodeKey(useParams().key!);
+  const rawKeyParam = useParams().key ?? "";
+  const key = decodeKey(rawKeyParam);
+  const [searchParams] = useSearchParams();
+  const routeParams = useMemo(() => parseSeasonEpisodeParams(searchParams), [searchParams]);
   const nav = useNavigate();
+
   const { data: d, error } = useAsync(() => getDetail(key), [key]);
-  const isTmdbSeries = key.includes(":tv:") || (key.startsWith("tmdb:") && !!d?.seasons);
-  const [season, setSeason] = useState(1);
-  const eps = useAsync(() => (isTmdbSeries ? tmdbSeason(key, season) : Promise.resolve([] as Episode[])), [key, season, isTmdbSeries]);
-  // Anime on AniList is one entry per season: gather the whole series so it's one show here.
-  const isAniList = key.startsWith("anilist:");
-  const aniSeasons = useAsync(() => (isAniList ? animeSeasons(key).catch(() => [] as AnimeSeason[]) : Promise.resolve([] as AnimeSeason[])), [key]);
-  const franchise = aniSeasons.data ?? [];
   const cw = useContinueWatching();
-  const [aniPick, setAniPick] = useState<string | null>(null);
-  useEffect(() => setAniPick(null), [key]);
-  // Default season: the one you watched most recently, else the entry you opened.
-  const lastWatched = useMemo(() => {
-    const keys = new Set(franchise.map((x) => x.key));
-    return cw.filter((p) => keys.has(p.media.key)).sort((a, b) => b.updatedAt - a.updatedAt)[0]?.media.key;
-  }, [franchise, cw]);
-  const seasonKey = isAniList ? aniPick ?? lastWatched ?? key : key;
-  const seasonDetail = useAsync(() => (seasonKey !== key ? getDetail(seasonKey) : Promise.resolve(null)), [seasonKey]);
-  // Anime: real episode titles, stills and synopses (ani.zip / AniList), for the selected season.
-  const animeEpData = useAsync(() => (isAniList ? animeEpisodes(seasonKey).catch(() => [] as Episode[]) : Promise.resolve([] as Episode[])), [seasonKey]);
-  const progress = cw.find((p) => p.media.key === seasonKey);
+
+  // Map any saved progress entry across the show or its cours to a canonical (season, episode) pair.
+  const matchedProgress = useMemo(() => {
+    if (!d) return undefined;
+    const allSeasons = [...(d.seasons ?? []), ...(d.specials ?? [])];
+    const validKeys = new Set<string>([d.key, ...(d.canonicalKey ? [d.canonicalKey] : [])]);
+    for (const s of allSeasons) {
+      if (s.key) validKeys.add(s.key);
+      for (const c of s.cours ?? []) validKeys.add(c.key);
+    }
+    const candidates = cw.filter((p) => validKeys.has(p.media.key)).sort((a, b) => b.updatedAt - a.updatedAt);
+    const latest = candidates[0];
+    if (!latest) return undefined;
+
+    // If progress was recorded against a specific cour without a canonical season, map it into its canonical season.
+    if (latest.season == null && allSeasons.length > 0) {
+      for (const s of allSeasons) {
+        const cour = s.cours?.find((c) => c.key === latest.media.key);
+        if (cour) {
+          const epOffset = (latest.episode ?? 1) + cour.startEpisode - 1;
+          return { ...latest, season: s.number, episode: clampEpisode(s, epOffset) ?? 1 };
+        }
+      }
+    }
+    return latest;
+  }, [d, cw]);
+
+  const [pickedSeason, setPickedSeason] = useState<number | null>(null);
+  useEffect(() => {
+    setPickedSeason(null);
+  }, [key]);
+
+  // Active canonical season, strictly clamped to playable seasons / specials.
+  const activeSeasonObj: CanonicalSeason | undefined = useMemo(() => {
+    if (!d || d.kind === "movie") return undefined;
+    const preferred = pickedSeason ?? routeParams.season ?? matchedProgress?.season ?? d.initialSeason;
+    return clampSeason(d, preferred);
+  }, [d, pickedSeason, routeParams.season, matchedProgress?.season]);
+
+  const season = activeSeasonObj?.number ?? 1;
+
+  const eps = useAsync(
+    () => (d && d.kind !== "movie" ? getSeasonEpisodes(d, activeSeasonObj?.number) : Promise.resolve([] as Episode[])),
+    [d?.key, activeSeasonObj?.number],
+  );
+
   useSettings(); // re-render when the audio preference changes
-  const saved = useWatchlist().some((e) => e.media.key === key);
+  const saved = useWatchlist().some((e) => e.media.key === key || (d?.canonicalKey && e.media.key === d.canonicalKey));
   const [tab, setTab] = useState<Tab>("episodes");
   const [swap, setSwap] = useState(false);
+  const swapTimer = useRef<number>();
+  useEffect(() => () => clearTimeout(swapTimer.current), []);
   const [page, setPage] = useState(0);
   const [jump, setJump] = useState("");
 
   useEffect(() => {
-    if (d?.seasons?.length) setSeason(progress?.season ?? d.seasons[0].number);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [d?.key]);
+    const resumeEp =
+      matchedProgress && (matchedProgress.season == null || matchedProgress.season === season)
+        ? matchedProgress.episode ?? 1
+        : 1;
+    setPage(Math.max(0, Math.floor((resumeEp - 1) / 50)));
+  }, [key, season, matchedProgress]);
 
-  useEffect(() => setPage(Math.max(0, Math.floor(((progress?.episode ?? 1) - 1) / 50))), [key, season]); // eslint-disable-line react-hooks/exhaustive-deps
-
+  const canonicalKey = d?.canonicalKey ?? d?.key ?? key;
   const anime = key.startsWith("anilist:") || d?.kind === "anime";
-  const audio = anime ? audioFor(key) : undefined;
-  /** The selected season's own record (episodes, MAL id); the show's while it loads or for single seasons. */
-  const sd = seasonKey === key ? d : seasonDetail.data ?? null;
-  const animeEps = !isTmdbSeries && sd?.episodeCount ? sd.episodeCount : 0;
-  const hasEps = isTmdbSeries || animeEps > 0;
+  const audio = anime ? audioFor(canonicalKey, [key, d?.key]) : undefined;
 
-  // What pressing Play would start: resume point, else the first episode, else the film.
-  const startS = progress ? progress.season : isTmdbSeries ? season : undefined;
-  const startE = progress ? progress.episode : hasEps ? 1 : undefined;
-  const req = useMemo(() => (sd ? { media: sd, season: startS, episode: startE, audio } : null), [sd, startS, startE, audio]);
+  const isSeries = d ? d.kind !== "movie" : !key.includes(":movie:");
+  const hasPlayableEps = !!(
+    isSeries &&
+    ((d?.seasons && d.seasons.length > 0) ||
+      (d?.specials && d.specials.length > 0) ||
+      (d?.episodeCount && d.episodeCount > 0))
+  );
+  const showEpisodesTab = isSeries && (hasPlayableEps || (d?.upcomingSeasons?.length ?? 0) > 0);
+
+  // What pressing Play would start: clamped resume point, else the first episode of the active season, else the film.
+  const startS = useMemo(() => {
+    if (!d || d.kind === "movie") return undefined;
+    if (matchedProgress?.season != null) {
+      return clampSeason(d, matchedProgress.season)?.number ?? activeSeasonObj?.number;
+    }
+    return activeSeasonObj?.number;
+  }, [d, matchedProgress?.season, activeSeasonObj?.number]);
+
+  const startE = useMemo(() => {
+    if (!d || d.kind === "movie") return undefined;
+    const targetS = startS != null ? clampSeason(d, startS) : activeSeasonObj;
+    return clampEpisode(targetS, matchedProgress?.episode ?? routeParams.episode ?? 1, d.episodeCount);
+  }, [d, startS, activeSeasonObj, matchedProgress?.episode, routeParams.episode]);
+
+  const req = useMemo(
+    () => (d ? resolvePlaybackRequest(d, startS, startE, audio) : null),
+    [d, startS, startE, audio],
+  );
 
   if (error) return <div className="page empty"><p>Couldn't load this title. {error.message}</p></div>;
   if (!d) return <div className="tp"><div className="tp-skeleton" /></div>;
 
   const watch = (s?: number, e?: number, srv?: string) => {
-    const qs = new URLSearchParams({ ...(s != null ? { s: String(s) } : {}), ...(e != null ? { e: String(e) } : {}), ...(audio ? { a: audio } : {}), ...(srv ? { srv } : {}) });
-    nav(`/watch/${encodeKey(seasonKey)}${qs.size ? `?${qs}` : ""}`, { viewTransition: true, state: { from: "app" } });
+    const resolved = resolvePlaybackRequest(d, s, e, audio);
+    const targetKey = resolved?.media.key ?? d.key;
+    const clampedS = resolved?.season ?? s;
+    const clampedE = resolved?.episode ?? e;
+    const qs = new URLSearchParams({
+      ...(clampedS != null ? { s: String(clampedS) } : {}),
+      ...(clampedE != null ? { e: String(clampedE) } : {}),
+      ...(audio ? { a: audio } : {}),
+      ...(srv ? { srv } : {}),
+    });
+    nav(`/watch/${encodeKey(targetKey)}${qs.size ? `?${qs}` : ""}`, { viewTransition: true, state: { from: "app" } });
   };
-  const epTag = progress?.episode != null ? `${progress.season != null ? `S${progress.season} · ` : ""}E${progress.episode}` : "";
-  const playLabel = progress
-    ? progress.upNext ? `Play ${epTag}` : epTag ? `Resume ${epTag}` : "Resume"
-    : hasEps ? "Play E1" : "Play";
+
+  const epTag =
+    matchedProgress && startE != null
+      ? `${startS != null && (d.seasons?.length ?? 0) > 1 ? `S${startS} · ` : startS === 0 ? "Specials · " : ""}E${startE}`
+      : "";
+  const playLabel = matchedProgress && hasPlayableEps
+    ? matchedProgress.upNext ? `Play ${epTag}` : epTag ? `Resume ${epTag}` : "Resume"
+    : hasPlayableEps ? "Play E1" : "Play";
+
+  const firstSeason = d.seasons?.[0];
+  const mainlineCount = d.seasons?.length ?? 0;
   const length =
     d.kind === "movie"
       ? fmtRuntime(d.runtime)
-      : d.seasons?.length
-        ? `${d.seasons.length} season${d.seasons.length > 1 ? "s" : ""}`
-        : franchise.length > 1
-          ? `${franchise.length} seasons`
-          : animeEps
-            ? `${animeEps} episode${animeEps === 1 ? "" : "s"}`
+      : mainlineCount > 1
+        ? `${mainlineCount} seasons`
+        : mainlineCount === 1 && firstSeason
+          ? `${firstSeason.episodeCount} episode${firstSeason.episodeCount === 1 ? "" : "s"}`
+          : d.episodeCount
+            ? `${d.episodeCount} episode${d.episodeCount === 1 ? "" : "s"}`
             : "";
-  const what = startE != null ? `${startS != null ? `S${startS} ` : ""}E${startE}` : "this film";
-  const tabs: [Tab, string][] = [...(hasEps ? [["episodes", "Episodes"] as [Tab, string]] : []), ["cast", anime ? "Characters & crew" : "Cast & crew"], ["details", "Details"], ["more", "More like this"]];
-  const curTab = hasEps || tab !== "episodes" ? tab : "cast";
+
+  const what = startE != null ? `${startS != null ? (startS === 0 ? "Specials " : `S${startS} `) : ""}E${startE}` : "this film";
+  const tabs: [Tab, string][] = [
+    ...(showEpisodesTab ? [["episodes", "Episodes"] as [Tab, string]] : []),
+    ["cast", anime ? "Characters & crew" : "Cast & crew"],
+    ["details", "Details"],
+    ["more", "More like this"],
+  ];
+  const curTab = showEpisodesTab || tab !== "episodes" ? tab : "cast";
 
   const changeAudio = (a: "sub" | "dub") => {
     setSwap(true);
-    setTimeout(() => {
-      setAudioFor(key, a);
+    clearTimeout(swapTimer.current);
+    swapTimer.current = window.setTimeout(() => {
+      setAudioFor(canonicalKey, a, [key, d?.key]);
       setSwap(false);
     }, 200);
   };
 
-  const epList: Episode[] = isTmdbSeries
-    ? eps.data ?? []
-    : Array.from({ length: animeEps }, (_, i) => {
-        const known = animeEpData.data?.find((e) => e.number === i + 1);
-        return known ? { ...known, runtime: known.runtime ?? d.runtime } : { season: 0, number: i + 1, title: `Episode ${i + 1}`, runtime: d.runtime };
-      });
+  const epList: Episode[] = eps.data ?? [];
+  const hasMultipleSelectors =
+    mainlineCount > 1 ||
+    (mainlineCount >= 1 && (d.specials?.length ?? 0) > 0) ||
+    (d.upcomingSeasons?.length ?? 0) > 0;
 
   return (
     <div className="tp">
@@ -140,7 +224,9 @@ export function Title() {
               <div className="airing"><Icon name="clock" size={14} /> Episode {d.nextAiring.episode} airs {new Date(d.nextAiring.at).toLocaleString(undefined, { weekday: "long", hour: "numeric", minute: "2-digit" })}</div>
             )}
             <div className="acts">
-              <button className="btn play" onClick={() => watch(startS, startE)}><Icon name="play" size={16} /> {playLabel}</button>
+              {(d.kind === "movie" || hasPlayableEps) && (
+                <button className="btn play" onClick={() => watch(startS, startE)}><Icon name="play" size={16} /> {playLabel}</button>
+              )}
               <button className={`btn glass ${saved ? "on" : ""}`} onClick={() => toggleList(d)}>
                 <Icon name={saved ? "check" : "bookmark"} size={17} /> {saved ? "In My List" : "My List"}
               </button>
@@ -149,41 +235,66 @@ export function Title() {
                 <a className="btn glass" href={`https://www.youtube.com/watch?v=${d.trailerYouTubeId}`} target="_blank" rel="noreferrer">Trailer</a>
               )}
             </div>
-            {progress && !progress.upNext && progress.duration > 0 && (
+            {matchedProgress && !matchedProgress.upNext && matchedProgress.duration > 0 && (
               <div className="resume">
-                <div className="resume-bar"><i style={{ width: `${(progress.position / progress.duration) * 100}%` }} /></div>
-                <span>{Math.max(1, Math.round((progress.duration - progress.position) / 60))}m left{progress.episode != null ? ` in E${progress.episode}` : ""}</span>
+                <div className="resume-bar"><i style={{ width: `${(matchedProgress.position / matchedProgress.duration) * 100}%` }} /></div>
+                <span>{Math.max(1, Math.round((matchedProgress.duration - matchedProgress.position) / 60))}m left{startE != null ? ` in E${startE}` : ""}</span>
               </div>
             )}
           </div>
-          {req ? <SmartSource req={req} what={what} onPlay={(srv) => watch(startS, startE, srv)} /> : <aside className="glass smart"><div className="smart-note">Loading season…</div></aside>}
+          {req ? (
+            <SmartSource req={req} what={what} onPlay={(srv) => watch(startS, startE, srv)} />
+          ) : (
+            <aside className="glass smart">
+              <div className="smart-note">{isSeries && !hasPlayableEps ? "No aired episodes available yet." : "Loading season…"}</div>
+            </aside>
+          )}
         </div>
 
         <div className="tabs" role="tablist">
           {tabs.map(([id, label]) => (
             <button key={id} role="tab" aria-selected={curTab === id} className={curTab === id ? "on" : ""} onClick={() => setTab(id)}>{label}</button>
           ))}
-          {curTab === "episodes" && isTmdbSeries && d.seasons && d.seasons.length > 1 && (
-            <div className="season-pick">
-              {d.seasons.map((s) => (
-                <button key={s.number} className={s.number === season ? "on" : ""} onClick={() => setSeason(s.number)}>S{s.number}</button>
-              ))}
-            </div>
-          )}
-          {curTab === "episodes" && franchise.length > 1 && (
-            <div className="season-pick">
-              {franchise.map((x) => (
+          {curTab === "episodes" && hasMultipleSelectors && (
+            <div className="season-pick" role="group" aria-label="Seasons">
+              {(d.seasons ?? []).map((s) => {
+                const courNote = s.cours && s.cours.length > 1 ? ` · ${s.cours.length} parts merged` : "";
+                return (
+                  <button
+                    key={s.number}
+                    className={s.number === season ? "on" : ""}
+                    title={`${s.name}${s.year ? ` (${s.year})` : ""} · ${s.episodeCount} episodes${courNote}`}
+                    onClick={() => {
+                      setPickedSeason(s.number);
+                      setPage(0);
+                    }}
+                  >
+                    S{s.number}
+                  </button>
+                );
+              })}
+              {(d.specials ?? []).map((sp) => (
                 <button
-                  key={x.key}
-                  className={x.key === seasonKey ? "on" : ""}
-                  title={`${x.title}${x.year ? ` (${x.year})` : ""}${x.episodes ? ` · ${x.episodes} episodes` : ""}`}
+                  key={`special-${sp.number}`}
+                  className={season === 0 ? "on" : ""}
+                  title={`${sp.name} · ${sp.episodeCount} special${sp.episodeCount === 1 ? "" : "s"}`}
                   onClick={() => {
-                    setAniPick(x.key);
+                    setPickedSeason(0);
                     setPage(0);
                   }}
                 >
-                  S{franchise.indexOf(x) + 1}
+                  Specials
                 </button>
+              ))}
+              {(d.upcomingSeasons ?? []).map((u) => (
+                <span
+                  key={`upcoming-${u.number}-${u.name}`}
+                  className="chip muted"
+                  title={`${u.name}${u.year ? ` (${u.year})` : ""} · Unaired / TBA`}
+                  aria-disabled="true"
+                >
+                  S{u.number} TBA
+                </span>
               ))}
             </div>
           )}
@@ -192,10 +303,25 @@ export function Title() {
         {curTab === "episodes" && (() => {
           // Long anime runs (One Piece is past 1,100) are paged in blocks of 50.
           const PAGE = 50;
-          const paged = !isTmdbSeries && epList.length > PAGE;
-          const pages = Math.ceil(epList.length / PAGE);
-          const shown = paged ? epList.slice(page * PAGE, page * PAGE + PAGE) : epList;
-          const upNext = progress?.episode != null ? progress.episode : undefined;
+          const paged = epList.length > PAGE;
+          const pages = Math.max(1, Math.ceil(epList.length / PAGE));
+          const safePage = Math.max(0, Math.min(page, pages - 1));
+          const shown = paged ? epList.slice(safePage * PAGE, safePage * PAGE + PAGE) : epList;
+          const upNext = matchedProgress?.episode != null ? matchedProgress.episode : undefined;
+
+          if (!eps.loading && epList.length === 0) {
+            return (
+              <div className="empty" style={{ padding: "32px 0" }}>
+                <p className="muted">No aired episodes available for this season yet.</p>
+                {firstSeason && season !== firstSeason.number && (
+                  <button className="btn glass sm" onClick={() => { setPickedSeason(firstSeason.number); setPage(0); }}>
+                    Go to Season {firstSeason.number}
+                  </button>
+                )}
+              </div>
+            );
+          }
+
           return (
             <>
               {(paged || epList.length > 12) && (
@@ -203,7 +329,7 @@ export function Title() {
                   {paged && (
                     <div className="season-strip">
                       {Array.from({ length: pages }, (_, p) => (
-                        <button key={p} className={p === page ? "on" : ""} onClick={() => setPage(p)}>{p * PAGE + 1}–{Math.min(epList.length, (p + 1) * PAGE)}</button>
+                        <button key={p} className={p === safePage ? "on" : ""} onClick={() => setPage(p)}>{p * PAGE + 1}–{Math.min(epList.length, (p + 1) * PAGE)}</button>
                       ))}
                     </div>
                   )}
@@ -212,7 +338,8 @@ export function Title() {
                     onSubmit={(ev) => {
                       ev.preventDefault();
                       const n = Number(jump);
-                      if (n >= 1 && n <= (epList[epList.length - 1]?.number ?? 0)) watch(isTmdbSeries ? season : undefined, n);
+                      const clamped = clampEpisode(activeSeasonObj, n, epList.length);
+                      if (clamped != null) watch(season, clamped);
                     }}
                   >
                     <Icon name="search" size={14} />
@@ -221,16 +348,17 @@ export function Title() {
                   </form>
                 </div>
               )}
-              <div className={`ep-grid swap ${swap ? "out" : ""} ${shown.some((e) => e.still) || d.backdrop ? "" : "compact"}`} key={`${season}-${audio}-${page}`}>
+              <div className={`ep-grid swap ${swap ? "out" : ""} ${shown.some((e) => e.still) || d.backdrop ? "" : "compact"}`} key={`${season}-${audio}-${safePage}`}>
                 {shown.map((e, i) => {
-                  const s = isTmdbSeries ? season : undefined;
-                  const p = getProgress(seasonKey, s, e.number);
-                  const isCur = upNext === e.number && (progress?.season ?? undefined) === s;
+                  const pKey = e.sourceKey ?? d.key;
+                  const pEp = e.courEpisode ?? e.number;
+                  const p = getProgress(canonicalKey, season, e.number, [d.key, pKey]) ?? getProgress(pKey, undefined, pEp);
+                  const isCur = upNext === e.number && (matchedProgress?.season ?? season) === season;
                   const watched = p && p.duration > 0 && p.position / p.duration > 0.92;
                   // Episodes without their own still (often unaired ones) get the show's art, dimmed.
                   const still = e.still ?? d.backdrop;
                   return (
-                    <button key={e.number} className={`ep-card ${isCur ? "cur" : ""} ${watched ? "seen" : ""}`} style={{ ["--i" as any]: Math.min(i, 14) }} onClick={() => watch(s, e.number)}>
+                    <button key={e.number} className={`ep-card ${isCur ? "cur" : ""} ${watched ? "seen" : ""}`} style={{ ["--i" as any]: Math.min(i, 14) }} onClick={() => watch(season, e.number)}>
                       <div className="ec-th">
                         {still && <img src={still} alt="" loading="lazy" decoding="async" className={e.still ? "" : "dim"} />}
                         <span className="ec-num">{e.number}</span>
@@ -245,13 +373,13 @@ export function Title() {
                         <div className="ec-d">
                           {p && p.duration > 0 && !watched
                             ? `${Math.max(1, Math.round((p.duration - p.position) / 60))}m left`
-                            : e.overview || (e.airDate ? new Date(e.airDate).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }) : audio ? (audio === "dub" ? "English dub" : "Japanese audio · English subtitles") : "")}
+                            : e.overview || (e.airDate ? new Date(`${e.airDate}T12:00:00`).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }) : audio ? (audio === "dub" ? "English dub" : "Japanese audio · English subtitles") : "")}
                         </div>
                       </div>
                     </button>
                   );
                 })}
-                {isTmdbSeries && eps.loading && !eps.data && Array.from({ length: 6 }, (_, i) => <div key={i} className="ep-card skeleton" />)}
+                {eps.loading && !eps.data && Array.from({ length: 6 }, (_, i) => <div key={i} className="ep-card skeleton" />)}
               </div>
             </>
           );
@@ -272,7 +400,7 @@ export function Title() {
               <>
                 <h5 className="people-hd">Behind the camera</h5>
                 {d.crew.map((c, i) => (
-                  <div key={c.name + c.job} className="person crew" style={{ ["--i" as any]: Math.min(i + d.cast.length, 20) }}>
+                  <div key={`${c.name}-${c.job}-${i}`} className="person crew" style={{ ["--i" as any]: Math.min(i + d.cast.length, 20) }}>
                     <div className="person-img" style={c.photo ? { backgroundImage: `url(${c.photo})` } : undefined}>{!c.photo && c.name[0]}</div>
                     <div className="person-name">{c.name}</div>
                     <div className="person-role">{c.job}</div>
