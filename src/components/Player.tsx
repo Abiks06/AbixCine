@@ -2157,12 +2157,14 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     onBack();
   };
 
-  const switchTo = async (i: number) => {
+  const switchTo = async (i: number, opts?: { demoteCurrent?: boolean }) => {
     const list = candsRef.current;
     let c = list[i];
     if (!c) return;
     const id = candKey(c);
-    const isSameActive = id === activeIdRef.current;
+    const prevCur = curRef.current;
+    const prevId = activeIdRef.current;
+    const isSameActive = id === prevId;
     if (isSameActive && c.probe?.ok !== false) return;
 
     verifyCtlRef.current?.abort();
@@ -2208,6 +2210,17 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     }
     if (!mountedRef.current || gen !== verifyGenRef.current) return;
     if (!candsRef.current.some((x) => candKey(x) === id)) return;
+
+    if (opts?.demoteCurrent && prevCur && prevId && prevId !== id) {
+      reported.current.delete(prevId);
+      setLiveVerifiedIds((prev) => {
+        if (!prev.has(prevId)) return prev;
+        const next = new Set(prev);
+        next.delete(prevId);
+        return next;
+      });
+      resultRef.current?.(prevCur, false);
+    }
 
     saveNowRef.current();
     failedSessionRef.current = -1;
@@ -2294,8 +2307,7 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     if (i === -1) i = findNext((c) => !c.probe);
     if (i === -1) i = findNext((_, j) => j !== idx);
     if (i === -1) return flash("No other server available");
-    if (cur) resultRef.current?.(cur, false);
-    void switchTo(i);
+    void switchTo(i, { demoteCurrent: true });
   };
   const changeAudio = (a: Audio) => {
     saveNow();
