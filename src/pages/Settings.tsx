@@ -25,7 +25,7 @@ import {
   type SubPref,
   type SubtitleCue,
 } from "../lib/subtitles";
-import { getHealth, reliability, resetHealth } from "../sources/health";
+import { circuitRemainingMs, getHealth, isCircuitHalfOpen, isCircuitOpen, reliability, resetHealth } from "../sources/health";
 import { scanLibrary } from "../sources/local";
 import { availableSources, DIRECT_SOURCES, PROVIDERS } from "../sources/registry";
 import { appVersion, checkForUpdates, installUpdate, useUpdate } from "../lib/updater";
@@ -76,7 +76,15 @@ export function Settings() {
   const [name, setName] = useState(user?.name ?? "");
   const [profileMsg, setProfileMsg] = useState<string | null>(null);
   const [showExternal, setShowExternal] = useState(s.jellyfin.enabled);
-  const [, setHealthTick] = useState(0);
+  const [healthTick, setHealthTick] = useState(0);
+  const enabledProviders = PROVIDERS.filter((p) => p.isEnabled(s));
+  const hasOpenCircuit = enabledProviders.some((p) => isCircuitOpen(p.id));
+  useEffect(() => {
+    if (!hasOpenCircuit) return;
+    const t = window.setInterval(() => setHealthTick((n) => n + 1), 15_000);
+    return () => window.clearInterval(t);
+  }, [hasOpenCircuit, healthTick]);
+  const formatCooldown = (ms: number) => (ms >= 60_000 ? `${Math.ceil(ms / 60_000)}m` : `${Math.max(1, Math.ceil(ms / 1000))}s`);
   const [subPref, setSubPref] = useState<SubPref>(() =>
     normalizeSubPref({ ...loadSubPref(), ...(s.subtitlePref ?? {}) }),
   );
@@ -340,14 +348,51 @@ export function Settings() {
             <button className="btn btn-glass sm" onClick={() => { resetHealth(); setHealthTick((n) => n + 1); }}>Reset history</button>
           </div>
           <div className="health-list">
-            {PROVIDERS.filter((p) => p.isEnabled(s)).map((p) => {
+            {enabledProviders.map((p) => {
               const h = getHealth(p.id);
               const seen = h.ok + h.fail > 0.5;
+              const relPct = Math.round(reliability(p.id) * 100);
+              const avgLat = h.latencyMs ?? h.latency;
+              const open = isCircuitOpen(p.id);
+              const remainMs = open ? circuitRemainingMs(p.id) : 0;
+              const halfOpen = !open && isCircuitHalfOpen(p.id);
+              const hasData = seen || avgLat != null || h.lookupMs != null || open || (h.streak ?? 0) > 0;
               return (
-                <div key={p.id} className="health">
-                  <span>{p.name}</span>
-                  <span className="muted">{seen ? `${Math.round(reliability(p.id) * 100)}% reliable` : "no history yet"}{h.latency != null ? ` · ~${Math.round(h.latency)} ms` : ""}</span>
-                  <i style={{ ["--w" as any]: `${seen ? reliability(p.id) * 100 : 0}%` }} />
+                <div key={p.id} className={`health ${open ? "tripped" : halfOpen ? "half-open" : ""}`}>
+                  <div className="health-main">
+                    <span className="health-name">{p.name}</span>
+                    {open && (
+                      <button
+                        type="button"
+                        className="health-cool"
+                        onClick={() => { resetHealth(p.id); setHealthTick((n) => n + 1); }}
+                        title={`Reset cooldown and failure streak for ${p.name}`}
+                      >
+                        Cooldown {formatCooldown(remainMs)} · tap to reset
+                      </button>
+                    )}
+                    {halfOpen && (
+                      <span className="health-half" title="Cooldown elapsed; next request tests recovery">
+                        Recovering
+                      </span>
+                    )}
+                  </div>
+                  <div className="health-right">
+                    <span className="health-stats">
+                      {seen ? `${relPct}% reliable` : "no history yet"}
+                      {avgLat != null ? ` · ~${Math.round(avgLat)} ms` : ""}
+                    </span>
+                    <button
+                      type="button"
+                      className="health-reset"
+                      disabled={!hasData}
+                      onClick={() => { resetHealth(p.id); setHealthTick((n) => n + 1); }}
+                      title={`Reset history for ${p.name}`}
+                    >
+                      Reset
+                    </button>
+                  </div>
+                  <i style={{ ["--w" as any]: `${seen ? relPct : 0}%` }} />
                 </div>
               );
             })}
