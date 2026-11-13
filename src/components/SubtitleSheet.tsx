@@ -27,7 +27,7 @@ export interface UnifiedSubTrack {
   streamIndex?: number;
   hlsIndex?: number;
   nativeTrack?: TextTrack;
-  provider?: "wyzie" | "opensubtitles";
+  provider?: "wyzie" | "opensubtitles" | "subdl";
   release?: string;
   cues?: SubtitleCue[];
   loading?: boolean;
@@ -86,6 +86,7 @@ const ORIGIN_LABELS: Record<SubTrackOrigin, string> = {
 const PROVIDER_LABELS: Record<OnlineSubtitleResult["provider"], string> = {
   wyzie: "Wyzie",
   opensubtitles: "OpenSubs",
+  subdl: "SubDL",
 };
 
 export const SubtitleSheet = memo(function SubtitleSheet({

@@ -404,6 +404,58 @@ fn ensure_in_library_roots(path: &Path) -> Result<PathBuf, String> {
     ensure_in_allowed_roots(path, &allowed_roots)
 }
 
+const OSHASH_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Compute the standard OpenSubtitles 64-bit file hash:
+/// `file_size + sum_u64_le(first 64 KiB) + sum_u64_le(last 64 KiB)` (wrapping 64-bit arithmetic),
+/// formatted as 16 lowercase hex characters.
+fn compute_oshash_from_path(canonical: &Path) -> Result<String, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(canonical).map_err(|e| e.to_string())?;
+    let file_size = file.metadata().map_err(|e| e.to_string())?.len();
+    if file_size < OSHASH_CHUNK_BYTES as u64 {
+        return Err("File is smaller than 64 KiB; cannot compute OpenSubtitles hash".into());
+    }
+
+    let sum_chunk = |buf: &[u8]| -> u64 {
+        buf.chunks_exact(8).fold(0u64, |acc, chunk| {
+            acc.wrapping_add(u64::from_le_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+            ]))
+        })
+    };
+
+    let mut buf = vec![0u8; OSHASH_CHUNK_BYTES];
+    file.read_exact(&mut buf).map_err(|e| e.to_string())?;
+    let head_sum = sum_chunk(&buf);
+
+    file.seek(SeekFrom::Start(file_size - OSHASH_CHUNK_BYTES as u64))
+        .map_err(|e| e.to_string())?;
+    file.read_exact(&mut buf).map_err(|e| e.to_string())?;
+    let tail_sum = sum_chunk(&buf);
+
+    let hash = file_size.wrapping_add(head_sum).wrapping_add(tail_sum);
+    Ok(format!("{hash:016x}"))
+}
+
+#[cfg(test)]
+fn compute_oshash_in_roots(path: &Path, allowed_roots: &[PathBuf]) -> Result<String, String> {
+    let canonical = ensure_in_allowed_roots(path, allowed_roots)?;
+    compute_oshash_from_path(&canonical)
+}
+
+#[tauri::command]
+async fn compute_oshash(path: String) -> Result<String, String> {
+    let path = PathBuf::from(&path);
+    tauri::async_runtime::spawn_blocking(move || {
+        let canonical = ensure_in_library_roots(&path)?;
+        compute_oshash_from_path(&canonical)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 fn is_text_sub_codec(codec: &str) -> bool {
     matches!(
         codec.trim().to_ascii_lowercase().as_str(),
@@ -722,6 +774,54 @@ mod local_media_tests {
         let big_file = root.0.join("big.vtt");
         std::fs::write(&big_file, vec![b'a'; 200]).unwrap();
         assert!(read_text_capped(&big_file, 100).is_err());
+    }
+
+    #[test]
+    fn computes_standard_opensubtitles_64bit_hash_and_enforces_library_roots() {
+        let root = TempDirGuard::new("oshash-root");
+        let outside = TempDirGuard::new("oshash-outside");
+        let canonical_root = std::fs::canonicalize(&root.0).unwrap();
+
+        // Reject files smaller than 64 KiB
+        let tiny = root.0.join("tiny.mkv");
+        std::fs::write(&tiny, vec![0u8; OSHASH_CHUNK_BYTES - 1]).unwrap();
+        assert!(compute_oshash_in_roots(&tiny, &[canonical_root.clone()]).is_err());
+
+        // Reject files outside LIBRARY_ROOTS
+        let outside_vid = outside.0.join("outside.mkv");
+        std::fs::write(&outside_vid, vec![0u8; OSHASH_CHUNK_BYTES]).unwrap();
+        assert!(compute_oshash_in_roots(&outside_vid, &[canonical_root.clone()]).is_err());
+
+        // Exact 64 KiB file: head and tail overlap completely -> file_size + 2 * sum(64 KiB)
+        let exact_64k = root.0.join("exact64k.mkv");
+        let mut data_64k = Vec::with_capacity(OSHASH_CHUNK_BYTES);
+        for i in 0..(OSHASH_CHUNK_BYTES / 8) {
+            data_64k.extend_from_slice(&(i as u64 + 1).to_le_bytes());
+        }
+        std::fs::write(&exact_64k, &data_64k).unwrap();
+        let sum_64k: u64 = (1..=(OSHASH_CHUNK_BYTES as u64 / 8)).fold(0u64, u64::wrapping_add);
+        let expected_64k = (OSHASH_CHUNK_BYTES as u64)
+            .wrapping_add(sum_64k)
+            .wrapping_add(sum_64k);
+        assert_eq!(
+            compute_oshash_in_roots(&exact_64k, &[canonical_root.clone()]).unwrap(),
+            format!("{expected_64k:016x}")
+        );
+
+        // Non-overlapping head & tail (> 128 KiB) with wrapping overflow arithmetic
+        let big_vid = root.0.join("movie.mkv");
+        let total_size = OSHASH_CHUNK_BYTES * 2 + 123;
+        let mut data_big = vec![0u8; total_size];
+        // Put 0x0102030405060708 in first 8 bytes of head and 0xffffffffffffffff in last 8 bytes of tail
+        let head_val: u64 = 0x0102_0304_0506_0708;
+        let tail_val: u64 = u64::MAX;
+        data_big[..8].copy_from_slice(&head_val.to_le_bytes());
+        data_big[total_size - 8..].copy_from_slice(&tail_val.to_le_bytes());
+        std::fs::write(&big_vid, &data_big).unwrap();
+        let expected_big = (total_size as u64).wrapping_add(head_val).wrapping_add(tail_val);
+        let got_big = compute_oshash_in_roots(&big_vid, &[canonical_root]).unwrap();
+        assert_eq!(got_big.len(), 16);
+        assert_eq!(got_big, format!("{expected_big:016x}"));
     }
 }
 
@@ -1322,6 +1422,7 @@ pub fn run() {
             probe_local_subtitles,
             extract_local_subtitle,
             save_sidecar_subtitle,
+            compute_oshash,
             stream::http_fetch,
             stream::http_fetch_bytes,
             shield::sniff_media,
