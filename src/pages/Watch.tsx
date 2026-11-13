@@ -254,6 +254,8 @@ export function Watch() {
         originalLanguage={d.originalLanguage}
         episodes={episodes}
         media={d}
+        season={season}
+        episode={episode}
         onProgress={onProgress}
         onEnded={() => settings.autoplayNext && goNext()}
         autoNext={settings.autoplayNext}

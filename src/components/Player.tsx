@@ -4,14 +4,39 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { fmtTime } from "../lib/format";
 import { ENHANCE_MODES, startEnhancer, upscalerAvailable, type EnhanceMode, type Enhancer, type EnhancerStats } from "../lib/enhance";
-import { decodeSubtitle, langBase, loadSubPref, loadSubtitle, preferredAudioTrackIndex, saveSubPref, toVtt, type CueSize, type SubPref } from "../lib/subtitles";
-import type { Audio } from "../lib/settings";
+import {
+  SUB_PREF_EVENT,
+  activeCuesAt,
+  cuesToVtt,
+  decodeSubtitle,
+  langBase,
+  loadSubPref,
+  loadSubTrackMemory,
+  normalizeSubPref,
+  parseSubtitles,
+  pickBestSubtitleIndex,
+  preferredAudioTrackIndex,
+  saveSubPref,
+  saveSubTrackMemory,
+  shouldAutoEnableSubtitles,
+  type CueAlign,
+  type SubPref,
+  type SubtitleCue,
+} from "../lib/subtitles";
+import {
+  fetchAndParseSubtitle,
+  searchOnlineSubtitles,
+  type OnlineSubtitleResult,
+} from "../lib/subtitleProviders";
+import { updateSettings, type Audio } from "../lib/settings";
 import type { Episode } from "../lib/types";
-import type { StreamCandidate } from "../sources/types";
+import type { StreamCandidate, SubtitleFormat } from "../sources/types";
 import { isUrlTokenExpired } from "../sources/native";
 import { initialCandidateIndex, probeHedged, verifyEmbed } from "../sources/registry";
 import { AudioToggle } from "./AudioToggle";
 import { Icon } from "./Icon";
+import { SubtitleOverlay } from "./SubtitleOverlay";
+import { SubtitleSheet, type UnifiedSubTrack } from "./SubtitleSheet";
 
 /** What the player needs to show the episode list and move between episodes. */
 export interface EpisodeNav {
@@ -49,28 +74,39 @@ interface Props {
   onAudio?: (a: Audio) => void;
   originalLanguage?: string;
   episodes?: EpisodeNav;
-  media?: { title: string; logo?: string; overview?: string; year?: number; rating?: number; backdrop?: string; kind?: string };
+  season?: number;
+  episode?: number;
+  media?: {
+    key?: string;
+    tmdbId?: number;
+    imdbId?: string;
+    title: string;
+    logo?: string;
+    overview?: string;
+    year?: number;
+    rating?: number;
+    backdrop?: string;
+    kind?: string;
+  };
 }
 
-interface SubTrack {
-  id: string;
-  label: string;
-  lang: string;
-  /** HLS rendition, sidecar track, or embedded track exposed by the media element. */
-  kind: "hls" | "file" | "native";
-  hlsIndex?: number;
-  src?: string;
-  nativeTrack?: TextTrack;
+interface ExtractedSubtitleResult {
+  format: "ass" | "vtt";
+  content: string;
+  path: string;
 }
 
-type Sheet = "servers" | "episodes" | "audio" | "picture";
+interface TrackCueCache {
+  cues?: SubtitleCue[];
+  raw?: string;
+  format?: SubtitleFormat;
+  loading?: boolean;
+  error?: string;
+}
+
+type Sheet = "servers" | "episodes" | "subtitles" | "audio" | "picture";
 
 const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2];
-const CUE_SIZES: { id: CueSize; label: string }[] = [
-  { id: "s", label: "S" },
-  { id: "m", label: "M" },
-  { id: "l", label: "L" },
-];
 const UP_NEXT_AT = 25; // seconds before the end
 const TIME_LEFT_KEY = "abx.timeLeft";
 const SHORTCUTS: [string, string][] = [
@@ -82,14 +118,65 @@ const SHORTCUTS: [string, string][] = [
   ["M", "Mute"],
   ["< / >", "Slower or faster"],
   [", / .", "Step a frame (paused)"],
-  ["C", "Subtitles on or off"],
-  ["[ / ]", "Subtitle timing"],
+  ["C · Shift+C", "Subtitles on/off · Cycle track"],
+  ["[ / ]", "Subtitle timing ±0.5s (Shift: ±0.1s)"],
   ["S · E", "Servers · Episodes"],
   ["N", "Next episode"],
   ["F · P", "Fullscreen · Picture-in-picture"],
   ["Esc", "Close panel, leave fullscreen, go back"],
 ];
 const ENHANCE_KEY = "abx.enhance.v1";
+const SUB_FILE_EXT_RX = /\.(srt|vtt|ass|ssa)$/i;
+const SUB_LANG_HINT_RX = /(?:^|[._ -])(en|eng|english|ja|jpn|japanese|fr|fra|fre|french|es|spa|spanish|de|deu|ger|german|pt|pt-br|por|portuguese|it|ita|italian|ar|ara|arabic|ko|kor|korean|zh|chi|zho|chinese|ru|rus|russian|hi|hin|tr|tur|pl|pol|nl|nld)(?:[._ -]|$)/i;
+
+function inferUserSubLang(filename: string): string {
+  const stem = filename.replace(/\.[^.]+$/, "");
+  const m = stem.match(SUB_LANG_HINT_RX);
+  return m ? langBase(m[1]) : "und";
+}
+
+function textTrackToCues(track: TextTrack, prefix: string): { cues: SubtitleCue[]; usingActiveFallback: boolean } {
+  const full = track.cues;
+  const usingActiveFallback = !(full && full.length > 0);
+  const list = usingActiveFallback ? track.activeCues : full;
+  if (!list || list.length === 0) return { cues: [], usingActiveFallback };
+  const out: SubtitleCue[] = [];
+  for (let i = 0; i < list.length; i++) {
+    const c = list[i] as VTTCue | (TextTrackCue & { text?: string });
+    const rawText = "text" in c && typeof c.text === "string" ? c.text : "";
+    const vc = c as Partial<VTTCue>;
+    const horiz = vc.align === "left" || vc.align === "start" ? 0 : vc.align === "right" || vc.align === "end" ? 2 : 1;
+    const vert = typeof vc.line === "number" ? (vc.line >= 0 && vc.line <= 25 ? 7 : vc.line > 25 && vc.line <= 65 ? 4 : 1) : 1;
+    const align = (vert + horiz) as CueAlign;
+    if (rawText.includes("<")) {
+      const parsed = parseSubtitles(`WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n${rawText}`, "vtt");
+      const first = parsed.cues[0];
+      out.push({
+        id: `${prefix}-${i}-${c.startTime}-${c.endTime}`,
+        start: c.startTime,
+        end: c.endTime,
+        text: first?.text ?? rawText,
+        spans: first?.spans ?? [{ text: rawText }],
+        align,
+      });
+    } else {
+      out.push({
+        id: `${prefix}-${i}-${c.startTime}-${c.endTime}`,
+        start: c.startTime,
+        end: c.endTime,
+        text: rawText,
+        spans: [{ text: rawText }],
+        align,
+      });
+    }
+  }
+  return { cues: out, usingActiveFallback };
+}
+
+function cueSignature(cues: readonly SubtitleCue[]): string {
+  if (!cues.length) return "";
+  return cues.map((c) => `${c.id}:${c.text}:${c.align}`).join("|");
+}
 
 const kindOf = (c: StreamCandidate) =>
   c.kind === "embed" ? "Online" : c.providerId === "local" ? "This PC" : c.providerId === "jellyfin" ? "Jellyfin" : "Direct";
@@ -143,11 +230,10 @@ function loadEnhance(): EnhanceMode {
   }
 }
 
-export function Player({ candidates: given, initialSource, onSourceResult, title, subtitle, startAt, onProgress, onEnded, onNext, autoNext, nextLabel, onBack, audio, onAudio, originalLanguage, episodes, media }: Props) {
+export function Player({ candidates: given, initialSource, onSourceResult, title, subtitle, startAt, onProgress, onEnded, onNext, autoNext, nextLabel, onBack, audio, onAudio, originalLanguage, episodes, media, season, episode }: Props) {
   const wrap = useRef<HTMLDivElement>(null);
   const video = useRef<HTMLVideoElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
-  const cueBox = useRef<HTMLDivElement>(null);
   const hlsRef = useRef<Hls | null>(null);
   const resumeAt = useRef(startAt ?? 0);
   // Servers verified from inside the player (standby ones checked on demand) replace the originals.
@@ -304,207 +390,909 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
 
   /* -------------------------------------------------------------- subtitles */
 
-  const [pref, setPref] = useState<SubPref>(loadSubPref);
-  const updatePref = (p: Partial<SubPref>) =>
-    setPref((x) => {
-      const n = { ...x, ...p };
-      saveSubPref(n);
-      return n;
+  const [pref, setPref] = useState<SubPref>(() => loadSubPref());
+  const prefRef = useRef(pref);
+  prefRef.current = pref;
+
+  const patchPref = useCallback((patch: Partial<SubPref>) => {
+    const next = normalizeSubPref({ ...prefRef.current, ...patch });
+    prefRef.current = next;
+    setPref(next);
+    saveSubPref(next);
+    updateSettings({ subtitlePref: next });
+  }, []);
+
+  useEffect(() => {
+    const syncFromStorage = () => setPref(loadSubPref());
+    const onStorage = (e: StorageEvent) => {
+      if (!e.key || e.key === "abx.subs.v1") syncFromStorage();
+    };
+    window.addEventListener(SUB_PREF_EVENT, syncFromStorage);
+    window.addEventListener("storage", onStorage);
+    return () => {
+      window.removeEventListener(SUB_PREF_EVENT, syncFromStorage);
+      window.removeEventListener("storage", onStorage);
+    };
+  }, []);
+
+  const epSeason = season ?? episodes?.season;
+  const epNumber = episode ?? episodes?.episode;
+  const subMemoryKey = useMemo(() => {
+    const base =
+      media?.key ||
+      (media?.tmdbId ? `tmdb:${media.kind ?? "media"}:${media.tmdbId}` : "") ||
+      (media?.imdbId ? `imdb:${media.imdbId}` : "") ||
+      cur?.localPath ||
+      title;
+    if (!base) return "";
+    return epNumber != null ? `${base}:s${epSeason ?? 0}e${epNumber}` : base;
+  }, [media?.key, media?.tmdbId, media?.imdbId, media?.kind, cur?.localPath, title, epSeason, epNumber]);
+  const subMemoryKeyRef = useRef(subMemoryKey);
+  subMemoryKeyRef.current = subMemoryKey;
+
+  const persistTrackMemory = useCallback((entry: {
+    selectedLang?: string;
+    selectedLabel?: string;
+    secondaryLang?: string;
+    offsetSec?: number;
+    enabled?: boolean;
+  }) => {
+    const key = subMemoryKeyRef.current;
+    if (!key) return;
+    saveSubTrackMemory(key, entry);
+  }, []);
+
+  const dragDepthRef = useRef(0);
+  const [dragOverSub, setDragOverSub] = useState(false);
+
+  const activeCurUrl = cur?.url ?? "";
+  const activeCurUrlRef = useRef(activeCurUrl);
+  activeCurUrlRef.current = activeCurUrl;
+
+  const [hlsReady, setHlsReady] = useState(false);
+  const [hlsSubsState, setHlsSubsState] = useState<{ url: string; tracks: UnifiedSubTrack[] }>({ url: "", tracks: [] });
+  const [nativeSubsState, setNativeSubsState] = useState<{ url: string; tracks: UnifiedSubTrack[] }>({ url: "", tracks: [] });
+  const [onlineSubsState, setOnlineSubsState] = useState<{ url: string; tracks: UnifiedSubTrack[] }>({ url: "", tracks: [] });
+  const [addedSubs, setAddedSubs] = useState<UnifiedSubTrack[]>([]);
+  const [trackDataState, setTrackDataState] = useState<{ url: string; data: Record<string, TrackCueCache> }>({ url: "", data: {} });
+
+  const hlsSubs = hlsSubsState.url === activeCurUrl ? hlsSubsState.tracks : [];
+  const nativeSubs = nativeSubsState.url === activeCurUrl ? nativeSubsState.tracks : [];
+  const onlineSubs = onlineSubsState.url === activeCurUrl ? onlineSubsState.tracks : [];
+  const trackData = trackDataState.url === activeCurUrl ? trackDataState.data : {};
+
+  const setHlsSubs = useCallback((tracks: UnifiedSubTrack[]) => {
+    setHlsSubsState({ url: activeCurUrlRef.current, tracks });
+  }, []);
+  const setNativeSubs = useCallback((tracks: UnifiedSubTrack[]) => {
+    setNativeSubsState({ url: activeCurUrlRef.current, tracks });
+  }, []);
+  const appendOnlineSub = useCallback((url: string, track: UnifiedSubTrack) => {
+    setOnlineSubsState((prev) => {
+      const list = prev.url === url ? prev.tracks : [];
+      return list.some((t) => t.id === track.id) ? { url, tracks: list } : { url, tracks: [...list, track] };
     });
-  const [hlsSubs, setHlsSubs] = useState<SubTrack[]>([]);
-  const [fileSubs, setFileSubs] = useState<SubTrack[]>([]);
-  const [nativeSubs, setNativeSubs] = useState<SubTrack[]>([]);
-  const [addedSubs, setAddedSubs] = useState<SubTrack[]>([]);
-  const addedSubsRef = useRef(addedSubs);
-  addedSubsRef.current = addedSubs;
-  const subTracks = useMemo(() => [...hlsSubs, ...nativeSubs, ...fileSubs, ...addedSubs], [hlsSubs, nativeSubs, fileSubs, addedSubs]);
+  }, []);
+  const patchTrackData = useCallback((url: string, id: string, entry: TrackCueCache) => {
+    setTrackDataState((prev) => ({
+      url,
+      data: prev.url === url ? { ...prev.data, [id]: entry } : { [id]: entry },
+    }));
+  }, []);
+
+  const trackDataRef = useRef(trackData);
+  trackDataRef.current = trackData;
+  const trackCtlsRef = useRef(new Map<string, AbortController>());
+  const sourceGenRef = useRef(0);
+
+  const candidateSubs = useMemo<UnifiedSubTrack[]>(() => {
+    const list = cur?.subtitles;
+    if (!list?.length || isEmbed) return [];
+    const counts = new Map<string, number>();
+    return list.map((s, i) => {
+      const baseLabel = s.label || s.lang || `Track ${i + 1}`;
+      const n = (counts.get(baseLabel) ?? 0) + 1;
+      counts.set(baseLabel, n);
+      const label = n > 1 ? `${baseLabel} ${n}` : baseLabel;
+      const origin: UnifiedSubTrack["origin"] =
+        s.source ?? (s.streamIndex != null || s.url.startsWith("embedded://") ? "embedded" : cur?.providerId === "local" ? "sidecar" : "stream");
+      return {
+        id: `cand-${i}`,
+        label,
+        lang: s.lang || "und",
+        origin,
+        format: s.format,
+        isDefault: s.isDefault,
+        isForced: s.isForced,
+        isHearingImpaired: s.isHearingImpaired,
+        url: s.url,
+        streamIndex: s.streamIndex,
+      };
+    });
+  }, [cur?.url, cur?.subtitles, cur?.providerId, isEmbed]);
+
+  const subTracks = useMemo<UnifiedSubTrack[]>(() => {
+    const raw = [...hlsSubs, ...nativeSubs, ...candidateSubs, ...onlineSubs, ...addedSubs];
+    return raw.map((t) => {
+      const d = trackData[t.id];
+      return d ? { ...t, ...d } : t;
+    });
+  }, [hlsSubs, nativeSubs, candidateSubs, onlineSubs, addedSubs, trackData]);
   const subTracksRef = useRef(subTracks);
   subTracksRef.current = subTracks;
+
+  const trackStructureKey = useMemo(
+    () => [...hlsSubs, ...nativeSubs, ...candidateSubs, ...onlineSubs, ...addedSubs].map((t) => t.id).join("|"),
+    [hlsSubs, nativeSubs, candidateSubs, onlineSubs, addedSubs],
+  );
+
   const [selectedSub, setSelectedSub] = useState<string | null>(null);
+  const selectedSubRef = useRef<string | null>(null);
+  selectedSubRef.current = selectedSub;
+  const [secondarySub, setSecondarySub] = useState<string | null>(null);
+  const secondarySubRef = useRef<string | null>(null);
+  secondarySubRef.current = secondarySub;
+
   const [audioTracks, setAudioTracks] = useState<{ id: number; label: string; lang: string }[]>([]);
   const [selectedAudioTrack, setSelectedAudioTrack] = useState<number>(-1);
   const manualAudio = useRef(false);
   const pendingSub = useRef<string | null>(null);
+  const pendingSecondary = useRef<string | null>(null);
   /** Once the viewer picks a track on this source, stop auto-choosing for them. */
   const manualSub = useRef(false);
-  const trackEls = useRef(new Map<string, HTMLTrackElement>());
-  const [offset, setOffset] = useState(0);
-  const offsetRef = useRef(0);
-  offsetRef.current = offset;
-  /** Offset already applied to each loaded <track>'s cues. */
-  const applied = useRef(new Map<string, number>());
+  const manualSecondary = useRef(false);
+  const lastActiveSubRef = useRef<{ prim: string; sec: string | null } | null>(null);
 
-  // Tracks are kept "hidden" (loaded, not drawn by the browser): AbixCine draws the cues itself
-  // so they sit above the enhancement canvas and lift clear of the controls.
-  const applySub = useCallback((id: string | null) => {
-    const t = id ? subTracksRef.current.find((x) => x.id === id) : undefined;
-    trackEls.current.forEach((el, tid) => {
-      el.track.mode = t?.kind === "file" && tid === id ? "hidden" : "disabled";
-    });
-    subTracksRef.current.forEach((track) => {
-      if (track.kind === "native" && track.nativeTrack) {
-        track.nativeTrack.mode = t?.kind === "native" && track.id === id ? "hidden" : "disabled";
+  const [offset, setOffset] = useState(() => (subMemoryKey ? loadSubTrackMemory(subMemoryKey)?.offsetSec ?? 0 : 0));
+  const offsetRef = useRef(offset);
+  offsetRef.current = offset;
+
+  const [activePrimaryCues, setActivePrimaryCues] = useState<SubtitleCue[]>([]);
+  const [activeSecondaryCues, setActiveSecondaryCues] = useState<SubtitleCue[]>([]);
+  const lastSigRef = useRef({ prim: "", sec: "" });
+
+  const [onlineResults, setOnlineResults] = useState<OnlineSubtitleResult[]>([]);
+  const [onlineLoading, setOnlineLoading] = useState(false);
+  const [onlineSearched, setOnlineSearched] = useState(false);
+  const [onlineError, setOnlineError] = useState<string | null>(null);
+  const [loadingOnlineId, setLoadingOnlineId] = useState<string | null>(null);
+  const [loadedOnlineMap, setLoadedOnlineMap] = useState<Map<string, string>>(() => new Map());
+  const searchCtlRef = useRef<AbortController | null>(null);
+  const loadOnlineCtlsRef = useRef(new Set<AbortController>());
+  const autoFetchedRef = useRef(new Set<string>());
+  const [savingTrackId, setSavingTrackId] = useState<string | null>(null);
+  const [savedTrackIds, setSavedTrackIds] = useState<Set<string>>(() => new Set());
+
+  const ensureTrackLoaded = useCallback(async (track: UnifiedSubTrack) => {
+    if (track.origin === "hls" || track.origin === "native" || track.origin === "user") return;
+    if (track.cues) return;
+    const existing = trackDataRef.current[track.id];
+    if (existing?.cues || existing?.loading) return;
+    const activeUrl = activeCurUrlRef.current;
+
+    if (track.origin === "embedded" && track.streamIndex != null) {
+      const localPath = curRef.current?.localPath;
+      if (!localPath) {
+        patchTrackData(activeUrl, track.id, { loading: false, error: "Local file path unavailable" });
+        return;
       }
-    });
+      const ctl = new AbortController();
+      trackCtlsRef.current.set(track.id, ctl);
+      const gen = sourceGenRef.current;
+      patchTrackData(activeUrl, track.id, { loading: true, error: undefined });
+      try {
+        const res = await invoke<ExtractedSubtitleResult>("extract_local_subtitle", {
+          path: localPath,
+          streamIndex: track.streamIndex,
+        });
+        if (ctl.signal.aborted || gen !== sourceGenRef.current || !mountedRef.current) return;
+        const parsed = parseSubtitles(res.content, res.format);
+        patchTrackData(activeUrl, track.id, { cues: parsed.cues, raw: res.content, format: parsed.format, loading: false, error: undefined });
+      } catch (e) {
+        if (ctl.signal.aborted || gen !== sourceGenRef.current || !mountedRef.current) return;
+        const msg = e instanceof Error ? e.message : String(e);
+        patchTrackData(activeUrl, track.id, { loading: false, error: msg });
+        if (selectedSubRef.current === track.id || secondarySubRef.current === track.id) {
+          flash(`Couldn't extract subtitle: ${msg}`);
+        }
+      } finally {
+        if (trackCtlsRef.current.get(track.id) === ctl) trackCtlsRef.current.delete(track.id);
+      }
+      return;
+    }
+
+    const url = track.url;
+    if (!url || url.startsWith("embedded://")) return;
+    const ctl = new AbortController();
+    trackCtlsRef.current.set(track.id, ctl);
+    const gen = sourceGenRef.current;
+    patchTrackData(activeUrl, track.id, { loading: true, error: undefined });
+    try {
+      const parsed = await fetchAndParseSubtitle(url, { formatHint: track.format, signal: ctl.signal });
+      if (ctl.signal.aborted || gen !== sourceGenRef.current || !mountedRef.current) return;
+      patchTrackData(activeUrl, track.id, { cues: parsed.cues, raw: parsed.raw, format: parsed.format, loading: false, error: undefined });
+    } catch (e) {
+      if (ctl.signal.aborted || (e instanceof DOMException && e.name === "AbortError")) return;
+      if (gen !== sourceGenRef.current || !mountedRef.current) return;
+      const msg = e instanceof Error ? e.message : String(e);
+      patchTrackData(activeUrl, track.id, { loading: false, error: msg });
+      if (selectedSubRef.current === track.id || secondarySubRef.current === track.id) {
+        flash(`Couldn't load subtitle: ${msg}`);
+      }
+    } finally {
+      if (trackCtlsRef.current.get(track.id) === ctl) trackCtlsRef.current.delete(track.id);
+    }
+  }, [patchTrackData]);
+
+  const applySubPair = useCallback((primId: string | null, secId: string | null) => {
+    const list = subTracksRef.current;
+    const prim = primId ? list.find((x) => x.id === primId) : undefined;
+    const safeSecId = secId && (!prim || secId !== prim.id) ? secId : null;
+    const sec = safeSecId ? list.find((x) => x.id === safeSecId) : undefined;
+
+    const finalPrim = prim ? prim.id : null;
+    const finalSec = sec ? sec.id : null;
+    selectedSubRef.current = finalPrim;
+    secondarySubRef.current = finalSec;
+    setSelectedSub(finalPrim);
+    setSecondarySub(finalSec);
+
+    const v = video.current;
     const hls = hlsRef.current;
     if (hls) {
       hls.subtitleDisplay = false;
-      hls.subtitleTrack = t?.kind === "hls" && t.hlsIndex != null ? t.hlsIndex : -1;
+      const activeHlsIdx =
+        prim?.origin === "hls" && prim.hlsIndex != null
+          ? prim.hlsIndex
+          : sec?.origin === "hls" && sec.hlsIndex != null
+            ? sec.hlsIndex
+            : -1;
+      hls.subtitleTrack = activeHlsIdx;
     }
-    setSelectedSub(t ? t.id : null);
-  }, []);
 
-  const chooseSub = (id: string | null) => {
+    if (v) {
+      list.forEach((track) => {
+        if (track.origin === "native" && track.nativeTrack) {
+          track.nativeTrack.mode = track.id === finalPrim || track.id === finalSec ? "hidden" : "disabled";
+        }
+      });
+      if (hls) {
+        Array.from(v.textTracks).forEach((tt) => {
+          if (tt.mode === "showing") tt.mode = "hidden";
+        });
+      }
+    }
+
+    if (prim) void ensureTrackLoaded(prim);
+    if (sec) void ensureTrackLoaded(sec);
+  }, [ensureTrackLoaded]);
+
+  const chooseSub = useCallback((id: string | null) => {
     manualSub.current = true;
-    applySub(id);
-    const t = subTracks.find((x) => x.id === id);
-    updatePref(t ? { on: true, lang: langBase(t.lang) } : { on: false });
+    const list = subTracksRef.current;
+    const t = id ? list.find((x) => x.id === id) : undefined;
+    const curSec = secondarySubRef.current;
+    const nextSec = !t ? null : curSec === t.id ? null : curSec;
+    if (curSec && !nextSec) manualSecondary.current = true;
+    if (t) lastActiveSubRef.current = { prim: t.id, sec: nextSec };
+    applySubPair(t ? t.id : null, nextSec);
+    const baseLang = t ? langBase(t.lang) : undefined;
+    patchPref(t ? { on: true, ...(baseLang && baseLang !== "und" ? { lang: baseLang } : {}) } : { on: false });
+    persistTrackMemory(
+      t
+        ? { enabled: true, selectedLang: baseLang, selectedLabel: t.label }
+        : { enabled: false },
+    );
     flash(`Subtitles: ${t ? t.label : "Off"}`);
-  };
+  }, [applySubPair, patchPref, persistTrackMemory]);
 
-  /** Best track for the viewer's language, falling back to English, then the first one. */
-  const preferredTrack = (list: SubTrack[]) => {
-    const want = pref.lang ?? "en";
-    const byLang = (l: string) => list.filter((t) => langBase(t.lang) === l);
-    const pick = (l: SubTrack[]) => l.find((t) => !/forced|signs/i.test(t.label)) ?? l[0];
-    return pick(byLang(want)) ?? pick(byLang("en")) ?? list[0];
-  };
+  const chooseSecondary = useCallback((id: string | null) => {
+    manualSecondary.current = true;
+    const list = subTracksRef.current;
+    const t = id ? list.find((x) => x.id === id) : undefined;
+    if (t && t.id === selectedSubRef.current) return;
+    if (selectedSubRef.current) {
+      lastActiveSubRef.current = { prim: selectedSubRef.current, sec: t ? t.id : null };
+    }
+    applySubPair(selectedSubRef.current, t ? t.id : null);
+    const baseLang = t ? langBase(t.lang) : "";
+    persistTrackMemory({ secondaryLang: baseLang && baseLang !== "und" ? baseLang : "" });
+    flash(t ? `Dual subtitle: ${t.label}` : "Dual subtitle off");
+  }, [applySubPair, persistTrackMemory]);
 
-  // Auto-pick when the track list changes: on if the viewer had subtitles on, or by default
-  // for subbed anime; otherwise make sure nothing (e.g. an HLS "default" track) shows.
+  const findPreferredSub = useCallback((list: UnifiedSubTrack[], p: SubPref) => {
+    if (!list.length) return undefined;
+    const idx = pickBestSubtitleIndex(list, p, originalLanguage);
+    return idx >= 0 ? list[idx] : list[0];
+  }, [originalLanguage]);
+
+  const findSecondaryForLang = useCallback((list: UnifiedSubTrack[], wantLang: string, p: SubPref, primaryId: string | null) => {
+    const base = langBase(wantLang);
+    if (!base || base === "und") return undefined;
+    const matching = list.filter((t) => t.id !== primaryId && langBase(t.lang) === base);
+    if (!matching.length) return undefined;
+    const idx = pickBestSubtitleIndex(matching, { ...p, lang: base }, originalLanguage);
+    return idx >= 0 ? matching[idx] : matching[0];
+  }, [originalLanguage]);
+
+  // Reset subtitle selection/caches whenever switching streams so auto-pick runs cleanly for the new source.
   useEffect(() => {
-    if (pendingSub.current && subTracks.some((t) => t.id === pendingSub.current)) {
+    sourceGenRef.current++;
+    searchCtlRef.current?.abort();
+    searchCtlRef.current = null;
+    loadOnlineCtlsRef.current.forEach((ctl) => ctl.abort());
+    loadOnlineCtlsRef.current.clear();
+    trackCtlsRef.current.forEach((ctl) => ctl.abort());
+    trackCtlsRef.current.clear();
+
+    setHlsReady(false);
+    setHlsSubsState({ url: activeCurUrl, tracks: [] });
+    setNativeSubsState({ url: activeCurUrl, tracks: [] });
+    setOnlineSubsState({ url: activeCurUrl, tracks: [] });
+    setTrackDataState({ url: activeCurUrl, data: {} });
+    setOnlineResults([]);
+    setOnlineLoading(false);
+    setOnlineSearched(false);
+    setOnlineError(null);
+    setLoadingOnlineId(null);
+    setLoadedOnlineMap(new Map());
+    setSavingTrackId(null);
+    setSavedTrackIds(new Set());
+    manualSub.current = false;
+    manualSecondary.current = false;
+    lastActiveSubRef.current = null;
+    selectedSubRef.current = null;
+    secondarySubRef.current = null;
+    setSelectedSub(null);
+    setSecondarySub(null);
+    lastSigRef.current = { prim: "", sec: "" };
+    setActivePrimaryCues([]);
+    setActiveSecondaryCues([]);
+    const restoredOffset = subMemoryKeyRef.current ? (loadSubTrackMemory(subMemoryKeyRef.current)?.offsetSec ?? 0) : 0;
+    offsetRef.current = restoredOffset;
+    setOffset(restoredOffset);
+  }, [activeCurUrl]);
+
+  // Apply pending user-loaded tracks or auto-pick best primary + optional dual track when available tracks change.
+  useEffect(() => {
+    const list = subTracksRef.current;
+    if (pendingSub.current && list.some((t) => t.id === pendingSub.current)) {
       const id = pendingSub.current;
       pendingSub.current = null;
       chooseSub(id);
       return;
     }
+    if (pendingSecondary.current && list.some((t) => t.id === pendingSecondary.current)) {
+      const secId = pendingSecondary.current;
+      pendingSecondary.current = null;
+      chooseSecondary(secId);
+      return;
+    }
     if (manualSub.current) return;
-    const wantOn = pref.on ?? audio === "sub";
-    applySub(wantOn && subTracks.length ? preferredTrack(subTracks)?.id ?? null : null);
-  }, [subTracks]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const toggleSub = () => {
-    if (!subTracks.length) return flash("No subtitles for this server");
-    chooseSub(selectedSub ? null : preferredTrack(subTracks)?.id ?? null);
-  };
+    const p = prefRef.current;
+    const mem = subMemoryKey ? loadSubTrackMemory(subMemoryKey) : null;
+    const wantOn =
+      mem?.enabled !== undefined
+        ? p.mode === "off"
+          ? false
+          : mem.enabled
+        : shouldAutoEnableSubtitles(p, audio, originalLanguage);
 
-  const addSubtitle = async (file?: File) => {
-    if (!file) return;
-    try {
-      const src = URL.createObjectURL(new Blob([toVtt(decodeSubtitle(await file.arrayBuffer()))], { type: "text/vtt" }));
-      const id = `added-${crypto.randomUUID()}`;
-      pendingSub.current = id;
-      setAddedSubs((current) => [...current, { id, label: file.name, lang: "und", kind: "file", src }]);
-      flash(`Added subtitle: ${file.name}`);
-    } catch (e) {
-      flash(`Couldn't load subtitle: ${e instanceof Error ? e.message : "invalid file"}`);
+    if (!wantOn || !list.length) {
+      applySubPair(null, null);
+      return;
     }
-  };
-  useEffect(() => () => addedSubsRef.current.forEach((s) => s.src && URL.revokeObjectURL(s.src)), []);
 
-  /** Shift loaded cues so their total offset matches the chosen delay. */
-  const shiftCues = (id: string, el: HTMLTrackElement) => {
-    const cues = el.track.cues;
-    if (!cues) return;
-    const target = offsetRef.current;
-    const delta = target - (applied.current.get(id) ?? 0);
-    if (!delta) return;
-    for (let i = 0; i < cues.length; i++) {
-      const c = cues[i];
-      c.startTime = Math.max(0, c.startTime + delta);
-      c.endTime = Math.max(0, c.endTime + delta);
+    let prim: UnifiedSubTrack | undefined;
+    if (mem?.selectedLabel) {
+      prim = list.find((t) => t.label === mem.selectedLabel);
     }
-    applied.current.set(id, target);
-  };
-  useEffect(() => {
-    trackEls.current.forEach((el, id) => applied.current.has(id) && shiftCues(id, el));
-  }, [offset]); // eslint-disable-line react-hooks/exhaustive-deps
-  const nudge = (d: number) => {
-    const n = Math.round((offset + d) * 10) / 10;
-    setOffset(n);
-    flash(`Subtitle delay ${n > 0 ? "+" : ""}${n.toFixed(1)}s`);
-  };
+    if (!prim && mem?.selectedLang && mem.selectedLang !== "und") {
+      prim = list.find((t) => langBase(t.lang) === langBase(mem.selectedLang) && !t.isForced)
+        ?? list.find((t) => langBase(t.lang) === langBase(mem.selectedLang));
+    }
+    if (!prim) {
+      prim = findPreferredSub(list, p);
+    }
 
-  // Sidecar / server subtitle files: fetch, decode, convert SRT to WebVTT, serve as blobs
-  // (same-origin, so no CORS trouble with the <track> element).
-  useEffect(() => {
-    setFileSubs([]);
-    const list = cur?.subtitles;
-    if (!list?.length || isEmbed) return;
-    const ctl = new AbortController();
-    const blobs: string[] = [];
-    Promise.all(
-      list.map((s, i) =>
-        loadSubtitle(s.url, ctl.signal)
-          .then((src) => {
-            if (ctl.signal.aborted) {
-              URL.revokeObjectURL(src);
-              return null;
-            }
-            blobs.push(src);
-            return { id: `file-${i}`, label: s.label || s.lang || `Track ${i + 1}`, lang: s.lang, kind: "file" as const, src };
-          })
-          .catch(() => null),
-      ),
-    ).then((tracks) => {
-      if (ctl.signal.aborted) return;
-      const ok = tracks.filter((t): t is NonNullable<typeof t> => !!t);
-      const seen = new Map<string, number>();
-      for (const t of ok) {
-        const n = (seen.get(t.label) ?? 0) + 1;
-        seen.set(t.label, n);
-        if (n > 1) t.label = `${t.label} ${n}`;
+    let sec: UnifiedSubTrack | undefined;
+    if (!manualSecondary.current && prim && list.length > 1) {
+      const wantSecLang = mem?.secondaryLang !== undefined ? mem.secondaryLang : p.secondaryLang;
+      if (wantSecLang) {
+        sec = findSecondaryForLang(list, wantSecLang, p, prim.id);
       }
-      setFileSubs(ok);
-    });
-    return () => {
-      ctl.abort();
-      blobs.forEach((b) => URL.revokeObjectURL(b));
-    };
-  }, [cur?.url]); // eslint-disable-line react-hooks/exhaustive-deps
+    }
 
-  // Draw the active cues of whichever track is selected (the one in "hidden" mode).
+    applySubPair(prim?.id ?? null, sec?.id ?? null);
+  }, [activeCurUrl, trackStructureKey, subMemoryKey, audio, originalLanguage, applySubPair, chooseSub, chooseSecondary, findPreferredSub, findSecondaryForLang]);
+
+  // Reset user-dropped files when moving to another title or episode, while keeping them across server switches.
+  useEffect(() => {
+    setAddedSubs([]);
+  }, [subMemoryKey]);
+
+  const toggleSub = useCallback(() => {
+    const list = subTracksRef.current;
+    if (!list.length) {
+      flash("No subtitles loaded — open Subtitles to search or drop a file");
+      return;
+    }
+    if (selectedSubRef.current || secondarySubRef.current) {
+      if (selectedSubRef.current) {
+        lastActiveSubRef.current = { prim: selectedSubRef.current, sec: secondarySubRef.current };
+      }
+      chooseSub(null);
+      return;
+    }
+    const last = lastActiveSubRef.current;
+    if (last && list.some((t) => t.id === last.prim)) {
+      manualSub.current = true;
+      const sec = last.sec && list.some((t) => t.id === last.sec && t.id !== last.prim) ? last.sec : null;
+      applySubPair(last.prim, sec);
+      const t = list.find((x) => x.id === last.prim);
+      const baseLang = t ? langBase(t.lang) : undefined;
+      patchPref({ on: true, ...(baseLang && baseLang !== "und" ? { lang: baseLang } : {}) });
+      persistTrackMemory({ enabled: true, selectedLang: baseLang, selectedLabel: t?.label });
+      flash(`Subtitles: ${t?.label ?? "On"}`);
+      return;
+    }
+    chooseSub(findPreferredSub(list, prefRef.current)?.id ?? null);
+  }, [applySubPair, chooseSub, findPreferredSub, patchPref, persistTrackMemory]);
+
+  const cycleSub = useCallback(() => {
+    const list = subTracksRef.current;
+    if (!list.length) {
+      flash("No subtitle tracks loaded");
+      return;
+    }
+    const curId = selectedSubRef.current;
+    if (!curId) {
+      chooseSub(list[0].id);
+      return;
+    }
+    const i = list.findIndex((t) => t.id === curId);
+    const next = i >= 0 && i + 1 < list.length ? list[i + 1].id : null;
+    chooseSub(next);
+  }, [chooseSub]);
+
+  const addSubtitleFiles = useCallback(async (files: FileList | File[]) => {
+    const all = Array.from(files);
+    const valid = all.filter((f) => SUB_FILE_EXT_RX.test(f.name));
+    if (!valid.length) {
+      flash("Drop an .srt, .vtt, .ass, or .ssa subtitle file");
+      return;
+    }
+    let firstId: string | null = null;
+    const loadedTracks: UnifiedSubTrack[] = [];
+    for (const file of valid) {
+      try {
+        const buf = await file.arrayBuffer();
+        const raw = decodeSubtitle(buf);
+        const extMatch = file.name.match(SUB_FILE_EXT_RX);
+        const hint = extMatch ? (extMatch[1].toLowerCase() as SubtitleFormat) : undefined;
+        const parsed = parseSubtitles(raw, hint);
+        const id = `added-${crypto.randomUUID()}`;
+        const lang = inferUserSubLang(file.name);
+        if (!firstId) firstId = id;
+        loadedTracks.push({
+          id,
+          label: file.name,
+          lang,
+          origin: "user",
+          format: hint ?? parsed.format,
+          raw,
+          cues: parsed.cues,
+        });
+      } catch (e) {
+        flash(`Couldn't load ${file.name}: ${e instanceof Error ? e.message : "invalid file"}`);
+      }
+    }
+    if (loadedTracks.length && mountedRef.current) {
+      if (firstId) pendingSub.current = firstId;
+      setAddedSubs((curList) => [...curList, ...loadedTracks]);
+      flash(loadedTracks.length === 1 ? `Loaded subtitle: ${loadedTracks[0].label}` : `Loaded ${loadedTracks.length} subtitle files`);
+    }
+  }, []);
+
+  const nudge = useCallback((delta: number) => {
+    const n = Math.round((offsetRef.current + delta) * 10) / 10;
+    offsetRef.current = n;
+    setOffset(n);
+    persistTrackMemory({ offsetSec: n });
+    flash(`Subtitle timing ${n > 0 ? "+" : ""}${n.toFixed(1)}s`);
+  }, [persistTrackMemory]);
+
+  const resetOffset = useCallback(() => {
+    offsetRef.current = 0;
+    setOffset(0);
+    persistTrackMemory({ offsetSec: 0 });
+    flash("Subtitle timing reset (0.0s)");
+  }, [persistTrackMemory]);
+
+  const searchOnline = useCallback(async (rawTitle: string, lang: string) => {
+    searchCtlRef.current?.abort();
+    const ctl = new AbortController();
+    searchCtlRef.current = ctl;
+    const gen = sourceGenRef.current;
+
+    const qTitle = (rawTitle || media?.title || title || "").trim();
+    const qLang = lang || prefRef.current.lang || "en";
+    const kind: "movie" | "tv" | "anime" | undefined =
+      media?.kind === "tv" || media?.kind === "anime" || media?.kind === "movie"
+        ? media.kind
+        : epNumber != null
+          ? "tv"
+          : undefined;
+
+    setOnlineLoading(true);
+    setOnlineError(null);
+    try {
+      const results = await searchOnlineSubtitles(
+        {
+          tmdbId: media?.tmdbId,
+          imdbId: media?.imdbId,
+          title: qTitle || undefined,
+          year: media?.year,
+          kind,
+          season: epSeason,
+          episode: epNumber,
+          languages: [qLang],
+          preferHearingImpaired: prefRef.current.preferHearingImpaired,
+        },
+        ctl.signal,
+      );
+      if (ctl.signal.aborted || gen !== sourceGenRef.current || !mountedRef.current) return;
+      setOnlineResults(results);
+      setOnlineSearched(true);
+    } catch (e) {
+      if (ctl.signal.aborted || (e instanceof DOMException && e.name === "AbortError")) return;
+      if (gen !== sourceGenRef.current || !mountedRef.current) return;
+      setOnlineError(e instanceof Error ? e.message : "Failed to search online subtitles");
+      setOnlineSearched(true);
+    } finally {
+      if (!ctl.signal.aborted && gen === sourceGenRef.current && mountedRef.current) {
+        setOnlineLoading(false);
+      }
+    }
+  }, [media?.tmdbId, media?.imdbId, media?.title, media?.year, media?.kind, title, epSeason, epNumber]);
+
+  const loadOnlineResult = useCallback(async (res: OnlineSubtitleResult, asSecondary: boolean) => {
+    const existingTrackId = loadedOnlineMap.get(res.id);
+    if (existingTrackId && subTracksRef.current.some((t) => t.id === existingTrackId)) {
+      if (asSecondary) chooseSecondary(existingTrackId);
+      else chooseSub(existingTrackId);
+      return;
+    }
+
+    const ctl = new AbortController();
+    loadOnlineCtlsRef.current.add(ctl);
+    const gen = sourceGenRef.current;
+    const activeUrl = activeCurUrlRef.current;
+    setLoadingOnlineId(res.id);
+    try {
+      const parsed = await fetchAndParseSubtitle(res.url, { formatHint: res.format, signal: ctl.signal });
+      if (ctl.signal.aborted || gen !== sourceGenRef.current || !mountedRef.current) return;
+      const trackId = `online-${res.id}`;
+      const label = res.release ? `${res.langName || res.lang} · ${res.release}` : (res.langName || res.lang);
+      const track: UnifiedSubTrack = {
+        id: trackId,
+        label,
+        lang: res.lang,
+        origin: "online",
+        format: res.format,
+        url: res.url,
+        provider: res.provider,
+        release: res.release,
+        isHearingImpaired: res.hearingImpaired,
+        isForced: res.forced,
+      };
+
+      patchTrackData(activeUrl, trackId, { cues: parsed.cues, raw: parsed.raw, format: res.format ?? parsed.format, loading: false });
+      setLoadedOnlineMap((prev) => {
+        const next = new Map(prev);
+        next.set(res.id, trackId);
+        return next;
+      });
+      if (asSecondary) pendingSecondary.current = trackId;
+      else pendingSub.current = trackId;
+      appendOnlineSub(activeUrl, track);
+    } catch (e) {
+      if (ctl.signal.aborted || (e instanceof DOMException && e.name === "AbortError")) return;
+      if (mountedRef.current) {
+        flash(`Online subtitle failed: ${e instanceof Error ? e.message : "download error"}`);
+      }
+    } finally {
+      loadOnlineCtlsRef.current.delete(ctl);
+      if (!ctl.signal.aborted && gen === sourceGenRef.current && mountedRef.current) {
+        setLoadingOnlineId((curId) => (curId === res.id ? null : curId));
+      }
+    }
+  }, [loadedOnlineMap, chooseSub, chooseSecondary, patchTrackData, appendOnlineSub]);
+
+  const canSaveSidecar = Boolean(!isEmbed && cur?.localPath && isTauri());
+
+  const saveSidecar = useCallback(async (track: UnifiedSubTrack) => {
+    const videoPath = curRef.current?.localPath;
+    if (!videoPath || savingTrackId) return;
+    setSavingTrackId(track.id);
+    try {
+      const cached = trackDataRef.current[track.id];
+      let content = cached?.raw ?? track.raw;
+      let ext: SubtitleFormat | undefined = cached?.format ?? track.format;
+      if (!content && (cached?.cues?.length || track.cues?.length)) {
+        content = cuesToVtt(cached?.cues ?? track.cues ?? []);
+        ext = "vtt";
+      }
+      if (!content && track.url) {
+        const parsed = await fetchAndParseSubtitle(track.url, { formatHint: track.format });
+        content = parsed.raw;
+        ext = parsed.format;
+      }
+      if (!content) {
+        flash("No subtitle content available to save");
+        return;
+      }
+      const safeExt = ext === "ass" || ext === "ssa" || ext === "vtt" ? ext : "srt";
+      const baseName = videoPath.split(/[\\/]/).pop() ?? "video";
+      const stem =
+        baseName
+          .replace(/\.[^.]+$/, "")
+          .replace(/[\/\\:*?"<>|\x00]/g, "_")
+          .replace(/\.{2,}/g, ".") || "subtitle";
+      const lang = langBase(track.lang);
+      const filename = lang && lang !== "und" ? `${stem}.${lang}.${safeExt}` : `${stem}.${safeExt}`;
+      await invoke<string>("save_sidecar_subtitle", {
+        videoPath,
+        filename,
+        content,
+      });
+      if (!mountedRef.current) return;
+      setSavedTrackIds((prev) => {
+        const next = new Set(prev);
+        next.add(track.id);
+        return next;
+      });
+      flash(`Saved ${filename} next to video`);
+    } catch (e) {
+      if (mountedRef.current) {
+        flash(`Save failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    } finally {
+      if (mountedRef.current) setSavingTrackId(null);
+    }
+  }, [savingTrackId]);
+
+  // Optional auto-fetch online subtitles when enabled, subtitles aren't off, and candidate lacks user's language.
+  useEffect(() => {
+    if (!cur || isEmbed || !pref.autoFetchOnline || pref.mode === "off") return;
+    if (cur.kind === "hls" && !hlsReady) return;
+    const wantLang = langBase(pref.lang || "en");
+    const fetchKey = `${cur.url}::${wantLang}`;
+    if (autoFetchedRef.current.has(fetchKey)) return;
+    if (manualSub.current) return;
+
+    const ctl = new AbortController();
+    const gen = sourceGenRef.current;
+    const activeUrl = activeCurUrlRef.current;
+    const timer = window.setTimeout(async () => {
+      if (ctl.signal.aborted || gen !== sourceGenRef.current || !mountedRef.current) return;
+      if (manualSub.current) return;
+      const list = subTracksRef.current;
+      const hasMatchingLang = list.some((t) => langBase(t.lang) === wantLang && !t.isForced);
+      if (hasMatchingLang) {
+        autoFetchedRef.current.add(fetchKey);
+        return;
+      }
+      const qTitle = (media?.title || title || "").trim();
+      if (!qTitle && !media?.tmdbId && !media?.imdbId) return;
+      autoFetchedRef.current.add(fetchKey);
+      const kind: "movie" | "tv" | "anime" | undefined =
+        media?.kind === "tv" || media?.kind === "anime" || media?.kind === "movie"
+          ? media.kind
+          : epNumber != null
+            ? "tv"
+            : undefined;
+      try {
+        const results = await searchOnlineSubtitles(
+          {
+            tmdbId: media?.tmdbId,
+            imdbId: media?.imdbId,
+            title: qTitle || undefined,
+            year: media?.year,
+            kind,
+            season: epSeason,
+            episode: epNumber,
+            languages: [wantLang],
+            preferHearingImpaired: prefRef.current.preferHearingImpaired,
+          },
+          ctl.signal,
+        );
+        if (ctl.signal.aborted || gen !== sourceGenRef.current || !mountedRef.current || !results.length) return;
+        setOnlineResults(results);
+        setOnlineSearched(true);
+        const top = results[0];
+        const parsed = await fetchAndParseSubtitle(top.url, { formatHint: top.format, signal: ctl.signal });
+        if (ctl.signal.aborted || gen !== sourceGenRef.current || !mountedRef.current || manualSub.current) return;
+        const trackId = `online-${top.id}`;
+        const label = top.release ? `${top.langName || top.lang} · ${top.release}` : (top.langName || top.lang);
+        const track: UnifiedSubTrack = {
+          id: trackId,
+          label,
+          lang: top.lang,
+          origin: "online",
+          format: top.format,
+          url: top.url,
+          provider: top.provider,
+          release: top.release,
+          isHearingImpaired: top.hearingImpaired,
+          isForced: top.forced,
+        };
+        patchTrackData(activeUrl, trackId, { cues: parsed.cues, raw: parsed.raw, format: top.format ?? parsed.format, loading: false });
+        setLoadedOnlineMap((prev) => {
+          const next = new Map(prev);
+          next.set(top.id, trackId);
+          return next;
+        });
+        pendingSub.current = trackId;
+        appendOnlineSub(activeUrl, track);
+        flash(`Auto-loaded ${top.langName || wantLang} subtitle`);
+      } catch {
+        /* ignore background auto-fetch errors */
+      }
+    }, 650);
+
+    return () => {
+      window.clearTimeout(timer);
+      ctl.abort();
+    };
+  }, [cur?.url, cur?.kind, isEmbed, hlsReady, pref.autoFetchOnline, pref.mode, pref.lang, media?.tmdbId, media?.imdbId, media?.title, media?.year, media?.kind, title, epSeason, epNumber, patchTrackData, appendOnlineSub]);
+
+  const findHlsTextTrack = useCallback((v: HTMLVideoElement, track: UnifiedSubTrack, activeHlsIndex: number): TextTrack | null => {
+    const vTracks = Array.from(v.textTracks).filter((t) => t.kind === "subtitles" || t.kind === "captions");
+    if (!vTracks.length) return null;
+    const base = langBase(track.lang);
+    return (
+      vTracks.find((t) => t.label === track.label && (base === "und" || langBase(t.language) === base)) ??
+      vTracks.find((t) => track.hlsIndex === activeHlsIndex && (t.mode === "hidden" || t.mode === "showing")) ??
+      vTracks.find((t) => t.label === track.label) ??
+      (track.hlsIndex != null && vTracks.length === hlsSubs.length ? vTracks[track.hlsIndex] : null) ??
+      null
+    );
+  }, [hlsSubs.length]);
+
+  const evaluateCues = useCallback(() => {
+    const v = video.current;
+    if (!v || isEmbed) {
+      if (lastSigRef.current.prim || lastSigRef.current.sec) {
+        lastSigRef.current = { prim: "", sec: "" };
+        setActivePrimaryCues([]);
+        setActiveSecondaryCues([]);
+      }
+      return;
+    }
+
+    const list = subTracksRef.current;
+    const primTrack = selectedSubRef.current ? list.find((t) => t.id === selectedSubRef.current) : undefined;
+    const secTrack = secondarySubRef.current ? list.find((t) => t.id === secondarySubRef.current) : undefined;
+    const tSec = v.currentTime || 0;
+    const offSec = offsetRef.current;
+    const hls = hlsRef.current;
+
+    const resolve = (track: UnifiedSubTrack | undefined): SubtitleCue[] => {
+      if (!track) return [];
+      const cached = trackDataRef.current[track.id]?.cues ?? track.cues;
+      if (cached) return activeCuesAt(cached, tSec, offSec);
+      if (track.origin === "native" && track.nativeTrack) {
+        if (track.nativeTrack.mode === "disabled") track.nativeTrack.mode = "hidden";
+        const { cues, usingActiveFallback } = textTrackToCues(track.nativeTrack, track.id);
+        return usingActiveFallback ? cues : activeCuesAt(cues, tSec, offSec);
+      }
+      if (track.origin === "hls" && hls) {
+        const tt = findHlsTextTrack(v, track, hls.subtitleTrack);
+        if (!tt) return [];
+        if (tt.mode === "disabled" && track.hlsIndex === hls.subtitleTrack) tt.mode = "hidden";
+        if (tt.mode === "showing") tt.mode = "hidden";
+        const { cues, usingActiveFallback } = textTrackToCues(tt, track.id);
+        return usingActiveFallback ? cues : activeCuesAt(cues, tSec, offSec);
+      }
+      return [];
+    };
+
+    const nextPrim = resolve(primTrack);
+    const nextSec = resolve(secTrack);
+    const primSig = cueSignature(nextPrim);
+    const secSig = cueSignature(nextSec);
+
+    if (primSig !== lastSigRef.current.prim) {
+      lastSigRef.current.prim = primSig;
+      setActivePrimaryCues(nextPrim);
+    }
+    if (secSig !== lastSigRef.current.sec) {
+      lastSigRef.current.sec = secSig;
+      setActiveSecondaryCues(nextSec);
+    }
+  }, [isEmbed, findHlsTextTrack]);
+  const evaluateCuesRef = useRef(evaluateCues);
+  evaluateCuesRef.current = evaluateCues;
+
+  // Unified Cue Engine: syncs <video>.textTracks, cuechange events, seeked, and active playback cadence.
   useEffect(() => {
     const v = video.current;
     if (!v || isEmbed) return;
-    let bound: TextTrack | null = null;
-    const paint = () => {
-      const box = cueBox.current;
-      if (!box) return;
-      box.replaceChildren();
-      const cues = bound?.activeCues;
-      if (!cues) return;
-      for (let i = 0; i < cues.length; i++) {
-        const c = cues[i] as VTTCue | (TextTrackCue & { text?: string });
-        const line = document.createElement("span");
-        line.className = "cue";
-        line.append("getCueAsHTML" in c && typeof c.getCueAsHTML === "function" ? c.getCueAsHTML() : document.createTextNode(c.text ?? ""));
-        box.append(line);
+    let boundPrimary: TextTrack | null = null;
+    let boundSecondary: TextTrack | null = null;
+    const run = () => evaluateCuesRef.current();
+
+    const syncTextTrackBindings = () => {
+      const primTrack = selectedSubRef.current ? subTracksRef.current.find((t) => t.id === selectedSubRef.current) : undefined;
+      const secTrack = secondarySubRef.current ? subTracksRef.current.find((t) => t.id === secondarySubRef.current) : undefined;
+      const hls = hlsRef.current;
+
+      const resolveTt = (t: UnifiedSubTrack | undefined): TextTrack | null => {
+        if (!t) return null;
+        if (t.origin === "native" && t.nativeTrack) return t.nativeTrack;
+        if (t.origin === "hls" && hls) return findHlsTextTrack(v, t, hls.subtitleTrack);
+        return null;
+      };
+
+      const nextP = resolveTt(primTrack);
+      const nextS = resolveTt(secTrack);
+      if (nextP !== boundPrimary) {
+        boundPrimary?.removeEventListener("cuechange", run);
+        boundPrimary = nextP;
+        boundPrimary?.addEventListener("cuechange", run);
       }
-    };
-    const bind = () => {
-      const next = Array.from(v.textTracks).find((t) => t.mode === "hidden") ?? null;
-      if (next !== bound) {
-        bound?.removeEventListener("cuechange", paint);
-        bound = next;
-        bound?.addEventListener("cuechange", paint);
+      if (nextS !== boundSecondary) {
+        boundSecondary?.removeEventListener("cuechange", run);
+        boundSecondary = nextS;
+        boundSecondary?.addEventListener("cuechange", run);
       }
-      paint();
+      run();
     };
-    v.textTracks.addEventListener("change", bind);
-    v.textTracks.addEventListener("addtrack", bind);
-    bind();
+
+    v.textTracks.addEventListener("change", syncTextTrackBindings);
+    v.textTracks.addEventListener("addtrack", syncTextTrackBindings);
+    v.addEventListener("timeupdate", run);
+    v.addEventListener("seeked", run);
+    v.addEventListener("playing", run);
+    v.addEventListener("pause", run);
+    syncTextTrackBindings();
+
     return () => {
-      v.textTracks.removeEventListener("change", bind);
-      v.textTracks.removeEventListener("addtrack", bind);
-      bound?.removeEventListener("cuechange", paint);
+      v.textTracks.removeEventListener("change", syncTextTrackBindings);
+      v.textTracks.removeEventListener("addtrack", syncTextTrackBindings);
+      v.removeEventListener("timeupdate", run);
+      v.removeEventListener("seeked", run);
+      v.removeEventListener("playing", run);
+      v.removeEventListener("pause", run);
+      boundPrimary?.removeEventListener("cuechange", run);
+      boundSecondary?.removeEventListener("cuechange", run);
     };
-  }, [cur?.url, isEmbed]);
-  // Selection or timing changed: repaint straight away rather than at the next cue boundary.
+  }, [cur?.url, isEmbed, selectedSub, secondarySub, findHlsTextTrack]);
+
+  // High-precision 60ms cue sync while playing with an active subtitle track.
   useEffect(() => {
-    video.current?.textTracks.dispatchEvent(new Event("change"));
-  }, [selectedSub, offset]);
+    if (isEmbed || !playing || (!selectedSub && !secondarySub)) return;
+    evaluateCues();
+    const timer = window.setInterval(evaluateCues, 60);
+    return () => window.clearInterval(timer);
+  }, [isEmbed, playing, selectedSub, secondarySub, evaluateCues]);
+
+  // Re-evaluate immediately when offset, selection, or cached parsed cues change (even while paused).
+  useEffect(() => {
+    evaluateCues();
+  }, [selectedSub, secondarySub, offset, trackData, evaluateCues]);
+
+  // Cleanup any in-flight subtitle requests on unmount.
+  useEffect(() => () => {
+    sourceGenRef.current++;
+    searchCtlRef.current?.abort();
+    loadOnlineCtlsRef.current.forEach((c) => c.abort());
+    loadOnlineCtlsRef.current.clear();
+    trackCtlsRef.current.forEach((c) => c.abort());
+    trackCtlsRef.current.clear();
+  }, []);
 
   /* ----------------------------------------------------------------- audio */
 
@@ -579,15 +1367,15 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     };
 
     const refreshSubtitles = () => {
-      const sidecars = new Set(Array.from(trackEls.current.values(), (el) => el.track));
-      const tracks = Array.from(v.textTracks)
+      if (hlsRef.current) return;
+      const tracks: UnifiedSubTrack[] = Array.from(v.textTracks)
         .map((track, i) => ({ track, i }))
-        .filter(({ track }) => (track.kind === "subtitles" || track.kind === "captions") && !sidecars.has(track))
+        .filter(({ track }) => track.kind === "subtitles" || track.kind === "captions")
         .map(({ track, i }) => ({
           id: `native-sub-${i}`,
           label: track.label || track.language || `Track ${i + 1}`,
           lang: track.language || "und",
-          kind: "native" as const,
+          origin: "native" as const,
           nativeTrack: track,
         }));
       setNativeSubs(tracks);
@@ -644,15 +1432,9 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     const c = curRef.current;
     if (!c) return;
     setPreparingLocal(false);
-    setHlsSubs([]);
-    setNativeSubs([]);
     setAudioTracks([]);
     setSelectedAudioTrack(-1);
     manualAudio.current = false;
-    setSelectedSub(null);
-    manualSub.current = false;
-    applied.current.clear();
-    setOffset(0);
     setLevels([]);
     setLevel(-1);
     setActiveLevel(-1);
@@ -709,6 +1491,7 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
       hlsRef.current = hls;
       hls.subtitleDisplay = false;
       hls.on(H.Events.MANIFEST_PARSED, (_, d) => {
+        setHlsReady(true);
         setLevels(d.levels.map((l) => ({ height: l.height })));
         seekAndPlay();
       });
@@ -727,8 +1510,19 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
       hls.on(H.Events.AUDIO_TRACK_SWITCHED, (_, d) => setSelectedAudioTrack(d.id));
       hls.on(H.Events.SUBTITLE_TRACKS_UPDATED, (_, d) => {
         setHlsSubs(
-          (d.subtitleTracks ?? []).map((t, i) => ({ id: `hls-${i}`, label: t.name || t.lang || `Track ${i + 1}`, lang: t.lang ?? "und", kind: "hls", hlsIndex: i })),
+          (d.subtitleTracks ?? []).map((t, i) => ({
+            id: `hls-${i}`,
+            label: t.name || t.lang || `Track ${i + 1}`,
+            lang: t.lang ?? "und",
+            origin: "hls" as const,
+            isDefault: Boolean(t.default),
+            isForced: Boolean(t.forced),
+            hlsIndex: i,
+          })),
         );
+      });
+      hls.on(H.Events.SUBTITLE_FRAG_PROCESSED, () => {
+        evaluateCuesRef.current();
       });
       let recoveries = 0;
       hls.on(H.Events.ERROR, (_, d) => {
@@ -1091,7 +1885,12 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
   const onKeyRef = useRef<(e: KeyboardEvent) => void>();
   onKeyRef.current = (e: KeyboardEvent) => {
     const el = e.target as HTMLElement | null;
-    if (el?.tagName === "INPUT" || el?.tagName === "TEXTAREA") return;
+    if (
+      el?.tagName === "INPUT" ||
+      el?.tagName === "TEXTAREA" ||
+      el?.tagName === "SELECT" ||
+      el?.isContentEditable
+    ) return;
     // Ctrl+K and friends belong to the app, not the player (Ctrl+K used to pause as well).
     if (e.ctrlKey || e.metaKey || e.altKey) return;
     poke();
@@ -1115,11 +1914,18 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
       case "ArrowUp": e.preventDefault(); changeVol(0.1); break;
       case "ArrowDown": e.preventDefault(); changeVol(-0.1); break;
       case "m": setMuted((x) => !x); break;
-      case "c": toggleSub(); break;
+      case "c":
+        if (e.shiftKey) cycleSub();
+        else toggleSub();
+        break;
       case "s": setSheet((x) => (x === "servers" ? null : "servers")); break;
       case "e": if (episodes) setSheet((x) => (x === "episodes" ? null : "episodes")); break;
-      case "[": if (selectedSub?.startsWith("file")) nudge(-0.5); break;
-      case "]": if (selectedSub?.startsWith("file")) nudge(0.5); break;
+      case "[": case "{":
+        if (selectedSubRef.current || secondarySubRef.current) nudge(e.shiftKey || k === "{" ? -0.1 : -0.5);
+        break;
+      case "]": case "}":
+        if (selectedSubRef.current || secondarySubRef.current) nudge(e.shiftKey || k === "}" ? 0.1 : 0.5);
+        break;
       case "<": changeSpeed(-1); break;
       case ">": changeSpeed(1); break;
       case ",": case ".": {
@@ -1222,7 +2028,18 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
   const q = cur?.probe?.quality ?? cur?.quality;
   const curLevel = level >= 0 ? levels[level]?.height : activeLevel >= 0 ? levels[activeLevel]?.height : undefined;
   const shownQ = curLevel ?? videoHeight ?? q;
-  const selTrack = subTracks.find((t) => t.id === selectedSub);
+  const primTrack = selectedSub ? subTracks.find((t) => t.id === selectedSub) : undefined;
+  const secTrack = secondarySub ? subTracks.find((t) => t.id === secondarySub) : undefined;
+  const primLangCode = primTrack ? langBase(primTrack.lang) : "";
+  const subPillText = primTrack
+    ? secTrack
+      ? `${primLangCode && primLangCode !== "und" ? primLangCode.toUpperCase() : "SUB"}×2`
+      : primLangCode && primLangCode !== "und"
+        ? primLangCode.toUpperCase()
+        : "ON"
+    : secTrack
+      ? "DUAL"
+      : null;
   const playable = candidates.filter((c) => c.probe?.ok).length;
   // Intro / credits skip, when the source knows where they are.
   const sk = cur?.skip;
@@ -1234,8 +2051,31 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
   return (
     <div
       ref={wrap}
-      className={`player cue-${pref.size} ${isEmbed ? "is-embed" : ""} ${hide || embedHide ? "idle" : ""} ${isFull ? "is-full" : ""} ${sheet ? "has-sheet" : ""}`}
+      className={`player ${isEmbed ? "is-embed" : ""} ${hide || embedHide ? "idle" : ""} ${isFull ? "is-full" : ""} ${sheet ? "has-sheet" : ""}`}
       onMouseMove={poke}
+      onDragEnter={(e) => {
+        if (isEmbed || !e.dataTransfer?.types?.includes("Files")) return;
+        dragDepthRef.current += 1;
+        setDragOverSub(true);
+      }}
+      onDragOver={(e) => {
+        if (isEmbed || !e.dataTransfer?.types?.includes("Files")) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "copy";
+      }}
+      onDragLeave={() => {
+        if (isEmbed) return;
+        dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+        if (dragDepthRef.current === 0) setDragOverSub(false);
+      }}
+      onDrop={(e) => {
+        if (isEmbed) return;
+        dragDepthRef.current = 0;
+        setDragOverSub(false);
+        if (!e.dataTransfer?.files?.length) return;
+        e.preventDefault();
+        void addSubtitleFiles(e.dataTransfer.files);
+      }}
     >
       <div
         className="screen"
@@ -1298,30 +2138,14 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
               onDurationChange={(e) => setDur(e.currentTarget.duration)}
               onEnded={() => { const v = video.current; if (v) onProgress?.(v.duration, v.duration); onEnded?.(); }}
               onError={() => cur?.kind === "file" && failover("unsupported or unreachable file")}
-            >
-              {[...fileSubs, ...addedSubs].map((s) => (
-                <track
-                  key={s.src}
-                  ref={(el) => {
-                    if (!el) return void trackEls.current.delete(s.id);
-                    if (trackEls.current.get(s.id) === el) return;
-                    trackEls.current.set(s.id, el);
-                    // React doesn't wire onLoad for <track>; cues exist only after this,
-                    // so that's when a timing offset chosen earlier gets applied.
-                    el.addEventListener("load", () => {
-                      applied.current.set(s.id, 0);
-                      shiftCues(s.id, el);
-                    }, { once: true });
-                  }}
-                  src={s.src}
-                  kind="subtitles"
-                  srcLang={langBase(s.lang) === "und" ? undefined : langBase(s.lang)}
-                  label={s.label}
-                />
-              ))}
-            </video>
+            />
             <canvas key={`${enhance}:${cur?.url ?? ""}`} ref={canvas} className={`enhance-canvas ${enhancing === "on" ? "on" : ""}`} aria-hidden />
-            <div ref={cueBox} className="cues" aria-live="polite" />
+            <SubtitleOverlay
+              cues={activePrimaryCues}
+              secondaryCues={activeSecondaryCues}
+              subPref={pref}
+              controlsVisible={!(hide || embedHide)}
+            />
           </>
         )}
         {waiting && (
@@ -1432,8 +2256,14 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
               </div>
               <div className="pc">
                 {audio && onAudio && <AudioToggle compact value={audio} onChange={changeAudio} />}
-                <button className={`pbtn icon ${selectedSub ? "lit" : ""} ${sheet === "audio" ? "on" : ""}`} onClick={() => openSheet("audio")} title="Audio & subtitles (C toggles)" aria-label="Subtitles">
-                  <Icon name="cc" size={20} />
+                <button
+                  className={`pbtn icon sub-pill-btn ${primTrack || secTrack ? "lit" : ""} ${sheet === "subtitles" ? "on" : ""}`}
+                  onClick={() => openSheet("subtitles")}
+                  title="Subtitles (C toggles · Shift+C cycles)"
+                  aria-label="Subtitles"
+                >
+                  <Icon name="subtitles" size={20} />
+                  {subPillText && <span className={`sub-pill-badge ${secTrack ? "dual" : ""}`}>{subPillText}</span>}
                 </button>
                 <button
                   className={`pbtn chipbtn ${sheet === "picture" ? "on" : ""}`}
@@ -1486,6 +2316,7 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
           <div className="ps-tabs" role="tablist">
             <button role="tab" className={sheet === "servers" ? "on" : ""} onClick={() => setSheet("servers")}>Servers</button>
             {episodes && <button role="tab" className={sheet === "episodes" ? "on" : ""} onClick={() => setSheet("episodes")}>Episodes</button>}
+            <button role="tab" className={sheet === "subtitles" ? "on" : ""} onClick={() => setSheet("subtitles")}>Subtitles</button>
             <button role="tab" className={sheet === "audio" ? "on" : ""} onClick={() => setSheet("audio")}>Audio</button>
             <button role="tab" className={sheet === "picture" ? "on" : ""} onClick={() => setSheet("picture")}>Picture</button>
           </div>
@@ -1498,6 +2329,38 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
           )}
 
           {sheet === "episodes" && episodes && <EpisodeSheet nav={episodes} onPick={pickEpisode} />}
+
+          {sheet === "subtitles" && (
+            <SubtitleSheet
+              isEmbed={isEmbed}
+              tracks={subTracks}
+              selectedId={selectedSub}
+              secondaryId={secondarySub}
+              onSelectPrimary={chooseSub}
+              onSelectSecondary={chooseSecondary}
+              offset={offset}
+              onNudge={nudge}
+              onResetOffset={resetOffset}
+              onUploadFiles={(files) => void addSubtitleFiles(files)}
+              subPref={pref}
+              onPatchPref={patchPref}
+              media={media}
+              season={epSeason}
+              episode={epNumber}
+              canSaveSidecar={canSaveSidecar}
+              onSaveSidecar={(track) => void saveSidecar(track)}
+              savingTrackId={savingTrackId}
+              savedTrackIds={savedTrackIds}
+              onlineResults={onlineResults}
+              onlineLoading={onlineLoading}
+              onlineSearched={onlineSearched}
+              onlineError={onlineError}
+              onSearchOnline={(qTitle, qLang) => void searchOnline(qTitle, qLang)}
+              onLoadOnline={(res, asDual) => void loadOnlineResult(res, asDual)}
+              loadingOnlineId={loadingOnlineId}
+              loadedOnlineMap={loadedOnlineMap}
+            />
+          )}
 
           {sheet === "audio" && (
             <div className="ps-section">
@@ -1527,53 +2390,14 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
                   </div>
                 </div>
               )}
-              {!isEmbed && cur?.kind === "file" && audioTracks.length === 0 && (
-                <p className="ps-note">Audio is selected by the media engine for this file. If it is silent, its audio codec may not be supported.</p>
-              )}
-              <div className="ps-block">
-                <div className="ps-label">Subtitles {!isEmbed && <kbd>C</kbd>}</div>
-                {isEmbed ? (
-                  <p className="ps-note">This server draws its own subtitles. Use the CC button inside its player.</p>
-                ) : (
-                  <div className="opt-list">
-                    <button className={`opt ${!selectedSub ? "on" : ""}`} onClick={() => chooseSub(null)}><span>Off</span></button>
-                    {subTracks.map((t) => (
-                      <button key={t.id} className={`opt ${selectedSub === t.id ? "on" : ""}`} onClick={() => chooseSub(t.id)}>
-                        <span>{t.label}</span>
-                        <small>{langBase(t.lang) !== "und" ? langBase(t.lang).toUpperCase() : ""}</small>
-                      </button>
-                    ))}
-                    <label className="btn glass sm sub-add">
-                      Load .srt / .vtt
-                      <input type="file" accept=".srt,.vtt,text/vtt,application/x-subrip" onChange={(e) => { void addSubtitle(e.currentTarget.files?.[0]); e.currentTarget.value = ""; }} />
-                    </label>
-                    {subTracks.length === 0 && (
-                      <p className="ps-note">
-                        {cur?.kind === "file" ? "No subtitle files next to this video. You can load an .srt or .vtt file." : "This server has no subtitle tracks. You can load an .srt or .vtt file."}
-                      </p>
-                    )}
-                  </div>
-                )}
-              </div>
-              {selTrack && (
-                <div className="ps-block">
-                  <div className="ps-label">Text size</div>
-                  <div className="seg3">
-                    {CUE_SIZES.map((sz) => (
-                      <button key={sz.id} className={pref.size === sz.id ? "on" : ""} onClick={() => updatePref({ size: sz.id })}>{sz.label}</button>
-                    ))}
-                  </div>
-                </div>
-              )}
-              {selTrack?.kind === "file" && (
-                <div className="ps-block">
-                  <div className="ps-label">Timing <kbd>[</kbd><kbd>]</kbd></div>
-                  <div className="seg3">
-                    <button onClick={() => nudge(-0.5)}>−0.5s</button>
-                    <button className={offset === 0 ? "on" : ""} onClick={() => nudge(-offset)}>{offset === 0 ? "In sync" : `${offset > 0 ? "+" : ""}${offset.toFixed(1)}s`}</button>
-                    <button onClick={() => nudge(0.5)}>+0.5s</button>
-                  </div>
-                </div>
+              {!audio && audioTracks.length === 0 && (
+                <p className="ps-note">
+                  {isEmbed
+                    ? "Audio tracks are controlled inside this stream's player."
+                    : cur?.kind === "file"
+                      ? "Audio is selected by the media engine for this file. If it is silent, its audio codec may not be supported."
+                      : "This stream provides a single audio track."}
+                </p>
               )}
             </div>
           )}
@@ -1656,6 +2480,16 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
                 <div key={k}><dt>{k}</dt><dd>{what}</dd></div>
               ))}
             </dl>
+          </div>
+        </div>
+      )}
+
+      {dragOverSub && !isEmbed && (
+        <div className="drop-sub-overlay" aria-hidden>
+          <div className="drop-sub-card">
+            <Icon name="subtitles" size={38} />
+            <strong>Drop subtitle file to load</strong>
+            <span>Supports .srt, .vtt, .ass, .ssa</span>
           </div>
         </div>
       )}

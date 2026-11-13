@@ -5,12 +5,64 @@ import { useLocation } from "react-router-dom";
 import { AudioToggle } from "../components/AudioToggle";
 import { Avatar } from "../components/Avatar";
 import { Icon } from "../components/Icon";
+import { SubtitleOverlay } from "../components/SubtitleOverlay";
 import { errorMessage, getApiBase, leaveGuest, signOut, updateProfile, useAuth } from "../lib/account";
 import { toggleSource, updateSettings, useSettings } from "../lib/settings";
+import {
+  COMMON_SUB_LANGS,
+  DEFAULT_SUB_PREF,
+  SUB_PREF_EVENT,
+  langLabel,
+  loadSubPref,
+  normalizeSubPref,
+  saveSubPref,
+  type CueSize,
+  type SubBg,
+  type SubEdge,
+  type SubFont,
+  type SubHIFilter,
+  type SubMode,
+  type SubPref,
+  type SubtitleCue,
+} from "../lib/subtitles";
 import { getHealth, reliability, resetHealth } from "../sources/health";
 import { scanLibrary } from "../sources/local";
 import { availableSources, DIRECT_SOURCES, PROVIDERS } from "../sources/registry";
 import { appVersion, checkForUpdates, installUpdate, useUpdate } from "../lib/updater";
+
+const SUB_COLOR_SWATCHES = [
+  { hex: "#ffffff", label: "White" },
+  { hex: "#ffe88a", label: "Warm Gold" },
+  { hex: "#98f5ff", label: "Cyan" },
+  { hex: "#b8ff9e", label: "Mint" },
+  { hex: "#e8eefc", label: "Ice Blue" },
+] as const;
+
+const PREVIEW_PRIMARY_CUES: SubtitleCue[] = [
+  {
+    id: "preview-primary",
+    start: 0,
+    end: 10,
+    text: "We'll stay awake until the city lights fade.",
+    spans: [
+      { text: "We'll stay awake until " },
+      { text: "the city lights", italic: true },
+      { text: " fade." },
+    ],
+    align: 2,
+  },
+];
+
+const PREVIEW_SECONDARY_CUES: SubtitleCue[] = [
+  {
+    id: "preview-secondary",
+    start: 0,
+    end: 10,
+    text: "街の灯りが消えるまで、起きていよう。",
+    spans: [{ text: "街の灯りが消えるまで、起きていよう。" }],
+    align: 2,
+  },
+];
 
 export function Settings() {
   const s = useSettings();
@@ -25,6 +77,10 @@ export function Settings() {
   const [profileMsg, setProfileMsg] = useState<string | null>(null);
   const [showExternal, setShowExternal] = useState(s.jellyfin.enabled);
   const [, setHealthTick] = useState(0);
+  const [subPref, setSubPref] = useState<SubPref>(() =>
+    normalizeSubPref({ ...loadSubPref(), ...(s.subtitlePref ?? {}) }),
+  );
+  const [previewDual, setPreviewDual] = useState(false);
   const upd = useUpdate();
   const [version, setVersion] = useState("");
   const mountedRef = useRef(true);
@@ -32,11 +88,41 @@ export function Settings() {
   useEffect(() => {
     mountedRef.current = true;
     void appVersion().then((v) => mountedRef.current && setVersion(v));
+    const syncSub = () => setSubPref(loadSubPref());
+    const onStorage = (e: StorageEvent) => {
+      if (!e.key || e.key === "abx.subs.v1") syncSub();
+    };
+    window.addEventListener(SUB_PREF_EVENT, syncSub);
+    window.addEventListener("storage", onStorage);
     return () => {
       mountedRef.current = false;
       jfCtlRef.current?.abort();
+      window.removeEventListener(SUB_PREF_EVENT, syncSub);
+      window.removeEventListener("storage", onStorage);
     };
   }, []);
+  useEffect(() => {
+    if (s.subtitlePref) {
+      setSubPref((prev) => normalizeSubPref({ ...prev, ...s.subtitlePref }));
+    }
+  }, [s.subtitlePref]);
+
+  const patchSubPref = (patch: Partial<SubPref>) => {
+    const next = saveSubPref({
+      ...subPref,
+      ...patch,
+      ...(patch.mode !== undefined
+        ? { on: patch.mode === "on" ? true : patch.mode === "off" ? false : undefined }
+        : {}),
+    });
+    setSubPref(next);
+    updateSettings({ subtitlePref: next });
+  };
+  const resetSubPref = () => {
+    const next = saveSubPref(DEFAULT_SUB_PREF);
+    setSubPref(next);
+    updateSettings({ subtitlePref: next });
+  };
 
   useEffect(() => {
     if (loc.hash === "#sources") sourcesRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -291,7 +377,273 @@ export function Settings() {
           <div><strong>Reduce motion</strong><span className="muted">Turns off the intro, page morphs and card tilt.</span></div>
           <input type="checkbox" className="switch" checked={s.reduceMotion} onChange={(e) => updateSettings({ reduceMotion: e.target.checked })} />
         </label>
-        <p className="muted kbd-help">Ctrl K or / anywhere: search and commands · Player: Space · ←/→ 5s (Shift 30s) · J/L 10s · 0–9 jump · ↑/↓ or wheel volume · M mute · &lt; &gt; speed · C subtitles · [ ] subtitle timing · S servers · E episodes · F fullscreen · P picture-in-picture · N next · ? all shortcuts · Esc back</p>
+        <p className="muted kbd-help">Ctrl K or / anywhere: search and commands · Player: Space · ←/→ 5s (Shift 30s) · J/L 10s · 0–9 jump · ↑/↓ or wheel volume · M mute · &lt; &gt; speed · C subtitles (Shift + C cycle) · [ ] subtitle timing (Shift ±0.1s) · S servers · E episodes · F fullscreen · P picture-in-picture · N next · ? all shortcuts · Esc back</p>
+      </section>
+
+      <section className="panel" id="subtitles">
+        <div className="sub-sheet-head-row" style={{ marginBottom: 6 }}>
+          <h2>Subtitles</h2>
+          <button className="btn btn-glass sm" onClick={resetSubPref}>
+            <Icon name="refresh" size={14} /> Reset to Defaults
+          </button>
+        </div>
+        <p className="muted">Configure default language matching, online subtitle auto-fetch, dual subtitles, and cinema typography across every source.</p>
+
+        <div className="sub-preview-stage" aria-label="Live subtitle preview">
+          <div className="sub-preview-bg" aria-hidden />
+          <div className="sub-preview-bar">
+            <span className="sub-preview-badge">Live Preview</span>
+            <button
+              className={`chip ${previewDual || !!subPref.secondaryLang ? "on" : ""}`}
+              onClick={() => setPreviewDual((x) => !x)}
+            >
+              <Icon name="dual" size={13} /> {previewDual || subPref.secondaryLang ? "Dual on" : "Preview dual"}
+            </button>
+          </div>
+          <SubtitleOverlay
+            preview
+            cues={PREVIEW_PRIMARY_CUES}
+            secondaryCues={previewDual || subPref.secondaryLang ? PREVIEW_SECONDARY_CUES : undefined}
+            subPref={subPref}
+            controlsVisible={false}
+          />
+        </div>
+
+        <div className="setting-line">
+          <div>
+            <strong>Default mode</strong>
+            <span className="muted">Auto turns subtitles on for foreign-language audio and subbed anime.</span>
+          </div>
+          <div className="sub-seg">
+            {(
+              [
+                { id: "auto", label: "Auto" },
+                { id: "on", label: "Always On" },
+                { id: "off", label: "Always Off" },
+              ] as { id: SubMode; label: string }[]
+            ).map((m) => (
+              <button key={m.id} className={subPref.mode === m.id ? "on" : ""} onClick={() => patchSubPref({ mode: m.id })}>
+                {m.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="setting-line">
+          <div>
+            <strong>Primary language</strong>
+            <span className="muted">Preferred track and default online search language.</span>
+          </div>
+          <select
+            className="sub-select"
+            aria-label="Primary subtitle language"
+            value={subPref.lang}
+            onChange={(e) => patchSubPref({ lang: e.target.value })}
+          >
+            {subPref.lang && !COMMON_SUB_LANGS.some((l) => l.code === subPref.lang) && (
+              <option value={subPref.lang}>{langLabel(subPref.lang)}</option>
+            )}
+            {COMMON_SUB_LANGS.map((l) => (
+              <option key={l.code} value={l.code}>{l.label}</option>
+            ))}
+          </select>
+        </div>
+
+        <div className="setting-line">
+          <div>
+            <strong>Secondary (dual) language</strong>
+            <span className="muted">Optional second track displayed at top-center for bilingual viewing.</span>
+          </div>
+          <select
+            className="sub-select"
+            aria-label="Secondary subtitle language"
+            value={subPref.secondaryLang}
+            onChange={(e) => patchSubPref({ secondaryLang: e.target.value })}
+          >
+            <option value="">Off</option>
+            {subPref.secondaryLang && !COMMON_SUB_LANGS.some((l) => l.code === subPref.secondaryLang) && (
+              <option value={subPref.secondaryLang}>{langLabel(subPref.secondaryLang)}</option>
+            )}
+            {COMMON_SUB_LANGS.map((l) => (
+              <option key={l.code} value={l.code}>{l.label}</option>
+            ))}
+          </select>
+        </div>
+
+        <div className="setting-line">
+          <div>
+            <strong>Hearing impaired (SDH)</strong>
+            <span className="muted">Preference when picking embedded, sidecar, or online tracks.</span>
+          </div>
+          <div className="sub-seg">
+            {(
+              [
+                { id: "any", label: "Any" },
+                { id: "avoid", label: "Avoid SDH" },
+                { id: "prefer", label: "Prefer SDH" },
+              ] as { id: SubHIFilter; label: string }[]
+            ).map((f) => (
+              <button
+                key={f.id}
+                className={subPref.preferHearingImpaired === f.id ? "on" : ""}
+                onClick={() => patchSubPref({ preferHearingImpaired: f.id })}
+              >
+                {f.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <label className="setting-line toggle">
+          <div>
+            <strong>Auto-fetch online subtitles</strong>
+            <span className="muted">Search Wyzie &amp; OpenSubtitles automatically when no track matches your primary language.</span>
+          </div>
+          <input
+            type="checkbox"
+            className="switch"
+            checked={subPref.autoFetchOnline}
+            onChange={(e) => patchSubPref({ autoFetchOnline: e.target.checked })}
+          />
+        </label>
+
+        <div className="setting-line">
+          <div><strong>Font size</strong></div>
+          <div className="sub-seg">
+            {(["xs", "s", "m", "l", "xl"] as CueSize[]).map((sz) => (
+              <button key={sz} className={subPref.size === sz ? "on" : ""} onClick={() => patchSubPref({ size: sz })}>
+                {sz.toUpperCase()}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="setting-line">
+          <div><strong>Font family</strong></div>
+          <div className="sub-seg">
+            {(
+              [
+                { id: "sans", label: "Sans" },
+                { id: "serif", label: "Serif" },
+                { id: "mono", label: "Mono" },
+                { id: "rounded", label: "Rounded" },
+              ] as { id: SubFont; label: string }[]
+            ).map((fn) => (
+              <button key={fn.id} className={subPref.font === fn.id ? "on" : ""} onClick={() => patchSubPref({ font: fn.id })}>
+                {fn.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="setting-line">
+          <div><strong>Text color</strong></div>
+          <div className="sub-swatches" role="radiogroup" aria-label="Subtitle text color">
+            {SUB_COLOR_SWATCHES.map((sw) => (
+              <button
+                key={sw.hex}
+                type="button"
+                role="radio"
+                aria-checked={subPref.color.toLowerCase() === sw.hex}
+                aria-label={sw.label}
+                title={sw.label}
+                className={`sub-swatch ${subPref.color.toLowerCase() === sw.hex ? "on" : ""}`}
+                style={{ backgroundColor: sw.hex }}
+                onClick={() => patchSubPref({ color: sw.hex })}
+              />
+            ))}
+          </div>
+        </div>
+
+        <div className="setting-line">
+          <div><strong>Background</strong></div>
+          <div className="sub-seg">
+            {(
+              [
+                { id: "glass", label: "Glass" },
+                { id: "box", label: "Box" },
+                { id: "none", label: "None" },
+              ] as { id: SubBg; label: string }[]
+            ).map((bg) => (
+              <button key={bg.id} className={subPref.bg === bg.id ? "on" : ""} onClick={() => patchSubPref({ bg: bg.id })}>
+                {bg.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="setting-line">
+          <div>
+            <strong>Background opacity</strong>
+            <span className="muted">Applies to Glass and Box styles.</span>
+          </div>
+          <div className="sub-range-ctrl">
+            <input
+              type="range"
+              aria-label="Subtitle background opacity"
+              min={0}
+              max={1}
+              step={0.05}
+              disabled={subPref.bg === "none"}
+              value={subPref.bgOpacity}
+              onChange={(e) => patchSubPref({ bgOpacity: Number(e.target.value) })}
+            />
+            <code>{Math.round(subPref.bgOpacity * 100)}%</code>
+          </div>
+        </div>
+
+        <div className="setting-line">
+          <div><strong>Text edge</strong></div>
+          <div className="sub-seg">
+            {(
+              [
+                { id: "shadow", label: "Shadow" },
+                { id: "outline", label: "Outline" },
+                { id: "raised", label: "Raised" },
+                { id: "none", label: "None" },
+              ] as { id: SubEdge; label: string }[]
+            ).map((edge) => (
+              <button key={edge.id} className={subPref.edge === edge.id ? "on" : ""} onClick={() => patchSubPref({ edge: edge.id })}>
+                {edge.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="setting-line">
+          <div>
+            <strong>Bottom offset</strong>
+            <span className="muted">Vertical margin when player controls are hidden.</span>
+          </div>
+          <div className="sub-range-ctrl">
+            <input
+              type="range"
+              aria-label="Subtitle bottom offset"
+              min={2}
+              max={45}
+              step={1}
+              value={subPref.bottomPct}
+              onChange={(e) => patchSubPref({ bottomPct: Number(e.target.value) })}
+            />
+            <code>{subPref.bottomPct}%</code>
+          </div>
+        </div>
+
+        <div className="setting-line">
+          <div><strong>Line height</strong></div>
+          <div className="sub-range-ctrl">
+            <input
+              type="range"
+              aria-label="Subtitle line height"
+              min={1}
+              max={2.2}
+              step={0.05}
+              value={subPref.lineHeight}
+              onChange={(e) => patchSubPref({ lineHeight: Number(e.target.value) })}
+            />
+            <code>{subPref.lineHeight.toFixed(2)}</code>
+          </div>
+        </div>
       </section>
 
       <section className="panel">

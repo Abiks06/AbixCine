@@ -43,6 +43,11 @@ const P: Record<string, string> = {
   refresh: "M20 11a8 8 0 0 0-14.6-4.5L4 8M4 4v4h4M4 13a8 8 0 0 0 14.6 4.5L20 16M20 20v-4h-4",
   hd: "M3 5h18v14H3zM7 9v6M7 12h4M11 9v6M14 9v6h2a3 3 0 0 0 0-6z",
   cc: "M3 5h18v14H3zM10 10.5a2 2 0 1 0 0 3M17 10.5a2 2 0 1 0 0 3",
+  subtitles: "M3 5h18v14H3zM7 11.5h6M15 11.5h2M7 15h3M12 15h5",
+  dual: "M3 5h14v9H3zM17 10h4v9H7v-5",
+  download: "M12 3v12M7 10l5 5 5-5M5 19h14",
+  upload: "M12 15V4M7 9l5-5 5 5M4 17v2a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-2",
+  sliders: "M4 7h10M18 7h2M14 5v4M4 12h4M12 12h8M8 10v4M4 17h11M19 17h1M15 15v4",
   pip: "M3 5h18v14H3zM12 12h6v4h-6z",
   keys: "M3 6h18v12H3zM7 10h.01M11 10h.01M15 10h.01M7 14h10",
 };
