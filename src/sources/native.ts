@@ -142,9 +142,65 @@ export interface FetchResult {
   body: string;
 }
 
+export interface FetchBytesResult {
+  status: number;
+  url: string;
+  bytes: ArrayBuffer;
+}
+
+function decodeBase64Bytes(b64Data: string): ArrayBuffer {
+  const bin = atob(b64Data);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) {
+    out[i] = bin.charCodeAt(i);
+  }
+  return out.buffer;
+}
+
+function abortReason(signal: AbortSignal): unknown {
+  return signal.reason !== undefined ? signal.reason : new DOMException("The operation was aborted.", "AbortError");
+}
+
 export function httpFetch(url: string, headers?: Record<string, string>, init?: { method?: string; body?: string }): Promise<FetchResult> {
   if (!native) return fetch(url, { headers, method: init?.method, body: init?.body }).then(async (r) => ({ status: r.status, url: r.url, body: await r.text() }));
   return invoke<FetchResult>("http_fetch", { url, headers, method: init?.method, body: init?.body });
+}
+
+export async function httpFetchBytes(
+  url: string,
+  headers?: Record<string, string>,
+  opts?: { signal?: AbortSignal },
+): Promise<FetchBytesResult> {
+  const signal = opts?.signal;
+  if (signal?.aborted) throw abortReason(signal);
+  if (!isTauri()) {
+    const r = await fetch(url, { headers, signal });
+    return { status: r.status, url: r.url || url, bytes: await r.arrayBuffer() };
+  }
+  const call = invoke<{ status: number; url: string; bodyB64: string }>("http_fetch_bytes", { url, headers });
+  const res = signal
+    ? await new Promise<{ status: number; url: string; bodyB64: string }>((resolve, reject) => {
+        const onAbort = () => reject(abortReason(signal));
+        signal.addEventListener("abort", onAbort, { once: true });
+        call.then(
+          (v) => {
+            signal.removeEventListener("abort", onAbort);
+            if (signal.aborted) reject(abortReason(signal));
+            else resolve(v);
+          },
+          (e) => {
+            signal.removeEventListener("abort", onAbort);
+            reject(signal.aborted ? abortReason(signal) : e);
+          },
+        );
+      })
+    : await call;
+  if (signal?.aborted) throw abortReason(signal);
+  return {
+    status: res.status,
+    url: res.url,
+    bytes: decodeBase64Bytes(res.bodyB64),
+  };
 }
 
 let nextSniffId = 0;
