@@ -4,7 +4,7 @@
  * AbortSignal cancellation, LRU caching, language normalization, scoring, and deduplication.
  */
 
-import { httpFetch, unwrapProxyUrl } from "../sources/native";
+import { httpFetch, httpFetchBytes, unwrapProxyUrl } from "../sources/native";
 import {
   decodeSubtitle,
   langBase,
@@ -477,15 +477,14 @@ export async function fetchAndParseSubtitle(
     text = decodeSubtitle(await res.arrayBuffer());
   } else {
     const res = await withTimeoutAndAbort(
-      httpFetch(url, opts?.headers),
+      httpFetchBytes(url, opts?.headers, { signal: opts?.signal }),
       FETCH_TIMEOUT_MS,
       opts?.signal,
     );
     if (res.status < 200 || res.status >= 300) {
       throw new Error(`HTTP ${res.status}`);
     }
-    const bytes = new TextEncoder().encode(res.body).buffer;
-    text = decodeSubtitle(bytes);
+    text = decodeSubtitle(res.bytes);
   }
   return { ...parseSubtitles(text, hint), raw: text };
 }

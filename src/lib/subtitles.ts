@@ -915,7 +915,10 @@ function parseVttInlineText(rawText: string): { spans: CueSpan[]; alignOverride?
       if (dummyState.italic !== prevItalic) out += dummyState.italic ? "<i>" : "</i>";
       if (dummyState.underline !== prevUnderline) out += dummyState.underline ? "<u>" : "</u>";
       if (dummyState.strike !== prevStrike) out += dummyState.strike ? "<s>" : "</s>";
-      if (dummyState.color !== prevColor && dummyState.color) out += `<font color="${dummyState.color}">`;
+      if (dummyState.color !== prevColor) {
+        if (prevColor) out += "</font>";
+        if (dummyState.color) out += `<font color="${dummyState.color}">`;
+      }
     }
     return out;
   });

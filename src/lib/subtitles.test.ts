@@ -296,20 +296,28 @@ cue-2
     ]);
   });
 
-  it("handles SRT with ASS positioning tags, unsafe font colors, and missing blank lines", () => {
+  it("handles SRT with ASS positioning tags, unsafe font colors, color resets, and missing blank lines", () => {
     const srt = `1
 00:00:01,000 --> 00:00:02,500
 {\\an8}<font color="expression(alert(1))">Top</font>
 2
 00:00:03,000 --> 00:00:04,000
-<u>Line</u>`;
+<u>Line</u>
+3
+00:00:04,500 --> 00:00:06,000
+{\\c&H0000FF&}Red {\\c&H00FF00&}Green {\\c}Plain`;
 
     const parsed = parseSubtitles(srt);
     expect(parsed.format).toBe("srt");
-    expect(parsed.cues).toHaveLength(2);
+    expect(parsed.cues).toHaveLength(3);
     expect(parsed.cues[0].align).toBe(8);
     expect(parsed.cues[0].spans).toEqual([{ text: "Top" }]);
     expect(parsed.cues[1].spans).toEqual([{ text: "Line", underline: true }]);
+    expect(parsed.cues[2].spans).toEqual([
+      { text: "Red ", color: "#ff0000" },
+      { text: "Green ", color: "#00ff00" },
+      { text: "Plain" },
+    ]);
   });
 
   it("round-trips special characters safely via cuesToVtt", () => {

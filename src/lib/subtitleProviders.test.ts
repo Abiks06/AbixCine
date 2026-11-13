@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { httpFetch, proxyUrl } from "../sources/native";
+import { httpFetch, httpFetchBytes, proxyUrl } from "../sources/native";
 import {
   clearSubtitleSearchCache,
   fetchAndParseSubtitle,
@@ -12,14 +12,17 @@ vi.mock("../sources/native", async (importOriginal) => {
   return {
     ...actual,
     httpFetch: vi.fn(),
+    httpFetchBytes: vi.fn(),
   };
 });
 
 const mockHttpFetch = vi.mocked(httpFetch);
+const mockHttpFetchBytes = vi.mocked(httpFetchBytes);
 
 beforeEach(() => {
   clearSubtitleSearchCache();
   mockHttpFetch.mockReset();
+  mockHttpFetchBytes.mockReset();
 });
 
 afterEach(() => {
@@ -211,15 +214,17 @@ describe("searchOnlineSubtitles", () => {
 });
 
 describe("fetchAndParseSubtitle", () => {
-  it("fetches remote HTTPS subtitles via httpFetch and parses them", async () => {
-    mockHttpFetch.mockResolvedValueOnce({
+  it("fetches remote HTTPS subtitles via httpFetchBytes and parses them", async () => {
+    const bytes = new TextEncoder().encode("1\n00:00:01,000 --> 00:00:02,500\n<i>Hello</i> world\n").buffer;
+    mockHttpFetchBytes.mockResolvedValueOnce({
       status: 200,
       url: "https://sub.example/movie.srt",
-      body: "1\n00:00:01,000 --> 00:00:02,500\n<i>Hello</i> world\n",
+      bytes,
     });
 
     const parsed = await fetchAndParseSubtitle("https://sub.example/movie.srt");
-    expect(mockHttpFetch).toHaveBeenCalledWith("https://sub.example/movie.srt", undefined);
+    expect(mockHttpFetchBytes).toHaveBeenCalledWith("https://sub.example/movie.srt", undefined, { signal: undefined });
+    expect(mockHttpFetch).not.toHaveBeenCalled();
     expect(parsed.format).toBe("srt");
     expect(parsed.raw).toContain("<i>Hello</i> world");
     expect(parsed.cues).toHaveLength(1);
@@ -229,6 +234,38 @@ describe("fetchAndParseSubtitle", () => {
     ]);
   });
 
+  it("preserves raw Windows-1252 and UTF-16LE bytes through httpFetchBytes", async () => {
+    // "1\n00:00:01,000 --> 00:00:02,000\ncafé" with Windows-1252 byte 0xe9
+    const prefix = Array.from(new TextEncoder().encode("1\n00:00:01,000 --> 00:00:02,000\ncaf"));
+    const win1252Bytes = Uint8Array.from([...prefix, 0xe9, 0x0a]).buffer;
+    mockHttpFetchBytes.mockResolvedValueOnce({
+      status: 200,
+      url: "https://sub.example/fr.srt",
+      bytes: win1252Bytes,
+    });
+
+    const parsed = await fetchAndParseSubtitle("https://sub.example/fr.srt");
+    expect(parsed.cues[0].text).toBe("café");
+    expect(parsed.raw).toContain("café");
+
+    // UTF-16LE BOM + SRT text
+    const src = "1\n00:00:01,000 --> 00:00:02,000\nUTF-16";
+    const utf16 = new Uint8Array(2 + src.length * 2);
+    utf16[0] = 0xff;
+    utf16[1] = 0xfe;
+    for (let i = 0; i < src.length; i++) {
+      utf16[2 + i * 2] = src.charCodeAt(i);
+      utf16[3 + i * 2] = 0;
+    }
+    mockHttpFetchBytes.mockResolvedValueOnce({
+      status: 200,
+      url: "https://sub.example/utf16.srt",
+      bytes: utf16.buffer,
+    });
+    const parsed16 = await fetchAndParseSubtitle("https://sub.example/utf16.srt");
+    expect(parsed16.cues[0].text).toBe("UTF-16");
+  });
+
   it("fetches proxy/blob/local URLs via fetch and decodes legacy encodings", async () => {
     const assUrl = proxyUrl("https://cdn.example/subs/anime.ass", { referer: "https://embed.example/" });
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
@@ -236,7 +273,7 @@ describe("fetchAndParseSubtitle", () => {
     );
     const parsedWin1252 = await fetchAndParseSubtitle("blob:https://app.local/1234", { formatHint: "srt" });
     expect(fetchSpy).toHaveBeenCalled();
-    expect(mockHttpFetch).not.toHaveBeenCalled();
+    expect(mockHttpFetchBytes).not.toHaveBeenCalled();
     expect(parsedWin1252.format).toBe("srt");
 
     const assBody = "[Script Info]\n[Events]\nFormat: Start, End, Text\nDialogue: 0:00:01.00,0:00:02.00,Proxy ASS";
@@ -247,7 +284,7 @@ describe("fetchAndParseSubtitle", () => {
   });
 
   it("rejects on HTTP error or aborted signal", async () => {
-    mockHttpFetch.mockResolvedValueOnce({ status: 404, url: "https://sub.example/404.srt", body: "" });
+    mockHttpFetchBytes.mockResolvedValueOnce({ status: 404, url: "https://sub.example/404.srt", bytes: new ArrayBuffer(0) });
     await expect(fetchAndParseSubtitle("https://sub.example/404.srt")).rejects.toThrow("HTTP 404");
 
     const ctl = new AbortController();
