@@ -178,6 +178,7 @@ function cueSignature(cues: readonly SubtitleCue[]): string {
   return cues.map((c) => `${c.id}:${c.text}:${c.align}`).join("|");
 }
 
+const candKey = (c: { url: string; pageUrl?: string }): string => c.pageUrl ?? c.url;
 const kindOf = (c: StreamCandidate) =>
   c.kind === "embed" ? "Online" : c.providerId === "local" ? "This PC" : c.providerId === "jellyfin" ? "Jellyfin" : "Direct";
 const audioTag = (c: StreamCandidate) =>
@@ -230,7 +231,7 @@ function loadEnhance(): EnhanceMode {
   }
 }
 
-export function Player({ candidates: given, initialSource, onSourceResult, title, subtitle, startAt, onProgress, onEnded, onNext, autoNext, nextLabel, onBack, audio, onAudio, originalLanguage, episodes, media, season, episode }: Props) {
+export function Player({ candidates: given, initialSource, onSourceResult, title, subtitle, startAt, onProgress, onEnded, onNext, autoNext, nextLabel, onBack, onRetry, audio, onAudio, originalLanguage, episodes, media, season, episode }: Props) {
   const wrap = useRef<HTMLDivElement>(null);
   const video = useRef<HTMLVideoElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
@@ -238,10 +239,39 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
   const resumeAt = useRef(startAt ?? 0);
   // Servers verified from inside the player (standby ones checked on demand) replace the originals.
   const [patched, setPatched] = useState<Record<string, StreamCandidate>>({});
-  const candidates = useMemo(() => given.map((c) => patched[c.pageUrl ?? c.url] ?? c), [given, patched]);
+  const [liveVerifiedIds, setLiveVerifiedIds] = useState<Set<string>>(() => new Set());
+  const liveVerifiedIdsRef = useRef(liveVerifiedIds);
+  liveVerifiedIdsRef.current = liveVerifiedIds;
+  const candidates = useMemo(
+    () =>
+      given.map((orig) => {
+        const key = candKey(orig);
+        const base = patched[key] ?? orig;
+        if (liveVerifiedIds.has(key) && !base.probe?.ok) {
+          return {
+            ...base,
+            probe: {
+              ok: true,
+              latencyMs: base.probe?.latencyMs ?? 0,
+              quality: base.probe?.quality ?? base.quality,
+            },
+          };
+        }
+        return base;
+      }),
+    [given, patched, liveVerifiedIds],
+  );
   const [checking, setChecking] = useState<string | null>(null);
-  const [idx, setIdx] = useState(() => initialCandidateIndex(candidates, initialSource));
+  const [activeId, setActiveId] = useState<string>(() => {
+    const initIdx = initialCandidateIndex(given, initialSource);
+    return given[initIdx] ? candKey(given[initIdx]) : "";
+  });
+  const [retrySeq, setRetrySeq] = useState(0);
+  const [probingStandby, setProbingStandby] = useState(false);
+  const [standbyProgress, setStandbyProgress] = useState<{ done: number; total: number } | null>(null);
   const [playing, setPlaying] = useState(false);
+  const [hasStarted, setHasStarted] = useState(false);
+  const [liveStreamId, setLiveStreamId] = useState<string | null>(null);
   const [time, setTime] = useState(0);
   const [dur, setDur] = useState(0);
   const [buffered, setBuffered] = useState(0);
@@ -269,8 +299,23 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
   const [timeLeft, setTimeLeft] = useState(() => localStorage.getItem(TIME_LEFT_KEY) === "1");
   const [keysOpen, setKeysOpen] = useState(false);
 
-  const cur = candidates[idx];
+  const idx = useMemo(() => {
+    if (!candidates.length) return -1;
+    if (activeId) {
+      const found = candidates.findIndex((c) => candKey(c) === activeId);
+      if (found >= 0) return found;
+    }
+    return initialCandidateIndex(candidates, initialSource);
+  }, [candidates, activeId, initialSource]);
+  const cur = idx >= 0 ? candidates[idx] : undefined;
   const isEmbed = cur?.kind === "embed";
+  const activeKey = cur ? candKey(cur) : activeId;
+
+  useEffect(() => {
+    if (cur && candKey(cur) !== activeId) {
+      setActiveId(candKey(cur));
+    }
+  }, [cur, activeId]);
 
   // Watch keeps appending late backup servers to `candidates`; read them through refs so a
   // new backup never re-runs the attach effect (which would restart the stream).
@@ -280,11 +325,21 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
   resultRef.current = onSourceResult;
   const curRef = useRef(cur);
   curRef.current = cur;
+  const activeIdRef = useRef(activeKey);
+  activeIdRef.current = activeKey;
+  const videoHeightRef = useRef<number | undefined>(undefined);
+  videoHeightRef.current = videoHeight;
+  const attachStartRef = useRef<number>(performance.now());
 
   const toastTimer = useRef<number>();
   const mountedRef = useRef(true);
   const verifyCtlRef = useRef<AbortController | null>(null);
   const verifyGenRef = useRef(0);
+  const standbyCtlRef = useRef<AbortController | null>(null);
+  const standbyGenRef = useRef(0);
+  const refreshCtlRef = useRef<AbortController | null>(null);
+  const activeSessionRef = useRef(0);
+  const failedSessionRef = useRef(-1);
   const flash = (msg: string) => {
     if (!mountedRef.current) return;
     setToast(msg);
@@ -297,6 +352,10 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
       mountedRef.current = false;
       verifyCtlRef.current?.abort();
       verifyCtlRef.current = null;
+      standbyCtlRef.current?.abort();
+      standbyCtlRef.current = null;
+      refreshCtlRef.current?.abort();
+      refreshCtlRef.current = null;
       clearTimeout(toastTimer.current);
       clearTimeout(bumpTimer.current);
     };
@@ -318,75 +377,174 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     if (p.time > 1) resumeAt.current = p.time;
     if (p.duration) onProgress?.(p.time, p.duration);
   };
+  const saveNowRef = useRef(saveNow);
+  saveNowRef.current = saveNow;
 
   /* --------------------------------------------------------------- failover */
 
+  const started = useRef(false);
+  const stallTimer = useRef<number>();
+  const clearStall = useCallback(() => clearTimeout(stallTimer.current), []);
+  const reported = useRef(new Set<string>());
+
   // Try the next candidate when the current one dies, keeping the playhead.
   const failover = useCallback((why: string) => {
-    saveNow();
-    setIdx((i) => {
-      const list = candsRef.current;
-      const dead = list[i];
-      if (dead) {
-        resultRef.current?.(dead, false);
-        // Show it as failed in the server list so nobody picks it again this session.
-        setPatched((p) => ({ ...p, [dead.pageUrl ?? dead.url]: { ...dead, probe: { ok: false, latencyMs: dead.probe?.latencyMs ?? 0, error: "won't play" } } }));
-      }
-      // Only servers that passed the playability check; prefer the ones ranked after this one.
-      const usable = (c: StreamCandidate, j: number) => j !== i && !!c.probe?.ok && c.kind !== "embed";
-      let next = list.findIndex((c, j) => j > i && usable(c, j));
-      if (next === -1) next = list.findIndex(usable);
-      if (next === -1) {
-        const standbys = list.filter((c, j) => j !== i && !c.probe && c.kind === "embed");
-        if (standbys.length > 0) {
-          verifyCtlRef.current?.abort();
-          const ctl = new AbortController();
-          verifyCtlRef.current = ctl;
-          const gen = ++verifyGenRef.current;
-          flash(`Checking backup servers (${why})…`);
-          void probeHedged(standbys.slice(0, 6), {
-            concurrency: 3,
-            maxWinners: 1,
-            signal: ctl.signal,
-            onCandidate: (r) => {
-              if (!mountedRef.current || ctl.signal.aborted || gen !== verifyGenRef.current) return;
-              setPatched((p) => ({ ...p, [r.pageUrl ?? r.url]: r }));
-            },
-          }).then((checked) => {
-            if (!mountedRef.current || ctl.signal.aborted || gen !== verifyGenRef.current) return;
-            const winner = checked.find((r) => r.probe?.ok);
-            if (winner) {
-              const wid = winner.pageUrl ?? winner.url;
-              const targetIdx = candsRef.current.findIndex((x) => (x.pageUrl ?? x.url) === wid);
-              if (targetIdx >= 0) {
-                flash(`Switched to ${winner.providerName} (${why})`);
-                setIdx(targetIdx);
-              }
-            } else {
-              flash(`Playback failed: ${why}`);
-              setSheet("servers");
-            }
+    if (!mountedRef.current) return;
+    if (failedSessionRef.current === activeSessionRef.current) return;
+    failedSessionRef.current = activeSessionRef.current;
+
+    clearStall();
+    saveNowRef.current();
+    setPlaying(false);
+    setHasStarted(false);
+    started.current = false;
+    setLiveStreamId(null);
+
+    const list = candsRef.current;
+    const dead = curRef.current;
+    const deadId = dead ? candKey(dead) : activeIdRef.current;
+
+    if (dead) {
+      reported.current.delete(deadId);
+      resultRef.current?.(dead, false);
+      setLiveVerifiedIds((prev) => {
+        if (!prev.has(deadId)) return prev;
+        const next = new Set(prev);
+        next.delete(deadId);
+        return next;
+      });
+      // Show it as failed in the server list so failover moves past it cleanly.
+      setPatched((prev) => ({
+        ...prev,
+        [deadId]: {
+          ...dead,
+          probe: { ok: false, latencyMs: dead.probe?.latencyMs ?? 0, error: why || "won't play" },
+        },
+      }));
+    }
+
+    verifyCtlRef.current?.abort();
+    verifyCtlRef.current = null;
+    standbyCtlRef.current?.abort();
+    standbyCtlRef.current = null;
+    refreshCtlRef.current?.abort();
+    refreshCtlRef.current = null;
+    setChecking(null);
+    setProbingStandby(false);
+    setStandbyProgress(null);
+
+    const curIndex = list.findIndex((c) => candKey(c) === deadId);
+    // Only servers that passed the playability check; prefer the ones ranked after this one.
+    const usable = (c: StreamCandidate) => candKey(c) !== deadId && !!c.probe?.ok && c.kind !== "embed";
+    const nextAfter = curIndex >= 0 ? list.find((c, j) => j > curIndex && usable(c)) : undefined;
+    const nextCand = nextAfter ?? list.find(usable);
+
+    if (nextCand) {
+      ++verifyGenRef.current;
+      const nextId = candKey(nextCand);
+      activeIdRef.current = nextId;
+      setActiveId(nextId);
+      flash(`Switched to ${nextCand.providerName} (${why})`);
+      return;
+    }
+
+    const standbys = list.filter((c) => candKey(c) !== deadId && !c.probe && c.kind === "embed");
+    if (standbys.length > 0) {
+      const ctl = new AbortController();
+      verifyCtlRef.current = ctl;
+      const gen = ++verifyGenRef.current;
+      setWaiting(true);
+      flash(`Checking backup servers (${why})…`);
+      void probeHedged(standbys.slice(0, 6), {
+        concurrency: 3,
+        maxWinners: 1,
+        signal: ctl.signal,
+        onCandidate: (r) => {
+          if (!mountedRef.current || ctl.signal.aborted || gen !== verifyGenRef.current) return;
+          setPatched((prev) => {
+            const k = candKey(r);
+            if (liveVerifiedIdsRef.current.has(k) && !r.probe?.ok) return prev;
+            return { ...prev, [k]: r };
           });
-          return i;
-        }
-        flash(`Playback failed: ${why}`);
-        setSheet("servers");
-        return i;
-      }
-      flash(`Switched to ${list[next].providerName} (${why})`);
+        },
+      })
+        .then((checked) => {
+          if (!mountedRef.current || ctl.signal.aborted || gen !== verifyGenRef.current) return;
+          if (verifyCtlRef.current === ctl) verifyCtlRef.current = null;
+          const winner = checked.find((r) => r.probe?.ok);
+          if (winner) {
+            const wid = candKey(winner);
+            if (candsRef.current.some((x) => candKey(x) === wid)) {
+              activeIdRef.current = wid;
+              setActiveId(wid);
+              flash(`Switched to ${winner.providerName} (${why})`);
+              return;
+            }
+          }
+          setWaiting(false);
+          flash(`Playback failed: ${why}`);
+          setSheet("servers");
+        })
+        .catch(() => {
+          if (!mountedRef.current || ctl.signal.aborted || gen !== verifyGenRef.current) return;
+          if (verifyCtlRef.current === ctl) verifyCtlRef.current = null;
+          setWaiting(false);
+          flash(`Playback failed: ${why}`);
+          setSheet("servers");
+        });
+      return;
+    }
+
+    setWaiting(false);
+    flash(`Playback failed: ${why}`);
+    setSheet("servers");
+  }, [clearStall]);
+
+  // First frame from a source counts as a successful play and promotes it to Ready immediately.
+  const onPlaying = useCallback(() => {
+    const c = curRef.current;
+    if (!c) return;
+    const key = candKey(c);
+    setLiveStreamId(key);
+    const connectLatencyMs = Math.max(1, Math.round(performance.now() - attachStartRef.current));
+    const liveHeight = video.current?.videoHeight || videoHeightRef.current;
+    const resolvedQuality = c.probe?.quality ?? liveHeight ?? c.quality;
+    const resolvedLatency =
+      c.probe?.ok && typeof c.probe.latencyMs === "number" && c.probe.latencyMs > 0
+        ? c.probe.latencyMs
+        : connectLatencyMs;
+    const promoted: StreamCandidate = {
+      ...c,
+      quality: resolvedQuality ?? c.quality,
+      probe: {
+        ok: true,
+        latencyMs: resolvedLatency,
+        quality: resolvedQuality,
+      },
+    };
+    setLiveVerifiedIds((prev) => {
+      if (prev.has(key)) return prev;
+      const next = new Set(prev);
+      next.add(key);
       return next;
     });
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // First frame from a source counts as a successful play (once per source).
-  const reported = useRef(new Set<string>());
-  const onPlaying = () => {
-    const c = curRef.current;
-    if (c && !reported.current.has(c.url)) {
-      reported.current.add(c.url);
-      resultRef.current?.(c, true);
+    setPatched((prev) => {
+      const existing = prev[key];
+      if (
+        existing?.probe?.ok &&
+        existing.url === promoted.url &&
+        existing.probe.latencyMs === promoted.probe?.latencyMs &&
+        existing.probe.quality === promoted.probe?.quality
+      ) {
+        return prev;
+      }
+      return { ...prev, [key]: promoted };
+    });
+    if (!reported.current.has(key)) {
+      reported.current.add(key);
+      resultRef.current?.(promoted, true);
     }
-  };
+  }, []);
 
   /* -------------------------------------------------------------- subtitles */
 
@@ -1485,33 +1643,39 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
   // Then move on to the next one at the same spot instead of spinning forever.
   const START_TIMEOUT = 20_000;
   const STALL_TIMEOUT = 15_000;
-  const started = useRef(false);
-  const stallTimer = useRef<number>();
-  const clearStall = () => clearTimeout(stallTimer.current);
-  const armStall = () => {
+  const armStall = useCallback(() => {
     clearStall();
     const v = video.current;
-    if (!v || v.paused && started.current) return;
+    if (!v || (v.paused && started.current)) return;
     stallTimer.current = window.setTimeout(() => {
       const vv = video.current;
       // Still not playing, not paused by the viewer, and no data arriving.
       if (vv && !(vv.paused && started.current) && vv.readyState < 3) failover(started.current ? "stalled" : "didn't start");
     }, started.current ? STALL_TIMEOUT : START_TIMEOUT);
-  };
+  }, [clearStall, failover]);
+  const armStallRef = useRef(armStall);
+  armStallRef.current = armStall;
   useEffect(() => {
     if (!cur || cur.kind === "embed" || preparingLocal) return;
     started.current = false;
+    setHasStarted(false);
     armStall();
     return clearStall;
-  }, [cur?.url, preparingLocal]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [cur?.url, cur?.kind, preparingLocal, retrySeq, armStall, clearStall]);
 
   /* ---------------------------------------------------------- attach source */
 
-  const refreshedUrlsRef = useRef(new Set<string>());
+  const lastRefreshedAtRef = useRef(new Map<string, number>());
 
   useEffect(() => {
     const c = curRef.current;
     if (!c) return;
+    activeSessionRef.current += 1;
+    attachStartRef.current = performance.now();
+    started.current = false;
+    setHasStarted(false);
+    setPlaying(false);
+    setLiveStreamId(null);
     setPreparingLocal(false);
     setAudioTracks([]);
     setSelectedAudioTrack(-1);
@@ -1524,6 +1688,8 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     setDur(0);
     hlsRef.current?.destroy();
     hlsRef.current = null;
+    refreshCtlRef.current?.abort();
+    refreshCtlRef.current = null;
     if (c.kind === "embed") {
       setWaiting(true);
       embedPos.current = { time: resumeAt.current, duration: 0 };
@@ -1552,7 +1718,7 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
       v.src = url;
       v.addEventListener("loadedmetadata", seekAndPlay, { once: true });
     };
-    const attachHls = (H: typeof Hls, streamUrl: string) => {
+    const attachHls = (H: typeof Hls, streamUrl: string, target: StreamCandidate) => {
       if (cancelled) return;
       v.crossOrigin = "anonymous";
       if (!H.isSupported()) {
@@ -1571,10 +1737,18 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
       });
       hlsRef.current = hls;
       hls.subtitleDisplay = false;
+      let recoveries = 0;
+      let midStreamRefreshing = false;
+      let lastNetErrCode: number | undefined;
       hls.on(H.Events.MANIFEST_PARSED, (_, d) => {
+        if (cancelled) return;
+        lastNetErrCode = undefined;
         setHlsReady(true);
         setLevels(d.levels.map((l) => ({ height: l.height })));
         seekAndPlay();
+      });
+      hls.on(H.Events.FRAG_LOADED, () => {
+        lastNetErrCode = undefined;
       });
       hls.on(H.Events.LEVEL_SWITCHED, (_, d) => {
         setActiveLevel(d.level);
@@ -1605,14 +1779,80 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
       hls.on(H.Events.SUBTITLE_FRAG_PROCESSED, () => {
         evaluateCuesRef.current();
       });
-      let recoveries = 0;
       hls.on(H.Events.ERROR, (_, d) => {
+        if (cancelled) return;
+        const netStatus =
+          d.networkDetails && typeof d.networkDetails === "object" && "status" in d.networkDetails
+            ? Number((d.networkDetails as { status?: number }).status)
+            : undefined;
+        const code = d.response?.code ?? (netStatus && Number.isFinite(netStatus) && netStatus > 0 ? netStatus : undefined);
+        if (d.type === H.ErrorTypes.NETWORK_ERROR && code) {
+          lastNetErrCode = code;
+        }
         if (!d.fatal) return;
+
         // Media errors get two local repair attempts (the second also swaps the audio codec), then the next source.
         if (d.type === H.ErrorTypes.MEDIA_ERROR && recoveries < 2) {
           if (recoveries++ === 1) hls.swapAudioCodec();
           hls.recoverMediaError();
-        } else failover(d.details);
+          return;
+        }
+
+        const httpCode = code ?? (d.type === H.ErrorTypes.NETWORK_ERROR ? lastNetErrCode : undefined);
+        const isAuthOrExpired =
+          httpCode === 401 ||
+          httpCode === 403 ||
+          httpCode === 410 ||
+          isUrlTokenExpired(target.url) ||
+          (typeof d.url === "string" && isUrlTokenExpired(d.url));
+        const targetId = candKey(target);
+        const lastRefresh = lastRefreshedAtRef.current.get(targetId) ?? 0;
+
+        if (
+          d.type === H.ErrorTypes.NETWORK_ERROR &&
+          isAuthOrExpired &&
+          target.pageUrl &&
+          !midStreamRefreshing &&
+          Date.now() - lastRefresh >= 60_000
+        ) {
+          midStreamRefreshing = true;
+          lastRefreshedAtRef.current.set(targetId, Date.now());
+          if (v.currentTime > 1) resumeAt.current = v.currentTime;
+          saveNowRef.current();
+          clearStall();
+          setWaiting(true);
+          flash(`Refreshing ${target.providerName} stream link…`);
+
+          if (hlsRef.current === hls) hlsRef.current = null;
+          hls.destroy();
+
+          refreshCtlRef.current?.abort();
+          const refreshCtl = new AbortController();
+          refreshCtlRef.current = refreshCtl;
+
+          void verifyEmbed(target, refreshCtl.signal)
+            .then((refreshed) => {
+              if (cancelled || refreshCtl.signal.aborted || !mountedRef.current) return;
+              if (refreshCtlRef.current === refreshCtl) refreshCtlRef.current = null;
+              if (!refreshed.probe?.ok) {
+                failover(refreshed.probe?.error ?? (httpCode ? `HTTP ${httpCode}` : d.details));
+                return;
+              }
+              setPatched((p) => ({ ...p, [targetId]: refreshed }));
+              if (refreshed.url === target.url) {
+                attachStream(refreshed);
+                armStallRef.current();
+              }
+            })
+            .catch((err: unknown) => {
+              if (cancelled || refreshCtl.signal.aborted || !mountedRef.current) return;
+              if (refreshCtlRef.current === refreshCtl) refreshCtlRef.current = null;
+              failover(err instanceof Error ? err.message : "stream token refresh failed");
+            });
+          return;
+        }
+
+        failover(httpCode ? `${d.details} (${httpCode})` : d.details);
       });
       hls.loadSource(streamUrl);
       hls.attachMedia(v);
@@ -1620,7 +1860,7 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     const attachStream = (target: StreamCandidate) => {
       // hls.js (~600 kB) is only parsed when a stream actually needs it; local files never load it.
       if (target.kind === "hls") {
-        import("hls.js").then((m) => attachHls(m.default, target.url), () => !cancelled && failover("player failed to load"));
+        import("hls.js").then((m) => attachHls(m.default, target.url, target), () => !cancelled && failover("player failed to load"));
       } else if (target.localPath) {
         setPreparingLocal(true);
         invoke<string>("prepare_local_media", { path: target.localPath })
@@ -1640,13 +1880,16 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
       }
     };
     // Re-validate and refresh stale/expired stream URLs before playback.
-    const candidateId = c.pageUrl ?? c.url;
-    if (c.pageUrl && isUrlTokenExpired(c.url) && !refreshedUrlsRef.current.has(candidateId)) {
-      refreshedUrlsRef.current.add(candidateId);
+    const candidateId = candKey(c);
+    const lastPreRefresh = lastRefreshedAtRef.current.get(candidateId) ?? 0;
+    if (c.pageUrl && isUrlTokenExpired(c.url) && Date.now() - lastPreRefresh >= 60_000) {
+      lastRefreshedAtRef.current.set(candidateId, Date.now());
       const refreshCtl = new AbortController();
+      refreshCtlRef.current = refreshCtl;
       void verifyEmbed(c, refreshCtl.signal)
         .then((refreshed) => {
           if (cancelled || refreshCtl.signal.aborted || !mountedRef.current) return;
+          if (refreshCtlRef.current === refreshCtl) refreshCtlRef.current = null;
           setPatched((p) => ({ ...p, [candidateId]: refreshed }));
           if (!refreshed.probe?.ok) {
             failover(refreshed.probe?.error ?? "expired stream");
@@ -1658,11 +1901,13 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
         })
         .catch((err: unknown) => {
           if (cancelled || refreshCtl.signal.aborted || !mountedRef.current) return;
+          if (refreshCtlRef.current === refreshCtl) refreshCtlRef.current = null;
           failover(err instanceof Error ? err.message : "expired stream refresh failed");
         });
       return () => {
         cancelled = true;
         refreshCtl.abort();
+        if (refreshCtlRef.current === refreshCtl) refreshCtlRef.current = null;
         v.removeEventListener("loadedmetadata", seekAndPlay);
         if (v.currentTime > 1) resumeAt.current = v.currentTime;
         hlsRef.current?.destroy();
@@ -1672,19 +1917,21 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     attachStream(c);
     return () => {
       cancelled = true;
+      refreshCtlRef.current?.abort();
+      refreshCtlRef.current = null;
       v.removeEventListener("loadedmetadata", seekAndPlay);
       if (v.currentTime > 1) resumeAt.current = v.currentTime;
       hlsRef.current?.destroy();
       hlsRef.current = null;
     };
-  }, [cur?.url, failover]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [cur?.url, cur?.kind, cur?.localPath, retrySeq, failover, clearStall]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* ------------------------------------------------------------------ embeds */
 
   // Built once per source so later playhead updates don't reload the iframe.
   const embedSrc = useMemo(
     () => (cur?.kind === "embed" ? withStart(cur.url, cur.startParam, resumeAt.current) : ""),
-    [cur?.url], // eslint-disable-line react-hooks/exhaustive-deps
+    [cur?.url, cur?.kind, cur?.startParam, retrySeq], // eslint-disable-line react-hooks/exhaustive-deps
   );
 
   // Embeds can't be watched directly, but most post their playhead to the parent window.
@@ -1696,7 +1943,13 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
       if (m.time != null && m.duration) {
         embedPos.current = { time: m.time, duration: m.duration };
         setEmbedClock(embedPos.current);
-        if (m.time > 0) onPlaying();
+        if (m.time > 0) {
+          setWaiting(false);
+          started.current = true;
+          setHasStarted(true);
+          setPlaying(true);
+          onPlaying();
+        }
       }
       if (m.ended) {
         const p = embedPos.current;
@@ -1706,7 +1959,7 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     };
     window.addEventListener("message", onMsg);
     return () => window.removeEventListener("message", onMsg);
-  }, [isEmbed, cur?.url, onProgress, onEnded]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [isEmbed, cur?.url, onProgress, onEnded, onPlaying]);
 
   /* ------------------------------------------------------------ enhancement */
 
@@ -1905,15 +2158,25 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
   };
 
   const switchTo = async (i: number) => {
-    if (i === idx) return;
+    const list = candsRef.current;
+    let c = list[i];
+    if (!c) return;
+    const id = candKey(c);
+    const isSameActive = id === activeIdRef.current;
+    if (isSameActive && c.probe?.ok !== false) return;
+
     verifyCtlRef.current?.abort();
     verifyCtlRef.current = null;
+    standbyCtlRef.current?.abort();
+    standbyCtlRef.current = null;
+    refreshCtlRef.current?.abort();
+    refreshCtlRef.current = null;
+    setProbingStandby(false);
+    setStandbyProgress(null);
     const gen = ++verifyGenRef.current;
-    let c = candidates[i];
-    if (!c) return;
-    const id = c.pageUrl ?? c.url;
-    // A standby server hasn't been checked yet: capture its stream first, play only if it has the title.
-    if (!c.probe && c.kind === "embed") {
+
+    // Unchecked standby embeds or previously failed embed/sniffed candidates get verified first.
+    if ((!c.probe || !c.probe.ok) && (c.kind === "embed" || Boolean(c.pageUrl))) {
       const ctl = new AbortController();
       verifyCtlRef.current = ctl;
       setChecking(id);
@@ -1922,31 +2185,115 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
         r = await verifyEmbed(c, ctl.signal);
       } catch (err) {
         if (!mountedRef.current || ctl.signal.aborted || gen !== verifyGenRef.current) return;
+        if (verifyCtlRef.current === ctl) verifyCtlRef.current = null;
         setChecking(null);
         flash(`Couldn't verify ${c.providerName}: ${err instanceof Error ? err.message : "check failed"}`);
         return;
       }
       if (!mountedRef.current || ctl.signal.aborted || gen !== verifyGenRef.current) return;
+      if (verifyCtlRef.current === ctl) verifyCtlRef.current = null;
       setChecking(null);
       setPatched((p) => ({ ...p, [id]: r }));
-      if (!r.probe?.ok) return flash(`${c.providerName} doesn't have this one`);
+      if (!r.probe?.ok) {
+        flash(
+          r.probe?.error && r.probe.error !== "no stream"
+            ? `${c.providerName}: ${r.probe.error}`
+            : `${c.providerName} doesn't have this one`,
+        );
+        return;
+      }
       c = r;
     } else {
       setChecking(null);
     }
     if (!mountedRef.current || gen !== verifyGenRef.current) return;
-    const targetIdx = candsRef.current.findIndex((x) => (x.pageUrl ?? x.url) === id);
-    const nextIdx = targetIdx >= 0 ? targetIdx : i;
-    if (nextIdx >= candsRef.current.length || nextIdx === idx) return;
-    saveNow();
-    setIdx(nextIdx);
+    if (!candsRef.current.some((x) => candKey(x) === id)) return;
+
+    saveNowRef.current();
+    failedSessionRef.current = -1;
+    started.current = false;
+    setHasStarted(false);
+    setPlaying(false);
+    setLiveStreamId(null);
+
+    if (id === activeIdRef.current) {
+      setRetrySeq((n) => n + 1);
+    } else {
+      activeIdRef.current = id;
+      setActiveId(id);
+    }
     flash(`Now playing from ${c.providerName}${resumeAt.current > 5 ? ` at ${fmtTime(resumeAt.current)}` : ""}`);
   };
-  /** "Not playing right?": move to the next server that isn't known to be missing the title. */
+
+  /** Probe up to 6 standby embed servers in the background while keeping playback uninterrupted. */
+  const checkStandbys = useCallback(() => {
+    if (standbyCtlRef.current) {
+      standbyCtlRef.current.abort();
+      standbyCtlRef.current = null;
+      standbyGenRef.current += 1;
+      setProbingStandby(false);
+      setStandbyProgress(null);
+      return;
+    }
+    const standbys = candsRef.current.filter((c) => !c.probe && c.kind === "embed").slice(0, 6);
+    if (!standbys.length) return;
+    const ctl = new AbortController();
+    standbyCtlRef.current = ctl;
+    const gen = ++standbyGenRef.current;
+    setProbingStandby(true);
+    setStandbyProgress({ done: 0, total: standbys.length });
+    void probeHedged(standbys, {
+      concurrency: 3,
+      maxWinners: standbys.length,
+      signal: ctl.signal,
+      onCandidate: (r) => {
+        if (!mountedRef.current || ctl.signal.aborted || gen !== standbyGenRef.current) return;
+        setStandbyProgress((p) => (p ? { ...p, done: Math.min(p.total, p.done + 1) } : null));
+        setPatched((prev) => {
+          const k = candKey(r);
+          if (liveVerifiedIdsRef.current.has(k) && !r.probe?.ok) return prev;
+          return { ...prev, [k]: r };
+        });
+      },
+    })
+      .then((checked) => {
+        if (!mountedRef.current || ctl.signal.aborted || gen !== standbyGenRef.current) return;
+        if (standbyCtlRef.current === ctl) standbyCtlRef.current = null;
+        setProbingStandby(false);
+        setStandbyProgress(null);
+        const readyCount = checked.filter((r) => r.probe?.ok).length;
+        flash(
+          readyCount > 0
+            ? `${readyCount} standby server${readyCount === 1 ? "" : "s"} ready`
+            : "No standby servers responded",
+        );
+      })
+      .catch(() => {
+        if (!mountedRef.current || ctl.signal.aborted || gen !== standbyGenRef.current) return;
+        if (standbyCtlRef.current === ctl) standbyCtlRef.current = null;
+        setProbingStandby(false);
+        setStandbyProgress(null);
+      });
+  }, []);
+
+  const refreshServerList = useCallback(() => {
+    if (!onRetry) return;
+    saveNowRef.current();
+    setSheet(null);
+    onRetry();
+  }, [onRetry]);
+
+  /** "Not playing right?": cycle to the next alternative server (verified first, then standby, then any other). */
   const nextServer = () => {
-    const after = candidates.findIndex((c, j) => j > idx && c.probe?.ok !== false);
-    const i = after === -1 ? candidates.findIndex((c, j) => j !== idx && c.probe?.ok !== false) : after;
-    if (i === -1) return flash("No other server has this one");
+    if (candidates.length <= 1) return flash("No other server available");
+    const findNext = (pred: (c: StreamCandidate, j: number) => boolean) => {
+      const after = candidates.findIndex((c, j) => j > idx && pred(c, j));
+      return after >= 0 ? after : candidates.findIndex((c, j) => j !== idx && pred(c, j));
+    };
+    let i = findNext((c) => !!c.probe?.ok);
+    if (i === -1) i = findNext((c) => !c.probe);
+    if (i === -1) i = findNext((_, j) => j !== idx);
+    if (i === -1) return flash("No other server available");
     if (cur) resultRef.current?.(cur, false);
     void switchTo(i);
   };
@@ -2063,9 +2410,10 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
   }, [title, subtitle, media?.backdrop, hasNext]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Stable callbacks for the side sheet, so its lists don't re-render with every playhead tick.
-  const latest = useRef({ switchTo, saveNow, episodes });
-  latest.current = { switchTo, saveNow, episodes };
+  const latest = useRef({ switchTo, saveNow, episodes, checkStandbys });
+  latest.current = { switchTo, saveNow, episodes, checkStandbys };
   const pickServer = useCallback((i: number) => void latest.current.switchTo(i), []);
+  const triggerCheckStandbys = useCallback(() => latest.current.checkStandbys(), []);
   const pickEpisode = useCallback((s: number | undefined, e: number) => {
     latest.current.saveNow();
     latest.current.episodes?.go(s, e);
@@ -2121,7 +2469,27 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     : secTrack
       ? "DUAL"
       : null;
-  const playable = candidates.filter((c) => c.probe?.ok).length;
+  const isActivelyStreaming = Boolean(
+    cur && (playing || hasStarted || (liveStreamId !== null && liveStreamId === activeKey)),
+  );
+  const isConnecting = Boolean(cur && !isActivelyStreaming && waiting);
+  const playableCount = candidates.filter((c) => c.probe?.ok).length;
+  const playable = Math.max(playableCount, cur && isActivelyStreaming ? 1 : 0);
+  const curLatency = cur?.probe?.ok && typeof cur.probe.latencyMs === "number" && cur.probe.latencyMs > 0 ? cur.probe.latencyMs : undefined;
+  const spDotClass = isActivelyStreaming
+    ? "live"
+    : isConnecting
+      ? "wait"
+      : checking || probingStandby
+        ? "busy"
+        : !cur || cur.probe?.ok === false
+          ? "off"
+          : "";
+  const spMeta = [
+    isActivelyStreaming ? "Playing" : isConnecting ? "Connecting" : null,
+    shownQ ? (shownQ >= 2160 ? "4K" : `${shownQ}p`) : null,
+    curLatency ? `${curLatency} ms` : null,
+  ].filter(Boolean).join(" · ");
   // Intro / credits skip, when the source knows where they are.
   const sk = cur?.skip;
   const inIntro = !!sk?.intro && time >= sk.intro[0] && time < sk.intro[1] - 1.5;
@@ -2170,7 +2538,7 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
       >
         {isEmbed ? (
           <iframe
-            key={cur.url}
+            key={`${cur.url}:${retrySeq}`}
             src={embedSrc}
             className={`embed-frame ${vivid ? "vivid" : ""}`}
             allow="autoplay; fullscreen; picture-in-picture; encrypted-media; gyroscope; accelerometer"
@@ -2178,6 +2546,9 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
             referrerPolicy="origin"
             onLoad={() => {
               setWaiting(false);
+              started.current = true;
+              setHasStarted(true);
+              setPlaying(true);
               onPlaying();
             }}
           />
@@ -2202,6 +2573,7 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
                 setWaiting(false);
                 clearStall();
                 started.current = true;
+                setHasStarted(true);
                 onPlaying();
               }}
               onCanPlay={() => {
@@ -2213,8 +2585,16 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
                 if (!dragging) setTime(v.currentTime);
                 setBuffered(bufferedAhead(v));
               }}
-              onLoadedMetadata={(e) => setVideoHeight(e.currentTarget.videoHeight || undefined)}
-              onResize={(e) => setVideoHeight(e.currentTarget.videoHeight || undefined)}
+              onLoadedMetadata={(e) => {
+                const h = e.currentTarget.videoHeight || undefined;
+                videoHeightRef.current = h;
+                setVideoHeight(h);
+              }}
+              onResize={(e) => {
+                const h = e.currentTarget.videoHeight || undefined;
+                videoHeightRef.current = h;
+                setVideoHeight(h);
+              }}
               onProgress={(e) => setBuffered(bufferedAhead(e.currentTarget))}
               onDurationChange={(e) => setDur(e.currentTarget.duration)}
               onEnded={() => { const v = video.current; if (v) onProgress?.(v.duration, v.duration); onEnded?.(); }}
@@ -2232,7 +2612,7 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
         {waiting && (
           <div className="pload" aria-label="Loading">
             <span className="pload-ring" />
-            <span className="pload-txt">{preparingLocal ? "Preparing local audio" : started.current ? "Buffering" : `Connecting to ${cur?.providerName ?? "server"}`}</span>
+            <span className="pload-txt">{preparingLocal ? "Preparing local audio" : hasStarted ? "Buffering" : `Connecting to ${cur?.providerName ?? "server"}`}</span>
           </div>
         )}
       </div>
@@ -2250,12 +2630,12 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
           <div className="ptop-actions">
             {isEmbed && audio && onAudio && <AudioToggle compact value={audio} onChange={changeAudio} />}
             <button className={`server-pill ${sheet === "servers" ? "on" : ""}`} onClick={() => openSheet("servers")} title="Servers (S)">
-              <span className="sp-dot" />
-              <span className="sp-name">{cur?.providerName}</span>
-              <span className="sp-meta">{[q ? `${q}p` : null, cur?.probe?.latencyMs ? `${cur.probe.latencyMs} ms` : null].filter(Boolean).join(" · ")}</span>
-              <span className="sp-count">{playable}</span>
+              <span className={`sp-dot ${spDotClass}`} />
+              <span className="sp-name">{cur?.providerName ?? "No server"}</span>
+              <span className="sp-meta">{spMeta}</span>
+              <span className="sp-count" title={`${playable} ready server${playable === 1 ? "" : "s"}`}>{playable}</span>
             </button>
-            {isEmbed && playable > 1 && (
+            {candidates.length > 1 && (
               <button className="pbtn" onClick={nextServer} title="Not playing? Try the next server">
                 <Icon name="refresh" size={17} /><span>Next server</span>
               </button>
@@ -2406,7 +2786,18 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
 
         <div className="ps-body" key={sheet ?? "none"}>
           {sheet === "servers" && (
-            <ServerList candidates={candidates} idx={idx} checking={checking} onPick={pickServer} />
+            <ServerList
+              candidates={candidates}
+              idx={idx}
+              checking={checking}
+              isStreaming={isActivelyStreaming}
+              isConnecting={isConnecting}
+              probingStandby={probingStandby}
+              standbyProgress={standbyProgress}
+              onPick={pickServer}
+              onCheckStandbys={triggerCheckStandbys}
+              onRefreshList={onRetry ? refreshServerList : undefined}
+            />
           )}
 
           {sheet === "episodes" && episodes && <EpisodeSheet nav={episodes} onPick={pickEpisode} />}
@@ -2590,48 +2981,142 @@ function bufferedAhead(v: HTMLVideoElement) {
 
 /* ------------------------------------------------------------------ servers */
 
-const ServerList = memo(function ServerList({ candidates, idx, checking, onPick }: { candidates: StreamCandidate[]; idx: number; checking: string | null; onPick: (i: number) => void }) {
-  const ok = candidates.filter((c) => c.probe?.ok);
-  const standby = candidates.filter((c) => !c.probe);
-  const missing = candidates.filter((c) => c.probe && !c.probe.ok);
-  const best = ok.reduce((m, c) => Math.min(m, c.probe?.latencyMs ?? Infinity), Infinity);
-  const row = (c: StreamCandidate) => {
-    const i = candidates.indexOf(c);
-    const state = c.probe?.ok ? "ok" : c.probe ? "off" : "standby";
+const ServerList = memo(function ServerList({
+  candidates,
+  idx,
+  checking,
+  isStreaming,
+  isConnecting,
+  probingStandby,
+  standbyProgress,
+  onPick,
+  onCheckStandbys,
+  onRefreshList,
+}: {
+  candidates: StreamCandidate[];
+  idx: number;
+  checking: string | null;
+  isStreaming: boolean;
+  isConnecting: boolean;
+  probingStandby: boolean;
+  standbyProgress: { done: number; total: number } | null;
+  onPick: (i: number) => void;
+  onCheckStandbys: () => void;
+  onRefreshList?: () => void;
+}) {
+  const entries = candidates.map((c, i) => {
     const now = i === idx;
-    const busy = checking === (c.pageUrl ?? c.url);
+    const state: "ok" | "standby" | "off" =
+      c.probe?.ok || (now && isStreaming) ? "ok" : !c.probe ? "standby" : "off";
+    return { c, i, now, state };
+  });
+  const ok = entries
+    .filter((x) => x.state === "ok")
+    .sort((a, b) => (a.now ? -1 : b.now ? 1 : 0));
+  const standby = entries.filter((x) => x.state === "standby");
+  const missing = entries.filter((x) => x.state === "off");
+  const standbyEmbedCount = candidates.filter((c) => !c.probe && c.kind === "embed").length;
+  const best = ok.reduce(
+    (m, { c }) => Math.min(m, c.probe?.latencyMs && c.probe.latencyMs > 0 ? c.probe.latencyMs : Infinity),
+    Infinity,
+  );
+  const row = ({ c, i, now, state }: { c: StreamCandidate; i: number; now: boolean; state: "ok" | "standby" | "off" }) => {
+    const key = candKey(c);
+    const busy = checking === key;
     const ms = c.probe?.latencyMs;
-    const bars = state !== "ok" || ms == null ? 0 : ms < 1500 ? 3 : ms < 5000 ? 2 : 1;
+    const bars = state !== "ok" || ms == null || ms <= 0 ? (state === "ok" ? 3 : 0) : ms < 1500 ? 3 : ms < 5000 ? 2 : 1;
     const tag = audioTag(c);
     const q = c.probe?.quality ?? c.quality;
+    const subText = busy
+      ? "Checking this server…"
+      : now && isStreaming
+        ? [
+            "Playing now",
+            c.via === "direct" ? "Direct" : c.via === "sniffed" ? "Ad-free" : kindOf(c),
+            ms && ms === best ? "fastest" : ms ? `${ms} ms` : null,
+          ].filter(Boolean).join(" · ")
+        : now && isConnecting
+          ? "Connecting to server…"
+          : state === "standby"
+            ? "Not checked yet · tap to check and play"
+            : state === "off"
+              ? c.probe?.error === "no stream" || c.probe?.error === "not found"
+                ? "No stream found · Tap to retry"
+                : `Preflight failed${c.probe?.error ? ` (${c.probe.error})` : ""} · Tap to retry`
+              : [
+                  c.via === "direct" ? "Direct" : c.via === "sniffed" ? "Ad-free" : kindOf(c),
+                  ms && ms === best ? "fastest" : ms ? `${ms} ms` : null,
+                ].filter(Boolean).join(" · ");
     return (
-      <button key={c.pageUrl ?? c.url} className={`srv ${now ? "now" : ""} ${state}`} disabled={state === "off" || busy} onClick={() => onPick(i)} style={{ ["--i" as any]: Math.min(i, 12) }}>
+      <button
+        key={key}
+        type="button"
+        className={`srv ${now ? "now" : ""} ${state}`}
+        disabled={busy}
+        onClick={() => onPick(i)}
+        style={{ ["--i" as any]: Math.min(i, 12) }}
+      >
         <span className={`srv-sig b${bars}`} aria-hidden><i /><i /><i /></span>
         <span className="srv-main">
           <span className="srv-name">
             {c.providerName}
             {i === 0 && state === "ok" && <em className="srv-auto">AUTO</em>}
           </span>
-          <span className="srv-sub">
-            {busy
-              ? "Checking this server…"
-              : state === "standby"
-                ? "Not checked yet · tap to check and play"
-                : state === "off"
-                  ? c.probe?.error === "no stream" || c.probe?.error === "not found" ? "No stream found" : `Found, but it won't play (${c.probe?.error})`
-                  : [c.via === "direct" ? "Direct" : c.via === "sniffed" ? "Ad-free" : kindOf(c), ms === best ? "fastest" : null].filter(Boolean).join(" · ")}
-          </span>
+          <span className="srv-sub">{subText}</span>
         </span>
         {q && state === "ok" ? <span className="srv-tag">{q >= 2160 ? "4K" : `${q}p`}</span> : null}
         {state === "ok" && <span className="srv-tag">{c.kind === "hls" ? "HLS" : c.kind === "file" ? "MP4" : "WEB"}</span>}
         {tag && <span className={`srv-tag ${tag === "JP?" ? "warn" : ""}`} title={tag === "JP?" ? "This server can't switch audio" : undefined}>{tag}</span>}
-        {busy ? <span className="mini-spin" /> : now ? <span className="eq" aria-label="Playing"><i /><i /><i /><i /></span> : state !== "off" && <Icon name="play" size={13} />}
+        {busy || (now && isConnecting) ? (
+          <span className="mini-spin" />
+        ) : now ? (
+          <span className="eq" aria-label="Playing"><i /><i /><i /><i /></span>
+        ) : state === "off" ? (
+          <Icon name="refresh" size={13} />
+        ) : (
+          <Icon name="play" size={13} />
+        )}
       </button>
     );
   };
   return (
     <div className="ps-section">
       <p className="ps-note">Every server below plays in AbixCine's own player, so there are no ads. Switching keeps your place.</p>
+      {(standbyEmbedCount > 0 || probingStandby || onRefreshList) && (
+        <div className="srv-actions">
+          {(standbyEmbedCount > 0 || probingStandby) && (
+            <button
+              type="button"
+              className={`srv-act ${probingStandby ? "busy" : ""}`}
+              onClick={onCheckStandbys}
+              title={probingStandby ? "Cancel standby check" : "Check up to 6 standby servers in the background"}
+            >
+              {probingStandby ? (
+                <>
+                  <span className="mini-spin" />
+                  <span>Checking standby ({standbyProgress?.done ?? 0}/{standbyProgress?.total ?? 0})…</span>
+                </>
+              ) : (
+                <>
+                  <Icon name="layers" size={14} />
+                  <span>Check standby servers</span>
+                </>
+              )}
+            </button>
+          )}
+          {onRefreshList && (
+            <button
+              type="button"
+              className="srv-act"
+              onClick={onRefreshList}
+              title="Re-run source discovery for all servers"
+            >
+              <Icon name="refresh" size={14} />
+              <span>Refresh server list</span>
+            </button>
+          )}
+        </div>
+      )}
       {ok.length > 0 && <div className="srv-group"><div className="ps-label">Ready · {ok.length}</div><div className="srv-list">{ok.map(row)}</div></div>}
       {standby.length > 0 && <div className="srv-group"><div className="ps-label">On standby · {standby.length}</div><div className="srv-list">{standby.map(row)}</div></div>}
       {missing.length > 0 && <div className="srv-group"><div className="ps-label">Unavailable · {missing.length}</div><div className="srv-list">{missing.map(row)}</div></div>}
