@@ -30,7 +30,7 @@ import {
   searchOnlineSubtitles,
   type OnlineSubtitleResult,
 } from "../lib/subtitleProviders";
-import { updateSettings, type Audio } from "../lib/settings";
+import { getSettings, updateSettings, type Audio } from "../lib/settings";
 import type { Episode } from "../lib/types";
 import type { StreamCandidate, SubtitleFormat } from "../sources/types";
 import { isUrlTokenExpired, native, proxyUrl, unwrapProxyUrl } from "../sources/native";
@@ -1103,6 +1103,15 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     flash("Subtitle timing reset (0.0s)");
   }, [persistTrackMemory]);
 
+  const readOptionalSubdlApiKey = useCallback((): string | undefined => {
+    try {
+      const raw = (getSettings() as unknown as Record<string, unknown> | undefined)?.subdlApiKey;
+      return typeof raw === "string" && raw.trim() ? raw.trim() : undefined;
+    } catch {
+      return undefined;
+    }
+  }, []);
+
   const searchOnline = useCallback(async (rawTitle: string, lang: string) => {
     searchCtlRef.current?.abort();
     const ctl = new AbortController();
@@ -1132,6 +1141,8 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
           episode: epNumber,
           languages: [qLang],
           preferHearingImpaired: prefRef.current.preferHearingImpaired,
+          localPath: curRef.current?.localPath,
+          subdlApiKey: readOptionalSubdlApiKey(),
         },
         ctl.signal,
       );
@@ -1148,7 +1159,7 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
         setOnlineLoading(false);
       }
     }
-  }, [media?.tmdbId, media?.imdbId, media?.title, media?.year, media?.kind, title, epSeason, epNumber]);
+  }, [media?.tmdbId, media?.imdbId, media?.title, media?.year, media?.kind, title, epSeason, epNumber, readOptionalSubdlApiKey]);
 
   const loadOnlineResult = useCallback(async (res: OnlineSubtitleResult, asSecondary: boolean) => {
     const existingTrackId = loadedOnlineMap.get(res.id);
@@ -1280,7 +1291,8 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
         return;
       }
       const qTitle = (media?.title || title || "").trim();
-      if (!qTitle && !media?.tmdbId && !media?.imdbId) return;
+      const localPath = curRef.current?.localPath;
+      if (!qTitle && !media?.tmdbId && !media?.imdbId && !localPath) return;
       autoFetchedRef.current.add(fetchKey);
       const kind: "movie" | "tv" | "anime" | undefined =
         media?.kind === "tv" || media?.kind === "anime" || media?.kind === "movie"
@@ -1300,6 +1312,8 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
             episode: epNumber,
             languages: [wantLang],
             preferHearingImpaired: prefRef.current.preferHearingImpaired,
+            localPath,
+            subdlApiKey: readOptionalSubdlApiKey(),
           },
           ctl.signal,
         );
@@ -1341,7 +1355,7 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
       window.clearTimeout(timer);
       ctl.abort();
     };
-  }, [cur?.url, cur?.kind, isEmbed, hlsReady, subMemoryKey, pref.autoFetchOnline, pref.mode, pref.lang, media?.tmdbId, media?.imdbId, media?.title, media?.year, media?.kind, title, epSeason, epNumber, patchTrackData, appendOnlineSub]);
+  }, [cur?.url, cur?.localPath, cur?.kind, isEmbed, hlsReady, subMemoryKey, pref.autoFetchOnline, pref.mode, pref.lang, media?.tmdbId, media?.imdbId, media?.title, media?.year, media?.kind, title, epSeason, epNumber, patchTrackData, appendOnlineSub, readOptionalSubdlApiKey]);
 
   const findHlsTextTrack = useCallback((v: HTMLVideoElement, track: UnifiedSubTrack, activeHlsIndex: number): TextTrack | null => {
     const vTracks = Array.from(v.textTracks).filter((t) => t.kind === "subtitles" || t.kind === "captions");

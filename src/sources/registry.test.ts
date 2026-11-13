@@ -18,6 +18,7 @@ import {
   resetHealth,
   serverHealthScore,
 } from "./health";
+import { DIRECT_EXTRACTORS } from "./extractors";
 import { jellyfinProvider } from "./jellyfin";
 import { kisskhProvider, decryptKisskhSubtitle } from "./kisskh";
 import { localProvider, sidecarTrack } from "./local";
@@ -26,6 +27,8 @@ import {
   candKey,
   candLine,
   clearResolveCache,
+  DIRECT_SOURCES,
+  embedProviders,
   initialCandidateIndex,
   probeHedged,
   promoteCachedCandidate,
@@ -1264,5 +1267,116 @@ describe("health recovery, incremental resolve cache & embed hardening", () => {
     const fetched = await fetch(track.url).then((r) => r.text());
     expect(fetched).toContain("Hello from Seoul!");
     expect(fetched).toContain("Line one\nLine two");
+  });
+});
+
+describe("Phase 2 direct extractor wiring", () => {
+  it("registers all DIRECT_EXTRACTORS in PROVIDERS and DIRECT_SOURCES with unique IDs", () => {
+    expect(DIRECT_EXTRACTORS.length).toBeGreaterThanOrEqual(10);
+    const providerIds = PROVIDERS.map((p) => p.id);
+    const directSourceIds = DIRECT_SOURCES.map((d) => d.id);
+
+    expect(new Set(providerIds).size).toBe(providerIds.length);
+    expect(new Set(directSourceIds).size).toBe(directSourceIds.length);
+
+    expect(directSourceIds).toContain("hianime");
+    expect(directSourceIds).toContain("kisskh");
+
+    for (const extractor of DIRECT_EXTRACTORS) {
+      expect(providerIds).toContain(extractor.id);
+      const entry = DIRECT_SOURCES.find((d) => d.id === extractor.id);
+      expect(entry).toBeDefined();
+      expect(entry?.name).toBeTruthy();
+      expect(entry?.note).toBeTruthy();
+    }
+  });
+
+  it("assigns direct extractors higher base priority than all sniffed embedProviders", () => {
+    const maxEmbedPriority = Math.max(...embedProviders.map((p) => p.priority));
+    const minDirectPriority = Math.min(...DIRECT_EXTRACTORS.map((p) => p.priority));
+    expect(minDirectPriority).toBeGreaterThan(maxEmbedPriority);
+
+    const firstEmbedIdx = PROVIDERS.findIndex((p) => p.id === embedProviders[0].id);
+    for (const extractor of DIRECT_EXTRACTORS) {
+      expect(extractor.priority).toBeGreaterThan(maxEmbedPriority);
+      expect(PROVIDERS.findIndex((p) => p.id === extractor.id)).toBeLessThan(firstEmbedIdx);
+    }
+
+    const req = request("test:direct-over-embed");
+    const vidlinkDirect = PROVIDERS.find((p) => p.id === "vidlink-direct")!;
+    const vidfastEmbed = PROVIDERS.find((p) => p.id === "vidfast")!;
+    const directScored = score(
+      {
+        providerId: vidlinkDirect.id,
+        providerName: vidlinkDirect.name,
+        label: "VidLink",
+        url: "https://cdn.example/direct.m3u8",
+        kind: "hls",
+        via: "direct",
+        probe: { ok: true, latencyMs: 250, quality: 1080 },
+      },
+      1080,
+      vidlinkDirect.priority,
+      req,
+    );
+    const sniffedScored = score(
+      {
+        providerId: vidfastEmbed.id,
+        providerName: vidfastEmbed.name,
+        label: "VidFast",
+        url: "https://cdn.example/sniffed.m3u8",
+        pageUrl: "https://vidfast.vc/movie/603",
+        kind: "hls",
+        via: "sniffed",
+        probe: { ok: true, latencyMs: 250, quality: 1080 },
+      },
+      1080,
+      vidfastEmbed.priority,
+      req,
+    );
+    expect(directScored.score).toBeGreaterThan(sniffedScored.score!);
+  });
+
+  it("toggles direct extractors via disabledSources without breaking fallback embeds", async () => {
+    const baseSettings = getSettings();
+    for (const extractor of DIRECT_EXTRACTORS) {
+      expect(extractor.isEnabled(baseSettings)).toBe(true);
+    }
+
+    // Disabling a direct extractor ID disables only that extractor
+    const toggledOff = { ...baseSettings, disabledSources: ["vidrock", "anizone"] };
+    expect(PROVIDERS.find((p) => p.id === "vidrock")!.isEnabled(toggledOff)).toBe(false);
+    expect(PROVIDERS.find((p) => p.id === "anizone")!.isEnabled(toggledOff)).toBe(false);
+    expect(PROVIDERS.find((p) => p.id === "zxcstreams")!.isEnabled(toggledOff)).toBe(true);
+    expect(PROVIDERS.find((p) => p.id === "vidlink-direct")!.isEnabled(toggledOff)).toBe(true);
+
+    // Disabling vidlink-direct leaves the vidlink embed fallback enabled; disabling vidlink disables both
+    const directOnlyDisabled = { ...baseSettings, disabledSources: ["vidlink-direct"] };
+    expect(PROVIDERS.find((p) => p.id === "vidlink-direct")!.isEnabled(directOnlyDisabled)).toBe(false);
+    expect(PROVIDERS.find((p) => p.id === "vidlink")!.isEnabled(directOnlyDisabled)).toBe(true);
+
+    const embedDisabled = { ...baseSettings, disabledSources: ["vidlink"] };
+    expect(PROVIDERS.find((p) => p.id === "vidlink-direct")!.isEnabled(embedDisabled)).toBe(false);
+    expect(PROVIDERS.find((p) => p.id === "vidlink")!.isEnabled(embedDisabled)).toBe(false);
+
+    // resolveSources respects disabledSources for direct extractors
+    const original = [...PROVIDERS];
+    const vidrock = PROVIDERS.find((p) => p.id === "vidrock")!;
+    const zxc = PROVIDERS.find((p) => p.id === "zxcstreams")!;
+    const vidrockSpy = vi.spyOn(vidrock, "find").mockResolvedValue([]);
+    const zxcSpy = vi.spyOn(zxc, "find").mockResolvedValue([]);
+    PROVIDERS.splice(0, PROVIDERS.length, vidrock, zxc);
+    updateSettings({ disabledSources: ["vidrock"] });
+
+    try {
+      await resolveSources(request("test:disabled-direct"), undefined, { record: false });
+      expect(vidrockSpy).not.toHaveBeenCalled();
+      expect(zxcSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      vidrockSpy.mockRestore();
+      zxcSpy.mockRestore();
+      PROVIDERS.splice(0, PROVIDERS.length, ...original);
+      localStorage.removeItem("abx.settings.v1");
+    }
   });
 });

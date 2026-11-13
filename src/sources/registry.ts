@@ -22,15 +22,33 @@ import { kisskhProvider } from "./kisskh";
 import { localProvider } from "./local";
 import { isUrlTokenExpired, native, normalizeHeaders, proxyUrl, sniff } from "./native";
 import { availableSources, embedProviders } from "./embeds";
+import { DIRECT_EXTRACTORS } from "./extractors";
 import { inferSniffedSubtitles, type HedgedProbeOptions, type ManifestValidation, type SourceProvider, type StreamCandidate, type VideoSource } from "./types";
 
 /** All known providers. Register new ones here. */
-export const PROVIDERS: SourceProvider[] = [localProvider, jellyfinProvider, animeDirectProvider, kisskhProvider, ...embedProviders];
+export const PROVIDERS: SourceProvider[] = [
+  localProvider,
+  jellyfinProvider,
+  animeDirectProvider,
+  kisskhProvider,
+  ...DIRECT_EXTRACTORS,
+  ...embedProviders,
+];
 
 /** Providers with their own entry in Settings → Servers (besides the embed list). */
 export const DIRECT_SOURCES = [
   { id: "hianime", name: "HiAnime", note: "Anime · direct stream with sub/dub, subtitles and intro skip" },
   { id: "kisskh", name: "KissKH", note: "Asian dramas and films · subtitled" },
+  { id: "vidlink-direct", name: "VidLink", note: "Movies, TV & anime · direct stream with subtitles" },
+  { id: "vidrock", name: "Vidrock", note: "Movies & TV · direct stream" },
+  { id: "zxcstreams", name: "ZXCStreams", note: "Movies & TV · direct stream" },
+  { id: "vixsrc", name: "VixSrc", note: "Movies & TV · direct stream with subtitles" },
+  { id: "vaplayer", name: "VaPlayer", note: "Movies & TV · direct stream" },
+  { id: "primesrc", name: "PrimeSrc", note: "Movies & TV · direct stream with subtitles" },
+  { id: "anizone", name: "AniZone", note: "Anime · direct stream with sub/dub and subtitles" },
+  { id: "kickassanime", name: "KickAssAnime", note: "Anime · direct stream with sub/dub and subtitles" },
+  { id: "anikoto", name: "Anikoto", note: "Anime · direct stream with sub/dub and subtitles" },
+  { id: "onetouchtv", name: "OneTouchTV", note: "Asian dramas · direct stream with subtitles" },
 ];
 
 export { availableSources, embedProviders };
