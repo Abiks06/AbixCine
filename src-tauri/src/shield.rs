@@ -467,6 +467,34 @@ pub fn cancel_sniff(app: AppHandle, cancel_id: String) {
     }
 }
 
+async fn acquire_permit_or_cancel<'a>(
+    semaphore: &'a tokio::sync::Semaphore,
+    mut cancel_rx: Option<&mut tokio::sync::watch::Receiver<bool>>,
+) -> Result<Option<tokio::sync::SemaphorePermit<'a>>, String> {
+    if let Some(rx) = cancel_rx.as_deref() {
+        if *rx.borrow() {
+            return Ok(None);
+        }
+    }
+    match cancel_rx.as_deref_mut() {
+        Some(rx) => {
+            tokio::select! {
+                p = semaphore.acquire() => Ok(Some(p.map_err(|e| e.to_string())?)),
+                _ = rx.changed() => Ok(None),
+            }
+        }
+        None => Ok(Some(semaphore.acquire().await.map_err(|e| e.to_string())?)),
+    }
+}
+
+fn cleanup_cancel_entry(cancel_id: Option<&str>) {
+    if let Some(cid) = cancel_id {
+        if let Ok(mut m) = cancel_map().lock() {
+            m.remove(cid);
+        }
+    }
+}
+
 /// Load `url` off-screen and return the stream it plays, or None if nothing turned up in time.
 #[tauri::command]
 pub async fn sniff_media(
@@ -477,6 +505,7 @@ pub async fn sniff_media(
 ) -> Result<Option<Sniffed>, String> {
     use std::sync::atomic::AtomicUsize;
     static N: AtomicUsize = AtomicUsize::new(0);
+    let target: url::Url = url.parse().map_err(|e: url::ParseError| e.to_string())?;
     let label = format!("sniff-{}", N.fetch_add(1, Ordering::Relaxed));
 
     let mut cancel_rx = if let Some(ref cid) = cancel_id {
@@ -499,39 +528,62 @@ pub async fn sniff_media(
         None
     };
 
+    // Acquire the concurrency permit before starting the outer timeout budget so queued sniffs
+    // waiting behind active WebView2 slots do not burn their page-load timeout while waiting.
+    let permit = match acquire_permit_or_cancel(sem(), cancel_rx.as_mut()).await {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            cleanup_cancel_entry(cancel_id.as_deref());
+            return Ok(None);
+        }
+        Err(e) => {
+            cleanup_cancel_entry(cancel_id.as_deref());
+            return Err(e);
+        }
+    };
+
     let budget = std::time::Duration::from_millis(timeout_ms.unwrap_or(14_000) + 6_000);
-    let fut = tokio::time::timeout(budget, sniff_inner(app.clone(), url, timeout_ms, label.clone()));
+    let fut = tokio::time::timeout(budget, sniff_inner(app.clone(), target, timeout_ms, label.clone()));
 
     let res = match cancel_rx.as_mut() {
         Some(rx) => {
-            tokio::select! {
-                r = fut => r.ok(),
-                _ = rx.changed() => None,
+            if *rx.borrow() {
+                None
+            } else {
+                tokio::select! {
+                    r = fut => r.ok(),
+                    _ = rx.changed() => None,
+                }
             }
         }
         None => fut.await.ok(),
     };
 
-    if let Some(ref cid) = cancel_id {
-        if let Ok(mut m) = cancel_map().lock() {
-            m.remove(cid);
-        }
-    }
+    cleanup_cancel_entry(cancel_id.as_deref());
 
-    // Hard ceiling or cancellation: whatever a page does, its window is destroyed on exit.
-    match res {
-        Some(r) => r,
+    // Hard ceiling or cancellation: whatever a page does, its window is destroyed on exit
+    // before the semaphore permit is released to the next waiting sniff.
+    let out = match res {
+        Some(r) => {
+            if r.is_err() {
+                if let Some(w) = app.get_webview_window(&label) {
+                    let _ = w.destroy();
+                }
+            }
+            r
+        }
         None => {
             if let Some(w) = app.get_webview_window(&label) {
                 let _ = w.destroy();
             }
             Ok(None)
         }
-    }
+    };
+    drop(permit);
+    out
 }
 
-async fn sniff_inner(app: AppHandle, url: String, timeout_ms: Option<u64>, label: String) -> Result<Option<Sniffed>, String> {
-    let target: url::Url = url.parse().map_err(|e: url::ParseError| e.to_string())?;
+async fn sniff_inner(app: AppHandle, target: url::Url, timeout_ms: Option<u64>, label: String) -> Result<Option<Sniffed>, String> {
     let t0 = std::time::Instant::now();
     let _ = t0; // only read by the debug timing log
     let dbg = |what: &str| {
@@ -541,7 +593,6 @@ async fn sniff_inner(app: AppHandle, url: String, timeout_ms: Option<u64>, label
         }
         let _ = what;
     };
-    let _permit = sem().acquire().await.map_err(|e| e.to_string())?;
     dbg("permit");
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Found>();
 
@@ -657,25 +708,140 @@ async fn sniff_inner(app: AppHandle, url: String, timeout_ms: Option<u64>, label
     if candidates.is_empty() {
         return Ok(None);
     }
-    // Prefer HLS master playlists over variant playlists, and HLS/DASH over progressive MP4.
+    Ok(select_verified_candidate(candidates, subs, |u, h| async move {
+        crate::stream::verify_playlist(&u, &h).await
+    })
+    .await)
+}
+
+fn url_path_and_query_lower(uri: &str) -> (Vec<String>, String) {
+    if let Ok(parsed) = url::Url::parse(uri) {
+        let host_labels = parsed
+            .host_str()
+            .unwrap_or("")
+            .split('.')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
+        let mut pq = parsed.path().to_ascii_lowercase();
+        if let Some(q) = parsed.query() {
+            pq.push('?');
+            pq.push_str(&q.to_ascii_lowercase());
+        }
+        (host_labels, pq)
+    } else {
+        let no_frag = uri.split('#').next().unwrap_or(uri);
+        (Vec::new(), no_frag.to_ascii_lowercase())
+    }
+}
+
+pub(crate) fn is_preview_or_ad_url(uri: &str) -> bool {
+    let (host_labels, pq) = url_path_and_query_lower(uri);
+    if host_labels.iter().any(|lbl| {
+        matches!(
+            lbl.as_str(),
+            "ad" | "ads" | "adserver" | "adserv" | "preroll" | "promo" | "preview" | "teaser" | "trailer" | "vast" | "vpaid"
+        )
+    }) {
+        return true;
+    }
+    if [
+        "preview",
+        "teaser",
+        "trailer",
+        "preroll",
+        "pre-roll",
+        "pre_roll",
+        "midroll",
+        "mid-roll",
+        "mid_roll",
+        "postroll",
+        "post-roll",
+        "post_roll",
+        "adbreak",
+        "ad-break",
+        "ad_break",
+        "advert",
+        "commercial",
+    ]
+    .iter()
+    .any(|kw| pq.contains(kw))
+    {
+        return true;
+    }
+    pq.split(|c: char| !c.is_ascii_alphanumeric()).any(|tok| {
+        if tok.is_empty() {
+            return false;
+        }
+        let base = tok.trim_end_matches(|c: char| c.is_ascii_digit());
+        matches!(
+            base,
+            "ad" | "ads" | "promo" | "promos" | "bumper" | "bumpers" | "vast" | "vpaid"
+        )
+    })
+}
+
+pub(crate) fn hls_url_priority(uri: &str) -> u8 {
+    let (_host_labels, pq) = url_path_and_query_lower(uri);
+    if pq.contains("master") {
+        0
+    } else if pq.contains("playlist") {
+        1
+    } else if pq.contains("index") {
+        2
+    } else {
+        3
+    }
+}
+
+pub(crate) fn sort_candidates(candidates: &mut [Sniffed]) {
+    // Deprioritize obvious preview/teaser/trailer/ad URLs when other candidates exist,
+    // prefer likely master/primary HLS playlists, and prefer HLS/DASH over progressive MP4.
     candidates.sort_by_key(|m| {
-        let rank_kind = match m.kind {
-            "hls" if m.url.contains("master") => 0,
-            "hls" => 1,
-            "dash" => 2,
-            _ => 3,
+        let deprio = u8::from(is_preview_or_ad_url(&m.url));
+        let (kind_rank, hls_rank) = match m.kind {
+            "hls" => (0u8, hls_url_priority(&m.url)),
+            "dash" => (1u8, 0u8),
+            _ => (2u8, 0u8),
         };
-        rank_kind
+        (deprio, kind_rank, hls_rank)
     });
+}
+
+async fn select_verified_candidate<F, Fut>(
+    mut candidates: Vec<Sniffed>,
+    subs: Vec<String>,
+    verify: F,
+) -> Option<Sniffed>
+where
+    F: Fn(String, Hdrs) -> Fut,
+    Fut: std::future::Future<Output = Option<u32>>,
+{
+    if candidates.is_empty() {
+        return None;
+    }
+    sort_candidates(&mut candidates);
+    let mut best_hls: Option<(bool, Sniffed)> = None;
     let mut fallback: Option<Sniffed> = None;
     for mut f in candidates {
+        let deprio = is_preview_or_ad_url(&f.url);
+        if matches!(best_hls, Some((false, _))) && deprio {
+            break;
+        }
         f.subtitles = subs.clone();
         if f.kind == "hls" {
-            match crate::stream::verify_playlist(&f.url, &f.headers).await {
-                Some(q) => {
+            match verify(f.url.clone(), f.headers.clone()).await {
+                Some(q) if q > 0 => {
                     f.verified = Some(true);
-                    f.quality = (q > 0).then_some(q);
-                    return Ok(Some(f));
+                    f.quality = Some(q);
+                    return Some(f);
+                }
+                Some(_) => {
+                    f.verified = Some(true);
+                    f.quality = None;
+                    if best_hls.is_none() {
+                        best_hls = Some((deprio, f));
+                    }
                 }
                 None => {
                     f.verified = Some(false);
@@ -685,15 +851,31 @@ async fn sniff_inner(app: AppHandle, url: String, timeout_ms: Option<u64>, label
                 }
             }
         } else {
-            return Ok(Some(f));
+            if let Some((_, best)) = best_hls {
+                return Some(best);
+            }
+            return Some(f);
         }
     }
-    Ok(fallback)
+    best_hls.map(|(_, best)| best).or(fallback)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, Mutex};
+
+    fn make_sniffed(url: &str, kind: &'static str) -> Sniffed {
+        Sniffed {
+            url: url.to_string(),
+            kind,
+            headers: Hdrs::default(),
+            subtitles: vec![],
+            verified: None,
+            quality: None,
+        }
+    }
 
     #[test]
     fn captures_supported_subtitle_extensions_and_mimes() {
@@ -717,5 +899,169 @@ mod tests {
         assert!(!is_sniffed_subtitle("https://cdn.example.com/bif/track?id=1", "text/vtt"));
         // Real subtitles must still be captured
         assert!(is_sniffed_subtitle("https://cdn.example.com/subs/English.vtt", "text/vtt"));
+    }
+
+    #[test]
+    fn ranks_master_primary_hls_ahead_of_variants_and_deprioritizes_previews_and_ads() {
+        assert!(is_preview_or_ad_url("https://cdn.example.com/ads/preroll.m3u8"));
+        assert!(is_preview_or_ad_url("https://cdn.example.com/video/preview_720.mp4"));
+        assert!(is_preview_or_ad_url("https://cdn.example.com/teaser/master.m3u8"));
+        assert!(is_preview_or_ad_url("https://cdn.example.com/movie-trailer.m3u8"));
+        // Words like "download", "adaptive", "shadow", "media" must NOT false-positive on "ad"
+        assert!(!is_preview_or_ad_url("https://cdn.example.com/download/adaptive/shadow_media/master.m3u8"));
+
+        let mut cands = vec![
+            make_sniffed("https://cdn.example.com/trailer/master.m3u8", "hls"),
+            make_sniffed("https://cdn.example.com/movie.mp4", "mp4"),
+            make_sniffed("https://cdn.example.com/ads/ad1/playlist.m3u8", "hls"),
+            make_sniffed("https://cdn.example.com/v/720p/chunklist.m3u8", "hls"),
+            make_sniffed("https://cdn.example.com/v/index.m3u8", "hls"),
+            make_sniffed("https://cdn.example.com/v/playlist.m3u8", "hls"),
+            make_sniffed("https://cdn.example.com/v/master.m3u8", "hls"),
+            make_sniffed("https://cdn.example.com/v/manifest.mpd", "dash"),
+        ];
+        sort_candidates(&mut cands);
+        let urls: Vec<&str> = cands.iter().map(|c| c.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://cdn.example.com/v/master.m3u8",
+                "https://cdn.example.com/v/playlist.m3u8",
+                "https://cdn.example.com/v/index.m3u8",
+                "https://cdn.example.com/v/720p/chunklist.m3u8",
+                "https://cdn.example.com/v/manifest.mpd",
+                "https://cdn.example.com/movie.mp4",
+                "https://cdn.example.com/trailer/master.m3u8",
+                "https://cdn.example.com/ads/ad1/playlist.m3u8",
+            ]
+        );
+    }
+
+    #[test]
+    fn prefers_multivariant_master_over_single_bitrate_without_extra_delay() {
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let calls_ref = calls.clone();
+        let chosen = tauri::async_runtime::block_on(select_verified_candidate(
+            vec![
+                make_sniffed("https://cdn.example.com/v/720p/playlist.m3u8", "hls"),
+                make_sniffed("https://cdn.example.com/v/alt_stream.m3u8", "hls"),
+                make_sniffed("https://cdn.example.com/v/backup.m3u8", "hls"),
+            ],
+            vec!["https://cdn.example.com/subs/en.vtt".into()],
+            move |u, _h| {
+                let calls_ref = calls_ref.clone();
+                async move {
+                    calls_ref.lock().unwrap().push(u.clone());
+                    if u.contains("720p") {
+                        Some(0)
+                    } else if u.contains("alt_stream") {
+                        Some(1080)
+                    } else {
+                        Some(720)
+                    }
+                }
+            },
+        ))
+        .unwrap();
+
+        assert_eq!(chosen.url, "https://cdn.example.com/v/alt_stream.m3u8");
+        assert_eq!(chosen.verified, Some(true));
+        assert_eq!(chosen.quality, Some(1080));
+        assert_eq!(chosen.subtitles, vec!["https://cdn.example.com/subs/en.vtt"]);
+        // Continued past single-bitrate Some(0), then stopped immediately once q > 0 validated cleanly.
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                "https://cdn.example.com/v/720p/playlist.m3u8",
+                "https://cdn.example.com/v/alt_stream.m3u8",
+            ]
+        );
+
+        // When the first HLS validates with q > 0, no further HLS requests are made at all.
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_ref = count.clone();
+        let immediate = tauri::async_runtime::block_on(select_verified_candidate(
+            vec![
+                make_sniffed("https://cdn.example.com/v/master.m3u8", "hls"),
+                make_sniffed("https://cdn.example.com/v/second_master.m3u8", "hls"),
+            ],
+            vec![],
+            move |_u, _h| {
+                let count_ref = count_ref.clone();
+                async move {
+                    count_ref.fetch_add(1, Ordering::Relaxed);
+                    Some(720)
+                }
+            },
+        ))
+        .unwrap();
+        assert_eq!(immediate.url, "https://cdn.example.com/v/master.m3u8");
+        assert_eq!(immediate.quality, Some(720));
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn falls_back_cleanly_for_single_bitrate_unverified_and_non_hls_candidates() {
+        // Single-bitrate verified HLS (Some(0)) still beats trailing MP4 and deprioritized preview masters.
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let calls_ref = calls.clone();
+        let single_hls = tauri::async_runtime::block_on(select_verified_candidate(
+            vec![
+                make_sniffed("https://cdn.example.com/preview/master.m3u8", "hls"),
+                make_sniffed("https://cdn.example.com/v/chunklist.m3u8", "hls"),
+                make_sniffed("https://cdn.example.com/v/video.mp4", "mp4"),
+            ],
+            vec![],
+            move |u, _h| {
+                let calls_ref = calls_ref.clone();
+                async move {
+                    calls_ref.lock().unwrap().push(u.clone());
+                    if u.contains("preview") { Some(1080) } else { Some(0) }
+                }
+            },
+        ))
+        .unwrap();
+        assert_eq!(single_hls.url, "https://cdn.example.com/v/chunklist.m3u8");
+        assert_eq!(single_hls.verified, Some(true));
+        assert_eq!(single_hls.quality, None);
+        assert_eq!(*calls.lock().unwrap(), vec!["https://cdn.example.com/v/chunklist.m3u8"]);
+
+        // Failed HLS verification falls back to MP4 when present, or unverified HLS when alone.
+        let mp4_fallback = tauri::async_runtime::block_on(select_verified_candidate(
+            vec![
+                make_sniffed("https://cdn.example.com/v/bad.m3u8", "hls"),
+                make_sniffed("https://cdn.example.com/v/film.mp4", "mp4"),
+            ],
+            vec![],
+            |_u, _h| async { None },
+        ))
+        .unwrap();
+        assert_eq!(mp4_fallback.url, "https://cdn.example.com/v/film.mp4");
+        assert_eq!(mp4_fallback.verified, None);
+
+        let hls_fallback = tauri::async_runtime::block_on(select_verified_candidate(
+            vec![make_sniffed("https://cdn.example.com/v/bad.m3u8", "hls")],
+            vec![],
+            |_u, _h| async { None },
+        ))
+        .unwrap();
+        assert_eq!(hls_fallback.url, "https://cdn.example.com/v/bad.m3u8");
+        assert_eq!(hls_fallback.verified, Some(false));
+    }
+
+    #[test]
+    fn queued_permit_acquisition_honors_cancellation_without_blocking() {
+        tauri::async_runtime::block_on(async {
+            let local_sem = tokio::sync::Semaphore::new(1);
+            let _held = local_sem.acquire().await.unwrap();
+            let (tx, mut rx) = tokio::sync::watch::channel(false);
+            let cancel_task = tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                let _ = tx.send(true);
+            });
+            let permit = acquire_permit_or_cancel(&local_sem, Some(&mut rx)).await.unwrap();
+            assert!(permit.is_none());
+            let _ = cancel_task.await;
+        });
     }
 }

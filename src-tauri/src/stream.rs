@@ -21,16 +21,143 @@ pub const PROXY_BASE: &str = if cfg!(windows) { "http://abxs.localhost" } else {
 /// Upper bound for one proxied byte range of a progressive file, so an open-ended
 /// `Range: bytes=N-` doesn't make us buffer a whole movie.
 const RANGE_CHUNK: u64 = 6 * 1024 * 1024;
+/// Maximum byte offset we are willing to discard from a `200 OK` body if upstream ignores `Range`.
+const MAX_RANGE_SKIP: u64 = RANGE_CHUNK * 4;
 
 /// Playlists fetched while verifying a capture, kept briefly so the player's first request is
 /// answered instantly (the slow part on a new host is the connection, which is now warm too).
 static PLAYLISTS: std::sync::Mutex<Option<HashMap<String, (std::time::Instant, String, Vec<u8>)>>> = std::sync::Mutex::new(None);
-const PLAYLIST_TTL: Duration = Duration::from_secs(25);
+const PLAYLIST_TTL: Duration = Duration::from_secs(60);
+const EXP_BUFFER_MS: u64 = 5_000;
+
+fn parse_epoch_ms(raw: &str) -> Option<u64> {
+    let s = raw.trim();
+    if !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let ms = match s.len() {
+        10 => s.parse::<u64>().ok()?.checked_mul(1000)?,
+        13 => s.parse::<u64>().ok()?,
+        _ => return None,
+    };
+    // Plausible token window: 2020-01-01 to 2100-01-01
+    (1_577_836_800_000..=4_102_444_800_000).contains(&ms).then_some(ms)
+}
+
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+pub(crate) fn is_url_token_expired_at(raw_url: &str, now_ms: u64) -> bool {
+    let Ok(u) = url::Url::parse(raw_url) else {
+        return false;
+    };
+    for (k, v) in u.query_pairs() {
+        let kl = k.to_ascii_lowercase();
+        if matches!(
+            kl.as_str(),
+            "exp" | "expires" | "e" | "token_exp" | "validto" | "endtime" | "etime" | "until"
+        ) {
+            if let Some(exp_ms) = parse_epoch_ms(&v) {
+                if exp_ms <= now_ms.saturating_add(EXP_BUFFER_MS) {
+                    return true;
+                }
+            }
+        }
+    }
+    let path = u.path().to_ascii_lowercase();
+    for key in ["exp", "expires", "validto"] {
+        for sep in ['=', '/'] {
+            let needle = format!("{key}{sep}");
+            let mut scan = path.as_str();
+            while let Some(pos) = scan.find(&needle) {
+                let preceded_ok = pos == 0 || matches!(scan.as_bytes()[pos - 1], b'/' | b'=' | b';');
+                let after = &scan[pos + needle.len()..];
+                if preceded_ok {
+                    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    if let Some(exp_ms) = parse_epoch_ms(&digits) {
+                        let rest_ok = after[digits.len()..]
+                            .chars()
+                            .next()
+                            .is_none_or(|c| matches!(c, '/' | ';' | '&'));
+                        if rest_ok && exp_ms <= now_ms.saturating_add(EXP_BUFFER_MS) {
+                            return true;
+                        }
+                    }
+                }
+                scan = after;
+            }
+        }
+    }
+    false
+}
+
+fn playlist_body_has_expired_token(body: &[u8], base_url: &str, now_ms: u64) -> bool {
+    let Ok(base) = url::Url::parse(base_url) else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(body);
+    if !text.trim_start_matches('\u{feff}').trim_start().starts_with("#EXTM3U") {
+        return false;
+    }
+    for line in text.lines() {
+        let l = line.trim();
+        if l.is_empty() {
+            continue;
+        }
+        if l.starts_with('#') {
+            let mut rest = l;
+            while let Some(i) = rest.find("URI=\"") {
+                let after = &rest[i + 5..];
+                let Some(end) = after.find('"') else {
+                    break;
+                };
+                let resolved = resolve(&base, &after[..end]);
+                if is_url_token_expired_at(&resolved, now_ms) {
+                    return true;
+                }
+                rest = &after[end + 1..];
+            }
+        } else {
+            let resolved = resolve(&base, l);
+            if is_url_token_expired_at(&resolved, now_ms) {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 fn cached_playlist(url: &str) -> Option<(String, Vec<u8>)> {
-    let g = PLAYLISTS.lock().ok()?;
-    let (at, final_url, body) = g.as_ref()?.get(url)?;
-    (at.elapsed() < PLAYLIST_TTL).then(|| (final_url.clone(), body.clone()))
+    cached_playlist_at(url, now_epoch_ms())
+}
+
+fn cached_playlist_at(url: &str, now_ms: u64) -> Option<(String, Vec<u8>)> {
+    if is_url_token_expired_at(url, now_ms) {
+        if let Ok(mut g) = PLAYLISTS.lock() {
+            if let Some(map) = g.as_mut() {
+                map.remove(url);
+            }
+        }
+        return None;
+    }
+    let mut g = PLAYLISTS.lock().ok()?;
+    let map = g.as_mut()?;
+    let expired = {
+        let (at, final_url, body) = map.get(url)?;
+        at.elapsed() >= PLAYLIST_TTL
+            || is_url_token_expired_at(final_url, now_ms)
+            || playlist_body_has_expired_token(body, final_url, now_ms)
+    };
+    if expired {
+        map.remove(url);
+        return None;
+    }
+    let (_, final_url, body) = map.get(url)?;
+    Some((final_url.clone(), body.clone()))
 }
 
 fn cache_playlist(url: &str, final_url: &str, body: &[u8]) {
@@ -39,6 +166,10 @@ fn cache_playlist(url: &str, final_url: &str, body: &[u8]) {
         map.retain(|_, (at, _, _)| at.elapsed() < PLAYLIST_TTL);
         map.insert(url.to_string(), (std::time::Instant::now(), final_url.to_string(), body.to_vec()));
     }
+}
+
+pub(crate) fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 429 | 500 | 502 | 503 | 504)
 }
 
 fn is_valid_m3u8_body(text: &str) -> bool {
@@ -61,7 +192,7 @@ pub async fn verify_playlist(url: &str, h: &Hdrs) -> Option<u32> {
     for attempt in 0..2 {
         let res = apply(client().get(url), h).timeout(Duration::from_secs(10)).send().await.ok()?;
         let status = res.status().as_u16();
-        if [429, 500, 502, 503, 504].contains(&status) && attempt == 0 {
+        if is_retryable_status(status) && attempt == 0 {
             tokio::time::sleep(Duration::from_millis(1200)).await;
             continue;
         }
@@ -432,6 +563,196 @@ fn resolve_proxy_content_type(target: &str, final_url: &str, upstream_ctype: &st
 
 const MPD_SNIFF_WINDOW: usize = 8192;
 
+fn is_video_extension(target: &str) -> bool {
+    let path = target.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase();
+    [".mp4", ".mkv", ".webm", ".m4v", ".mov"]
+        .iter()
+        .any(|e| path.ends_with(e))
+}
+
+pub(crate) fn parse_byte_range(header: &str) -> Option<(u64, Option<u64>)> {
+    let trimmed = header.trim();
+    if trimmed.len() < 6 || !trimmed[..6].eq_ignore_ascii_case("bytes=") {
+        return None;
+    }
+    let spec = trimmed[6..].trim();
+    if spec.contains(',') {
+        return None;
+    }
+    let (start_s, end_s) = spec.split_once('-')?;
+    let start = start_s.trim().parse::<u64>().ok()?;
+    let end_s = end_s.trim();
+    if end_s.is_empty() {
+        return Some((start, None));
+    }
+    let end = end_s.parse::<u64>().ok()?;
+    (end >= start).then_some((start, Some(end)))
+}
+
+pub(crate) fn plan_outbound_range(
+    raw_range: Option<&str>,
+    target: &str,
+    looks_playlist: bool,
+    looks_dash: bool,
+) -> (Option<String>, Option<(u64, u64)>) {
+    if let Some(r) = raw_range {
+        if !looks_playlist && !looks_dash {
+            if let Some((start, opt_end)) = parse_byte_range(r) {
+                let max_len = match opt_end {
+                    Some(end) => end.saturating_sub(start).saturating_add(1).min(RANGE_CHUNK),
+                    None => RANGE_CHUNK,
+                };
+                let capped_end = start.saturating_add(max_len.saturating_sub(1));
+                return (Some(format!("bytes={start}-{capped_end}")), Some((start, max_len)));
+            }
+        }
+        return (Some(r.to_string()), None);
+    }
+    // A progressive file asked for without a range: answer with the first chunk (206),
+    // never the whole movie in one buffered response.
+    if is_video_extension(target) {
+        return (Some(format!("bytes=0-{}", RANGE_CHUNK - 1)), Some((0, RANGE_CHUNK)));
+    }
+    (None, None)
+}
+
+pub(crate) fn build_content_range(start: u64, len: usize, total: Option<u64>) -> String {
+    let end = start.saturating_add(len as u64).saturating_sub(1);
+    match total {
+        Some(t) => format!("bytes {start}-{end}/{t}"),
+        None => format!("bytes {start}-{end}/*"),
+    }
+}
+
+pub(crate) struct RangeWindow {
+    skip_remaining: u64,
+    max_bytes: usize,
+    buf: Vec<u8>,
+    has_more: bool,
+}
+
+impl RangeWindow {
+    pub(crate) fn new(start: u64, max_bytes: usize) -> Self {
+        Self {
+            skip_remaining: start,
+            max_bytes,
+            buf: Vec::with_capacity(max_bytes.min(512 * 1024)),
+            has_more: false,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    pub(crate) fn is_full(&self) -> bool {
+        self.buf.len() >= self.max_bytes
+    }
+
+    pub(crate) fn mark_has_more(&mut self) {
+        self.has_more = true;
+    }
+
+    pub(crate) fn push_chunk(&mut self, mut slice: &[u8]) -> bool {
+        if self.skip_remaining > 0 {
+            let skip = self.skip_remaining.min(slice.len() as u64) as usize;
+            self.skip_remaining -= skip as u64;
+            slice = &slice[skip..];
+            if slice.is_empty() {
+                return false;
+            }
+        }
+        let avail = self.max_bytes.saturating_sub(self.buf.len());
+        if avail > 0 {
+            let take = avail.min(slice.len());
+            self.buf.extend_from_slice(&slice[..take]);
+            slice = &slice[take..];
+        }
+        if !slice.is_empty() {
+            self.has_more = true;
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<u8>, bool) {
+        (self.buf, self.has_more)
+    }
+}
+
+pub(crate) fn should_guard_range_200(
+    upstream_status: StatusCode,
+    is_manifest_hint: bool,
+    requested_range: Option<(u64, u64)>,
+    target: &str,
+    final_url: &str,
+    ctype: &str,
+    upstream_cl: Option<u64>,
+) -> bool {
+    if upstream_status != StatusCode::OK || is_manifest_hint {
+        return false;
+    }
+    if requested_range.is_some() {
+        return true;
+    }
+    let ctype_lower = ctype.to_ascii_lowercase();
+    let is_video = is_video_extension(target)
+        || is_video_extension(final_url)
+        || ctype_lower.starts_with("video/");
+    is_video && upstream_cl.is_none_or(|n| n > RANGE_CHUNK * 2)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_media_response(
+    upstream_status: StatusCode,
+    synthetically_chunked: bool,
+    chunk_start: u64,
+    upstream_cl: Option<u64>,
+    upstream_crange: Option<&str>,
+    upstream_accept_ranges: Option<&str>,
+    resolved_ctype: Option<String>,
+    body: Vec<u8>,
+    was_unwrapped: bool,
+) -> Response<Vec<u8>> {
+    let out_status = if synthetically_chunked {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        upstream_status
+    };
+    let mut b = cors(Response::builder().status(out_status));
+    if let Some(ct) = resolved_ctype {
+        b = b.header(header::CONTENT_TYPE, ct);
+    }
+    if synthetically_chunked {
+        if !was_unwrapped && !body.is_empty() {
+            b = b.header(header::CONTENT_RANGE, build_content_range(chunk_start, body.len(), upstream_cl));
+        }
+        b = b.header(header::ACCEPT_RANGES, "bytes");
+        if !was_unwrapped {
+            b = b.header(header::CONTENT_LENGTH, body.len().to_string());
+        }
+    } else {
+        if !was_unwrapped {
+            if let Some(cr) = upstream_crange {
+                b = b.header(header::CONTENT_RANGE, cr);
+            }
+        }
+        if out_status == StatusCode::OK || out_status == StatusCode::PARTIAL_CONTENT {
+            let accepts_bytes = out_status == StatusCode::PARTIAL_CONTENT
+                || upstream_crange.is_some()
+                || !upstream_accept_ranges.is_some_and(|v| v.eq_ignore_ascii_case("none"));
+            if accepts_bytes {
+                b = b.header(header::ACCEPT_RANGES, "bytes");
+            }
+            if !was_unwrapped {
+                let len = upstream_cl.unwrap_or(body.len() as u64);
+                b = b.header(header::CONTENT_LENGTH, len.to_string());
+            }
+        }
+    }
+    b.body(body).unwrap()
+}
+
 pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
     if req.method() == tauri::http::Method::OPTIONS {
         return cors(Response::builder().status(StatusCode::NO_CONTENT)).body(Vec::new()).unwrap();
@@ -462,8 +783,9 @@ pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
     // and a playlist pointing at abxs:// would be unloadable there.
     let base = PROXY_BASE;
 
-    let looks_playlist = target.contains(".m3u8");
-    let looks_dash = target.contains(".mpd");
+    let target_lower = target.to_ascii_lowercase();
+    let looks_playlist = target_lower.contains(".m3u8");
+    let looks_dash = target_lower.contains(".mpd");
     if let Some((final_url, body)) = cached_playlist(&target) {
         let text = String::from_utf8_lossy(&body);
         let head = &text[..text.len().min(MPD_SNIFF_WINDOW)];
@@ -482,94 +804,190 @@ pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
             .body(out.into_bytes())
             .unwrap();
     }
-    let mut rb = apply(client().get(&target), &h);
-    if let Some(r) = req.headers().get(header::RANGE).and_then(|v| v.to_str().ok()) {
-        let capped = match r.strip_prefix("bytes=").and_then(|s| s.strip_suffix('-')).and_then(|s| s.parse::<u64>().ok()) {
-            Some(start) if !looks_playlist && !looks_dash => format!("bytes={}-{}", start, start + RANGE_CHUNK - 1),
-            _ => r.to_string(),
-        };
-        rb = rb.header(header::RANGE, capped);
+
+    let raw_range = req.headers().get(header::RANGE).and_then(|v| v.to_str().ok());
+    let (outbound_range, requested_range) = plan_outbound_range(raw_range, &target, looks_playlist, looks_dash);
+    let can_retry = req.method() == tauri::http::Method::GET;
+
+    let mut res_opt = None;
+    for attempt in 0..2 {
+        let mut rb = apply(client().get(&target), &h);
+        if let Some(ref rng) = outbound_range {
+            rb = rb.header(header::RANGE, rng.as_str());
+        }
+        match rb.send().await {
+            Ok(r) => {
+                if can_retry && attempt == 0 && is_retryable_status(r.status().as_u16()) {
+                    drop(r);
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    continue;
+                }
+                res_opt = Some(r);
+                break;
+            }
+            Err(e) => {
+                if can_retry && attempt == 0 {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    continue;
+                }
+                return fail(StatusCode::BAD_GATEWAY, &e.to_string());
+            }
+        }
+    }
+    let mut res = match res_opt {
+        Some(r) => r,
+        None => return fail(StatusCode::BAD_GATEWAY, "upstream retry exhausted"),
+    };
+
+    let status = res.status();
+    let ctype = res.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let crange = res
+        .headers()
+        .get(header::CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let upstream_cl = res
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok());
+    let upstream_accept_ranges = res
+        .headers()
+        .get(header::ACCEPT_RANGES)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string());
+    let final_url = res.url().to_string();
+
+    let ctype_lower = ctype.to_ascii_lowercase();
+    let is_manifest_hint = looks_playlist
+        || looks_dash
+        || ctype_lower.contains("mpegurl")
+        || ctype_lower.contains("dash+xml");
+
+    let (body, synthetically_chunked, chunk_start) = if should_guard_range_200(
+        status,
+        is_manifest_hint,
+        requested_range,
+        &target,
+        &final_url,
+        &ctype,
+        upstream_cl,
+    ) {
+        let (start, max_len) = requested_range.unwrap_or((0, RANGE_CHUNK));
+        if let Some(total) = upstream_cl {
+            if start >= total {
+                return cors(Response::builder().status(StatusCode::RANGE_NOT_SATISFIABLE))
+                    .header(header::CONTENT_RANGE, format!("bytes */{total}"))
+                    .header(header::ACCEPT_RANGES, "bytes")
+                    .body(Vec::new())
+                    .unwrap();
+            }
+        }
+        if start > MAX_RANGE_SKIP {
+            return fail(StatusCode::BAD_GATEWAY, "upstream ignored Range for large offset");
+        }
+        let mut window = RangeWindow::new(start, max_len as usize);
+        while let Some(chunk) = match res.chunk().await {
+            Ok(c) => c,
+            Err(e) => return fail(StatusCode::BAD_GATEWAY, &e.to_string()),
+        } {
+            if window.push_chunk(&chunk) {
+                break;
+            }
+            if window.is_full() {
+                if let Some(total) = upstream_cl {
+                    if start.saturating_add(window.len() as u64) >= total {
+                        break;
+                    }
+                    window.mark_has_more();
+                    break;
+                }
+            }
+        }
+        drop(res);
+        let (buf, has_more) = window.into_parts();
+        if buf.is_empty() && start > 0 {
+            return cors(Response::builder().status(StatusCode::RANGE_NOT_SATISFIABLE))
+                .header(header::CONTENT_RANGE, "bytes */*")
+                .header(header::ACCEPT_RANGES, "bytes")
+                .body(Vec::new())
+                .unwrap();
+        }
+        let chunked = (has_more || start > 0) && !buf.is_empty();
+        (buf, chunked, start)
     } else {
-        // A progressive file asked for without a range: answer with the first chunk (206),
-        // never the whole movie in one buffered response.
-        let path = target.split('?').next().unwrap_or("").to_ascii_lowercase();
-        if [".mp4", ".mkv", ".webm", ".m4v", ".mov"].iter().any(|e| path.ends_with(e)) {
-            rb = rb.header(header::RANGE, format!("bytes=0-{}", RANGE_CHUNK - 1));
+        let bytes = match res.bytes().await {
+            Ok(b) => b,
+            Err(e) => return fail(StatusCode::BAD_GATEWAY, &e.to_string()),
+        };
+        (bytes.to_vec(), false, 0)
+    };
+
+    if !synthetically_chunked && status.is_success() {
+        let is_playlist = looks_playlist
+            || ctype_lower.contains("mpegurl")
+            || body.starts_with(b"#EXTM3U")
+            || body.get(..3) == Some(b"\xEF\xBB\xBF") && body[3..].starts_with(b"#EXTM3U");
+        if is_playlist {
+            let text = String::from_utf8_lossy(&body);
+            let out = rewrite_playlist(&text, &final_url, &h, base);
+            return cors(Response::builder().status(status.as_u16()))
+                .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
+                .header(header::CACHE_CONTROL, "no-cache")
+                .body(out.into_bytes())
+                .unwrap();
+        }
+        let is_dash = looks_dash
+            || ctype_lower.contains("dash+xml")
+            || {
+                let head = String::from_utf8_lossy(&body[..body.len().min(MPD_SNIFF_WINDOW)]);
+                head.contains("<MPD")
+            };
+        if is_dash {
+            let text = String::from_utf8_lossy(&body);
+            let out = rewrite_mpd(&text, &final_url, &h, base);
+            return cors(Response::builder().status(status.as_u16()))
+                .header(header::CONTENT_TYPE, "application/dash+xml")
+                .header(header::CACHE_CONTROL, "no-cache")
+                .body(out.into_bytes())
+                .unwrap();
         }
     }
 
-    let res = match rb.send().await {
-        Ok(r) => r,
-        Err(e) => return fail(StatusCode::BAD_GATEWAY, &e.to_string()),
-    };
-    let status = res.status();
-    let ctype = res.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-    let crange = res.headers().get(header::CONTENT_RANGE).cloned();
-    let final_url = res.url().to_string();
-    let body = match res.bytes().await {
-        Ok(b) => b,
-        Err(e) => return fail(StatusCode::BAD_GATEWAY, &e.to_string()),
-    };
-
-    let is_playlist = looks_playlist
-        || ctype.contains("mpegurl")
-        || body.starts_with(b"#EXTM3U")
-        || body.get(..3) == Some(b"\xEF\xBB\xBF") && body[3..].starts_with(b"#EXTM3U");
-    let is_dash = looks_dash
-        || ctype.contains("dash+xml")
-        || {
-            let head = String::from_utf8_lossy(&body[..body.len().min(MPD_SNIFF_WINDOW)]);
-            head.contains("<MPD")
-        };
-    let mut b = cors(Response::builder().status(status.as_u16()));
-    if is_playlist && status.is_success() {
-        let text = String::from_utf8_lossy(&body);
-        let out = rewrite_playlist(&text, &final_url, &h, base);
-        return b
-            .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
-            .header(header::CACHE_CONTROL, "no-cache")
-            .body(out.into_bytes())
-            .unwrap();
-    }
-    if is_dash && status.is_success() {
-        let text = String::from_utf8_lossy(&body);
-        let out = rewrite_mpd(&text, &final_url, &h, base);
-        return b
-            .header(header::CONTENT_TYPE, "application/dash+xml")
-            .header(header::CACHE_CONTROL, "no-cache")
-            .body(out.into_bytes())
-            .unwrap();
-    }
     // Some hosts disguise MPEG-TS segments as images: strip a PNG/WebP header before the TS sync byte.
-    let body = unwrap_disguised_segment(body.to_vec());
+    let (body, was_unwrapped) = unwrap_disguised_segment(body);
     let resolved_ctype = if status.is_success() {
         resolve_proxy_content_type(&target, &final_url, &ctype)
     } else {
         (!ctype.trim().is_empty()).then(|| ctype.trim().to_string())
     };
-    if let Some(resolved_ctype) = resolved_ctype {
-        b = b.header(header::CONTENT_TYPE, resolved_ctype);
-    }
-    if let Some(cr) = crange {
-        b = b.header(header::CONTENT_RANGE, cr).header(header::ACCEPT_RANGES, "bytes");
-    }
-    b.body(body).unwrap()
+    build_media_response(
+        status,
+        synthetically_chunked,
+        chunk_start,
+        upstream_cl,
+        crange.as_deref(),
+        upstream_accept_ranges.as_deref(),
+        resolved_ctype,
+        body,
+        was_unwrapped,
+    )
 }
 
-fn unwrap_disguised_segment(body: Vec<u8>) -> Vec<u8> {
+fn unwrap_disguised_segment(body: Vec<u8>) -> (Vec<u8>, bool) {
     let png = body.starts_with(&[0x89, 0x50, 0x4e, 0x47]);
     let webp = body.len() > 12 && &body[0..4] == b"RIFF" && &body[8..12] == b"WEBP";
     if !(png || webp) {
-        return body;
+        return (body, false);
     }
     // Find the first MPEG-TS sync byte that repeats every 188 bytes.
     let limit = body.len().saturating_sub(188 * 3).min(64 * 1024);
     for i in 0..limit {
         if body[i] == 0x47 && body[i + 188] == 0x47 && body[i + 376] == 0x47 {
-            return body[i..].to_vec();
+            return (body[i..].to_vec(), i > 0);
         }
     }
-    body
+    (body, false)
 }
 
 const MAX_FETCH_BYTES: usize = 20 * 1024 * 1024;
@@ -758,7 +1176,9 @@ mod tests {
             ts[k * 188] = 0x47;
         }
         b.extend(&ts);
-        assert_eq!(unwrap_disguised_segment(b)[0], 0x47);
+        let (unwrapped, stripped) = unwrap_disguised_segment(b);
+        assert!(stripped);
+        assert_eq!(unwrapped[0], 0x47);
     }
 
     #[test]
@@ -815,5 +1235,174 @@ mod tests {
         // Enforce 20 MiB cap
         let oversized = vec![0u8; MAX_FETCH_BYTES + 1];
         assert!(encode_fetch_bytes(200, "https://example.com/huge.srt".into(), &oversized).is_err());
+    }
+
+    #[test]
+    fn classifies_retryable_upstream_statuses() {
+        for s in [429, 500, 502, 503, 504] {
+            assert!(is_retryable_status(s), "expected status {s} to be retryable");
+        }
+        for s in [200, 206, 302, 400, 401, 403, 404, 410, 416] {
+            assert!(!is_retryable_status(s), "expected status {s} not to be retryable");
+        }
+    }
+
+    #[test]
+    fn plans_range_requests_and_synthetic_206_windows() {
+        assert_eq!(parse_byte_range("bytes=0-"), Some((0, None)));
+        assert_eq!(parse_byte_range("Bytes=1024-2047"), Some((1024, Some(2047))));
+        assert_eq!(parse_byte_range("bytes=0-10, 20-30"), None);
+        assert_eq!(parse_byte_range("bytes=500-100"), None);
+
+        // Open-ended and oversized ranges are capped at RANGE_CHUNK for media; small ranges stay intact
+        assert_eq!(
+            plan_outbound_range(Some("bytes=0-"), "https://cdn.x/movie.mp4", false, false),
+            (Some(format!("bytes=0-{}", RANGE_CHUNK - 1)), Some((0, RANGE_CHUNK)))
+        );
+        assert_eq!(
+            plan_outbound_range(Some("bytes=100-50000000"), "https://cdn.x/movie.mp4", false, false),
+            (Some(format!("bytes=100-{}", 100 + RANGE_CHUNK - 1)), Some((100, RANGE_CHUNK)))
+        );
+        assert_eq!(
+            plan_outbound_range(Some("bytes=0-65535"), "https://cdn.x/movie.mp4", false, false),
+            (Some("bytes=0-65535".into()), Some((0, 65536)))
+        );
+        // Video extensions without an incoming Range request the initial chunk
+        assert_eq!(
+            plan_outbound_range(None, "https://cdn.x/video.mkv?tok=1", false, false),
+            (Some(format!("bytes=0-{}", RANGE_CHUNK - 1)), Some((0, RANGE_CHUNK)))
+        );
+        // Playlists leave Range un-capped
+        assert_eq!(
+            plan_outbound_range(Some("bytes=0-"), "https://cdn.x/master.m3u8", true, false),
+            (Some("bytes=0-".into()), None)
+        );
+
+        // Guard triggers when upstream ignores Range and returns 200 OK, or on huge video 200 OK
+        assert!(should_guard_range_200(
+            StatusCode::OK,
+            false,
+            Some((0, RANGE_CHUNK)),
+            "https://cdn.x/video.mp4",
+            "https://cdn.x/video.mp4",
+            "video/mp4",
+            Some(2_000_000_000),
+        ));
+        assert!(should_guard_range_200(
+            StatusCode::OK,
+            false,
+            None,
+            "https://cdn.x/play?id=1",
+            "https://cdn.x/play?id=1",
+            "video/mp4",
+            Some(RANGE_CHUNK * 2 + 1),
+        ));
+        assert!(!should_guard_range_200(
+            StatusCode::PARTIAL_CONTENT,
+            false,
+            Some((0, RANGE_CHUNK)),
+            "https://cdn.x/video.mp4",
+            "https://cdn.x/video.mp4",
+            "video/mp4",
+            Some(RANGE_CHUNK),
+        ));
+        assert!(!should_guard_range_200(
+            StatusCode::OK,
+            true,
+            None,
+            "https://cdn.x/master.m3u8",
+            "https://cdn.x/master.m3u8",
+            "application/vnd.apple.mpegurl",
+            Some(1024),
+        ));
+
+        // RangeWindow slices accurately across chunk boundaries and stops early once excess bytes appear
+        let mut w = RangeWindow::new(5, 4);
+        assert!(!w.push_chunk(b"012"));
+        assert!(!w.push_chunk(b"3456"));
+        assert!(w.push_chunk(b"789ABC"));
+        let (buf, has_more) = w.into_parts();
+        assert_eq!(buf, b"5678");
+        assert!(has_more);
+
+        assert_eq!(build_content_range(0, 6_291_456, Some(2_000_000_000)), "bytes 0-6291455/2000000000");
+        assert_eq!(build_content_range(100, 500, None), "bytes 100-599/*");
+    }
+
+    #[test]
+    fn forwards_content_length_and_accept_ranges_cleanly_on_200_and_206() {
+        // Synthetic 206 emits 206, Content-Range, Accept-Ranges: bytes, and chunk Content-Length
+        let syn = build_media_response(
+            StatusCode::OK,
+            true,
+            0,
+            Some(2_000_000_000),
+            None,
+            None,
+            Some("video/mp4".into()),
+            vec![1, 2, 3, 4],
+            false,
+        );
+        assert_eq!(syn.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(syn.headers().get(header::CONTENT_RANGE).unwrap(), "bytes 0-3/2000000000");
+        assert_eq!(syn.headers().get(header::ACCEPT_RANGES).unwrap(), "bytes");
+        assert_eq!(syn.headers().get(header::CONTENT_LENGTH).unwrap(), "4");
+
+        // Normal 200 preserves Content-Length and exposes Accept-Ranges: bytes
+        let ok = build_media_response(
+            StatusCode::OK,
+            false,
+            0,
+            Some(1234),
+            None,
+            None,
+            Some("video/mp4".into()),
+            vec![0; 1234],
+            false,
+        );
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(ok.headers().get(header::ACCEPT_RANGES).unwrap(), "bytes");
+        assert_eq!(ok.headers().get(header::CONTENT_LENGTH).unwrap(), "1234");
+
+        // Unwrapped PNG/WebP TS segment must NOT forward stale upstream Content-Length
+        let unwrapped = build_media_response(
+            StatusCode::OK,
+            false,
+            0,
+            Some(999),
+            None,
+            None,
+            Some("video/mp2t".into()),
+            vec![0x47; 188],
+            true,
+        );
+        assert!(unwrapped.headers().get(header::CONTENT_LENGTH).is_none());
+        assert_eq!(unwrapped.headers().get(header::ACCEPT_RANGES).unwrap(), "bytes");
+    }
+
+    #[test]
+    fn playlist_cache_uses_60s_ttl_and_respects_expired_token_queries() {
+        assert_eq!(PLAYLIST_TTL, Duration::from_secs(60));
+        let now_ms = 1_750_000_000_000u64;
+        let fresh_exp = 1_750_000_120u64; // +120s
+        let stale_exp = 1_750_000_002u64; // +2s (within 5s buffer -> expired)
+
+        let fresh_url = format!("https://test-cache.example.com/1/master.m3u8?exp={fresh_exp}");
+        let stale_url = format!("https://test-cache.example.com/2/master.m3u8?expires={stale_exp}");
+        let nested_stale_url = "https://test-cache.example.com/3/master.m3u8";
+
+        let valid_body = b"#EXTM3U\n#EXTINF:6,\nhttps://cdn.example.com/seg1.ts\n";
+        let expired_nested_body = format!(
+            "#EXTM3U\n#EXTINF:6,\nhttps://cdn.example.com/seg1.ts?exp={stale_exp}\n"
+        );
+
+        cache_playlist(&fresh_url, &fresh_url, valid_body);
+        cache_playlist(&stale_url, &stale_url, valid_body);
+        cache_playlist(nested_stale_url, nested_stale_url, expired_nested_body.as_bytes());
+
+        assert!(cached_playlist_at(&fresh_url, now_ms).is_some());
+        assert!(cached_playlist_at(&stale_url, now_ms).is_none());
+        assert!(cached_playlist_at(nested_stale_url, now_ms).is_none());
+        assert!(is_url_token_expired_at(&format!("https://cdn.example.com/exp/{stale_exp}/master.m3u8"), now_ms));
     }
 }
