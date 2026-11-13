@@ -14,6 +14,9 @@ tauri-build = { version = "2", features = [] }
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-single-instance = "2"
 
+[features]
+torrent = ["dep:librqbit", "dep:librqbit-core", "dep:librqbit-sha1-wrapper"]
+
 [dependencies]
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
@@ -23,10 +26,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "charset"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
-tokio = { version = "1", features = ["sync", "time", "macros"] }
+tokio = { version = "1", features = ["sync", "time", "macros", "net", "io-util"] }
 base64 = "0.22"
 url = "2"
 adblock = { version = "0.13", default-features = false, features = ["embedded-domain-resolver", "full-regex-handling"] }
+librqbit = { version = "9.1", optional = true, default-features = false }
+librqbit-core = { version = "9.1", optional = true, default-features = false, features = ["sha1-crypto-hash"] }
+librqbit-sha1-wrapper = { version = "9.1", optional = true, default-features = false, features = ["sha1-crypto-hash"] }
 
 [profile.release]
 codegen-units = 1
