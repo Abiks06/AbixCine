@@ -10,6 +10,7 @@ import {
   isStaleStreamUrl,
   lastPick,
   lookupTimeout,
+  recentFailureFactor,
   recentlyFailed,
   recordLookup,
   recordLookupFailure,
@@ -35,7 +36,18 @@ export const DIRECT_SOURCES = [
 export { availableSources, embedProviders };
 export type { VideoSource, ManifestValidation, HedgedProbeOptions };
 
-export { recordPlayback, isCircuitOpen, serverHealthScore, isStaleStreamUrl } from "./health";
+export {
+  recordPlayback,
+  isCircuitOpen,
+  isCircuitHalfOpen,
+  circuitRemainingMs,
+  resetHealth,
+  serverHealthScore,
+  isStaleStreamUrl,
+} from "./health";
+
+/** Canonical candidate identifier shared across source resolution, Watch, and Player. */
+export const candKey = (c: { url: string; pageUrl?: string }): string => c.pageUrl ?? c.url;
 
 const PROVIDER_TIMEOUT = 8000;
 const PROBE_TIMEOUT = 6000;
@@ -450,12 +462,15 @@ export async function probeHedged(candidates: StreamCandidate[], opts: HedgedPro
 
   const queue = [...candidates];
   const resultsById = new Map<string, StreamCandidate>();
-  for (const c of candidates) resultsById.set(c.pageUrl ?? c.url, c);
+  for (const c of candidates) resultsById.set(candKey(c), c);
 
   const inFlight = new Set<AbortController>();
   let winners = 0;
   let running = 0;
   let limit = concurrency;
+  const hedgeCap = candidates.some((c) => c.kind === "embed")
+    ? Math.max(concurrency, Math.min(4, concurrency + 1))
+    : concurrency + 2;
   let hedgeTimer: ReturnType<typeof setTimeout> | undefined;
 
   const cancelInFlight = () => {
@@ -475,16 +490,16 @@ export async function probeHedged(candidates: StreamCandidate[], opts: HedgedPro
       if (running === 0 && (queue.length === 0 || winners >= maxWinners || opts.signal?.aborted)) {
         clearTimeout(hedgeTimer);
         opts.signal?.removeEventListener("abort", onAbort);
-        resolve(candidates.map((c) => resultsById.get(c.pageUrl ?? c.url) ?? c));
+        resolve(candidates.map((c) => resultsById.get(candKey(c)) ?? c));
       }
     };
 
     const scheduleHedge = () => {
       clearTimeout(hedgeTimer);
-      if (winners === 0 && queue.length > 0 && running >= limit && limit < concurrency + 2) {
+      if (winners === 0 && queue.length > 0 && running >= limit && limit < hedgeCap) {
         hedgeTimer = setTimeout(() => {
           if (winners === 0 && queue.length > 0 && !opts.signal?.aborted) {
-            limit = concurrency + 2;
+            limit = hedgeCap;
             pump();
           }
         }, hedgeDelayMs);
@@ -494,7 +509,7 @@ export async function probeHedged(candidates: StreamCandidate[], opts: HedgedPro
     const pump = () => {
       while (running < limit && queue.length > 0 && winners < maxWinners && !opts.signal?.aborted) {
         const cand = queue.shift()!;
-        const id = cand.pageUrl ?? cand.url;
+        const id = candKey(cand);
         const { ctl, cleanup } = linkSignal(opts.signal);
         inFlight.add(ctl);
         running++;
@@ -553,10 +568,10 @@ export function score(c: StreamCandidate, preferred: number, priority: number, r
   const latency = Math.min(startupMs, 12000) / 12000;
   const rel = reliability(c.providerId);
   const circuitOpen = isCircuitOpen(c.providerId);
-  const shaky = recentlyFailed(c.providerId) ? 12 : 0;
+  const shaky = 12 * recentFailureFactor(c.providerId);
   const tripped = circuitOpen ? 25 : 0;
   const pick = lastPick(req);
-  const memory = pick && pick.providerId === c.providerId && !shaky && !circuitOpen ? 8 : 0;
+  const memory = pick && pick.providerId === c.providerId && shaky === 0 && !circuitOpen ? 8 : 0;
   const own = c.via === "direct" || c.via === "sniffed" || c.providerId === "local" || c.providerId === "jellyfin" ? 25 : 0;
   const provider = PROVIDERS.find((p) => p.id === c.providerId);
   const originalLanguage = "originalLanguage" in req.media && typeof req.media.originalLanguage === "string"
@@ -575,7 +590,7 @@ export function score(c: StreamCandidate, preferred: number, priority: number, r
   if (memory) why.push("played this show before");
   if (languageMiss) why.push("French source for non-French title");
   if (rel > 0.8 && getHealth(c.providerId).ok > 3) why.push("reliable");
-  if (shaky || circuitOpen) why.push("failed recently");
+  if (shaky > 0 || circuitOpen) why.push("failed recently");
   if (broken) why.push("wouldn't play last time");
   return {
     ...c,
@@ -592,9 +607,11 @@ function isAbortedProbe(c: StreamCandidate, signal?: AbortSignal) {
 }
 
 export function initialCandidateIndex(candidates: StreamCandidate[], preferred?: string) {
-  const selected = preferred
-    ? candidates.findIndex((c) => c.url === preferred || c.pageUrl === preferred || c.providerId === preferred)
-    : -1;
+  let selected = -1;
+  if (preferred) {
+    selected = candidates.findIndex((c) => candKey(c) === preferred || c.url === preferred || c.pageUrl === preferred);
+    if (selected < 0) selected = candidates.findIndex((c) => c.providerId === preferred);
+  }
   return selected >= 0 ? selected : Math.max(0, candidates.findIndex((c) => c.probe?.ok !== false));
 }
 
@@ -625,8 +642,57 @@ const results = new Map<string, { at: number; ranked: StreamCandidate[]; events:
 const resultKey = (req: PlaybackRequest, s: Settings) =>
   `${reqKey(req)}|${JSON.stringify([s.libraryPaths, s.jellyfin.enabled && s.jellyfin.url, s.disabledSources, s.enabledExtras, s.preferredQuality])}`;
 
-/** Forget cached races after a source is toggled or playback resolves against a captured URL. */
+/** Forget cached races after a source is toggled or playback fails against a cached URL. */
 export const clearResolveCache = () => results.clear();
+
+const isEmbedCandidate = (c: StreamCandidate, embedProviderIds: Set<string>): boolean =>
+  c.kind === "embed" || (c.via === "sniffed" && embedProviderIds.has(c.providerId));
+
+/**
+ * Update an existing fresh cached race entry in place when playback succeeds or a standby
+ * candidate is verified on demand, instead of clearing the whole resolve cache.
+ */
+export function promoteCachedCandidate(req: PlaybackRequest, candidate: StreamCandidate): void {
+  const s = getSettings();
+  const ck = resultKey(req, s);
+  const hit = results.get(ck);
+  if (!hit || Date.now() - hit.at >= RESULT_TTL) return;
+
+  const key = candKey(candidate);
+  const idx = hit.ranked.findIndex(
+    (x) => candKey(x) === key || x.url === candidate.url || (!!candidate.pageUrl && x.pageUrl === candidate.pageUrl),
+  );
+  if (idx < 0 && candidate.providerId === "manual") return;
+
+  const promoted: StreamCandidate = candidate.probe?.ok
+    ? candidate
+    : {
+        ...candidate,
+        probe: {
+          ok: true,
+          latencyMs: candidate.probe?.latencyMs ?? 0,
+          quality: candidate.probe?.quality ?? candidate.quality,
+        },
+      };
+  const prio = Object.fromEntries(PROVIDERS.map((p) => [p.id, p.priority]));
+  const scored = score(promoted, s.preferredQuality, prio[promoted.providerId] ?? 0, req);
+  const nextRanked = (idx >= 0 ? hit.ranked.map((x, i) => (i === idx ? scored : x)) : [...hit.ranked, scored]).sort(sortByScore);
+
+  const embedProviderIds = new Set(PROVIDERS.filter((p) => p.category === "embed").map((p) => p.id));
+  const verifiedEmbeds = nextRanked.filter((c) => c.probe?.ok && isEmbedCandidate(c, embedProviderIds)).length;
+
+  const providerCount = nextRanked.filter((c) => c.providerId === promoted.providerId).length;
+  const nextEvents = hit.events.some((e) => e.providerId === promoted.providerId)
+    ? hit.events.map((e) => (e.providerId === promoted.providerId ? { ...e, status: "done" as const, count: providerCount } : e))
+    : [...hit.events, { providerId: promoted.providerId, status: "done" as const, count: providerCount }];
+
+  results.set(ck, {
+    ...hit,
+    ranked: nextRanked,
+    events: nextEvents,
+    budget: Math.max(hit.budget, verifiedEmbeds),
+  });
+}
 
 /**
  * Ask every enabled provider in parallel. Direct candidates are probed as they arrive; embed
@@ -637,6 +703,7 @@ export function resolveSources(req: PlaybackRequest, onEvent?: (e: ResolveEvent)
   const s = getSettings();
   const enabled = PROVIDERS.filter((p) => p.isEnabled(s));
   const prio = Object.fromEntries(PROVIDERS.map((p) => [p.id, p.priority]));
+  const embedProviderIds = new Set(PROVIDERS.filter((p) => p.category === "embed").map((p) => p.id));
   const budget = opts.verifyBudget ?? 3;
   const seen = new Set<string>();
   const record = opts.record !== false;
@@ -647,18 +714,40 @@ export function resolveSources(req: PlaybackRequest, onEvent?: (e: ResolveEvent)
   const ck = resultKey(req, s);
 
   const hit = results.get(ck);
+  const isFreshHit = !!hit && Date.now() - hit.at < RESULT_TTL;
+  const refreshedHit = isFreshHit
+    ? hit.ranked.map((c) =>
+        c.probe?.ok && isStaleStreamUrl(c.url, hit.at)
+          ? { ...c, probe: { ok: false, latencyMs: c.probe.latencyMs, error: "token expired" } }
+          : c,
+      )
+    : [];
   // Reuse a recent race only if its verified winners are still fresh (not marked bad or expired).
-  const hasUncheckedEmbeds = hit?.ranked.some((c) => c.kind === "embed" && !c.probe);
-  const hitHasFreshWinner = hit?.ranked.some((c) => c.probe?.ok && !isStaleStreamUrl(c.url, hit.at) && !isCircuitOpen(c.providerId));
-  if (hit && Date.now() - hit.at < RESULT_TTL && hitHasFreshWinner && (hit.budget >= budget || !hasUncheckedEmbeds)) {
-    const again = hit.ranked
-      .map((c) => (c.probe?.ok && isStaleStreamUrl(c.url, hit.at) ? { ...c, probe: { ok: false, latencyMs: c.probe.latencyMs, error: "token expired" } } : c))
+  const hasUncheckedEmbeds = refreshedHit.some((c) => c.kind === "embed" && !c.probe);
+  const hitHasFreshWinner = refreshedHit.some(
+    (c) => c.probe?.ok && !isStaleStreamUrl(c.url, hit!.at) && !isCircuitOpen(c.providerId),
+  );
+  const cachedVerifiedEmbeds = refreshedHit.filter((c) => c.probe?.ok && isEmbedCandidate(c, embedProviderIds)).length;
+
+  if (isFreshHit && hitHasFreshWinner && (Math.max(hit.budget, cachedVerifiedEmbeds) >= budget || !hasUncheckedEmbeds)) {
+    const again = refreshedHit
       .map((c) => score(c, s.preferredQuality, prio[c.providerId] ?? 0, req))
       .sort(sortByScore);
-    hit.events.forEach((e) => onEvent?.(e));
-    opts.onUpdate?.(again);
+    if (!opts.signal?.aborted) {
+      hit.events.forEach((e) => onEvent?.(e));
+      opts.onUpdate?.(again);
+    }
     return Promise.resolve(again);
   }
+
+  const incrementalUpgrade = isFreshHit && hitHasFreshWinner && hit.budget < budget && hasUncheckedEmbeds;
+  if (incrementalUpgrade && opts.signal?.aborted) {
+    const again = refreshedHit
+      .map((c) => score(c, s.preferredQuality, prio[c.providerId] ?? 0, req))
+      .sort(sortByScore);
+    return Promise.resolve(again);
+  }
+
   const finalEvents: Record<string, ResolveEvent> = {};
   const emit = (e: ResolveEvent) => {
     finalEvents[e.providerId] = e;
@@ -689,8 +778,8 @@ export function resolveSources(req: PlaybackRequest, onEvent?: (e: ResolveEvent)
         recordProbe(c);
       }
       const scored = score(c, s.preferredQuality, prio[c.providerId] ?? 0, req);
-      const id = c.pageUrl ?? c.url;
-      ranked = [...ranked.filter((x) => (x.pageUrl ?? x.url) !== id), scored].sort(sortByScore);
+      const id = candKey(c);
+      ranked = [...ranked.filter((x) => candKey(x) !== id), scored].sort(sortByScore);
       opts.onUpdate?.(ranked);
       if (opts.early && !settled && !graceTimer && c.probe?.ok) graceTimer = setTimeout(finish, GRACE_MS);
     };
@@ -709,10 +798,10 @@ export function resolveSources(req: PlaybackRequest, onEvent?: (e: ResolveEvent)
 
     const scheduleHedge = () => {
       clearTimeout(hedgeTimer);
-      if (verified === 0 && queue.length > 0 && running >= maxParallel && maxParallel < 5) {
+      if (verified === 0 && queue.length > 0 && running >= maxParallel && maxParallel < 4) {
         hedgeTimer = setTimeout(() => {
           if (verified === 0 && queue.length > 0 && !opts.signal?.aborted) {
-            maxParallel = 5;
+            maxParallel = 4;
             pump();
           }
         }, HEDGE_DELAY_MS);
@@ -766,19 +855,46 @@ export function resolveSources(req: PlaybackRequest, onEvent?: (e: ResolveEvent)
       abortActiveProbes();
       finish();
     };
+    const cacheAt = incrementalUpgrade ? hit.at : undefined;
     const maybeDone = () => {
       if (!lookupsDone || running) return;
       if (queue.length && verified < budget) return;
       clearTimeout(hedgeTimer);
       opts.signal?.removeEventListener("abort", onAbort);
       // Whatever wasn't checked stays listed as standby (probe undefined).
-      for (const c of queue.splice(0)) upsert(c);
+      for (const c of queue.splice(0)) {
+        if (!ranked.some((x) => candKey(x) === candKey(c))) upsert(c);
+      }
       if (!opts.signal?.aborted && ranked.some((c) => c.probe?.ok)) {
-        results.set(ck, { at: Date.now(), ranked, events: Object.values(finalEvents), budget });
+        results.set(ck, { at: cacheAt ?? Date.now(), ranked, events: Object.values(finalEvents), budget });
       }
       finish();
     };
     opts.signal?.addEventListener("abort", onAbort, { once: true });
+
+    if (incrementalUpgrade) {
+      ranked = refreshedHit
+        .map((c) => {
+          seen.add(candKey(c));
+          seen.add(c.url);
+          if (c.probe) probed.add(c.providerId);
+          return score(c, s.preferredQuality, prio[c.providerId] ?? 0, req);
+        })
+        .sort(sortByScore);
+      verified = cachedVerifiedEmbeds;
+      for (const c of refreshedHit) {
+        if (c.kind === "embed" && !c.probe) queue.push(c);
+      }
+      lookupsDone = true;
+      hit.events.forEach((ev) => emit(ev));
+      opts.onUpdate?.(ranked);
+      if (opts.early && ranked.some((c) => c.probe?.ok)) {
+        graceTimer = setTimeout(finish, GRACE_MS);
+      }
+      pump();
+      maybeDone();
+      return;
+    }
 
     const runs = enabled.map(async (p) => {
       emit({ providerId: p.id, status: "searching" });
@@ -800,7 +916,12 @@ export function resolveSources(req: PlaybackRequest, onEvent?: (e: ResolveEvent)
       }
       const lookupMs = Math.round(performance.now() - t0);
       const fresh = found
-        .filter((c) => !seen.has(c.url) && (seen.add(c.url), true))
+        .filter((c) => {
+          const k = candKey(c);
+          if (seen.has(k)) return false;
+          seen.add(k);
+          return true;
+        })
         .map((c) => ({ ...c, lookupMs }));
       emit({ providerId: p.id, status: "done", count: fresh.length });
       const embeds = fresh.filter((c) => c.kind === "embed");

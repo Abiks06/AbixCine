@@ -52,6 +52,7 @@ const MAX_PICKS = 400;
 export const CIRCUIT_STREAK_THRESHOLD = 3;
 const CIRCUIT_BASE_MS = 2 * 60_000;
 const CIRCUIT_MAX_MS = 30 * 60_000;
+const RECENT_FAIL_MS = 10 * 60_000;
 
 function read<T>(k: string, fallback: T): T {
   try {
@@ -89,7 +90,7 @@ function bump(providerId: string, ok: boolean, latencyMs?: number) {
     h.lastOk = now;
     h.streak = 0;
     delete h.circuitUntil;
-    if (latencyMs != null) {
+    if (latencyMs != null && Number.isFinite(latencyMs) && latencyMs >= 0) {
       const nextLat = prevLat == null ? latencyMs : prevLat * (1 - ALPHA) + latencyMs * ALPHA;
       h.latency = nextLat;
       h.latencyMs = nextLat;
@@ -97,7 +98,7 @@ function bump(providerId: string, ok: boolean, latencyMs?: number) {
   } else {
     h.lastFail = now;
     h.streak = (h.streak ?? 0) + 1;
-    if (latencyMs != null && latencyMs > 0) {
+    if (latencyMs != null && Number.isFinite(latencyMs) && latencyMs > 0) {
       const penalty = Math.max(latencyMs, 4000);
       const nextLat = prevLat == null ? penalty : prevLat * (1 - ALPHA * 0.5) + penalty * (ALPHA * 0.5);
       h.latency = nextLat;
@@ -117,6 +118,16 @@ function bump(providerId: string, ok: boolean, latencyMs?: number) {
 export function isCircuitOpen(providerId: string): boolean {
   const h = getHealth(providerId);
   return !!h.circuitUntil && Date.now() < h.circuitUntil;
+}
+
+/**
+ * True when a provider's circuit cooldown has elapsed without an intervening success,
+ * making it eligible for a half-open recovery trial.
+ */
+export function isCircuitHalfOpen(providerId?: string): boolean {
+  if (!providerId) return false;
+  const h = getHealth(providerId);
+  return !!h.circuitUntil && Date.now() >= h.circuitUntil && (h.streak == null || h.streak > 0);
 }
 
 /** Remaining cooldown in ms while a provider's circuit breaker is open (0 when closed). */
@@ -177,8 +188,21 @@ export function isStaleStreamUrl(url: string, savedAt?: number): boolean {
 /** Playback outcome: the strongest signal, so it counts double. */
 export function recordPlayback(req: PlaybackRequest, c: StreamCandidate, ok: boolean) {
   if (c.providerId === "manual") return;
-  bump(c.providerId, ok, c.probe?.latencyMs);
-  bump(c.providerId, ok, c.probe?.latencyMs);
+  const existing = getHealth(c.providerId);
+  const probeLat =
+    c.probe?.latencyMs != null && Number.isFinite(c.probe.latencyMs) && c.probe.latencyMs >= 0
+      ? c.probe.latencyMs
+      : undefined;
+  const existingLat = existing.latencyMs ?? existing.latency;
+  const fallbackLat =
+    existingLat == null || !Number.isFinite(existingLat) || existingLat < 0
+      ? c.lookupMs != null && Number.isFinite(c.lookupMs) && c.lookupMs >= 0
+        ? c.lookupMs
+        : 500
+      : undefined;
+  const latencySample = ok ? (probeLat ?? fallbackLat) : probeLat;
+  bump(c.providerId, ok, latencySample);
+  bump(c.providerId, ok, latencySample);
   const k = titleKey(req);
   if (ok) {
     const pick = { providerId: c.providerId, url: c.url, at: Date.now() };
@@ -187,6 +211,13 @@ export function recordPlayback(req: PlaybackRequest, c: StreamCandidate, ok: boo
     if (keys.length > MAX_PICKS) {
       keys.sort((a, b) => picks[a].at - picks[b].at);
       for (const old of keys.slice(0, keys.length - MAX_PICKS)) delete picks[old];
+    }
+    const toClear = [c.url, c.pageUrl].filter((u): u is string => !!u && u in badUrls);
+    if (toClear.length) {
+      const nextBad = { ...badUrls };
+      for (const u of toClear) delete nextBad[u];
+      badUrls = nextBad;
+      write(BKEY, badUrls);
     }
   } else {
     picks = { ...picks };
@@ -200,11 +231,6 @@ export function recordPlayback(req: PlaybackRequest, c: StreamCandidate, ok: boo
         .sort((a, b) => b[1] - a[1])
         .slice(0, MAX_BAD),
     );
-    write(BKEY, badUrls);
-  }
-  if (ok && badUrls[c.url]) {
-    const { [c.url]: _, ...rest } = badUrls;
-    badUrls = rest;
     write(BKEY, badUrls);
   }
   write(PKEY, picks);
@@ -231,15 +257,26 @@ export function reliability(providerId: string) {
   return (h.ok + 1) / (h.ok + h.fail + 2);
 }
 
+/** Decaying failure factor in [0, 1] across the 10-minute recent-failure window. */
+export function recentFailureFactor(providerId: string, now = Date.now()): number {
+  const h = getHealth(providerId);
+  if (!h.lastFail) return 0;
+  if (h.lastOk && h.lastOk >= h.lastFail) return 0;
+  const age = now - h.lastFail;
+  if (age < 0) return 1;
+  if (age >= RECENT_FAIL_MS) return 0;
+  return 1 - age / RECENT_FAIL_MS;
+}
+
 /** Failed in the last 10 minutes? Then it's probably still down. */
 export function recentlyFailed(providerId: string) {
-  const h = getHealth(providerId);
-  return !!h.lastFail && Date.now() - h.lastFail < 10 * 60_000 && (!h.lastOk || h.lastOk < h.lastFail);
+  return recentFailureFactor(providerId) > 0;
 }
 
 /**
  * Composite server health score combining base priority, Laplace reliability,
- * EWMA latency, recent failure penalty, and circuit-breaker state.
+ * EWMA latency, decaying recent failure penalty, circuit-breaker state, and
+ * a clean half-open trial bonus once cooldown expires.
  */
 export function serverHealthScore(providerId: string, basePriority = 0): number {
   const h = getHealth(providerId);
@@ -248,9 +285,10 @@ export function serverHealthScore(providerId: string, basePriority = 0): number 
   const hasTiming = lat != null || h.lookupMs != null;
   const rtt = (lat ?? 1500) + (h.lookupMs ?? 0);
   const speed = hasTiming ? Math.max(-8, 12 - rtt / 400) : 0;
-  const recentFail = recentlyFailed(providerId) ? -12 : 0;
+  const recentFail = -12 * recentFailureFactor(providerId);
   const circuitPenalty = isCircuitOpen(providerId) ? -45 : 0;
-  return basePriority + rel + speed + recentFail + circuitPenalty;
+  const halfOpenBonus = isCircuitHalfOpen(providerId) ? 6 : 0;
+  return basePriority + rel + speed + recentFail + circuitPenalty + halfOpenBonus;
 }
 
 /**
@@ -263,7 +301,26 @@ export function lookupTimeout(providerId: string, base: number) {
   return Math.round(Math.max(2500, Math.min(base, h.lookupMs * 3 + 1500)));
 }
 
-export function resetHealth() {
+/** Reset persisted health/picks/badUrls for one provider, or clear all when omitted. */
+export function resetHealth(providerId?: string): void {
+  if (providerId) {
+    if (providerId in health) {
+      const { [providerId]: _, ...rest } = health;
+      health = rest;
+      write(HKEY, health);
+    }
+    let picksChanged = false;
+    const nextPicks: Record<string, TitlePick> = {};
+    for (const [k, pick] of Object.entries(picks)) {
+      if (pick.providerId === providerId) picksChanged = true;
+      else nextPicks[k] = pick;
+    }
+    if (picksChanged) {
+      picks = nextPicks;
+      write(PKEY, picks);
+    }
+    return;
+  }
   health = {};
   picks = {};
   badUrls = {};

@@ -176,10 +176,18 @@ export const availableSources: VideoSource[] = [
   },
 ];
 
-const MAX_TMDB_CACHE = 200;
-const tmdbResolutionMap = new Map<string, Promise<string | null>>();
+interface TmdbLookupEntry {
+  promise: Promise<string | null>;
+  callers: number;
+  settled: boolean;
+  aborted: boolean;
+}
 
-export function buildEmbedUrl(template: string, id: string, season?: number, episode?: number): string {
+const MAX_TMDB_CACHE = 200;
+const tmdbResolutionMap = new Map<string, TmdbLookupEntry>();
+
+export function buildEmbedUrl(template?: string, id?: string, season?: number, episode?: number): string {
+  if (!template?.trim() || !id) return "";
   return template
     .replaceAll("{id}", id)
     .replaceAll("{season}", String(season ?? 1))
@@ -220,13 +228,26 @@ function pickBestTmdbMatch(
   return best;
 }
 
-function withCallerSignal<T>(p: Promise<T | null>, signal?: AbortSignal): Promise<T | null> {
-  if (!signal) return p;
+function attachTmdbSignal(key: string, entry: TmdbLookupEntry, signal?: AbortSignal): Promise<string | null> {
+  if (!signal) {
+    entry.callers++;
+    return entry.promise;
+  }
   if (signal.aborted) return Promise.resolve(null);
-  return new Promise<T | null>((resolve, reject) => {
-    const onAbort = () => resolve(null);
+  if (!entry.settled) entry.callers++;
+  return new Promise<string | null>((resolve, reject) => {
+    const onAbort = () => {
+      if (!entry.settled) {
+        entry.callers = Math.max(0, entry.callers - 1);
+        if (entry.callers === 0) {
+          entry.aborted = true;
+          if (tmdbResolutionMap.get(key) === entry) tmdbResolutionMap.delete(key);
+        }
+      }
+      resolve(null);
+    };
     signal.addEventListener("abort", onAbort, { once: true });
-    p.then(
+    entry.promise.then(
       (v) => {
         signal.removeEventListener("abort", onAbort);
         resolve(signal.aborted ? null : v);
@@ -253,14 +274,21 @@ export function resolveTmdbId(req: PlaybackRequest, signal?: AbortSignal): Promi
   }
 
   // De-duplicate in-flight lookups with LRU refresh
-  if (tmdbResolutionMap.has(key)) {
-    const cachedLookup = tmdbResolutionMap.get(key)!;
+  const existing = tmdbResolutionMap.get(key);
+  if (existing) {
     tmdbResolutionMap.delete(key);
-    tmdbResolutionMap.set(key, cachedLookup);
-    return withCallerSignal(cachedLookup, signal);
+    tmdbResolutionMap.set(key, existing);
+    return attachTmdbSignal(key, existing, signal);
   }
 
-  const lookup = (async () => {
+  const entry: TmdbLookupEntry = {
+    promise: Promise.resolve(null),
+    callers: 0,
+    settled: false,
+    aborted: false,
+  };
+
+  entry.promise = (async () => {
     try {
       const q = req.media.title || req.media.originalTitle;
       if (!q) return null;
@@ -293,8 +321,12 @@ export function resolveTmdbId(req: PlaybackRequest, signal?: AbortSignal): Promi
     }
     return null;
   })().then((resolved) => {
-    // Never permanently poison the map with null on transient network failures.
-    if (!resolved) tmdbResolutionMap.delete(key);
+    entry.settled = true;
+    // Never poison the LRU map with null on transient failures or fully-aborted lookups.
+    if (!resolved || entry.aborted) {
+      if (tmdbResolutionMap.get(key) === entry) tmdbResolutionMap.delete(key);
+      return null;
+    }
     return resolved;
   });
 
@@ -302,12 +334,19 @@ export function resolveTmdbId(req: PlaybackRequest, signal?: AbortSignal): Promi
     const oldest = tmdbResolutionMap.keys().next().value;
     if (oldest !== undefined) tmdbResolutionMap.delete(oldest);
   }
-  tmdbResolutionMap.set(key, lookup);
-  return withCallerSignal(lookup, signal);
+  tmdbResolutionMap.set(key, entry);
+  return attachTmdbSignal(key, entry, signal);
 }
 
-/** Fill an anime template. Returns null when it needs an id this entry doesn't have. */
-function buildAnimeUrl(template: string, anilist: string, mal: number | undefined, episode: number | undefined, audio: "sub" | "dub") {
+/** Fill an anime template. Returns null when missing or lacking a required id. */
+export function buildAnimeUrl(
+  template: string | undefined,
+  anilist: string,
+  mal: number | undefined,
+  episode: number | undefined,
+  audio: "sub" | "dub",
+): string | null {
+  if (!template?.trim() || !anilist) return null;
   if (template.includes("{mal}") && !mal) return null;
   return template
     .replaceAll("{anilist}", anilist)
@@ -364,10 +403,9 @@ export function createEmbedProvider(src: VideoSource, index: number): SourceProv
 
       const tmdbId = await resolveTmdbId(req, signal);
       if (!tmdbId || signal.aborted) return [];
-      const url =
-        req.media.kind === "movie"
-          ? buildEmbedUrl(src.urls.movie, tmdbId)
-          : buildEmbedUrl(src.urls.tv, tmdbId, req.season, req.episode);
+      const template = req.media.kind === "movie" ? src.urls?.movie : src.urls?.tv;
+      const url = buildEmbedUrl(template, tmdbId, req.season, req.episode);
+      if (!url) return [];
       return [
         {
           ...base,

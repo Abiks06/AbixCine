@@ -3,8 +3,13 @@ import type { PlaybackRequest } from "../lib/types";
 import { getEntry, saveProgress } from "../lib/progress";
 import { applyRemoteSettings, getSettings, updateSettings } from "../lib/settings";
 import { animeDirectProvider } from "./anime-direct";
+import { buildAnimeUrl, buildEmbedUrl, resolveTmdbId } from "./embeds";
 import {
+  badUrl,
   CIRCUIT_STREAK_THRESHOLD,
+  circuitRemainingMs,
+  getHealth,
+  isCircuitHalfOpen,
   isCircuitOpen,
   lastPick,
   recordLookupFailure,
@@ -18,16 +23,19 @@ import { kisskhProvider } from "./kisskh";
 import { localProvider, sidecarTrack } from "./local";
 import {
   availableSources,
+  candKey,
   candLine,
   clearResolveCache,
   initialCandidateIndex,
   probeHedged,
+  promoteCachedCandidate,
   PROVIDERS,
   quickCheck,
   resolveSources,
   score,
   validateManifest,
   verifyEmbed,
+  type ResolveEvent,
 } from "./registry";
 import { isUrlTokenExpired, normalizeHeaders, proxyUrl, unwrapProxyUrl, type Sniffed } from "./native";
 import { inferSubtitleMeta, isThumbnailSubtitleUrl, type SourceProvider, type StreamCandidate } from "./types";
@@ -764,6 +772,416 @@ describe("subtitle metadata inference & source providers", () => {
     } finally {
       window.removeEventListener("abx:subpref", onSubPref);
       localStorage.removeItem("abx.subs.v1");
+      localStorage.removeItem("abx.settings.v1");
+    }
+  });
+});
+
+describe("health recovery, incremental resolve cache & embed hardening", () => {
+  it("supports selective resetHealth(providerId) vs full reset and clears badUrls for both url and pageUrl on playback success", () => {
+    const reqA = request("test:selective-a");
+    const reqB = request("test:selective-b");
+    const candA = candidate("srv-a");
+    const candB: StreamCandidate = {
+      ...candidate("srv-b"),
+      url: "https://cdn.example/b-stream.m3u8",
+      pageUrl: "https://srv-b.example/embed/1",
+    };
+
+    recordPlayback(reqA, candA, true);
+    for (let i = 0; i < CIRCUIT_STREAK_THRESHOLD; i++) recordLookupFailure("srv-a", 5000);
+    expect(isCircuitOpen("srv-a")).toBe(true);
+    expect(circuitRemainingMs("srv-a")).toBeGreaterThan(0);
+
+    recordPlayback(reqB, { ...candB, url: candB.pageUrl! }, false);
+    recordPlayback(reqB, candB, false);
+    expect(badUrl(candB.url)).toBe(true);
+    expect(badUrl(candB.pageUrl!)).toBe(true);
+    expect(getHealth("srv-b").fail).toBeGreaterThan(0);
+
+    // Selective reset clears only srv-a without erasing srv-b health or badUrls
+    resetHealth("srv-a");
+    expect(getHealth("srv-a")).toEqual({ ok: 0, fail: 0 });
+    expect(isCircuitOpen("srv-a")).toBe(false);
+    expect(circuitRemainingMs("srv-a")).toBe(0);
+    expect(lastPick(reqA)).toBeUndefined();
+    expect(getHealth("srv-b").fail).toBeGreaterThan(0);
+    expect(badUrl(candB.url)).toBe(true);
+
+    // Playback success clears badUrls for both url and pageUrl, resets streak/circuit, and records valid latency when absent
+    recordPlayback(reqB, { ...candB, url: "https://cdn.example/b-fresh.m3u8" }, true);
+    expect(badUrl("https://cdn.example/b-fresh.m3u8")).toBe(false);
+    expect(badUrl(candB.pageUrl!)).toBe(false);
+    expect(getHealth("srv-b").streak).toBe(0);
+    expect(getHealth("srv-b").circuitUntil).toBeUndefined();
+    expect(getHealth("srv-b").latencyMs).toBeGreaterThanOrEqual(0);
+
+    // Fresh provider playback without probe latency still populates valid latency
+    recordPlayback(reqA, candidate("srv-fresh"), true);
+    expect(getHealth("srv-fresh").latencyMs).toBeGreaterThan(0);
+
+    // Full reset clears everything including badUrls
+    recordPlayback(reqB, candB, false);
+    expect(badUrl(candB.url)).toBe(true);
+    resetHealth();
+    expect(getHealth("srv-b")).toEqual({ ok: 0, fail: 0 });
+    expect(badUrl(candB.url)).toBe(false);
+  });
+
+  it("transitions expired circuits to half-open with smooth decay and trial bonus, re-trips on failure, and closes on playback success", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-13T00:00:00Z"));
+    try {
+      const req = request("test:half-open");
+      for (let i = 0; i < CIRCUIT_STREAK_THRESHOLD; i++) {
+        recordLookupFailure("flaky-srv", 8000);
+      }
+      expect(isCircuitOpen("flaky-srv")).toBe(true);
+      expect(isCircuitHalfOpen("flaky-srv")).toBe(false);
+      expect(isCircuitHalfOpen(undefined)).toBe(false);
+      const openScore = serverHealthScore("flaky-srv", 15);
+
+      // Still open at 60s
+      vi.advanceTimersByTime(60_000);
+      expect(isCircuitOpen("flaky-srv")).toBe(true);
+      expect(isCircuitHalfOpen("flaky-srv")).toBe(false);
+      expect(circuitRemainingMs("flaky-srv")).toBeGreaterThan(0);
+
+      // Cooldown expires after 2m -> half-open with trial bonus + decayed penalty
+      vi.advanceTimersByTime(61_000);
+      expect(isCircuitOpen("flaky-srv")).toBe(false);
+      expect(isCircuitHalfOpen("flaky-srv")).toBe(true);
+      expect(circuitRemainingMs("flaky-srv")).toBe(0);
+      const halfOpenAt2m = serverHealthScore("flaky-srv", 15);
+      expect(halfOpenAt2m).toBeGreaterThan(openScore + 40);
+
+      // Smooth decay reduces penalty further as time passes
+      vi.advanceTimersByTime(4 * 60_000);
+      expect(serverHealthScore("flaky-srv", 15)).toBeGreaterThan(halfOpenAt2m);
+
+      // A failure during half-open re-opens the circuit with doubled cooldown (4m)
+      recordLookupFailure("flaky-srv", 8000);
+      expect(isCircuitOpen("flaky-srv")).toBe(true);
+      expect(isCircuitHalfOpen("flaky-srv")).toBe(false);
+      expect(circuitRemainingMs("flaky-srv")).toBeGreaterThan(3 * 60_000);
+
+      // After 4m cooldown expires again, playback success closes circuit cleanly
+      vi.advanceTimersByTime(4 * 60_000 + 1000);
+      expect(isCircuitHalfOpen("flaky-srv")).toBe(true);
+      recordPlayback(req, { ...candidate("flaky-srv"), probe: { ok: true, latencyMs: 180 } }, true);
+      expect(isCircuitOpen("flaky-srv")).toBe(false);
+      expect(isCircuitHalfOpen("flaky-srv")).toBe(false);
+      expect(getHealth("flaky-srv").streak).toBe(0);
+      expect(getHealth("flaky-srv").circuitUntil).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("incrementally upgrades resolveSources cache without re-sniffing already-verified winners and caps hedged concurrency at 4", async () => {
+    const original = [...PROVIDERS];
+    const findCounts = new Map<string, number>();
+    const providers: SourceProvider[] = ["first", "second", "third", "fourth", "fifth", "sixth"].map((id, i) => ({
+      id,
+      name: id,
+      category: "embed",
+      priority: 20 - i,
+      isEnabled: () => true,
+      find: async () => {
+        findCounts.set(id, (findCounts.get(id) ?? 0) + 1);
+        return [candidate(id)];
+      },
+    }));
+    PROVIDERS.splice(0, PROVIDERS.length, ...providers);
+
+    const sniffCalls: string[] = [];
+    mockSniff.mockImplementation((url: string, _ms?: number, signal?: AbortSignal) => {
+      sniffCalls.push(url);
+      const host = new URL(url).hostname.split(".")[0];
+      const stream: Sniffed = {
+        url: `https://media.example/${host}/master.m3u8`,
+        kind: "hls",
+        headers: {},
+        subtitles: [],
+        verified: true,
+        quality: 1080,
+      };
+      if (host === "first") return Promise.resolve(stream);
+      return new Promise<Sniffed | null>((resolve) => {
+        const t = setTimeout(() => resolve(stream), 15);
+        signal?.addEventListener("abort", () => {
+          clearTimeout(t);
+          resolve(null);
+        }, { once: true });
+      });
+    });
+
+    try {
+      const req = request("test:incremental-upgrade");
+      const firstPass = await resolveSources(req, undefined, { verifyBudget: 1, record: false });
+      const firstWinners = firstPass.filter((c) => c.probe?.ok);
+      expect(firstWinners.length).toBeGreaterThanOrEqual(1);
+      expect(firstPass.some((c) => c.kind === "embed" && !c.probe)).toBe(true);
+
+      const winnerPageUrls = new Set(firstWinners.map((c) => candKey(c)));
+      const sniffCountAfterFirst = sniffCalls.length;
+      expect(findCounts.get("first")).toBe(1);
+
+      // Upgrading verifyBudget from 1 -> 3 reuses cached lookups & winners, probing only standby embeds
+      const events: ResolveEvent[] = [];
+      const updates: StreamCandidate[][] = [];
+      const upgraded = await resolveSources(req, (e) => events.push(e), {
+        verifyBudget: 3,
+        record: false,
+        onUpdate: (r) => updates.push(r),
+      });
+
+      expect(upgraded.filter((c) => c.probe?.ok).length).toBeGreaterThanOrEqual(3);
+      expect(events.filter((e) => e.status === "done")).toHaveLength(providers.length);
+      expect(updates[0].some((c) => winnerPageUrls.has(candKey(c)) && c.probe?.ok)).toBe(true);
+      // Provider lookups were not repeated
+      expect(findCounts.get("first")).toBe(1);
+      // Already-verified winners were not sniffed a second time
+      const newSniffUrls = sniffCalls.slice(sniffCountAfterFirst);
+      expect(newSniffUrls.length).toBeGreaterThan(0);
+      for (const u of newSniffUrls) {
+        expect(winnerPageUrls.has(u)).toBe(false);
+      }
+
+      // Check early: true resolves after GRACE_MS while standby backups finish in background
+      clearResolveCache();
+      sniffCalls.length = 0;
+      const pendingSniffs: Record<string, (v: Sniffed | null) => void> = {};
+      mockSniff.mockImplementation((url: string, _ms?: number, signal?: AbortSignal) => {
+        sniffCalls.push(url);
+        const host = new URL(url).hostname.split(".")[0];
+        if (host === "first") {
+          return Promise.resolve({
+            url: "https://media.example/first/master.m3u8",
+            kind: "hls",
+            headers: {},
+            subtitles: [],
+            verified: true,
+            quality: 1080,
+          });
+        }
+        return new Promise<Sniffed | null>((resolve) => {
+          pendingSniffs[host] = resolve;
+          signal?.addEventListener("abort", () => resolve(null), { once: true });
+        });
+      });
+
+      vi.useFakeTimers();
+      try {
+        await resolveSources(request("test:early-upgrade"), undefined, { verifyBudget: 1, record: false });
+        const bgUpdates: StreamCandidate[][] = [];
+        const earlyPromise = resolveSources(request("test:early-upgrade"), undefined, {
+          verifyBudget: 3,
+          early: true,
+          record: false,
+          onUpdate: (r) => bgUpdates.push(r),
+        });
+        await vi.advanceTimersByTimeAsync(260);
+        const earlyOut = await earlyPromise;
+        expect(earlyOut.find((c) => c.providerId === "first")?.probe?.ok).toBe(true);
+
+        // Background probes settle and notify via onUpdate
+        pendingSniffs.second?.({
+          url: "https://media.example/second/master.m3u8",
+          kind: "hls",
+          headers: {},
+          subtitles: [],
+          verified: true,
+          quality: 720,
+        });
+        pendingSniffs.third?.({
+          url: "https://media.example/third/master.m3u8",
+          kind: "hls",
+          headers: {},
+          subtitles: [],
+          verified: true,
+          quality: 1080,
+        });
+        await vi.runAllTimersAsync();
+        expect(bgUpdates[bgUpdates.length - 1].filter((c) => c.probe?.ok).length).toBeGreaterThanOrEqual(3);
+
+        // Hedge concurrency cap is 4 (matching Rust Semaphore(4)) rather than 5
+        clearResolveCache();
+        sniffCalls.length = 0;
+        mockSniff.mockImplementation((url: string, _ms?: number, signal?: AbortSignal) => {
+          sniffCalls.push(url);
+          return new Promise<Sniffed | null>((resolve) => {
+            signal?.addEventListener("abort", () => resolve(null), { once: true });
+          });
+        });
+        const ctl = new AbortController();
+        const cappedRace = resolveSources(request("test:hedge-cap"), undefined, {
+          verifyBudget: 2,
+          record: false,
+          signal: ctl.signal,
+        });
+        await vi.advanceTimersByTimeAsync(10);
+        expect(sniffCalls).toHaveLength(3);
+        await vi.advanceTimersByTimeAsync(2600);
+        expect(sniffCalls).toHaveLength(4);
+        ctl.abort();
+        await cappedRace;
+      } finally {
+        vi.useRealTimers();
+      }
+    } finally {
+      PROVIDERS.splice(0, PROVIDERS.length, ...original);
+    }
+  });
+
+  it("preserves fresh verified state across lookups via promoteCachedCandidate and matches canonical candKey", async () => {
+    const original = [...PROVIDERS];
+    const findCalls = vi.fn(async (id: string) => [candidate(id)]);
+    const providers: SourceProvider[] = ["first", "second", "third", "fourth"].map((id, i) => ({
+      id,
+      name: id,
+      category: "embed",
+      priority: 20 - i,
+      isEnabled: () => true,
+      find: () => findCalls(id),
+    }));
+    PROVIDERS.splice(0, PROVIDERS.length, ...providers);
+    mockSniff.mockImplementation((url: string, _ms?: number, signal?: AbortSignal) => {
+      const host = new URL(url).hostname.split(".")[0];
+      const stream: Sniffed = {
+        url: `https://media.example/${host}/master.m3u8`,
+        kind: "hls",
+        headers: {},
+        subtitles: [],
+        verified: true,
+        quality: 1080,
+      };
+      if (host === "first") return Promise.resolve(stream);
+      return new Promise<Sniffed | null>((resolve) => {
+        const t = setTimeout(() => resolve(stream), 15);
+        signal?.addEventListener("abort", () => {
+          clearTimeout(t);
+          resolve(null);
+        }, { once: true });
+      });
+    });
+
+    try {
+      const req = request("test:promote-cache");
+      const initial = await resolveSources(req, undefined, { verifyBudget: 1, record: false });
+      const standby = initial.find((c) => c.providerId === "second")!;
+      expect(standby.probe).toBeUndefined();
+      expect(candKey(standby)).toBe(standby.pageUrl);
+      expect(initialCandidateIndex(initial, candKey(standby))).toBe(initial.indexOf(standby));
+
+      const sniffCallsBefore = mockSniff.mock.calls.length;
+      const findCallsBefore = findCalls.mock.calls.length;
+
+      // Promote standby candidate on demand (with sniffed direct URL & quality)
+      const promotedUrl = proxyUrl("https://cdn.example/second-direct.m3u8", { referer: "https://second.example/" });
+      promoteCachedCandidate(req, {
+        ...standby,
+        url: promotedUrl,
+        kind: "hls",
+        via: "sniffed",
+        probe: { ok: true, latencyMs: 65, quality: 1080 },
+      });
+
+      // Also verify promoting a candidate without probe.ok sets it to ok: true
+      const third = initial.find((c) => c.providerId === "third")!;
+      promoteCachedCandidate(req, { ...third, probe: { ok: false, latencyMs: 40, error: "timeout" } });
+
+      // Request budget: 2 -> first & second are already verified in cache, so zero extra sniff/find calls
+      const cachedAgain = await resolveSources(req, undefined, { verifyBudget: 2, record: false });
+      expect(findCalls.mock.calls.length).toBe(findCallsBefore);
+      expect(mockSniff.mock.calls.length).toBe(sniffCallsBefore);
+
+      const secondAgain = cachedAgain.find((c) => candKey(c) === candKey(standby));
+      expect(secondAgain?.probe).toMatchObject({ ok: true, latencyMs: 65, quality: 1080 });
+      expect(secondAgain?.url).toBe(promotedUrl);
+      expect(secondAgain?.via).toBe("sniffed");
+      expect(cachedAgain.find((c) => c.providerId === "third")?.probe?.ok).toBe(true);
+    } finally {
+      PROVIDERS.splice(0, PROVIDERS.length, ...original);
+    }
+  });
+
+  it("hardens buildEmbedUrl / buildAnimeUrl against missing templates and keeps resolveTmdbId cache clean on failures and aborts", async () => {
+    expect(buildEmbedUrl(undefined, "603")).toBe("");
+    expect(buildEmbedUrl("", "603")).toBe("");
+    expect(buildEmbedUrl("https://vidfast.vc/tv/{id}/{season}/{episode}", "1399", 2, 5)).toBe(
+      "https://vidfast.vc/tv/1399/2/5",
+    );
+
+    expect(buildAnimeUrl(undefined, "21", 21, 1, "sub")).toBeNull();
+    expect(buildAnimeUrl("https://vidlink.pro/anime/{mal}/{episode}/{audio}", "21", undefined, 1, "sub")).toBeNull();
+    expect(buildAnimeUrl("https://vidnest.fun/anime/{anilist}/{episode}/{audio}", "21", undefined, 3, "dub")).toBe(
+      "https://vidnest.fun/anime/21/3/dub",
+    );
+
+    updateSettings({ tmdbKey: "test-tmdb-key" });
+    try {
+      // 1. Transient failure does not poison LRU cache
+      const transientReq: PlaybackRequest = {
+        media: { key: "anilist:999101", kind: "anime", title: "TransientLookupUniqueTitle", overview: "", genres: [] },
+      };
+      const fetchTransient = vi
+        .fn()
+        .mockResolvedValueOnce(new Response("error", { status: 503 }))
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ results: [{ id: 77101, media_type: "tv", name: "TransientLookupUniqueTitle" }] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+        );
+      vi.stubGlobal("fetch", fetchTransient);
+
+      expect(await resolveTmdbId(transientReq)).toBeNull();
+      expect(await resolveTmdbId(transientReq)).toBe("77101");
+      expect(fetchTransient).toHaveBeenCalledTimes(2);
+
+      // 2. Pre-aborted and mid-flight aborted calls never cache
+      const abortedReq: PlaybackRequest = {
+        media: { key: "anilist:999102", kind: "anime", title: "AbortedLookupUniqueTitleA", overview: "", genres: [] },
+      };
+      const retryReqSameKey: PlaybackRequest = {
+        media: { key: "anilist:999102", kind: "anime", title: "AbortedLookupUniqueTitleB", overview: "", genres: [] },
+      };
+      let releaseFirst!: (r: Response) => void;
+      const fetchAborted = vi
+        .fn()
+        .mockImplementationOnce(() => new Promise<Response>((resolve) => { releaseFirst = resolve; }))
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ results: [{ id: 88202, media_type: "tv", name: "AbortedLookupUniqueTitleB" }] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+        );
+      vi.stubGlobal("fetch", fetchAborted);
+
+      const preAborted = new AbortController();
+      preAborted.abort();
+      expect(await resolveTmdbId(abortedReq, preAborted.signal)).toBeNull();
+      expect(fetchAborted).toHaveBeenCalledTimes(0);
+
+      const inflightCtl = new AbortController();
+      const firstCall = resolveTmdbId(abortedReq, inflightCtl.signal);
+      inflightCtl.abort();
+      expect(await firstCall).toBeNull();
+
+      // Even if the aborted background fetch resolves with an ID, it must not be cached for that key
+      releaseFirst(
+        new Response(JSON.stringify({ results: [{ id: 11111, media_type: "tv", name: "AbortedLookupUniqueTitleA" }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+      await new Promise((r) => setTimeout(r, 10));
+
+      // Subsequent lookup on the same media key runs fresh instead of returning cached 11111
+      expect(await resolveTmdbId(retryReqSameKey)).toBe("88202");
+      expect(fetchAborted).toHaveBeenCalledTimes(2);
+    } finally {
       localStorage.removeItem("abx.settings.v1");
     }
   });
