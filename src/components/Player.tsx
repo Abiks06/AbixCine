@@ -184,7 +184,15 @@ function cueSignature(cues: readonly SubtitleCue[]): string {
 
 const candKey = (c: { url: string; pageUrl?: string }): string => c.pageUrl ?? c.url;
 const kindOf = (c: StreamCandidate) =>
-  c.kind === "embed" ? "Online" : c.providerId === "local" ? "This PC" : c.providerId === "jellyfin" ? "Jellyfin" : "Direct";
+  c.kind === "embed"
+    ? "Online"
+    : /^magnet:/i.test(c.url)
+      ? "Torrent"
+      : c.providerId === "local"
+        ? "This PC"
+        : c.providerId === "jellyfin"
+          ? "Jellyfin"
+          : "Direct";
 const audioTag = (c: StreamCandidate) =>
   c.audio === "dub" ? "DUB" : c.audio === "sub" ? "SUB" : c.audio === "dual" ? "DUAL" : c.audio === "unknown" ? "JP?" : null;
 
@@ -290,7 +298,17 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
   const [speed, setSpeed] = useState(1);
   const [waiting, setWaiting] = useState(true);
   const [preparingLocal, setPreparingLocal] = useState(false);
+  const [preparingTorrent, setPreparingTorrent] = useState(false);
   const [idle, setIdle] = useState(false);
+  const activeTorrentIdRef = useRef<number | null>(null);
+  const stopActiveTorrent = useCallback(() => {
+    const id = activeTorrentIdRef.current;
+    if (id == null) return;
+    activeTorrentIdRef.current = null;
+    if (isTauri()) {
+      void invoke("torrent_stop", { id }).catch(() => {});
+    }
+  }, []);
   const [sheet, setSheet] = useState<Sheet | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [isFull, setIsFull] = useState(false);
@@ -1105,7 +1123,7 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
 
   const readOptionalSubdlApiKey = useCallback((): string | undefined => {
     try {
-      const raw = (getSettings() as unknown as Record<string, unknown> | undefined)?.subdlApiKey;
+      const raw = getSettings().subdlApiKey;
       return typeof raw === "string" && raw.trim() ? raw.trim() : undefined;
     } catch {
       return undefined;
@@ -1707,12 +1725,12 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
   const armStallRef = useRef(armStall);
   armStallRef.current = armStall;
   useEffect(() => {
-    if (!cur || cur.kind === "embed" || preparingLocal) return;
+    if (!cur || cur.kind === "embed" || preparingLocal || preparingTorrent) return;
     started.current = false;
     setHasStarted(false);
     armStall();
     return clearStall;
-  }, [cur?.url, cur?.kind, preparingLocal, retrySeq, armStall, clearStall]);
+  }, [cur?.url, cur?.kind, preparingLocal, preparingTorrent, retrySeq, armStall, clearStall]);
 
   /* ---------------------------------------------------------- attach source */
 
@@ -1728,6 +1746,8 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     setPlaying(false);
     setLiveStreamId(null);
     setPreparingLocal(false);
+    setPreparingTorrent(false);
+    stopActiveTorrent();
     setAudioTracks([]);
     setSelectedAudioTrack(-1);
     manualAudio.current = false;
@@ -2049,6 +2069,67 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
           (m) => attachDash(((m as { default?: typeof shaka }).default ?? m) as typeof shaka, dashUrl, target),
           () => !cancelled && failover("DASH player failed to load"),
         );
+      } else if (/^magnet:/i.test(target.url.trim())) {
+        const magnetUri = target.url.trim();
+        if (!isTauri()) {
+          setWaiting(false);
+          failover("torrent playback requires the desktop app");
+          return;
+        }
+        setPreparingTorrent(true);
+        const rawFileIdx = (target as { fileIdx?: unknown }).fileIdx;
+        const fileIdx = typeof rawFileIdx === "number" && Number.isFinite(rawFileIdx) ? rawFileIdx : null;
+        void (async () => {
+          try {
+            const supported = await invoke<boolean>("torrent_is_supported").catch(() => false);
+            if (cancelled) return;
+            if (!supported) {
+              setPreparingTorrent(false);
+              setWaiting(false);
+              failover("torrent streaming is not enabled in this build");
+              return;
+            }
+            const info = await invoke<unknown>("torrent_start_stream", {
+              magnetOrHash: magnetUri,
+              fileIdx,
+            });
+            const rec = info && typeof info === "object" ? (info as Record<string, unknown>) : null;
+            const streamId = rec && typeof rec.id === "number" && Number.isFinite(rec.id) ? rec.id : null;
+            const streamUrl =
+              typeof info === "string"
+                ? info.trim()
+                : typeof rec?.url === "string"
+                  ? rec.url.trim()
+                  : typeof rec?.streamUrl === "string"
+                    ? rec.streamUrl.trim()
+                    : typeof rec?.stream_url === "string"
+                      ? rec.stream_url.trim()
+                      : "";
+            if (cancelled) {
+              if (streamId != null) {
+                void invoke("torrent_stop", { id: streamId }).catch(() => {});
+              }
+              return;
+            }
+            if (!/^https?:\/\//i.test(streamUrl)) {
+              if (streamId != null) {
+                void invoke("torrent_stop", { id: streamId }).catch(() => {});
+              }
+              setPreparingTorrent(false);
+              setWaiting(false);
+              failover("torrent stream returned an invalid URL");
+              return;
+            }
+            activeTorrentIdRef.current = streamId;
+            setPreparingTorrent(false);
+            loadFile(streamUrl);
+          } catch (error: unknown) {
+            if (cancelled) return;
+            setPreparingTorrent(false);
+            setWaiting(false);
+            failover(`torrent stream failed: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        })();
       } else if (target.localPath) {
         setPreparingLocal(true);
         invoke<string>("prepare_local_media", { path: target.localPath })
@@ -2098,6 +2179,7 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
         if (refreshCtlRef.current === refreshCtl) refreshCtlRef.current = null;
         v.removeEventListener("loadedmetadata", seekAndPlay);
         if (v.currentTime > 1) resumeAt.current = v.currentTime;
+        stopActiveTorrent();
         destroyAttachedPlayers();
       };
     }
@@ -2108,9 +2190,10 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
       refreshCtlRef.current = null;
       v.removeEventListener("loadedmetadata", seekAndPlay);
       if (v.currentTime > 1) resumeAt.current = v.currentTime;
+      stopActiveTorrent();
       destroyAttachedPlayers();
     };
-  }, [cur?.url, cur?.kind, cur?.localPath, retrySeq, failover, clearStall]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [cur?.url, cur?.kind, cur?.localPath, retrySeq, failover, clearStall, stopActiveTorrent]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* ------------------------------------------------------------------ embeds */
 
@@ -2846,7 +2929,15 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
         {waiting && (
           <div className="pload" aria-label="Loading">
             <span className="pload-ring" />
-            <span className="pload-txt">{preparingLocal ? "Preparing local audio" : hasStarted ? "Buffering" : `Connecting to ${cur?.providerName ?? "server"}`}</span>
+            <span className="pload-txt">
+              {preparingTorrent
+                ? "Starting torrent stream"
+                : preparingLocal
+                  ? "Preparing local audio"
+                  : hasStarted
+                    ? "Buffering"
+                    : `Connecting to ${cur?.providerName ?? "server"}`}
+            </span>
           </div>
         )}
       </div>

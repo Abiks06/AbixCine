@@ -37,6 +37,8 @@ export interface Settings {
   enabledExtras: string[];
   /** Synced subtitle appearance and language preferences (mirrored with abx.subs.v1). */
   subtitlePref?: SyncedSubtitlePref;
+  /** Optional local-only SubDL API key for online subtitle search (never synced). */
+  subdlApiKey?: string;
 }
 
 /** Settings that follow the account. Library folders and server credentials stay on this device. */

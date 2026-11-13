@@ -23,6 +23,8 @@ import { localProvider } from "./local";
 import { isUrlTokenExpired, native, normalizeHeaders, proxyUrl, sniff } from "./native";
 import { availableSources, embedProviders } from "./embeds";
 import { DIRECT_EXTRACTORS } from "./extractors";
+import { pluginProvidersSource } from "./pluginRunner";
+import { stremioProvider } from "./stremio";
 import { inferSniffedSubtitles, type HedgedProbeOptions, type ManifestValidation, type SourceProvider, type StreamCandidate, type VideoSource } from "./types";
 
 /** All known providers. Register new ones here. */
@@ -32,6 +34,8 @@ export const PROVIDERS: SourceProvider[] = [
   animeDirectProvider,
   kisskhProvider,
   ...DIRECT_EXTRACTORS,
+  stremioProvider,
+  pluginProvidersSource,
   ...embedProviders,
 ];
 
@@ -49,6 +53,8 @@ export const DIRECT_SOURCES = [
   { id: "kickassanime", name: "KickAssAnime", note: "Anime · direct stream with sub/dub and subtitles" },
   { id: "anikoto", name: "Anikoto", note: "Anime · direct stream with sub/dub and subtitles" },
   { id: "onetouchtv", name: "OneTouchTV", note: "Asian dramas · direct stream with subtitles" },
+  { id: "stremio", name: "Stremio Addons", note: "External addons · direct HTTP, Debrid & optional torrent streams" },
+  { id: "plugins", name: "JS Plugins", note: "Sandboxed JS plugins · custom user-installed stream providers" },
 ];
 
 export { availableSources, embedProviders };
@@ -308,7 +314,7 @@ const QUICK_CHECK_MS = 5000;
  * progressive file must answer with real video header bytes.
  */
 export async function quickCheck(c: StreamCandidate, signal?: AbortSignal): Promise<{ ok: boolean; quality?: number; error?: string }> {
-  if (c.kind === "embed") return { ok: true };
+  if (c.kind === "embed" || /^magnet:/i.test(c.url)) return { ok: true };
   if (isUrlTokenExpired(c.url)) return { ok: false, error: "token expired" };
   if (c.kind === "file") return playCheck(c, signal);
   const { ctl, cleanup } = linkSignal(signal);
@@ -393,6 +399,7 @@ const firstUri = (playlist: string) => playlist.split(/\r?\n/).map((l) => l.trim
  * for DASH, valid MPD structure; for files, the first bytes must be an MP4/WebM/TS header.
  */
 export async function playCheck(c: StreamCandidate, signal?: AbortSignal): Promise<{ ok: boolean; quality?: number; error?: string }> {
+  if (/^magnet:/i.test(c.url)) return { ok: true };
   if (isUrlTokenExpired(c.url)) return { ok: false, error: "token expired" };
   const { ctl, cleanup } = linkSignal(signal);
   const timer = setTimeout(() => ctl.abort(), PLAY_CHECK_MS);

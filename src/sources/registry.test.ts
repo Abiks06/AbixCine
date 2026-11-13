@@ -30,6 +30,7 @@ import {
   DIRECT_SOURCES,
   embedProviders,
   initialCandidateIndex,
+  playCheck,
   probeHedged,
   promoteCachedCandidate,
   PROVIDERS,
@@ -41,6 +42,8 @@ import {
   type ResolveEvent,
 } from "./registry";
 import { isUrlTokenExpired, normalizeHeaders, proxyUrl, unwrapProxyUrl, type Sniffed } from "./native";
+import { clearPlugins, installPlugin, pluginProvidersSource, PLUGINS_STORAGE_KEY, togglePlugin } from "./pluginRunner";
+import { saveStremioAddons, STREMIO_STORAGE_KEY, stremioProvider } from "./stremio";
 import { inferSubtitleMeta, isThumbnailSubtitleUrl, type SourceProvider, type StreamCandidate } from "./types";
 
 const { mockSniff, mockHttpFetch, mockInvoke, mockIsTauri } = vi.hoisted(() => ({
@@ -1378,5 +1381,116 @@ describe("Phase 2 direct extractor wiring", () => {
       PROVIDERS.splice(0, PROVIDERS.length, ...original);
       localStorage.removeItem("abx.settings.v1");
     }
+  });
+});
+
+describe("Phase 3 Stremio & JS plugin registry wiring", () => {
+  afterEach(() => {
+    localStorage.removeItem(STREMIO_STORAGE_KEY);
+    localStorage.removeItem(PLUGINS_STORAGE_KEY);
+    localStorage.removeItem("abx.settings.v1");
+    clearPlugins();
+    clearResolveCache();
+    vi.restoreAllMocks();
+  });
+
+  it("registers stremioProvider and pluginProvidersSource in PROVIDERS and DIRECT_SOURCES", () => {
+    expect(PROVIDERS.some((p) => p.id === "stremio")).toBe(true);
+    expect(PROVIDERS.some((p) => p.id === "plugins")).toBe(true);
+    expect(DIRECT_SOURCES.some((s) => s.id === "stremio")).toBe(true);
+    expect(DIRECT_SOURCES.some((s) => s.id === "plugins")).toBe(true);
+    expect(stremioProvider.category).toBe("external");
+    expect(pluginProvidersSource.category).toBe("external");
+  });
+
+  it("keeps stremioProvider and pluginProvidersSource safe and empty when unconfigured", async () => {
+    const settings = getSettings();
+    const signal = new AbortController().signal;
+    expect(stremioProvider.isEnabled(settings)).toBe(false);
+    expect(pluginProvidersSource.isEnabled(settings)).toBe(false);
+    await expect(stremioProvider.find(request("test:unconfigured-stremio"), settings, signal)).resolves.toEqual([]);
+    await expect(pluginProvidersSource.find(request("test:unconfigured-plugins"), settings, signal)).resolves.toEqual([]);
+  });
+
+  it("toggles stremio and plugins cleanly via addon/plugin state and disabledSources", async () => {
+    saveStremioAddons([
+      {
+        id: "com.example.torrentio",
+        name: "Example Stremio",
+        version: "1.0.0",
+        manifestUrl: "https://addon.example.com/manifest.json",
+        baseUrl: "https://addon.example.com",
+        resources: ["stream"],
+        types: ["movie", "series"],
+        enabled: true,
+      },
+    ]);
+    installPlugin({
+      id: "test-plugin",
+      name: "Test JS Plugin",
+      version: "1.0.0",
+      mediaTypes: ["movie", "tv", "anime"],
+      allowedHosts: [],
+      script: "return [];",
+      enabled: true,
+      priority: 30,
+    });
+
+    expect(stremioProvider.isEnabled(getSettings())).toBe(true);
+    expect(pluginProvidersSource.isEnabled(getSettings())).toBe(true);
+
+    updateSettings({ disabledSources: ["stremio", "plugins"] });
+    expect(stremioProvider.isEnabled(getSettings())).toBe(false);
+    expect(pluginProvidersSource.isEnabled(getSettings())).toBe(false);
+
+    const stremioSpy = vi.spyOn(stremioProvider, "find").mockResolvedValue([]);
+    const pluginSpy = vi.spyOn(pluginProvidersSource, "find").mockResolvedValue([]);
+    const fakeDirect: SourceProvider = {
+      id: "fake-direct",
+      name: "FakeDirect",
+      priority: 1,
+      category: "external",
+      isEnabled: () => true,
+      find: async () => [],
+    };
+    const original = [...PROVIDERS];
+    PROVIDERS.splice(0, PROVIDERS.length, stremioProvider, pluginProvidersSource, fakeDirect);
+    try {
+      await resolveSources(request("test:phase3-disabled"), undefined, { record: false });
+      expect(stremioSpy).not.toHaveBeenCalled();
+      expect(pluginSpy).not.toHaveBeenCalled();
+
+      updateSettings({ disabledSources: [] });
+      clearResolveCache();
+      togglePlugin("test-plugin", false);
+      expect(pluginProvidersSource.isEnabled(getSettings())).toBe(false);
+      await resolveSources(request("test:phase3-stremio-only"), undefined, { record: false });
+      expect(stremioSpy).toHaveBeenCalledTimes(1);
+      expect(pluginSpy).not.toHaveBeenCalled();
+    } finally {
+      PROVIDERS.splice(0, PROVIDERS.length, ...original);
+    }
+  });
+
+  it("treats magnet: torrent candidates as valid in quickCheck and playCheck", async () => {
+    const magnetCandidate: StreamCandidate = {
+      url: "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Sample",
+      kind: "file",
+      label: "Sample 1080p",
+      providerId: "stremio",
+      providerName: "Stremio",
+      via: "direct",
+    };
+    await expect(quickCheck(magnetCandidate)).resolves.toEqual({ ok: true });
+    await expect(playCheck(magnetCandidate)).resolves.toEqual({ ok: true });
+  });
+
+  it("keeps subdlApiKey local-only and preserves it across applyRemoteSettings", () => {
+    updateSettings({ subdlApiKey: "subdl-local-secret" });
+    expect(getSettings().subdlApiKey).toBe("subdl-local-secret");
+
+    applyRemoteSettings({ preferredQuality: "720p", subdlApiKey: "should-not-sync" } as Record<string, unknown>);
+    expect(getSettings().preferredQuality).toBe("720p");
+    expect(getSettings().subdlApiKey).toBe("subdl-local-secret");
   });
 });

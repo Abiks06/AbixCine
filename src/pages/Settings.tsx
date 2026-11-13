@@ -1,4 +1,4 @@
-import { isTauri } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useRef, useState } from "react";
 import { useLocation } from "react-router-dom";
@@ -7,7 +7,9 @@ import { Avatar } from "../components/Avatar";
 import { Icon } from "../components/Icon";
 import { SubtitleOverlay } from "../components/SubtitleOverlay";
 import { errorMessage, getApiBase, leaveGuest, signOut, updateProfile, useAuth } from "../lib/account";
+import { loadDebridConfig, saveDebridConfig, type DebridProvider } from "../lib/debrid";
 import { toggleSource, updateSettings, useSettings } from "../lib/settings";
+import { clearSubtitleSearchCache } from "../lib/subtitleProviders";
 import {
   COMMON_SUB_LANGS,
   DEFAULT_SUB_PREF,
@@ -27,7 +29,26 @@ import {
 } from "../lib/subtitles";
 import { circuitRemainingMs, getHealth, isCircuitHalfOpen, isCircuitOpen, reliability, resetHealth } from "../sources/health";
 import { scanLibrary } from "../sources/local";
-import { availableSources, DIRECT_SOURCES, PROVIDERS } from "../sources/registry";
+import { httpFetch } from "../sources/native";
+import {
+  installPlugin,
+  listPlugins,
+  removePlugin,
+  togglePlugin,
+  validatePluginFetchUrl,
+  validatePluginManifest,
+  type ProviderPluginManifest,
+} from "../sources/pluginRunner";
+import { availableSources, clearResolveCache, DIRECT_SOURCES, PROVIDERS } from "../sources/registry";
+import {
+  addStremioAddon,
+  fetchStremioManifest,
+  getStremioConfig,
+  removeStremioAddon,
+  toggleStremioAddon,
+  updateStremioConfig,
+  type StremioAddonConfig,
+} from "../sources/stremio";
 import { appVersion, checkForUpdates, installUpdate, useUpdate } from "../lib/updater";
 
 const SUB_COLOR_SWATCHES = [
@@ -93,9 +114,40 @@ export function Settings() {
   const [version, setVersion] = useState("");
   const mountedRef = useRef(true);
   const jfCtlRef = useRef<AbortController | null>(null);
+  const stremioCtlRef = useRef<AbortController | null>(null);
+  const pluginCtlRef = useRef<AbortController | null>(null);
+
+  const [stremioAddons, setStremioAddons] = useState<StremioAddonConfig[]>(() => getStremioConfig().addons);
+  const [torrentMode, setTorrentMode] = useState<boolean>(() => Boolean(getStremioConfig().torrentMode));
+  const [torrentSupported, setTorrentSupported] = useState(false);
+  const [stremioUrl, setStremioUrl] = useState("");
+  const [stremioBusy, setStremioBusy] = useState(false);
+  const [stremioMsg, setStremioMsg] = useState("");
+
+  const [debridProvider, setDebridProvider] = useState<DebridProvider | "none">(() => {
+    const cfg = loadDebridConfig();
+    return cfg && cfg.enabled !== false ? cfg.provider : "none";
+  });
+  const [debridKey, setDebridKey] = useState(() => loadDebridConfig()?.apiKey ?? "");
+  const [debridMsg, setDebridMsg] = useState("");
+
+  const [plugins, setPlugins] = useState<ProviderPluginManifest[]>(() => listPlugins());
+  const [pluginUrl, setPluginUrl] = useState("");
+  const [pluginPaste, setPluginPaste] = useState("");
+  const [pluginBusy, setPluginBusy] = useState(false);
+  const [pluginMsg, setPluginMsg] = useState("");
+
+  const [subdlKey, setSubdlKey] = useState(s.subdlApiKey ?? "");
+  const [subdlMsg, setSubdlMsg] = useState("");
+
   useEffect(() => {
     mountedRef.current = true;
     void appVersion().then((v) => mountedRef.current && setVersion(v));
+    if (isTauri()) {
+      void invoke<boolean>("torrent_is_supported")
+        .then((ok) => mountedRef.current && setTorrentSupported(Boolean(ok)))
+        .catch(() => mountedRef.current && setTorrentSupported(false));
+    }
     const syncSub = () => setSubPref(loadSubPref());
     const onStorage = (e: StorageEvent) => {
       if (!e.key || e.key === "abx.subs.v1") syncSub();
@@ -105,6 +157,8 @@ export function Settings() {
     return () => {
       mountedRef.current = false;
       jfCtlRef.current?.abort();
+      stremioCtlRef.current?.abort();
+      pluginCtlRef.current?.abort();
       window.removeEventListener(SUB_PREF_EVENT, syncSub);
       window.removeEventListener("storage", onStorage);
     };
@@ -114,6 +168,210 @@ export function Settings() {
       setSubPref((prev) => normalizeSubPref({ ...prev, ...s.subtitlePref }));
     }
   }, [s.subtitlePref]);
+  useEffect(() => {
+    setSubdlKey(s.subdlApiKey ?? "");
+  }, [s.subdlApiKey]);
+
+  const refreshStremioState = () => {
+    const cfg = getStremioConfig();
+    setStremioAddons(cfg.addons);
+    setTorrentMode(Boolean(cfg.torrentMode));
+  };
+
+  const handleAddStremioAddon = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const raw = stremioUrl.trim();
+    if (!raw || stremioBusy) return;
+    stremioCtlRef.current?.abort();
+    const ctl = new AbortController();
+    stremioCtlRef.current = ctl;
+    setStremioBusy(true);
+    setStremioMsg("Fetching addon manifest...");
+    try {
+      await fetchStremioManifest(raw, ctl.signal);
+      const addon = await addStremioAddon(raw, ctl.signal);
+      clearResolveCache();
+      if (!mountedRef.current || ctl.signal.aborted) return;
+      refreshStremioState();
+      setStremioUrl("");
+      setStremioMsg(`Added ${addon.name} (v${addon.version})`);
+    } catch (err) {
+      if (!mountedRef.current || ctl.signal.aborted) return;
+      setStremioMsg(err instanceof Error ? err.message : "Could not add Stremio addon");
+    } finally {
+      if (mountedRef.current) setStremioBusy(false);
+    }
+  };
+
+  const handleToggleStremioAddon = (addon: StremioAddonConfig, enabled: boolean) => {
+    toggleStremioAddon(addon.id, enabled);
+    clearResolveCache();
+    refreshStremioState();
+  };
+
+  const handleRemoveStremioAddon = (addon: StremioAddonConfig) => {
+    removeStremioAddon(addon.id);
+    clearResolveCache();
+    refreshStremioState();
+    setStremioMsg(`Removed ${addon.name}`);
+  };
+
+  const handleTorrentModeToggle = (enabled: boolean) => {
+    updateStremioConfig({ torrentMode: enabled });
+    clearResolveCache();
+    refreshStremioState();
+    setStremioMsg(enabled ? "Torrent P2P mode enabled for Stremio addons." : "Torrent P2P mode disabled.");
+  };
+
+  const handleSaveDebrid = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (debridProvider === "none") {
+      saveDebridConfig(null);
+      clearResolveCache();
+      setDebridMsg("Debrid disabled on this device.");
+      return;
+    }
+    const key = debridKey.trim();
+    if (!key) {
+      setDebridMsg("Enter your Debrid API key first.");
+      return;
+    }
+    saveDebridConfig({ provider: debridProvider, apiKey: key, enabled: true });
+    clearResolveCache();
+    setDebridMsg(`Saved ${debridProvider} API key locally.`);
+  };
+
+  const handleClearDebrid = () => {
+    saveDebridConfig(null);
+    clearResolveCache();
+    setDebridProvider("none");
+    setDebridKey("");
+    setDebridMsg("Cleared local Debrid credentials.");
+  };
+
+  const buildManifestFromInput = (rawText: string, sourceUrl?: string): ProviderPluginManifest => {
+    const trimmed = rawText.trim();
+    if (trimmed.startsWith("{")) {
+      const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+      const withDefaults: Record<string, unknown> = {
+        mediaTypes: ["movie", "tv", "anime"],
+        allowedHosts: [],
+        enabled: true,
+        priority: 30,
+        ...parsed,
+      };
+      if (!withDefaults.script && !withDefaults.scriptUrl && sourceUrl) {
+        withDefaults.scriptUrl = sourceUrl;
+      }
+      return validatePluginManifest(withDefaults);
+    }
+
+    const tag = (name: string): string | undefined => {
+      const m = trimmed.match(new RegExp(`^\\s*//\\s*@${name}\\s+(.+)$`, "mi"));
+      return m?.[1]?.trim() || undefined;
+    };
+    const slugBase = (tag("id") ?? tag("name") ?? (sourceUrl ? new URL(sourceUrl).hostname.replace(/\./g, "-") : "custom-plugin"))
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 48);
+    const id = slugBase || `plugin-${Date.now().toString(36)}`;
+    const name = tag("name") || id;
+    const version = tag("version") || "1.0.0";
+    const mediaTypesRaw = (tag("mediaTypes") || "movie,tv,anime")
+      .split(/[\s,]+/)
+      .map((v) => v.trim().toLowerCase())
+      .filter((v): v is "movie" | "tv" | "anime" => v === "movie" || v === "tv" || v === "anime");
+    const allowedHosts = (tag("allowedHosts") || "")
+      .split(/[\s,]+/)
+      .map((v) => v.trim())
+      .filter(Boolean);
+
+    const candidate: Record<string, unknown> = {
+      id,
+      name,
+      version,
+      description: tag("description"),
+      mediaTypes: mediaTypesRaw.length ? mediaTypesRaw : ["movie", "tv", "anime"],
+      allowedHosts,
+      script: trimmed,
+      enabled: true,
+      priority: 30,
+    };
+    return validatePluginManifest(candidate);
+  };
+
+  const handleInstallPluginFromUrl = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const raw = pluginUrl.trim();
+    if (!raw || pluginBusy) return;
+    let safeUrl: string;
+    try {
+      safeUrl = validatePluginFetchUrl(raw);
+    } catch (err) {
+      setPluginMsg(err instanceof Error ? err.message : "Invalid plugin URL");
+      return;
+    }
+    pluginCtlRef.current?.abort();
+    const ctl = new AbortController();
+    pluginCtlRef.current = ctl;
+    setPluginBusy(true);
+    setPluginMsg("Fetching plugin...");
+    try {
+      const res = await httpFetch(safeUrl);
+      if (!mountedRef.current || ctl.signal.aborted) return;
+      if (res.status < 200 || res.status >= 300) throw new Error(`HTTP ${res.status} loading plugin`);
+      const manifest = buildManifestFromInput(res.body, safeUrl);
+      const installed = installPlugin(manifest);
+      clearResolveCache();
+      if (!mountedRef.current || ctl.signal.aborted) return;
+      setPlugins(listPlugins());
+      setPluginUrl("");
+      setPluginMsg(`Installed ${installed.name} (v${installed.version})`);
+    } catch (err) {
+      if (!mountedRef.current || ctl.signal.aborted) return;
+      setPluginMsg(err instanceof Error ? err.message : "Could not install plugin from URL");
+    } finally {
+      if (mountedRef.current) setPluginBusy(false);
+    }
+  };
+
+  const handleInstallPluginFromPaste = (e: React.FormEvent) => {
+    e.preventDefault();
+    const raw = pluginPaste.trim();
+    if (!raw || pluginBusy) return;
+    try {
+      const manifest = buildManifestFromInput(raw);
+      const installed = installPlugin(manifest);
+      clearResolveCache();
+      setPlugins(listPlugins());
+      setPluginPaste("");
+      setPluginMsg(`Installed ${installed.name} (v${installed.version})`);
+    } catch (err) {
+      setPluginMsg(err instanceof Error ? err.message : "Could not install pasted plugin");
+    }
+  };
+
+  const handleTogglePlugin = (plugin: ProviderPluginManifest, enabled: boolean) => {
+    togglePlugin(plugin.id, enabled);
+    clearResolveCache();
+    setPlugins(listPlugins());
+  };
+
+  const handleRemovePlugin = (plugin: ProviderPluginManifest) => {
+    removePlugin(plugin.id);
+    clearResolveCache();
+    setPlugins(listPlugins());
+    setPluginMsg(`Removed ${plugin.name}`);
+  };
+
+  const handleSaveSubdlKey = (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmed = subdlKey.trim();
+    updateSettings({ subdlApiKey: trimmed || undefined });
+    clearSubtitleSearchCache();
+    setSubdlMsg(trimmed ? "SubDL API key saved locally." : "SubDL API key cleared.");
+  };
 
   const patchSubPref = (patch: Partial<SubPref>) => {
     const next = saveSubPref({
@@ -400,6 +658,211 @@ export function Settings() {
         </div>
       </section>
 
+      <section className="panel" id="extensions">
+        <h2>Addons, Debrid &amp; Plugins</h2>
+        <p className="muted">Configure external Stremio addons, Debrid unrestricting, and sandboxed JS providers on this device.</p>
+
+        <div className="source-block">
+          <div className="source-head">
+            <div>
+              <strong>Stremio Addons</strong>
+              <p className="muted">Install Stremio HTTP or Debrid-backed addon manifests by URL.</p>
+            </div>
+            <span className="badge">{stremioAddons.filter((a) => a.enabled).length} active</span>
+          </div>
+
+          <form className="field-row" onSubmit={handleAddStremioAddon} style={{ marginTop: 12 }}>
+            <input
+              type="url"
+              value={stremioUrl}
+              onChange={(e) => setStremioUrl(e.target.value)}
+              placeholder="https://addon.example/manifest.json"
+              disabled={stremioBusy}
+            />
+            <button type="submit" className="btn btn-glass sm" disabled={stremioBusy || !stremioUrl.trim()}>
+              <Icon name="plus" size={14} /> {stremioBusy ? "Adding..." : "Add addon"}
+            </button>
+          </form>
+          {stremioMsg && <p className="muted" style={{ marginTop: 8 }}>{stremioMsg}</p>}
+
+          {stremioAddons.length > 0 && (
+            <div className="source-grid" style={{ marginTop: 12 }}>
+              {stremioAddons.map((addon) => (
+                <div className="source-tile" key={addon.id}>
+                  <label className="setting-line toggle" style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ minWidth: 0 }}>
+                      <strong>{addon.name}</strong>
+                      <span className="muted">
+                        v{addon.version} · {(addon.types ?? []).join(", ") || "streams"}
+                      </span>
+                    </div>
+                    <input
+                      type="checkbox"
+                      className="switch"
+                      checked={addon.enabled}
+                      onChange={(e) => handleToggleStremioAddon(addon, e.target.checked)}
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    className="icon-btn"
+                    onClick={() => handleRemoveStremioAddon(addon)}
+                    aria-label={`Remove ${addon.name}`}
+                    style={{ marginLeft: 8 }}
+                  >
+                    <Icon name="x" size={14} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <label className="setting-line toggle" style={{ marginTop: 14 }}>
+            <div>
+              <strong>Allow P2P torrent streams</strong>
+              <span className="muted">
+                {torrentSupported
+                  ? "Allow Stremio addons to return magnet streams when Debrid or HTTP is unavailable."
+                  : "Requires desktop torrent support (unavailable in this runtime)."}
+              </span>
+            </div>
+            <input
+              type="checkbox"
+              className="switch"
+              checked={torrentMode}
+              disabled={!torrentSupported && !torrentMode}
+              onChange={(e) => handleTorrentModeToggle(e.target.checked)}
+            />
+          </label>
+        </div>
+
+        <div className="source-block">
+          <div className="source-head">
+            <div>
+              <strong>Debrid</strong>
+              <p className="muted">Stored locally on this device only — never synced to your account.</p>
+            </div>
+            <span className="badge">{debridProvider === "none" ? "Off" : debridProvider}</span>
+          </div>
+
+          <form className="field-grid" onSubmit={handleSaveDebrid} style={{ marginTop: 12 }}>
+            <label className="field">
+              <span>Service</span>
+              <select
+                className="sub-select"
+                value={debridProvider}
+                onChange={(e) => {
+                  const next = e.target.value as DebridProvider | "none";
+                  setDebridProvider(next);
+                  setDebridMsg("");
+                }}
+              >
+                <option value="none">None (disabled)</option>
+                <option value="realdebrid">Real-Debrid</option>
+                <option value="torbox">TorBox</option>
+                <option value="alldebrid">AllDebrid</option>
+              </select>
+            </label>
+            <label className="field">
+              <span>API key</span>
+              <input
+                type="password"
+                value={debridKey}
+                onChange={(e) => setDebridKey(e.target.value)}
+                placeholder={debridProvider === "none" ? "Select a Debrid service first" : "Paste your Debrid API key"}
+                disabled={debridProvider === "none"}
+              />
+            </label>
+            <div className="btn-row">
+              <button type="submit" className="btn btn-glass sm">Save Debrid</button>
+              <button type="button" className="btn btn-glass sm" onClick={handleClearDebrid}>Clear</button>
+            </div>
+            {debridMsg && <p className="muted">{debridMsg}</p>}
+          </form>
+        </div>
+
+        <div className="source-block">
+          <div className="source-head">
+            <div>
+              <strong>JS Provider Plugins</strong>
+              <p className="muted">Install sandboxed JavaScript stream providers from a URL, manifest JSON, or script.</p>
+            </div>
+            <span className="badge">{plugins.filter((p) => p.enabled).length} active</span>
+          </div>
+
+          <form className="field-row" onSubmit={handleInstallPluginFromUrl} style={{ marginTop: 12 }}>
+            <input
+              type="url"
+              value={pluginUrl}
+              onChange={(e) => setPluginUrl(e.target.value)}
+              placeholder="https://example.com/plugin.json or plugin.js"
+              disabled={pluginBusy}
+            />
+            <button type="submit" className="btn btn-glass sm" disabled={pluginBusy || !pluginUrl.trim()}>
+              <Icon name="link" size={14} /> {pluginBusy ? "Installing..." : "Install URL"}
+            </button>
+          </form>
+
+          <form onSubmit={handleInstallPluginFromPaste} style={{ marginTop: 10 }}>
+            <textarea
+              value={pluginPaste}
+              onChange={(e) => setPluginPaste(e.target.value)}
+              placeholder='Paste JSON manifest or JS script (optional headers: // @id my-plugin, // @name My Plugin)'
+              rows={4}
+              style={{
+                width: "100%",
+                padding: "10px 14px",
+                borderRadius: 11,
+                background: "rgba(0, 0, 0, 0.35)",
+                border: "1px solid var(--line-2)",
+                color: "var(--fg)",
+                fontFamily: "monospace",
+                fontSize: 12,
+                resize: "vertical",
+              }}
+            />
+            <div className="btn-row" style={{ marginTop: 8 }}>
+              <button type="submit" className="btn btn-glass sm" disabled={pluginBusy || !pluginPaste.trim()}>
+                <Icon name="plus" size={14} /> Install pasted plugin
+              </button>
+            </div>
+          </form>
+          {pluginMsg && <p className="muted" style={{ marginTop: 8 }}>{pluginMsg}</p>}
+
+          {plugins.length > 0 && (
+            <div className="source-grid" style={{ marginTop: 12 }}>
+              {plugins.map((plugin) => (
+                <div className="source-tile" key={plugin.id}>
+                  <label className="setting-line toggle" style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ minWidth: 0 }}>
+                      <strong>{plugin.name}</strong>
+                      <span className="muted">
+                        v{plugin.version} · {plugin.mediaTypes.join(", ")}
+                      </span>
+                    </div>
+                    <input
+                      type="checkbox"
+                      className="switch"
+                      checked={plugin.enabled}
+                      onChange={(e) => handleTogglePlugin(plugin, e.target.checked)}
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    className="icon-btn"
+                    onClick={() => handleRemovePlugin(plugin)}
+                    aria-label={`Remove ${plugin.name}`}
+                    style={{ marginLeft: 8 }}
+                  >
+                    <Icon name="x" size={14} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </section>
+
       <section className="panel">
         <h2>Playback</h2>
         <div className="setting-line">
@@ -542,7 +1005,7 @@ export function Settings() {
         <label className="setting-line toggle">
           <div>
             <strong>Auto-fetch online subtitles</strong>
-            <span className="muted">Search Wyzie &amp; OpenSubtitles automatically when no track matches your primary language.</span>
+            <span className="muted">Search Wyzie, OpenSubtitles &amp; SubDL automatically when no track matches your primary language.</span>
           </div>
           <input
             type="checkbox"
@@ -551,6 +1014,32 @@ export function Settings() {
             onChange={(e) => patchSubPref({ autoFetchOnline: e.target.checked })}
           />
         </label>
+
+        <form className="field" onSubmit={handleSaveSubdlKey} style={{ marginTop: 14 }}>
+          <span>SubDL API key (optional · device-only)</span>
+          <div className="field-row">
+            <input
+              type="password"
+              value={subdlKey}
+              onChange={(e) => setSubdlKey(e.target.value)}
+              placeholder="Paste your SubDL API key"
+            />
+            <button type="submit" className="btn btn-glass sm">Save</button>
+            <button
+              type="button"
+              className="btn btn-glass sm"
+              onClick={() => {
+                setSubdlKey("");
+                updateSettings({ subdlApiKey: undefined });
+                clearSubtitleSearchCache();
+                setSubdlMsg("SubDL API key cleared.");
+              }}
+            >
+              Clear
+            </button>
+          </div>
+          {subdlMsg && <span className="muted">{subdlMsg}</span>}
+        </form>
 
         <div className="setting-line">
           <div><strong>Font size</strong></div>
