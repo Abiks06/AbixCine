@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+import { clearAnimeMappingCache, seedAnimeMappings } from "../lib/animeMapping";
 import { episodeMatches, parseEpisode, titleMatches } from "../sources/local";
 import { parseName } from "../lib/library";
 import {
@@ -348,6 +349,161 @@ describe("deterministic season reconciliation & canonical normalizer", () => {
       s: 1,
       e: 14,
       a: "dub",
+    });
+  });
+
+  describe("animeMapping-backed normalizer integration", () => {
+    afterEach(() => {
+      clearAnimeMappingCache();
+    });
+
+    it("enriches TMDB anime seasons with cour splits and resolves exact courEpisode and malId", () => {
+      seedAnimeMappings({
+        anibridge: {
+          "tmdb_show:120089:s1": {
+            "anilist:140960": { "1-12": "1-12" },
+            "mal:50265": { "1-12": "1-12" },
+            "anilist:142838": { "13-25": "1-13" },
+            "mal:50602": { "13-25": "1-13" },
+          },
+          "tmdb_show:120089:s2": {
+            "anilist:158927": { "1-12": "1-12" },
+            "mal:53887": { "1-12": "1-12" },
+          },
+        },
+      });
+
+      const tmdb = normalizeTmdbSeasons(
+        [
+          { season_number: 1, name: "Season 1", episode_count: 25, air_date: "2022-04-09" },
+          { season_number: 2, name: "Season 2", episode_count: 12, air_date: "2023-10-07" },
+        ],
+        "tmdb:tv:120089",
+        120089,
+      );
+
+      expect(tmdb.seasons[0].cours).toHaveLength(2);
+      expect(tmdb.seasons[0].cours?.[0]).toMatchObject({ anilistId: 140960, malId: 50265, startEpisode: 1, endEpisode: 12 });
+      expect(tmdb.seasons[0].cours?.[1]).toMatchObject({ anilistId: 142838, malId: 50602, startEpisode: 13, endEpisode: 25 });
+      expect(tmdb.seasons[1]).toMatchObject({ anilistId: 158927, malId: 53887 });
+
+      const detail: MediaDetail = {
+        key: "tmdb:tv:120089",
+        tmdbId: 120089,
+        kind: "anime",
+        title: "SPY x FAMILY",
+        overview: "",
+        genres: [],
+        seasons: tmdb.seasons,
+        cast: [],
+        crew: [],
+        related: [],
+      };
+
+      const cour2Req = resolvePlaybackRequest(detail, 1, 15, "sub");
+      expect(cour2Req).toMatchObject({
+        season: 1,
+        episode: 15,
+        courEpisode: 3,
+        media: {
+          key: "tmdb:tv:120089",
+          tmdbId: 120089,
+          anilistId: 142838,
+          malId: 50602,
+        },
+      });
+    });
+
+    it("folds untagged split cours sharing a TMDB season while keeping explicit Season 2 separate", () => {
+      seedAnimeMappings({
+        fribb: [
+          {
+            type: "TV",
+            anilist_id: 141391,
+            mal_id: 50307,
+            themoviedb_id: { tv: 200001 },
+            season: { tmdb: 1 },
+          },
+          {
+            type: "TV",
+            anilist_id: 150000,
+            mal_id: 51000,
+            themoviedb_id: { tv: 200001 },
+            season: { tmdb: 1 },
+            episode_offset: { tmdb: 13 },
+          },
+          {
+            type: "TV",
+            anilist_id: 154587,
+            mal_id: 52991,
+            themoviedb_id: { tv: 209867 },
+            season: { tmdb: 1 },
+          },
+          {
+            type: "TV",
+            anilist_id: 182255,
+            mal_id: 59978,
+            themoviedb_id: { tv: 209867 },
+            season: { tmdb: 1 },
+            episode_offset: { tmdb: 28 },
+          },
+        ],
+      });
+
+      // Untagged split cour ("The Separation") lacks "Part 2" in its title but maps to same TMDB S1 with offset 13
+      const tybwNodes: RawAnilistNode[] = [
+        {
+          id: 141391,
+          idMal: null,
+          format: "TV",
+          status: "FINISHED",
+          episodes: 13,
+          seasonYear: 2022,
+          startDate: { year: 2022, month: 10, day: 11 },
+          title: { english: "Bleach: Thousand-Year Blood War", romaji: "Bleach: Sennen Kessen-hen" },
+        },
+        {
+          id: 150000,
+          idMal: null,
+          format: "TV",
+          status: "FINISHED",
+          episodes: 13,
+          seasonYear: 2023,
+          startDate: { year: 2023, month: 7, day: 8 },
+          title: { english: "Bleach: Thousand-Year Blood War - The Separation", romaji: "Bleach: Sennen Kessen-hen - Ketsubetsu-tan" },
+        },
+      ];
+
+      const tybw = reconcileAnimeSeasons(tybwNodes, "anilist:141391");
+      expect(tybw.seasons).toHaveLength(1);
+      expect(tybw.seasons[0].episodeCount).toBe(26);
+      expect(tybw.seasons[0].cours).toHaveLength(2);
+      expect(tybw.seasons[0].cours?.[0].malId).toBe(50307);
+      expect(tybw.seasons[0].cours?.[1]).toMatchObject({ malId: 51000, startEpisode: 14, endEpisode: 26 });
+
+      // Explicit "Season 2" remains separate even when TMDB puts it under season 1 with episode_offset 28
+      const frierenNodes: RawAnilistNode[] = [
+        {
+          id: 154587,
+          idMal: 52991,
+          format: "TV",
+          status: "FINISHED",
+          episodes: 28,
+          seasonYear: 2023,
+          title: { english: "Frieren: Beyond Journey's End", romaji: "Sousou no Frieren" },
+        },
+        {
+          id: 182255,
+          idMal: 59978,
+          format: "TV",
+          status: "FINISHED",
+          episodes: 24,
+          seasonYear: 2026,
+          title: { english: "Frieren: Beyond Journey's End Season 2", romaji: "Sousou no Frieren 2nd Season" },
+        },
+      ];
+      const frieren = reconcileAnimeSeasons(frierenNodes, "anilist:154587");
+      expect(frieren.seasons).toHaveLength(2);
     });
   });
 });

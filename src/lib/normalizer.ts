@@ -1,3 +1,9 @@
+import {
+  areSameTmdbSeasonCoursSync,
+  getTmdbSeasonMappingSync,
+  resolveAnimeIdsSync,
+  resolveCourEpisodeMappingSync,
+} from "./animeMapping";
 import { stripHtml } from "./format";
 import type { CanonicalSeason, Episode, Media, MediaDetail, PlaybackRequest, SeasonCour } from "./types";
 
@@ -182,6 +188,7 @@ export function normalizeTmdbSeasons(
     }
 
     const isUpcoming = !!airDate && airDate > nowIso;
+    const mapped = tmdbId ? getTmdbSeasonMappingSync(tmdbId, num, epCount) : undefined;
     seasons.push({
       number: num,
       name,
@@ -190,6 +197,9 @@ export function normalizeTmdbSeasons(
       airDate,
       status: isUpcoming ? "upcoming" : "aired",
       key: seriesKey,
+      ...(mapped?.anilistId ? { anilistId: mapped.anilistId } : {}),
+      ...(mapped?.malId ? { malId: mapped.malId } : {}),
+      ...(mapped?.cours ? { cours: mapped.cours } : {}),
     });
   }
 
@@ -241,6 +251,7 @@ export function reconcileAnimeSeasons(
     const title = node.title?.english || node.title?.romaji || `Season`;
     const epCount = resolveAnilistEpisodeCount(node);
     const year = node.seasonYear ?? node.startDate?.year ?? undefined;
+    const malId = node.idMal ?? resolveAnimeIdsSync({ anilistId: node.id }).malId;
     const isShortOrSpecial = isShortOrSpecialNode(node, rootFormat);
     const isMainlineFormat = MAINLINE_FORMATS.has(node.format ?? "") && !isShortOrSpecial;
 
@@ -255,12 +266,12 @@ export function reconcileAnimeSeasons(
           status: "special",
           key: `anilist:${node.id}`,
           anilistId: node.id,
-          malId: node.idMal ?? undefined,
+          malId,
           cours: [
             {
               key: `anilist:${node.id}`,
               anilistId: node.id,
-              malId: node.idMal ?? undefined,
+              malId,
               title,
               startEpisode: 1,
               endEpisode: epCount,
@@ -286,7 +297,7 @@ export function reconcileAnimeSeasons(
         status: "upcoming",
         key: `anilist:${node.id}`,
         anilistId: node.id,
-        malId: node.idMal ?? undefined,
+        malId,
       });
       continue;
     }
@@ -328,7 +339,18 @@ export function reconcileAnimeSeasons(
           foldIntoPrev = true;
         }
       }
+
+      if (
+        !foldIntoPrev &&
+        prevSeason.anilistId != null &&
+        (explicitSeason == null || explicitSeason === prevSeason.number) &&
+        areSameTmdbSeasonCoursSync(prevSeason.anilistId, node.id)
+      ) {
+        foldIntoPrev = true;
+      }
     }
+
+    const nodeMalId = node.idMal ?? resolveAnimeIdsSync({ anilistId: node.id }).malId;
 
     if (foldIntoPrev && prevSeason) {
       const startEpisode = prevSeason.episodeCount + 1;
@@ -336,7 +358,7 @@ export function reconcileAnimeSeasons(
       const cour: SeasonCour = {
         key: `anilist:${node.id}`,
         anilistId: node.id,
-        malId: node.idMal ?? undefined,
+        malId: nodeMalId,
         title,
         startEpisode,
         endEpisode,
@@ -351,7 +373,7 @@ export function reconcileAnimeSeasons(
       const cour: SeasonCour = {
         key: `anilist:${node.id}`,
         anilistId: node.id,
-        malId: node.idMal ?? undefined,
+        malId: nodeMalId,
         title,
         startEpisode: 1,
         endEpisode: epCount,
@@ -366,7 +388,7 @@ export function reconcileAnimeSeasons(
         status: node.status === "RELEASING" ? "airing" : "aired",
         key: `anilist:${node.id}`,
         anilistId: node.id,
-        malId: node.idMal ?? undefined,
+        malId: nodeMalId,
         cours: [cour],
       });
     }
@@ -675,12 +697,27 @@ export function resolvePlaybackRequest(
 
   if (cour) {
     const courEpisode = Math.max(1, epNum - cour.startEpisode + 1);
+    const isTmdbDetail = detail.key.startsWith("tmdb:");
+    const baseMalId = cour.malId ?? targetSeason?.malId ?? detail.malId;
+    const baseAnilistId = cour.anilistId ?? detail.anilistId;
+    const mappedIds =
+      baseMalId == null || baseAnilistId == null || detail.tmdbId == null
+        ? resolveAnimeIdsSync({
+            anilistId: baseAnilistId,
+            malId: baseMalId,
+            tmdbId: detail.tmdbId,
+            key: detail.key,
+            kind: detail.kind,
+            season: seasonNum,
+            episode: epNum,
+          })
+        : undefined;
     const mediaForCour: Media = {
       ...detail,
-      key: cour.key,
-      anilistId: cour.anilistId ?? detail.anilistId,
-      malId: cour.malId ?? targetSeason?.malId ?? detail.malId,
-      tmdbId: detail.tmdbId,
+      key: isTmdbDetail ? detail.key : cour.key,
+      anilistId: baseAnilistId ?? mappedIds?.anilistId,
+      malId: baseMalId ?? mappedIds?.malId,
+      tmdbId: detail.tmdbId ?? mappedIds?.tmdbId,
     };
     return {
       media: mediaForCour,
@@ -690,6 +727,33 @@ export function resolvePlaybackRequest(
       absolute,
       audio,
     };
+  }
+
+  if (detail.kind === "anime" || detail.key.startsWith("anilist:")) {
+    const mapped = resolveCourEpisodeMappingSync({
+      key: detail.key,
+      kind: detail.kind,
+      tmdbId: detail.tmdbId,
+      anilistId: detail.anilistId,
+      malId: detail.malId,
+      season: seasonNum,
+      episode: epNum,
+    });
+    if (mapped.malId || mapped.anilistId || mapped.tmdbId || mapped.source) {
+      return {
+        media: {
+          ...detail,
+          anilistId: detail.anilistId ?? mapped.anilistId,
+          malId: detail.malId ?? mapped.malId,
+          tmdbId: detail.tmdbId ?? mapped.tmdbId,
+        },
+        season: seasonNum,
+        episode: epNum,
+        courEpisode: mapped.courEpisode,
+        absolute,
+        audio,
+      };
+    }
   }
 
   return {
