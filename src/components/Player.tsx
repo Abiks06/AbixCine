@@ -395,7 +395,11 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
   prefRef.current = pref;
 
   const patchPref = useCallback((patch: Partial<SubPref>) => {
-    const next = normalizeSubPref({ ...prefRef.current, ...patch });
+    const syncedPatch: Partial<SubPref> =
+      patch.on !== undefined && patch.mode === undefined
+        ? { ...patch, mode: patch.on ? (prefRef.current.mode === "off" ? "on" : prefRef.current.mode) : "off" }
+        : patch;
+    const next = normalizeSubPref({ ...prefRef.current, ...syncedPatch });
     prefRef.current = next;
     setPref(next);
     saveSubPref(next);
@@ -465,7 +469,23 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     setHlsSubsState({ url: activeCurUrlRef.current, tracks });
   }, []);
   const setNativeSubs = useCallback((tracks: UnifiedSubTrack[]) => {
-    setNativeSubsState({ url: activeCurUrlRef.current, tracks });
+    const url = activeCurUrlRef.current;
+    setNativeSubsState((prev) => {
+      if (
+        prev.url === url &&
+        prev.tracks.length === tracks.length &&
+        prev.tracks.every(
+          (t, i) =>
+            t.id === tracks[i].id &&
+            t.label === tracks[i].label &&
+            t.lang === tracks[i].lang &&
+            t.nativeTrack === tracks[i].nativeTrack,
+        )
+      ) {
+        return prev;
+      }
+      return { url, tracks };
+    });
   }, []);
   const appendOnlineSub = useCallback((url: string, track: UnifiedSubTrack) => {
     setOnlineSubsState((prev) => {
@@ -546,6 +566,8 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
   const [offset, setOffset] = useState(() => (subMemoryKey ? loadSubTrackMemory(subMemoryKey)?.offsetSec ?? 0 : 0));
   const offsetRef = useRef(offset);
   offsetRef.current = offset;
+  const [timingShiftUnsupported, setTimingShiftUnsupported] = useState(false);
+  const timingShiftUnsupportedRef = useRef(false);
 
   const [activePrimaryCues, setActivePrimaryCues] = useState<SubtitleCue[]>([]);
   const [activeSecondaryCues, setActiveSecondaryCues] = useState<SubtitleCue[]>([]);
@@ -651,15 +673,16 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     }
 
     if (v) {
-      list.forEach((track) => {
-        if (track.origin === "native" && track.nativeTrack) {
-          track.nativeTrack.mode = track.id === finalPrim || track.id === finalSec ? "hidden" : "disabled";
+      for (let i = 0; i < v.textTracks.length; i++) {
+        const tt = v.textTracks[i];
+        const isNativeSelected =
+          (prim?.origin === "native" && prim.nativeTrack === tt) ||
+          (sec?.origin === "native" && sec.nativeTrack === tt);
+        if (!hls) {
+          tt.mode = isNativeSelected ? "hidden" : "disabled";
+        } else if (tt.mode === "showing") {
+          tt.mode = "hidden";
         }
-      });
-      if (hls) {
-        Array.from(v.textTracks).forEach((tt) => {
-          if (tt.mode === "showing") tt.mode = "hidden";
-        });
       }
     }
 
@@ -677,14 +700,13 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     if (t) lastActiveSubRef.current = { prim: t.id, sec: nextSec };
     applySubPair(t ? t.id : null, nextSec);
     const baseLang = t ? langBase(t.lang) : undefined;
-    patchPref(t ? { on: true, ...(baseLang && baseLang !== "und" ? { lang: baseLang } : {}) } : { on: false });
     persistTrackMemory(
       t
         ? { enabled: true, selectedLang: baseLang, selectedLabel: t.label }
         : { enabled: false },
     );
     flash(`Subtitles: ${t ? t.label : "Off"}`);
-  }, [applySubPair, patchPref, persistTrackMemory]);
+  }, [applySubPair, persistTrackMemory]);
 
   const chooseSecondary = useCallback((id: string | null) => {
     manualSecondary.current = true;
@@ -748,6 +770,8 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     lastSigRef.current = { prim: "", sec: "" };
     setActivePrimaryCues([]);
     setActiveSecondaryCues([]);
+    timingShiftUnsupportedRef.current = false;
+    setTimingShiftUnsupported(false);
     const restoredOffset = subMemoryKeyRef.current ? (loadSubTrackMemory(subMemoryKeyRef.current)?.offsetSec ?? 0) : 0;
     offsetRef.current = restoredOffset;
     setOffset(restoredOffset);
@@ -774,9 +798,7 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     const mem = subMemoryKey ? loadSubTrackMemory(subMemoryKey) : null;
     const wantOn =
       mem?.enabled !== undefined
-        ? p.mode === "off"
-          ? false
-          : mem.enabled
+        ? mem.enabled
         : shouldAutoEnableSubtitles(p, audio, originalLanguage);
 
     if (!wantOn || !list.length) {
@@ -832,13 +854,12 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
       applySubPair(last.prim, sec);
       const t = list.find((x) => x.id === last.prim);
       const baseLang = t ? langBase(t.lang) : undefined;
-      patchPref({ on: true, ...(baseLang && baseLang !== "und" ? { lang: baseLang } : {}) });
       persistTrackMemory({ enabled: true, selectedLang: baseLang, selectedLabel: t?.label });
       flash(`Subtitles: ${t?.label ?? "On"}`);
       return;
     }
     chooseSub(findPreferredSub(list, prefRef.current)?.id ?? null);
-  }, [applySubPair, chooseSub, findPreferredSub, patchPref, persistTrackMemory]);
+  }, [applySubPair, chooseSub, findPreferredSub, persistTrackMemory]);
 
   const cycleSub = useCallback(() => {
     const list = subTracksRef.current;
@@ -896,6 +917,10 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
   }, []);
 
   const nudge = useCallback((delta: number) => {
+    if (timingShiftUnsupportedRef.current) {
+      flash("Timing offset isn't supported on active-cue-only tracks");
+      return;
+    }
     const n = Math.round((offsetRef.current + delta) * 10) / 10;
     offsetRef.current = n;
     setOffset(n);
@@ -904,6 +929,10 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
   }, [persistTrackMemory]);
 
   const resetOffset = useCallback(() => {
+    if (timingShiftUnsupportedRef.current) {
+      flash("Timing offset isn't supported on active-cue-only tracks");
+      return;
+    }
     offsetRef.current = 0;
     setOffset(0);
     persistTrackMemory({ offsetSec: 0 });
@@ -1065,7 +1094,9 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
 
   // Optional auto-fetch online subtitles when enabled, subtitles aren't off, and candidate lacks user's language.
   useEffect(() => {
-    if (!cur || isEmbed || !pref.autoFetchOnline || pref.mode === "off") return;
+    const mem = subMemoryKey ? loadSubTrackMemory(subMemoryKey) : null;
+    if (!cur || isEmbed || !pref.autoFetchOnline) return;
+    if (mem?.enabled === false || (pref.mode === "off" && mem?.enabled !== true)) return;
     if (cur.kind === "hls" && !hlsReady) return;
     const wantLang = langBase(pref.lang || "en");
     const fetchKey = `${cur.url}::${wantLang}`;
@@ -1146,7 +1177,7 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
       window.clearTimeout(timer);
       ctl.abort();
     };
-  }, [cur?.url, cur?.kind, isEmbed, hlsReady, pref.autoFetchOnline, pref.mode, pref.lang, media?.tmdbId, media?.imdbId, media?.title, media?.year, media?.kind, title, epSeason, epNumber, patchTrackData, appendOnlineSub]);
+  }, [cur?.url, cur?.kind, isEmbed, hlsReady, subMemoryKey, pref.autoFetchOnline, pref.mode, pref.lang, media?.tmdbId, media?.imdbId, media?.title, media?.year, media?.kind, title, epSeason, epNumber, patchTrackData, appendOnlineSub]);
 
   const findHlsTextTrack = useCallback((v: HTMLVideoElement, track: UnifiedSubTrack, activeHlsIndex: number): TextTrack | null => {
     const vTracks = Array.from(v.textTracks).filter((t) => t.kind === "subtitles" || t.kind === "captions");
@@ -1169,6 +1200,10 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
         setActivePrimaryCues([]);
         setActiveSecondaryCues([]);
       }
+      if (timingShiftUnsupportedRef.current) {
+        timingShiftUnsupportedRef.current = false;
+        setTimingShiftUnsupported(false);
+      }
       return;
     }
 
@@ -1179,28 +1214,36 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     const offSec = offsetRef.current;
     const hls = hlsRef.current;
 
-    const resolve = (track: UnifiedSubTrack | undefined): SubtitleCue[] => {
-      if (!track) return [];
+    const resolve = (track: UnifiedSubTrack | undefined): { cues: SubtitleCue[]; activeFallback: boolean } => {
+      if (!track) return { cues: [], activeFallback: false };
       const cached = trackDataRef.current[track.id]?.cues ?? track.cues;
-      if (cached) return activeCuesAt(cached, tSec, offSec);
+      if (cached) return { cues: activeCuesAt(cached, tSec, offSec), activeFallback: false };
       if (track.origin === "native" && track.nativeTrack) {
-        if (track.nativeTrack.mode === "disabled") track.nativeTrack.mode = "hidden";
+        if (track.nativeTrack.mode !== "hidden") track.nativeTrack.mode = "hidden";
         const { cues, usingActiveFallback } = textTrackToCues(track.nativeTrack, track.id);
-        return usingActiveFallback ? cues : activeCuesAt(cues, tSec, offSec);
+        return { cues: usingActiveFallback ? cues : activeCuesAt(cues, tSec, offSec), activeFallback: usingActiveFallback };
       }
       if (track.origin === "hls" && hls) {
         const tt = findHlsTextTrack(v, track, hls.subtitleTrack);
-        if (!tt) return [];
+        if (!tt) return { cues: [], activeFallback: false };
         if (tt.mode === "disabled" && track.hlsIndex === hls.subtitleTrack) tt.mode = "hidden";
         if (tt.mode === "showing") tt.mode = "hidden";
         const { cues, usingActiveFallback } = textTrackToCues(tt, track.id);
-        return usingActiveFallback ? cues : activeCuesAt(cues, tSec, offSec);
+        return { cues: usingActiveFallback ? cues : activeCuesAt(cues, tSec, offSec), activeFallback: usingActiveFallback };
       }
-      return [];
+      return { cues: [], activeFallback: false };
     };
 
-    const nextPrim = resolve(primTrack);
-    const nextSec = resolve(secTrack);
+    const primRes = resolve(primTrack);
+    const secRes = resolve(secTrack);
+    const nextPrim = primRes.cues;
+    const nextSec = secRes.cues;
+    const nextUnsupported = primTrack ? primRes.activeFallback : secTrack ? secRes.activeFallback : false;
+    if (nextUnsupported !== timingShiftUnsupportedRef.current) {
+      timingShiftUnsupportedRef.current = nextUnsupported;
+      setTimingShiftUnsupported(nextUnsupported);
+    }
+
     const primSig = cueSignature(nextPrim);
     const secSig = cueSignature(nextSec);
 
@@ -1238,6 +1281,17 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
 
       const nextP = resolveTt(primTrack);
       const nextS = resolveTt(secTrack);
+      for (let i = 0; i < v.textTracks.length; i++) {
+        const tt = v.textTracks[i];
+        const isActive = tt === nextP || tt === nextS;
+        if (tt.mode === "showing") {
+          tt.mode = isActive || hls ? "hidden" : "disabled";
+        } else if (!hls && !isActive && tt.mode !== "disabled") {
+          tt.mode = "disabled";
+        } else if (!hls && isActive && tt.mode !== "hidden") {
+          tt.mode = "hidden";
+        }
+      }
       if (nextP !== boundPrimary) {
         boundPrimary?.removeEventListener("cuechange", run);
         boundPrimary = nextP;
@@ -1367,17 +1421,44 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     };
 
     const refreshSubtitles = () => {
-      if (hlsRef.current) return;
-      const tracks: UnifiedSubTrack[] = Array.from(v.textTracks)
-        .map((track, i) => ({ track, i }))
-        .filter(({ track }) => track.kind === "subtitles" || track.kind === "captions")
-        .map(({ track, i }) => ({
-          id: `native-sub-${i}`,
+      if (hlsRef.current) {
+        for (let i = 0; i < v.textTracks.length; i++) {
+          if (v.textTracks[i].mode === "showing") v.textTracks[i].mode = "hidden";
+        }
+        return;
+      }
+      const activeCur = curRef.current;
+      const hasEmbeddedCandidate =
+        activeCur?.providerId === "local" &&
+        Boolean(activeCur.subtitles?.some((t) => t.source === "embedded" || t.streamIndex != null || t.url.startsWith("embedded://")));
+      if (hasEmbeddedCandidate) {
+        for (let i = 0; i < v.textTracks.length; i++) {
+          if (v.textTracks[i].mode !== "disabled") v.textTracks[i].mode = "disabled";
+        }
+        setNativeSubs([]);
+        return;
+      }
+      const currentPrim = selectedSubRef.current;
+      const currentSec = secondarySubRef.current;
+      const tracks: UnifiedSubTrack[] = [];
+      for (let i = 0; i < v.textTracks.length; i++) {
+        const track = v.textTracks[i];
+        if (track.kind !== "subtitles" && track.kind !== "captions") continue;
+        const id = `native-sub-${i}`;
+        const isSelected = id === currentPrim || id === currentSec;
+        if (track.mode === "showing") {
+          track.mode = isSelected ? "hidden" : "disabled";
+        } else if (!isSelected && track.mode !== "disabled") {
+          track.mode = "disabled";
+        }
+        tracks.push({
+          id,
           label: track.label || track.language || `Track ${i + 1}`,
           lang: track.language || "und",
           origin: "native" as const,
           nativeTrack: track,
-        }));
+        });
+      }
       setNativeSubs(tracks);
     };
 
@@ -2339,6 +2420,7 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
               onSelectPrimary={chooseSub}
               onSelectSecondary={chooseSecondary}
               offset={offset}
+              timingUnsupported={timingShiftUnsupported}
               onNudge={nudge}
               onResetOffset={resetOffset}
               onUploadFiles={(files) => void addSubtitleFiles(files)}

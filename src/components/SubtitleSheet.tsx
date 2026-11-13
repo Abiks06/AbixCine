@@ -42,6 +42,7 @@ export interface SubtitleSheetProps {
   onSelectPrimary: (id: string | null) => void;
   onSelectSecondary: (id: string | null) => void;
   offset: number;
+  timingUnsupported?: boolean;
   onNudge: (delta: number) => void;
   onResetOffset: () => void;
   onUploadFiles: (files: FileList | File[]) => void;
@@ -95,6 +96,7 @@ export const SubtitleSheet = memo(function SubtitleSheet({
   onSelectPrimary,
   onSelectSecondary,
   offset,
+  timingUnsupported = false,
   onNudge,
   onResetOffset,
   onUploadFiles,
@@ -266,20 +268,23 @@ export const SubtitleSheet = memo(function SubtitleSheet({
               <Icon name="clock" size={12} /> Timing <kbd>[</kbd><kbd>]</kbd>
             </div>
             <span className="ps-sub">
-              {offset === 0 ? "In sync" : `${offset > 0 ? "+" : ""}${offset.toFixed(1)}s`}
+              {timingUnsupported ? "Active cues only" : offset === 0 ? "In sync" : `${offset > 0 ? "+" : ""}${offset.toFixed(1)}s`}
             </span>
           </div>
           <div className="sub-timing-grid">
-            <button type="button" onClick={() => onNudge(-1)}>−1s</button>
-            <button type="button" onClick={() => onNudge(-0.5)}>−0.5</button>
-            <button type="button" onClick={() => onNudge(-0.1)}>−0.1</button>
-            <button type="button" className={offset === 0 ? "on" : ""} onClick={onResetOffset}>
+            <button type="button" disabled={timingUnsupported} onClick={() => onNudge(-1)}>−1s</button>
+            <button type="button" disabled={timingUnsupported} onClick={() => onNudge(-0.5)}>−0.5</button>
+            <button type="button" disabled={timingUnsupported} onClick={() => onNudge(-0.1)}>−0.1</button>
+            <button type="button" disabled={timingUnsupported} className={offset === 0 ? "on" : ""} onClick={onResetOffset}>
               Reset
             </button>
-            <button type="button" onClick={() => onNudge(0.1)}>+0.1</button>
-            <button type="button" onClick={() => onNudge(0.5)}>+0.5</button>
-            <button type="button" onClick={() => onNudge(1)}>+1s</button>
+            <button type="button" disabled={timingUnsupported} onClick={() => onNudge(0.1)}>+0.1</button>
+            <button type="button" disabled={timingUnsupported} onClick={() => onNudge(0.5)}>+0.5</button>
+            <button type="button" disabled={timingUnsupported} onClick={() => onNudge(1)}>+1s</button>
           </div>
+          {timingUnsupported && (
+            <p className="ps-note">Timing offset isn't supported for this track because the player only exposes live active cues.</p>
+          )}
         </div>
       )}
 
