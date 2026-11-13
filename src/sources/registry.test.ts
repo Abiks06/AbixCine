@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PlaybackRequest } from "../lib/types";
 import { getEntry, saveProgress } from "../lib/progress";
-import { getSettings } from "../lib/settings";
+import { applyRemoteSettings, getSettings, updateSettings } from "../lib/settings";
+import { animeDirectProvider } from "./anime-direct";
 import {
   CIRCUIT_STREAK_THRESHOLD,
   isCircuitOpen,
@@ -12,6 +13,9 @@ import {
   resetHealth,
   serverHealthScore,
 } from "./health";
+import { jellyfinProvider } from "./jellyfin";
+import { kisskhProvider } from "./kisskh";
+import { localProvider, sidecarTrack } from "./local";
 import {
   availableSources,
   candLine,
@@ -23,15 +27,27 @@ import {
   resolveSources,
   score,
   validateManifest,
+  verifyEmbed,
 } from "./registry";
 import { isUrlTokenExpired, normalizeHeaders, proxyUrl, unwrapProxyUrl, type Sniffed } from "./native";
-import type { SourceProvider, StreamCandidate } from "./types";
+import { inferSubtitleMeta, isThumbnailSubtitleUrl, type SourceProvider, type StreamCandidate } from "./types";
 
-const { mockSniff } = vi.hoisted(() => ({ mockSniff: vi.fn() }));
+const { mockSniff, mockHttpFetch, mockInvoke, mockIsTauri } = vi.hoisted(() => ({
+  mockSniff: vi.fn(),
+  mockHttpFetch: vi.fn(),
+  mockInvoke: vi.fn(),
+  mockIsTauri: vi.fn(() => false),
+}));
 vi.mock("./native", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./native")>()),
   native: true,
   sniff: mockSniff,
+  httpFetch: mockHttpFetch,
+}));
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: mockInvoke,
+  isTauri: mockIsTauri,
+  convertFileSrc: (path: string) => `asset://localhost/${encodeURIComponent(path)}`,
 }));
 
 const request = (key: string): PlaybackRequest => ({
@@ -63,6 +79,10 @@ beforeEach(() => {
 afterEach(() => {
   clearResolveCache();
   resetHealth();
+  mockHttpFetch.mockReset();
+  mockInvoke.mockReset();
+  mockIsTauri.mockReturnValue(false);
+  vi.unstubAllGlobals();
 });
 
 describe("source ranking", () => {
@@ -422,5 +442,329 @@ describe("hedged probing & circuit breaker", () => {
     const out = await probeHedged(batch, { concurrency: 3, maxWinners: 1 });
     expect(out.find((c) => c.providerId === "winner")?.probe?.ok).toBe(true);
     expect(aborted).toEqual(expect.arrayContaining(["slow1", "slow2"]));
+  });
+});
+
+describe("subtitle metadata inference & source providers", () => {
+  it("filters thumbnail, sprite, storyboard, preview VTT and BIF URLs", () => {
+    expect(isThumbnailSubtitleUrl("https://cdn.example/sub.vtt", "thumbnails")).toBe(true);
+    expect(isThumbnailSubtitleUrl("https://cdn.example/thumbnails.vtt?token=1")).toBe(true);
+    expect(isThumbnailSubtitleUrl("https://cdn.example/thumbs/sprite.vtt")).toBe(true);
+    expect(isThumbnailSubtitleUrl("https://cdn.example/storyboard.vtt")).toBe(true);
+    expect(isThumbnailSubtitleUrl("https://cdn.example/preview.vtt")).toBe(true);
+    expect(isThumbnailSubtitleUrl("https://cdn.example/bif/12345")).toBe(true);
+    expect(isThumbnailSubtitleUrl("https://cdn.example/video.bif?sig=1")).toBe(true);
+    expect(isThumbnailSubtitleUrl(proxyUrl("https://cdn.example/thumbnails.vtt"))).toBe(true);
+
+    expect(isThumbnailSubtitleUrl("https://cdn.example/subs/en.vtt")).toBe(false);
+    expect(isThumbnailSubtitleUrl("https://cdn.example/subs/ja.ass?token=abc")).toBe(false);
+    expect(isThumbnailSubtitleUrl("https://cdn.example/subs/es.srt", "captions")).toBe(false);
+  });
+
+  it("infers format, language codes, locales, and tags across URLs and filenames", () => {
+    expect(inferSubtitleMeta("https://cdn.example/subs/en.vtt?expires=123")).toMatchObject({
+      lang: "en",
+      label: "English",
+      format: "vtt",
+      isDefault: false,
+      isForced: false,
+      isHearingImpaired: false,
+    });
+    expect(inferSubtitleMeta("https://cdn.example/subs/pt-br/movie.forced.ass?tok=1")).toMatchObject({
+      lang: "pt-br",
+      format: "ass",
+      isForced: true,
+    });
+    expect(inferSubtitleMeta("https://cdn.example/ja/ep_01_signs.ssa")).toMatchObject({
+      lang: "ja",
+      format: "ssa",
+      isForced: true,
+    });
+    expect(inferSubtitleMeta("https://cdn.example/drama/ep1_english.srt")).toMatchObject({
+      lang: "en",
+      label: "English",
+      format: "srt",
+    });
+    expect(inferSubtitleMeta("https://cdn.example/id/98765/fr.vtt")).toMatchObject({
+      lang: "fr",
+      label: "French",
+      format: "vtt",
+    });
+    expect(inferSubtitleMeta("https://cdn.example/subs/id.vtt")).toMatchObject({
+      lang: "id",
+      label: "Indonesian",
+      format: "vtt",
+    });
+    expect(inferSubtitleMeta("Movie.2024.spa.sdh.default.srt")).toMatchObject({
+      lang: "es",
+      format: "srt",
+      isDefault: true,
+      isHearingImpaired: true,
+    });
+    expect(inferSubtitleMeta("Movie.eng.hi.cc.vtt")).toMatchObject({
+      lang: "en",
+      format: "vtt",
+      isHearingImpaired: true,
+    });
+    expect(inferSubtitleMeta("https://cdn.example/subs/de.vtt").lang).toBe("de");
+    expect(inferSubtitleMeta("https://cdn.example/subs/ger.vtt").lang).toBe("de");
+    expect(inferSubtitleMeta("https://cdn.example/subs/ar.vtt").lang).toBe("ar");
+    expect(inferSubtitleMeta("https://cdn.example/subs/ko.vtt").lang).toBe("ko");
+    expect(inferSubtitleMeta("https://cdn.example/subs/zh.vtt").lang).toBe("zh");
+    expect(inferSubtitleMeta("https://cdn.example/subs/12345.vtt")).toMatchObject({
+      lang: "und",
+      label: "Subtitles",
+      format: "vtt",
+    });
+  });
+
+  it("extracts sidecar metadata and probes embedded text subtitles in localProvider", async () => {
+    expect(sidecarTrack("D:/Movies/The.English.Patient.1996.fr.forced.ass", "The.English.Patient.1996")).toMatchObject({
+      lang: "fr",
+      format: "ass",
+      isForced: true,
+      source: "sidecar",
+    });
+
+    mockIsTauri.mockReturnValue(true);
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "scan_library") {
+        return {
+          files: [
+            {
+              path: "D:/Anime/Frieren/Frieren - 01.mkv",
+              name: "Frieren - 01",
+              size: 500_000_000,
+              subs: ["D:/Anime/Frieren/Subs/Frieren - 01.en.forced.ass"],
+            },
+          ],
+          errors: [],
+        };
+      }
+      if (cmd === "probe_local_subtitles") {
+        return [
+          { index: 2, codec: "ass", lang: "eng", title: "Full Subtitles", isDefault: true, isForced: false, isHearingImpaired: false, isText: true },
+          { index: 3, codec: "hdmv_pgs_subtitle", lang: "jpn", title: "PGS", isDefault: false, isForced: false, isHearingImpaired: false, isText: false },
+        ];
+      }
+      return [];
+    });
+
+    const settings = { ...getSettings(), libraryPaths: ["D:/Anime"] };
+    const req: PlaybackRequest = {
+      media: { key: "anilist:154587", kind: "anime", title: "Frieren", overview: "", genres: [] },
+      episode: 1,
+      audio: "sub",
+    };
+    const res = await localProvider.find(req, settings, new AbortController().signal);
+    expect(res).toHaveLength(1);
+    expect(res[0].subtitles).toEqual([
+      expect.objectContaining({ lang: "en", format: "ass", isForced: true, source: "sidecar" }),
+      expect.objectContaining({
+        lang: "en",
+        url: "embedded://2",
+        streamIndex: 2,
+        format: "ass",
+        isDefault: true,
+        source: "embedded",
+      }),
+    ]);
+
+    // Defensive handling when probe_local_subtitles throws
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "scan_library") {
+        return {
+          files: [{ path: "D:/Anime/Frieren/Frieren - 02.mkv", name: "Frieren - 02", size: 500_000_000, subs: [] }],
+          errors: [],
+        };
+      }
+      throw new Error("ffprobe missing");
+    });
+    const resErr = await localProvider.find(
+      { ...req, episode: 2 },
+      { ...settings, libraryPaths: ["D:/Anime2"] },
+      new AbortController().signal,
+    );
+    expect(resErr).toHaveLength(1);
+    expect(resErr[0].subtitles).toEqual([]);
+  });
+
+  it("infers sniffed subtitle metadata and filters thumbnails in verifyEmbed and kisskhProvider", async () => {
+    mockSniff.mockResolvedValue({
+      url: "https://media.example/master.m3u8",
+      kind: "hls",
+      headers: { referer: "https://embed.example/" },
+      subtitles: [
+        "https://cdn.example/thumbs/thumbnails.vtt",
+        "https://cdn.example/subs/es.forced.srt?v=2",
+        "https://cdn.example/subs/pt-br/track.ass",
+      ],
+      verified: true,
+      quality: 1080,
+    });
+
+    const verified = await verifyEmbed(candidate("vidfast"));
+    expect(verified.subtitles).toHaveLength(2);
+    expect(verified.subtitles?.[0]).toMatchObject({
+      lang: "es",
+      format: "srt",
+      isForced: true,
+      source: "stream",
+    });
+    expect(verified.subtitles?.[1]).toMatchObject({
+      lang: "pt-br",
+      format: "ass",
+      source: "stream",
+    });
+
+    mockHttpFetch.mockImplementation(async (url: string) => {
+      if (url.includes("/Search")) {
+        return { status: 200, url, body: JSON.stringify([{ id: 77, title: "My Drama", episodesCount: 16 }]) };
+      }
+      return { status: 200, url, body: JSON.stringify({ id: 77, title: "My Drama", episodes: [{ id: 501, number: 1 }] }) };
+    });
+    const kissRes = await kisskhProvider.find(
+      {
+        media: { key: "tmdb:tv:999", kind: "tv", title: "My Drama", overview: "", genres: [], originalLanguage: "ko" },
+        season: 1,
+        episode: 1,
+      },
+      getSettings(),
+      new AbortController().signal,
+    );
+    expect(kissRes).toHaveLength(1);
+    expect(kissRes[0].subtitles).toHaveLength(2);
+    expect(kissRes[0].subtitles?.[0]).toMatchObject({ lang: "es", format: "srt", source: "stream" });
+  });
+
+  it("filters thumbnails and preserves ASS/default metadata in animeDirectProvider", async () => {
+    const cfg = {
+      src: "https://cdn.example/master.m3u8",
+      subtitles: [
+        { src: "https://cdn.example/thumbnails.vtt", kind: "thumbnails", label: "Thumbnails" },
+        { src: "https://cdn.example/ara.ass?tok=1", lang: "en", label: "Arabic (-)", default: true },
+        { src: "https://cdn.example/eng.vtt", lang: "en", label: "English" },
+      ],
+    };
+    const key = new TextEncoder().encode("otaku-embed-v1");
+    const jsonBytes = new TextEncoder().encode(JSON.stringify(cfg));
+    const xored = jsonBytes.map((b, i) => b ^ key[i % key.length]);
+    const b64 = btoa(String.fromCharCode(...xored));
+    mockHttpFetch.mockResolvedValue({
+      status: 200,
+      url: "https://zokoanime.video/stream/mal/21/1/sub",
+      body: `<script>window.__P="${b64}"</script>`,
+    });
+
+    const out = await animeDirectProvider.find(
+      {
+        media: { key: "anilist:21", kind: "anime", title: "One Piece", overview: "", genres: [], malId: 21 },
+        episode: 1,
+        audio: "sub",
+      },
+      getSettings(),
+      new AbortController().signal,
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0].subtitles).toHaveLength(2);
+    expect(out[0].subtitles?.[0]).toMatchObject({
+      lang: "ar",
+      label: "Arabic",
+      format: "ass",
+      isDefault: true,
+      source: "stream",
+    });
+    expect(out[0].subtitles?.[1]).toMatchObject({
+      lang: "en",
+      label: "English",
+      format: "vtt",
+      isDefault: false,
+      source: "stream",
+    });
+  });
+
+  it("preserves ASS codec URLs and subtitle metadata flags in jellyfinProvider", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            Items: [
+              {
+                Id: "item-1",
+                Name: "Test Film",
+                ProductionYear: 2024,
+                Height: 1080,
+                MediaSources: [
+                  {
+                    Id: "src-1",
+                    MediaStreams: [
+                      { Type: "Subtitle", Index: 2, Codec: "ass", Language: "eng", DisplayTitle: "English ASS", IsDefault: true, IsForced: false, IsHearingImpaired: false, IsTextSubtitleStream: true },
+                      { Type: "Subtitle", Index: 3, Codec: "subrip", Language: "spa", DisplayTitle: "Spanish SDH", IsDefault: false, IsForced: false, IsHearingImpaired: true, IsTextSubtitleStream: true },
+                      { Type: "Subtitle", Index: 4, Codec: "pgssub", Language: "jpn", IsTextSubtitleStream: false },
+                    ],
+                  },
+                ],
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      ),
+    );
+
+    const jfSettings = {
+      ...getSettings(),
+      jellyfin: { enabled: true, url: "http://localhost:8096", apiKey: "secret" },
+    };
+    const res = await jellyfinProvider.find(
+      { media: { key: "tmdb:movie:1", kind: "movie", title: "Test Film", year: 2024, overview: "", genres: [] } },
+      jfSettings,
+      new AbortController().signal,
+    );
+    expect(res).toHaveLength(1);
+    expect(res[0].subtitles).toHaveLength(2);
+    expect(res[0].subtitles?.[0]).toMatchObject({
+      lang: "en",
+      format: "ass",
+      isDefault: true,
+      isForced: false,
+      isHearingImpaired: false,
+      source: "stream",
+    });
+    expect(res[0].subtitles?.[0].url).toContain("/Subtitles/2/0/Stream.ass?");
+    expect(res[0].subtitles?.[1]).toMatchObject({
+      lang: "es",
+      format: "vtt",
+      isHearingImpaired: true,
+      source: "stream",
+    });
+    expect(res[0].subtitles?.[1].url).toContain("/Subtitles/3/0/Stream.vtt?");
+  });
+
+  it("syncs subtitlePref cleanly and mirrors to abx.subs.v1 without wiping existing defaults", () => {
+    localStorage.setItem("abx.subs.v1", JSON.stringify({ size: "m", lang: "en", bgOpacity: 0.72 }));
+    const events: unknown[] = [];
+    const onSubPref = (e: Event) => events.push((e as CustomEvent).detail);
+    window.addEventListener("abx:subpref", onSubPref);
+
+    try {
+      applyRemoteSettings({ subtitlePref: { size: "l", font: "mono" } });
+      expect(getSettings().subtitlePref).toEqual({ size: "l", lang: "en", bgOpacity: 0.72, font: "mono" });
+      expect(JSON.parse(localStorage.getItem("abx.subs.v1")!)).toEqual({
+        size: "l",
+        lang: "en",
+        bgOpacity: 0.72,
+        font: "mono",
+      });
+      expect(events).toHaveLength(1);
+
+      updateSettings({ subtitlePref: { size: "xl", lang: "ja", bgOpacity: 0.72, font: "mono" } });
+      expect(getSettings().subtitlePref).toMatchObject({ size: "xl", lang: "ja", font: "mono" });
+    } finally {
+      window.removeEventListener("abx:subpref", onSubPref);
+      localStorage.removeItem("abx.subs.v1");
+      localStorage.removeItem("abx.settings.v1");
+    }
   });
 });

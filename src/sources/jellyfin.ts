@@ -1,5 +1,5 @@
 import type { PlaybackRequest } from "../lib/types";
-import type { SourceProvider, StreamCandidate, SubtitleTrack } from "./types";
+import { inferSubtitleMeta, type SourceProvider, type StreamCandidate, type SubtitleFormat, type SubtitleTrack } from "./types";
 
 /**
  * Jellyfin (or Emby, same API shape) media server. Uses an API key created in
@@ -9,7 +9,11 @@ interface JellyfinMediaStream {
   Type?: string;
   Language?: string;
   Index?: number;
+  Codec?: string;
   IsTextSubtitleStream?: boolean;
+  IsDefault?: boolean;
+  IsForced?: boolean;
+  IsHearingImpaired?: boolean;
   DisplayTitle?: string;
   Title?: string;
 }
@@ -74,11 +78,23 @@ function tracksFor(base: string, key: string, item: JellyfinItem, want?: "sub" |
   }
   const subtitles: SubtitleTrack[] = streams
     .filter((st) => st.Type === "Subtitle" && (st.IsTextSubtitleStream ?? true) && st.Index != null)
-    .map((st) => ({
-      lang: String(st.Language ?? "und"),
-      label: st.DisplayTitle || st.Title || st.Language || `Track ${st.Index}`,
-      url: `${b}/Videos/${item.Id}/${sourceId}/Subtitles/${st.Index}/0/Stream.vtt?api_key=${encodeURIComponent(key)}`,
-    }));
+    .map((st) => {
+      const rawCodec = String(st.Codec ?? "").toLowerCase().trim();
+      const isAss = rawCodec === "ass" || rawCodec === "ssa";
+      const streamExt = isAss ? rawCodec : "vtt";
+      const format: SubtitleFormat = isAss ? rawCodec : "vtt";
+      const meta = inferSubtitleMeta("", st.Language, st.DisplayTitle || st.Title);
+      return {
+        lang: meta.lang !== "und" ? meta.lang : String(st.Language ?? "und"),
+        label: st.DisplayTitle || st.Title || (meta.label !== "Subtitles" ? meta.label : st.Language || `Track ${st.Index}`),
+        url: `${b}/Videos/${item.Id}/${sourceId}/Subtitles/${st.Index}/0/Stream.${streamExt}?api_key=${encodeURIComponent(key)}`,
+        format,
+        isDefault: Boolean(st.IsDefault || meta.isDefault),
+        isForced: Boolean(st.IsForced || meta.isForced),
+        isHearingImpaired: Boolean(st.IsHearingImpaired || meta.isHearingImpaired),
+        source: "stream",
+      };
+    });
   return { sourceId, audioIndex, audio, subtitles };
 }
 

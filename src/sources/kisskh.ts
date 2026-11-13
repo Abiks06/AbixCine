@@ -2,7 +2,7 @@ import { cached } from "../lib/cache";
 import { normTitle } from "../lib/format";
 import type { MediaDetail, PlaybackRequest } from "../lib/types";
 import { DEFAULT_UA, httpFetch, native, normalizeHeaders, proxyUrl, sniff } from "./native";
-import type { SourceProvider, StreamCandidate } from "./types";
+import { inferSniffedSubtitles, type SourceProvider, type StreamCandidate } from "./types";
 
 /**
  * KissKH: Korean, Chinese, Japanese, Thai and Taiwanese dramas and films with subtitles
@@ -97,7 +97,7 @@ export const kisskhProvider: SourceProvider = {
         via: "sniffed",
         pageUrl: page,
         headers,
-        subtitles: got.subtitles.map((u, i) => ({ lang: "en", label: i ? `English ${i + 1}` : "English", url: proxyUrl(u, headers, page) })),
+        subtitles: inferSniffedSubtitles(got.subtitles, (u) => proxyUrl(u, headers, page)),
         ...(got.verified === true
           ? { probe: { ok: true, latencyMs: Math.round(performance.now() - t0), quality: got.quality ?? undefined } }
           : {}),

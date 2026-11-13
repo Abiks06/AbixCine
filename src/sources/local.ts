@@ -1,13 +1,20 @@
 import { invoke, convertFileSrc, isTauri } from "@tauri-apps/api/core";
 import { normTitle } from "../lib/format";
 import type { PlaybackRequest } from "../lib/types";
-import type { SourceProvider, StreamCandidate, SubtitleTrack } from "./types";
+import {
+  codecToSubtitleFormat,
+  inferSubtitleMeta,
+  type EmbeddedSubtitle,
+  type SourceProvider,
+  type StreamCandidate,
+  type SubtitleTrack,
+} from "./types";
 
 export interface LibFile {
   path: string;
   name: string;
   size: number;
-  /** Sidecar .srt/.vtt files found next to the video. */
+  /** Sidecar .srt/.vtt/.ass/.ssa files found next to the video (or in Subs/ subfolders). */
   subs?: string[];
 }
 
@@ -80,30 +87,58 @@ export function titleMatches(hay: string, req: Pick<PlaybackRequest, "media">) {
     });
 }
 
-const LANGS: Record<string, [string, string]> = {
-  en: ["en", "English"], eng: ["en", "English"], english: ["en", "English"],
-  ja: ["ja", "Japanese"], jp: ["ja", "Japanese"], jpn: ["ja", "Japanese"], japanese: ["ja", "Japanese"],
-  fr: ["fr", "French"], fre: ["fr", "French"], fra: ["fr", "French"], french: ["fr", "French"],
-  es: ["es", "Spanish"], spa: ["es", "Spanish"], spanish: ["es", "Spanish"],
-  de: ["de", "German"], ger: ["de", "German"], deu: ["de", "German"], german: ["de", "German"],
-  pt: ["pt", "Portuguese"], por: ["pt", "Portuguese"], it: ["it", "Italian"], ita: ["it", "Italian"],
-  ar: ["ar", "Arabic"], ara: ["ar", "Arabic"], zh: ["zh", "Chinese"], chi: ["zh", "Chinese"],
-  ko: ["ko", "Korean"], kor: ["ko", "Korean"], ru: ["ru", "Russian"], rus: ["ru", "Russian"],
-  portuguese: ["pt", "Portuguese"], italian: ["it", "Italian"], arabic: ["ar", "Arabic"],
-  chinese: ["zh", "Chinese"], korean: ["ko", "Korean"], russian: ["ru", "Russian"],
-};
-
-/** "Show.S01E02.en.forced.srt" next to "Show.S01E02.mkv" -> English (forced). */
+/** "Show.S01E02.en.forced.ass" next to "Show.S01E02.mkv" -> English · Forced (ass, sidecar). */
 export function sidecarTrack(subPath: string, videoName: string): SubtitleTrack {
   const file = subPath.split(/[\\/]/).pop() ?? subPath;
-  const stem = file.slice(0, file.lastIndexOf("."));
+  const dot = file.lastIndexOf(".");
+  const stem = dot >= 0 ? file.slice(0, dot) : file;
+  const ext = dot >= 0 ? file.slice(dot) : "";
+  const videoStem = stripExt(videoName);
   // Only the part after the video's own name says anything about the track.
-  const rest = stem.toLowerCase().startsWith(videoName.toLowerCase()) ? stem.slice(videoName.length) : stem;
-  const tags = rest.toLowerCase().split(/[ ._-]+/).filter(Boolean);
-  const lang = tags.map((t) => LANGS[t]).find(Boolean);
-  const extra = tags.filter((t) => t === "forced" || t === "sdh" || t === "signs").map((t) => (t === "sdh" ? "SDH" : t));
-  const name = lang?.[1] ?? (rest.replace(/^[ ._-]+/, "") || "Subtitles");
-  return { lang: lang?.[0] ?? "und", label: extra.length ? `${name} (${extra.join(", ")})` : name, url: convertFileSrc(subPath) };
+  const rest = stem.toLowerCase().startsWith(videoStem.toLowerCase()) ? stem.slice(videoStem.length) : stem;
+  const cleanedRest = rest.replace(/^[ ._-]+/, "");
+  const meta = inferSubtitleMeta(`${cleanedRest || "sub"}${ext}`);
+  const isTagOnly = /^(?:forced|sdh|hi|cc|signs|default)$/i.test(cleanedRest);
+  const label = meta.lang === "und" && cleanedRest && !isTagOnly ? cleanedRest : meta.label;
+  return {
+    lang: meta.lang,
+    label,
+    url: convertFileSrc(subPath),
+    ...(meta.format ? { format: meta.format } : {}),
+    isDefault: meta.isDefault,
+    isForced: meta.isForced,
+    isHearingImpaired: meta.isHearingImpaired,
+    source: "sidecar",
+  };
+}
+
+function embeddedTrack(s: EmbeddedSubtitle): SubtitleTrack {
+  const rawTitle = s.title?.trim() || undefined;
+  const meta = inferSubtitleMeta("", s.lang ?? undefined, rawTitle);
+  const format = codecToSubtitleFormat(s.codec) ?? meta.format;
+  const isDefault = Boolean(s.isDefault || meta.isDefault);
+  const isForced = Boolean(s.isForced || meta.isForced);
+  const isHearingImpaired = Boolean(s.isHearingImpaired || meta.isHearingImpaired);
+
+  const langOnlyLabel = meta.lang !== "und" ? inferSubtitleMeta("", meta.lang).label : "Subtitles";
+  let label = meta.label;
+  if (rawTitle && meta.lang !== "und" && !rawTitle.toLowerCase().includes(langOnlyLabel.toLowerCase())) {
+    label = `${langOnlyLabel} · ${rawTitle}`;
+  }
+  if (isForced && !/forced|signs/i.test(label)) label = `${label} · Forced`;
+  if (isHearingImpaired && !/\b(?:sdh|hi|cc)\b|hearing/i.test(label)) label = `${label} · SDH`;
+
+  return {
+    lang: meta.lang,
+    label,
+    url: `embedded://${s.index}`,
+    ...(format ? { format } : {}),
+    isDefault,
+    isForced,
+    isHearingImpaired,
+    source: "embedded",
+    streamIndex: s.index,
+  };
 }
 
 /** Does this file hold the requested episode? Handles multi-episode files and anime absolute numbering. */
@@ -137,9 +172,11 @@ export const localProvider: SourceProvider = {
   category: "local",
   priority: 30,
   isEnabled: (s) => s.libraryPaths.length > 0,
-  async find(req, s) {
+  async find(req, s, signal) {
+    if (signal?.aborted) return [];
     const files = await scanLibrary(s.libraryPaths);
-    const out: StreamCandidate[] = [];
+    if (signal?.aborted) return [];
+    const matched: { file: LibFile; audio: "sub" | "dub" | "dual" }[] = [];
     for (const f of files) {
       // Match against the file name plus its parent folders, since many libraries are "Show/Season 1/01.mkv".
       const hay = f.path.split(/[\\/]/).slice(-3).join(" ");
@@ -156,18 +193,36 @@ export const localProvider: SourceProvider = {
       // One anime entry, two audio tracks: keep files that carry the audio the user picked.
       const audio = audioOf(hay);
       if (req.audio && audio !== "dual" && audio !== req.audio) continue;
-      out.push({
-        providerId: "local",
-        providerName: "Local library",
-        label: f.name + (req.audio ? (audio === "dual" ? " · dual audio" : ` · ${audio}`) : ""),
-        url: convertFileSrc(f.path),
-        kind: f.path.toLowerCase().endsWith(".m3u8") ? "hls" : "file",
-        ...(f.path.toLowerCase().endsWith(".m3u8") ? {} : { localPath: f.path }),
-        quality: qualityOf(f.name),
-        audio: req.audio ? audio : undefined,
-        subtitles: f.subs?.map((p) => sidecarTrack(p, f.name)),
-      });
+      matched.push({ file: f, audio });
     }
-    return out;
+
+    const canProbe = isTauri();
+    return Promise.all(
+      matched.map(async ({ file: f, audio }): Promise<StreamCandidate> => {
+        const isHls = f.path.toLowerCase().endsWith(".m3u8");
+        const sidecars = f.subs?.map((p) => sidecarTrack(p, f.name)) ?? [];
+        const rawEmbedded =
+          canProbe && !isHls && !signal?.aborted
+            ? await invoke<EmbeddedSubtitle[]>("probe_local_subtitles", { path: f.path }).catch(() => [])
+            : [];
+        const embedded = Array.isArray(rawEmbedded)
+          ? rawEmbedded
+              .filter((sub) => sub && sub.isText !== false && typeof sub.index === "number")
+              .map(embeddedTrack)
+          : [];
+        const subtitles = [...sidecars, ...embedded];
+        return {
+          providerId: "local",
+          providerName: "Local library",
+          label: f.name + (req.audio ? (audio === "dual" ? " · dual audio" : ` · ${audio}`) : ""),
+          url: convertFileSrc(f.path),
+          kind: isHls ? "hls" : "file",
+          ...(isHls ? {} : { localPath: f.path }),
+          quality: qualityOf(f.name),
+          audio: req.audio ? audio : undefined,
+          ...(f.subs !== undefined || subtitles.length ? { subtitles } : {}),
+        };
+      }),
+    );
   },
 };

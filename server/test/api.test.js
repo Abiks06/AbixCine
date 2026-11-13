@@ -115,3 +115,72 @@ test("tmdb proxy is off without a key", async () => {
   const r = await call("GET", "/tmdb/movie/popular", null, tokens.accessToken);
   assert.equal(r.statusCode, 501);
 });
+
+test("subtitlePref sync validates, sanitizes, and enforces size limits", async () => {
+  const t = tokens.accessToken;
+
+  // Reject non-plain-object payloads
+  for (const bad of ["string", ["array"], 123, null]) {
+    const r = await call("PUT", "/settings", { subtitlePref: bad }, t);
+    assert.equal(r.statusCode, 400);
+  }
+
+  // Reject oversized subtitlePref (> 2048 bytes)
+  const oversized = await call("PUT", "/settings", { subtitlePref: { lang: "en", pad: "x".repeat(2500) } }, t);
+  assert.equal(oversized.statusCode, 400);
+
+  // Sanitize unknown/nested/unsafe fields while keeping valid primitives
+  const valid = await call(
+    "PUT",
+    "/settings",
+    {
+      subtitlePref: {
+        mode: "on",
+        lang: "PT-BR",
+        secondaryLang: "en",
+        size: "l",
+        font: "rounded",
+        color: "#FFE88A",
+        bg: "glass",
+        bgOpacity: 0.8,
+        edge: "outline",
+        bottomPct: 12,
+        lineHeight: 1.4,
+        preferHearingImpaired: "avoid",
+        autoFetchOnline: true,
+        unknownKey: "should-be-dropped",
+        nested: { deep: true },
+      },
+    },
+    t,
+  );
+  assert.equal(valid.statusCode, 200);
+
+  const synced = (await call("GET", "/sync", null, t)).json();
+  assert.deepEqual(synced.settings.subtitlePref, {
+    mode: "on",
+    lang: "pt-br",
+    secondaryLang: "en",
+    size: "l",
+    font: "rounded",
+    color: "#ffe88a",
+    bg: "glass",
+    bgOpacity: 0.8,
+    edge: "outline",
+    bottomPct: 12,
+    lineHeight: 1.4,
+    preferHearingImpaired: "avoid",
+    autoFetchOnline: true,
+  });
+
+  // Reject invalid color / size values via sanitization
+  const unsafeColor = await call(
+    "PUT",
+    "/settings",
+    { subtitlePref: { size: "m", color: "javascript:alert(1)", bgOpacity: 5 } },
+    t,
+  );
+  assert.equal(unsafeColor.statusCode, 200);
+  const afterUnsafe = (await call("GET", "/sync", null, t)).json();
+  assert.deepEqual(afterUnsafe.settings.subtitlePref, { size: "m" });
+});

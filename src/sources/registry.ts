@@ -21,7 +21,7 @@ import { kisskhProvider } from "./kisskh";
 import { localProvider } from "./local";
 import { isUrlTokenExpired, native, normalizeHeaders, proxyUrl, sniff } from "./native";
 import { availableSources, embedProviders } from "./embeds";
-import type { HedgedProbeOptions, ManifestValidation, SourceProvider, StreamCandidate, VideoSource } from "./types";
+import { inferSniffedSubtitles, type HedgedProbeOptions, type ManifestValidation, type SourceProvider, type StreamCandidate, type VideoSource } from "./types";
 
 /** All known providers. Register new ones here. */
 export const PROVIDERS: SourceProvider[] = [localProvider, jellyfinProvider, animeDirectProvider, kisskhProvider, ...embedProviders];
@@ -257,11 +257,7 @@ export async function verifyEmbed(c: StreamCandidate, signal?: AbortSignal): Pro
     via: "sniffed",
     pageUrl: page,
     headers,
-    subtitles: got.subtitles.map((u, i) => ({
-      lang: "und",
-      label: got.subtitles.length > 1 ? `Track ${i + 1}` : "Subtitles",
-      url: proxyUrl(u, headers, page),
-    })),
+    subtitles: inferSniffedSubtitles(got.subtitles, (u) => proxyUrl(u, headers, page)),
   };
   // The playlist was already fetched and checked in Rust (warming the connection and leaving it
   // cached for the player); files get a quick header check. The player's watchdog is the final test.

@@ -8,11 +8,61 @@ import { tmdbProxy } from "./tmdb.js";
 const EMAIL_RX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const KEY_RX = /^[a-z]+:[a-z0-9:]+$/i; // e.g. tmdb:movie:603, anilist:21
 // Settings that follow the user across devices. Device-specific things (library folders) stay local.
-const SYNCED_SETTINGS = ["preferredQuality", "autoplayNext", "reduceMotion", "animeAudio", "audioByTitle"];
+const SYNCED_SETTINGS = ["preferredQuality", "autoplayNext", "reduceMotion", "animeAudio", "audioByTitle", "subtitlePref"];
 /** Client clocks are trusted for last-write-wins, but never further ahead than this (else a bad clock locks a row forever). */
 const MAX_SKEW_MS = 5 * 60_000;
 const MAX_MEDIA_BYTES = 8 * 1024;
+const MAX_SUBTITLE_PREF_BYTES = 2048;
 const MAX_WATCHLIST = 2000;
+
+const isPlainObject = (v) =>
+  !!v && typeof v === "object" && !Array.isArray(v) && (Object.getPrototypeOf(v) === Object.prototype || Object.getPrototypeOf(v) === null);
+
+const SUBTITLE_ENUMS = {
+  mode: new Set(["auto", "on", "off"]),
+  size: new Set(["xs", "s", "m", "l", "xl"]),
+  font: new Set(["sans", "serif", "mono", "rounded"]),
+  bg: new Set(["glass", "box", "none"]),
+  edge: new Set(["shadow", "outline", "raised", "none"]),
+  preferHearingImpaired: new Set(["any", "avoid", "prefer"]),
+};
+
+function sanitizeSubtitlePref(raw) {
+  if (!isPlainObject(raw)) return null;
+  let serialized;
+  try {
+    serialized = JSON.stringify(raw);
+  } catch {
+    return null;
+  }
+  if (!serialized || serialized.length > MAX_SUBTITLE_PREF_BYTES) return null;
+
+  const clean = {};
+  for (const [key, val] of Object.entries(raw)) {
+    if (key === "on" || key === "autoFetchOnline") {
+      if (typeof val === "boolean") clean[key] = val;
+    } else if (key in SUBTITLE_ENUMS) {
+      if (typeof val === "string" && SUBTITLE_ENUMS[key].has(val)) clean[key] = val;
+    } else if (key === "lang" || key === "secondaryLang") {
+      if (typeof val === "string") {
+        const trimmed = val.trim().toLowerCase();
+        if (trimmed.length <= 24 && /^[a-z0-9_-]*$/.test(trimmed)) clean[key] = trimmed;
+      }
+    } else if (key === "color") {
+      if (typeof val === "string") {
+        const trimmed = val.trim().toLowerCase();
+        if (/^#[0-9a-f]{3,8}$/.test(trimmed)) clean[key] = trimmed;
+      }
+    } else if (key === "bgOpacity") {
+      if (typeof val === "number" && Number.isFinite(val) && val >= 0 && val <= 1) clean[key] = val;
+    } else if (key === "bottomPct") {
+      if (typeof val === "number" && Number.isFinite(val) && val >= 0 && val <= 100) clean[key] = val;
+    } else if (key === "lineHeight") {
+      if (typeof val === "number" && Number.isFinite(val) && val >= 0.5 && val <= 4) clean[key] = val;
+    }
+  }
+  return clean;
+}
 
 /** Parse a client timestamp: reject garbage, clamp the future. */
 function clientTime(v) {
@@ -184,8 +234,15 @@ export async function buildApp({ logger = true } = {}) {
     return { ok: true };
   });
 
-  app.put("/settings", { preHandler: requireUser }, async (req) => {
-    const clean = Object.fromEntries(Object.entries(req.body ?? {}).filter(([k]) => SYNCED_SETTINGS.includes(k)));
+  app.put("/settings", { preHandler: requireUser }, async (req, reply) => {
+    const body = req.body ?? {};
+    if (!isPlainObject(body)) return reply.code(400).send({ error: "bad_request" });
+    const clean = Object.fromEntries(Object.entries(body).filter(([k]) => SYNCED_SETTINGS.includes(k)));
+    if ("subtitlePref" in clean) {
+      const sanitized = sanitizeSubtitlePref(clean.subtitlePref);
+      if (!sanitized) return reply.code(400).send({ error: "bad_request" });
+      clean.subtitlePref = sanitized;
+    }
     await q(
       `INSERT INTO user_settings (user_id, data, updated_at) VALUES ($1, $2, now())
        ON CONFLICT (user_id) DO UPDATE SET data = user_settings.data || EXCLUDED.data, updated_at = now()`,

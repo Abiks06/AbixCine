@@ -1,7 +1,8 @@
 import { cached } from "../lib/cache";
+import { langBase } from "../lib/subtitles";
 import type { PlaybackRequest } from "../lib/types";
 import { DEFAULT_UA, httpFetch, native, normalizeHeaders, proxyUrl, type StreamHeaders } from "./native";
-import type { SourceProvider, StreamCandidate, SubtitleTrack } from "./types";
+import { inferSubtitleMeta, isThumbnailSubtitleUrl, type SourceProvider, type StreamCandidate, type SubtitleTrack } from "./types";
 
 /**
  * Direct anime streams from the HiAnime network's player (the same backend ani-cli and
@@ -24,6 +25,8 @@ interface DecodedSubtitle {
   src?: string;
   lang?: string;
   label?: string;
+  kind?: string;
+  default?: boolean;
 }
 
 interface DecodedConfig {
@@ -102,9 +105,26 @@ export const animeDirectProvider: SourceProvider = {
     const src = typeof cfg?.src === "string" ? cfg.src : undefined;
     if (!src) return [];
     const subtitles: SubtitleTrack[] = (Array.isArray(cfg?.subtitles) ? cfg.subtitles : [])
-      .filter((s): s is DecodedSubtitle & { src: string } => typeof s?.src === "string" && s.src.length > 0)
-      // The player mislabels every track's lang as "en"; the label is the reliable part.
-      .map((s) => ({ lang: String(s.label ?? s.lang ?? "und"), label: String(s.label ?? "Subtitles").replace(/\s*\(-.*\)$/, ""), url: proxyUrl(s.src, STREAM_HEADERS, HOST) }));
+      .filter(
+        (s): s is DecodedSubtitle & { src: string } =>
+          typeof s?.src === "string" && s.src.length > 0 && !isThumbnailSubtitleUrl(s.src, s.kind),
+      )
+      .map((s) => {
+        const cleanLabel = String(s.label ?? "Subtitles").replace(/\s*\(-.*\)$/, "").trim() || "Subtitles";
+        // The player mislabels every track's lang as "en"; the label (or URL) is the reliable part.
+        const meta = inferSubtitleMeta(s.src, undefined, cleanLabel);
+        const lang = langBase(meta.lang !== "und" ? meta.lang : (s.label ?? s.lang ?? "und"));
+        return {
+          lang,
+          label: cleanLabel === "Subtitles" && meta.label !== "Subtitles" ? meta.label : cleanLabel,
+          url: proxyUrl(s.src, STREAM_HEADERS, HOST),
+          ...(meta.format ? { format: meta.format } : {}),
+          isDefault: Boolean(s.default || meta.isDefault),
+          isForced: meta.isForced,
+          isHearingImpaired: meta.isHearingImpaired,
+          source: "stream",
+        };
+      });
     const sk = cfg?.skip ?? {};
     const range = (r?: DecodedRange): [number, number] | undefined =>
       r && typeof r.start === "number" && typeof r.end === "number" && r.end > r.start ? [r.start, r.end] : undefined;
