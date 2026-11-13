@@ -1,3 +1,4 @@
+import { resolveAnimeIds, resolveCourEpisodeMapping } from "../lib/animeMapping";
 import { cached } from "../lib/cache";
 import { langBase } from "../lib/subtitles";
 import type { PlaybackRequest } from "../lib/types";
@@ -48,13 +49,19 @@ function decodeConfig(blob: string): DecodedConfig | null {
 
 const ANILIST = "https://graphql.anilist.co";
 /**
- * MAL id for a request. AniList entries carry it; TMDB anime (one entry with seasons) is
- * matched on AniList by title, using "Season N" for later seasons, and checked by year.
+ * MAL id for a request. Uses cached Fribb/Anibridge ID & cour mappings first, falling back
+ * to AniList GraphQL title search only when no mapping hit is available.
  */
-export async function malIdFor(req: PlaybackRequest): Promise<number | null> {
+export async function malIdFor(req: PlaybackRequest, signal?: AbortSignal): Promise<number | null> {
   if (req.media.malId) return req.media.malId;
+  if (signal?.aborted) return null;
   const kind = req.media.kind;
   if (kind !== "anime" && !req.media.key.startsWith("anilist:")) return null;
+
+  const mapped = await resolveAnimeIds(req, signal);
+  if (mapped.malId) return mapped.malId;
+  if (signal?.aborted) return null;
+
   const season = req.season ?? 1;
   const base = req.media.originalTitle || req.media.title;
   const q = season > 1 ? `${req.media.title} season ${season}` : base;
@@ -63,6 +70,7 @@ export async function malIdFor(req: PlaybackRequest): Promise<number | null> {
       const res = await fetch(ANILIST, {
         method: "POST",
         headers: { "content-type": "application/json", accept: "application/json" },
+        signal,
         body: JSON.stringify({
           query: `query($q:String){ Page(perPage:6){ media(type:ANIME,search:$q,sort:SEARCH_MATCH){ idMal format seasonYear } } }`,
           variables: { q },
@@ -92,9 +100,22 @@ export const animeDirectProvider: SourceProvider = {
   async find(req: PlaybackRequest, _s, signal): Promise<StreamCandidate[]> {
     const isAnime = req.media.kind === "anime" || req.media.key.startsWith("anilist:");
     if (!isAnime || signal.aborted) return [];
-    const mal = await malIdFor(req);
+
+    let mal: number | null = req.media.malId ?? null;
+    let ep = req.courEpisode;
+    if (!mal || (ep == null && req.media.key.startsWith("tmdb:"))) {
+      const mapped = await resolveCourEpisodeMapping(req, signal);
+      if (signal.aborted) return [];
+      if (!mal && mapped.malId) mal = mapped.malId;
+      if (ep == null && (mapped.malId || mapped.anilistId)) {
+        ep = mapped.courEpisode;
+      }
+    }
+    if (!mal) {
+      mal = await malIdFor(req, signal);
+    }
     if (!mal || signal.aborted) return [];
-    const ep = req.courEpisode ?? req.episode ?? 1;
+    ep = ep ?? req.episode ?? 1;
     const audio = req.audio ?? "sub";
     const page = `${HOST}/stream/mal/${mal}/${ep}/${audio}`;
     const res = await httpFetch(page, { Referer: "https://hianime.at/", Origin: "https://hianime.at", "User-Agent": DEFAULT_UA });

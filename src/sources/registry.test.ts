@@ -19,7 +19,7 @@ import {
   serverHealthScore,
 } from "./health";
 import { jellyfinProvider } from "./jellyfin";
-import { kisskhProvider } from "./kisskh";
+import { kisskhProvider, decryptKisskhSubtitle } from "./kisskh";
 import { localProvider, sidecarTrack } from "./local";
 import {
   availableSources,
@@ -1184,5 +1184,85 @@ describe("health recovery, incremental resolve cache & embed hardening", () => {
     } finally {
       localStorage.removeItem("abx.settings.v1");
     }
+  });
+
+  it("decrypts KissKH AES-128-CBC .txt/.txt1 subtitles into playable data: URLs", async () => {
+    const encKey = await crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode("8056483646328763"),
+      { name: "AES-CBC" },
+      false,
+      ["encrypt"],
+    );
+    const iv = new TextEncoder().encode("6852612370185273");
+    const encryptLine = async (plain: string) => {
+      const cipher = await crypto.subtle.encrypt({ name: "AES-CBC", iv }, encKey, new TextEncoder().encode(plain));
+      return btoa(String.fromCharCode(...new Uint8Array(cipher)));
+    };
+
+    const c1 = await encryptLine("Hello from Seoul!");
+    const c2 = await encryptLine("Line one\nLine two");
+    const encryptedSrt = `1\n00:00:01,000 --> 00:00:03,000\n${c1}\n\n2\n00:00:04,000 --> 00:00:06,500\n${c2}\n`;
+
+    const dec = await decryptKisskhSubtitle(encryptedSrt);
+    expect(dec.decrypted).toBe(true);
+    expect(dec.text).toContain("Hello from Seoul!");
+    expect(dec.text).toContain("Line one\nLine two");
+
+    // Unencrypted SRT passes through unchanged
+    const plainSrt = "1\n00:00:01,000 --> 00:00:02,000\nAlready plain\n";
+    const passthrough = await decryptKisskhSubtitle(plainSrt);
+    expect(passthrough.decrypted).toBe(false);
+    expect(passthrough.text).toBe(plainSrt);
+
+    // End-to-end kisskhProvider.find with encrypted .txt1 subtitle from /api/Sub/{epId}
+    mockSniff.mockResolvedValueOnce({
+      url: "https://media.example/kisskh-master.m3u8",
+      kind: "hls",
+      headers: { referer: "https://kisskh.co/" },
+      subtitles: [],
+      verified: true,
+      quality: 1080,
+    });
+    mockHttpFetch.mockImplementation(async (url: string) => {
+      if (url.includes("/Search")) {
+        return { status: 200, url, body: JSON.stringify([{ id: 88, title: "Encrypted Drama", episodesCount: 8 }]) };
+      }
+      if (url.includes("/Drama/")) {
+        return { status: 200, url, body: JSON.stringify({ id: 88, title: "Encrypted Drama", episodes: [{ id: 901, number: 1 }] }) };
+      }
+      if (url.includes("/api/Sub/901")) {
+        return {
+          status: 200,
+          url,
+          body: JSON.stringify([{ src: "https://cdn.kisskh.example/901/en.txt1", label: "English", land: "en", default: true }]),
+        };
+      }
+      if (url === "https://cdn.kisskh.example/901/en.txt1") {
+        return { status: 200, url, body: encryptedSrt };
+      }
+      return { status: 404, url, body: "" };
+    });
+
+    const found = await kisskhProvider.find(
+      {
+        media: { key: "tmdb:tv:8800", kind: "tv", title: "Encrypted Drama", overview: "", genres: [], originalLanguage: "ko" },
+        season: 1,
+        episode: 1,
+      },
+      getSettings(),
+      new AbortController().signal,
+    );
+    expect(found).toHaveLength(1);
+    expect(found[0].subtitles).toHaveLength(1);
+    const track = found[0].subtitles![0];
+    expect(track.lang).toBe("en");
+    expect(track.format).toBe("srt");
+    expect(track.isDefault).toBe(true);
+    expect(track.url).toMatch(/^data:text\/plain;charset=utf-8;base64,/);
+
+    const fetched = await fetch(track.url).then((r) => r.text());
+    expect(fetched).toContain("Hello from Seoul!");
+    expect(fetched).toContain("Line one\nLine two");
   });
 });

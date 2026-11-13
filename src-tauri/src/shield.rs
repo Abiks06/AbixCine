@@ -1,9 +1,11 @@
 //! Network shield and stream sniffer (WebView2).
 //!
-//! Shield: ad, pop-under and tracker hosts are answered with an empty 403 before a request
-//! leaves the machine, in every frame (embeds included). Pop-ups and new windows opened by
-//! frames are swallowed, a frame can't navigate the app away, and pages can't start downloads.
-//! Nothing is shown to the viewer; blocked requests are only counted.
+//! Shield: powered by `brave/adblock-rust` (`adblock::Engine`). Ad, pop-under, crypto-miner,
+//! redirector and tracker requests are answered with an empty 403 before a request leaves the
+//! machine, in every frame (embeds included), and targeted cosmetic/scriptlet rules sanitize
+//! embed overlays and popunder hooks without touching AbixCine's own UI or video players.
+//! Pop-ups and new windows opened by frames are swallowed, a frame can't navigate the app
+//! away, and pages can't start downloads. Blocked requests are only counted.
 //!
 //! Sniffer: an off-screen, muted window loads an embed page with the same shield, nudges its
 //! player to start, and reports the first HLS playlist (or MP4) it requests, together with the
@@ -11,8 +13,18 @@
 //! through the proxy, so the embed page (and its ads) never appear.
 
 use crate::stream::Hdrs;
+use adblock::{
+    lists::{FilterSet, ParseOptions},
+    request::Request as AdblockRequest,
+    resources::{MimeType, Resource, ResourceType},
+    Engine,
+};
+use base64::{engine::general_purpose::STANDARD as B64_STD, Engine as _};
 use serde::Serialize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, OnceLock, RwLock,
+};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -61,11 +73,315 @@ pub const BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartSc
 /// player when they think they're being inspected.
 pub const BLOCKED_URL_PARTS: &[&str] = &["disable-devtool", "devtools-detect", "devtools-detector", "adblock-detect", "fuckadblock", "blockadblock"];
 
+/// Curated EasyList / uBlock ruleset layered over `BLOCKED_HOSTS` and `BLOCKED_URL_PARTS`:
+/// covers local exemptions, additional ad/tracker/redirector domains, crypto miners,
+/// third-party popunder & VAST/VPAID patterns, and safe embed cosmetic/scriptlet rules.
+const CURATED_RULES: &str = r#"
+! Local & Tauri protocol exemptions
+@@||localhost^$important
+@@||127.0.0.1^$important
+@@||abxs.localhost^$important
+@@||tauri.localhost^$important
+@@||asset.localhost^$important
+
+! Additional ad networks, trackers & embed redirectors
+||a.magsrv.com^
+||s.magsrv.com^
+||a.realsrv.com^
+||s.realsrv.com^
+||syndication.exoclick.com^
+||syndication.realsrv.com^
+||cdn.tsyndicate.com^
+||ero-advertising.com^
+||plugrush.com^
+||twinred.com^
+||trafficforce.com^
+||adxpansion.com^
+||protraffic.net^
+||cloudflareinsights.com^
+||alexametrics.com^
+||mc.yandex.com^
+||pixel.facebook.com^
+||bat.bing.com^
+||ads.twitter.com^
+||analytics.tiktok.com^
+
+! Crypto miners
+||coinhive.com^
+||coin-hive.com^
+||authedmine.com^
+||jsecoin.com^
+||crypto-loot.com^
+||cryptoloot.pro^
+||minero.cc^
+||webminepool.com^
+||monero-miner.com^
+||ppoi.org^
+||browsermine.com^
+||coinimp.com^
+||webminerpool.com^
+
+! Pop-under, redirector & ad-tag URL patterns (third-party / script scoped so media is untouched)
+*/popunder*.js$script
+*/pop.js$script,third-party
+*/popup*.js$script,third-party
+/pagead/$script,third-party
+/vast.xml$xmlhttprequest,third-party
+/vpaid$script,third-party
+
+! Targeted cosmetic hide rules for ad overlays & click-hijack layers (never player controls)
+##.adsbytrafficjunky
+##.adsbox
+##.ad-overlay
+##.ads-overlay
+##.pop-overlay
+##.popunder-overlay
+##.exo-ipp
+##.mgbox
+##ins.adsbygoogle
+##[id^="mgid"]
+##[id*="ScriptRoot"]
+##iframe[src*="doubleclick.net"]
+##iframe[src*="googlesyndication.com"]
+##iframe[src*="exosrv.com"]
+##iframe[src*="realsrv.com"]
+##iframe[src*="adsterra.com"]
+##iframe[src*="highperformanceformat.com"]
+##div[style*="z-index: 2147483647"] > a[target="_blank"]
+
+! Safe anti-popup & anti-adblock scriptlets for streaming embed hosts/entities
+vidsrc.*,vidlink.*,2embed.*,embed.*,multiembed.*,moviesapi.*,smashy.*,autoembed.*,vidbinge.*,vidplay.*,megacloud.*,filemoon.*,streamwish.*,doodstream.*,dood.*,mixdrop.*,voe.*,streamtape.*,upstream.*,lulustream.*,vidhide.*,filelions.*,hglink.*,cybervynx.*##+js(nowoif)
+vidsrc.*,vidlink.*,2embed.*,embed.*,multiembed.*,moviesapi.*,smashy.*,autoembed.*,vidbinge.*,vidplay.*,megacloud.*,filemoon.*,streamwish.*,doodstream.*,dood.*,mixdrop.*,voe.*,streamtape.*,upstream.*,lulustream.*,vidhide.*,filelions.*,hglink.*,cybervynx.*##+js(set-constant, canRunAds, true)
+vidsrc.*,vidlink.*,2embed.*,embed.*,multiembed.*,moviesapi.*,smashy.*,autoembed.*,vidbinge.*,vidplay.*,megacloud.*,filemoon.*,streamwish.*,doodstream.*,dood.*,mixdrop.*,voe.*,streamtape.*,upstream.*,lulustream.*,vidhide.*,filelions.*,hglink.*,cybervynx.*##+js(set-constant, isAdBlockActive, false)
+vidsrc.*,vidlink.*,2embed.*,embed.*,multiembed.*,moviesapi.*,smashy.*,autoembed.*,vidbinge.*,vidplay.*,megacloud.*,filemoon.*,streamwish.*,doodstream.*,dood.*,mixdrop.*,voe.*,streamtape.*,upstream.*,lulustream.*,vidhide.*,filelions.*,hglink.*,cybervynx.*##+js(set-constant, adblockDetected, false)
+"#;
+
+const SHIELD_CACHE_FILE: &str = "shield_filters.txt";
+const FILTER_UPDATE_URL: &str =
+    "https://pgl.yoyo.org/adservers/serverlist.php?hostformat=adblockplus&showintro=0&mimetype=plaintext";
+const MAX_CACHE_BYTES: usize = 2 * 1024 * 1024;
+const CACHE_TTL_SECS: u64 = 24 * 60 * 60;
+
 static BLOCKED: AtomicU64 = AtomicU64::new(0);
+static ENGINE: OnceLock<RwLock<Arc<Engine>>> = OnceLock::new();
+static CACHE_INIT: OnceLock<()> = OnceLock::new();
+
+fn shield_resources() -> Vec<Resource> {
+    let nowoif_js = r#"function abxNoWoiF() {
+  if (window.__abxNoWoiF) return;
+  window.__abxNoWoiF = true;
+  const origOpen = window.open;
+  window.open = function(url) {
+    try {
+      if (!url || typeof url !== 'string') return null;
+      const s = url.trim().toLowerCase();
+      if (s === '' || s === 'about:blank' || s.startsWith('http://') || s.startsWith('https://')) {
+        return null;
+      }
+    } catch {}
+    return origOpen ? origOpen.apply(this, arguments) : null;
+  };
+}"#;
+    let set_const_js = r#"function abxSetConstant(prop, val) {
+  try {
+    let parsed;
+    if (val === 'true') parsed = true;
+    else if (val === 'false') parsed = false;
+    else if (val === 'null') parsed = null;
+    else if (val === 'undefined') parsed = undefined;
+    else if (val === 'noopFunc') parsed = function() {};
+    else if (val === 'trueFunc') parsed = function() { return true; };
+    else if (val === 'falseFunc') parsed = function() { return false; };
+    else parsed = val;
+    const parts = String(prop).split('.');
+    let obj = window;
+    for (let i = 0; i < parts.length - 1; i++) {
+      if (!obj[parts[i]] || typeof obj[parts[i]] !== 'object') return;
+      obj = obj[parts[i]];
+    }
+    const leaf = parts[parts.length - 1];
+    Object.defineProperty(obj, leaf, {
+      get: () => parsed,
+      set: () => {},
+      configurable: true
+    });
+  } catch {}
+}"#;
+    vec![
+        Resource {
+            name: "nowoif.js".to_string(),
+            aliases: vec![],
+            kind: ResourceType::Mime(MimeType::ApplicationJavascript),
+            content: B64_STD.encode(nowoif_js),
+            dependencies: vec![],
+            permission: Default::default(),
+        },
+        Resource {
+            name: "set-constant.js".to_string(),
+            aliases: vec![],
+            kind: ResourceType::Mime(MimeType::ApplicationJavascript),
+            content: B64_STD.encode(set_const_js),
+            dependencies: vec![],
+            permission: Default::default(),
+        },
+    ]
+}
+
+pub(crate) fn build_engine(extra_rules: Option<&str>) -> Engine {
+    let mut filter_set = FilterSet::new(false);
+    filter_set.add_filter_list(CURATED_RULES.to_string(), ParseOptions::default());
+
+    let mut host_rules = String::with_capacity(BLOCKED_HOSTS.len() * 24 + BLOCKED_URL_PARTS.len() * 24);
+    for h in BLOCKED_HOSTS {
+        host_rules.push_str("||");
+        host_rules.push_str(h);
+        host_rules.push_str("^\n");
+    }
+    for part in BLOCKED_URL_PARTS {
+        host_rules.push('*');
+        host_rules.push_str(part);
+        host_rules.push_str("*\n");
+    }
+    filter_set.add_filter_list(host_rules, ParseOptions::default());
+
+    if let Some(extra) = extra_rules {
+        if !extra.trim().is_empty() {
+            filter_set.add_filter_list(extra.to_string(), ParseOptions::default());
+        }
+    }
+
+    let mut eng = Engine::new_with_filter_set(filter_set);
+    eng.use_resources(shield_resources());
+    eng
+}
+
+fn engine_lock() -> &'static RwLock<Arc<Engine>> {
+    ENGINE.get_or_init(|| RwLock::new(Arc::new(build_engine(None))))
+}
+
+fn engine() -> Arc<Engine> {
+    match engine_lock().read() {
+        Ok(guard) => Arc::clone(&guard),
+        Err(poisoned) => Arc::clone(&poisoned.into_inner()),
+    }
+}
+
+fn swap_engine_with_extra(extra_rules: &str) {
+    let next = Arc::new(build_engine(Some(extra_rules)));
+    if let Ok(mut guard) = engine_lock().write() {
+        *guard = next;
+    }
+}
+
+fn maybe_refresh_filter_cache(app: &AppHandle) {
+    if CACHE_INIT.set(()).is_err() {
+        return;
+    }
+    let Ok(dir) = app.path().app_local_data_dir() else {
+        return;
+    };
+    let path = dir.join(SHIELD_CACHE_FILE);
+    let allow_remote = std::env::var_os("ABX_NO_FILTER_UPDATE").is_none()
+        && std::env::var_os("ABX_SNIFF_TEST").is_none();
+
+    tauri::async_runtime::spawn(async move {
+        let mut needs_refresh = allow_remote;
+        if let Ok(meta) = tokio::fs::metadata(&path).await {
+            if meta.len() <= MAX_CACHE_BYTES as u64 {
+                if let Ok(text) = tokio::fs::read_to_string(&path).await {
+                    if text.contains("||") {
+                        swap_engine_with_extra(&text);
+                    }
+                }
+            }
+            if let Ok(modified) = meta.modified() {
+                if let Ok(age) = std::time::SystemTime::now().duration_since(modified) {
+                    if age.as_secs() < CACHE_TTL_SECS {
+                        needs_refresh = false;
+                    }
+                }
+            }
+        }
+        if !needs_refresh {
+            return;
+        }
+        let Ok(resp) = crate::stream::client()
+            .get(FILTER_UPDATE_URL)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+        else {
+            return;
+        };
+        if !resp.status().is_success() {
+            return;
+        }
+        let Ok(body) = resp.text().await else {
+            return;
+        };
+        if body.len() > MAX_CACHE_BYTES
+            || !body.contains("||")
+            || body.trim_start().starts_with('<')
+        {
+            return;
+        }
+        if let Some(parent) = path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        let tmp = path.with_extension("txt.tmp");
+        if tokio::fs::write(&tmp, body.as_bytes()).await.is_ok() {
+            let _ = tokio::fs::rename(&tmp, &path).await;
+        }
+        swap_engine_with_extra(&body);
+    });
+}
+
+/// Returns true for local app origins, proxy URLs, and internal browser schemes that must
+/// never be blocked or cosmetically modified.
+pub fn is_exempt_url(uri: &str) -> bool {
+    let lower = uri.trim_start().to_ascii_lowercase();
+    if lower.is_empty()
+        || lower.starts_with("about:")
+        || lower.starts_with("data:")
+        || lower.starts_with("blob:")
+        || lower.starts_with("tauri:")
+        || lower.starts_with("asset:")
+        || lower.starts_with("abxs:")
+        || lower.starts_with("javascript:")
+    {
+        return true;
+    }
+    host_of(uri).is_some_and(|h| {
+        let h = h.trim_end_matches('.').to_ascii_lowercase();
+        h == "localhost" || h.ends_with(".localhost") || h == "127.0.0.1" || h == "[::1]" || h == "::1"
+    })
+}
+
+pub(crate) fn check_network_request_with_engine(
+    eng: &Engine,
+    uri: &str,
+    source_url: &str,
+    request_type: &str,
+    method: &str,
+) -> bool {
+    if is_exempt_url(uri) {
+        return false;
+    }
+    match AdblockRequest::new(uri, source_url, request_type, method) {
+        Ok(req) => eng.check_network_request(&req).should_block(),
+        Err(_) => {
+            let lower = uri.to_ascii_lowercase();
+            BLOCKED_URL_PARTS.iter().any(|p| lower.contains(p))
+        }
+    }
+}
+
+pub fn check_network_request(uri: &str, source_url: &str, request_type: &str) -> bool {
+    check_network_request_with_engine(&engine(), uri, source_url, request_type, "get")
+}
 
 pub fn is_blocked_url(uri: &str) -> bool {
-    let lower = uri.to_ascii_lowercase();
-    host_of(uri).is_some_and(|h| is_blocked_host(&h)) || BLOCKED_URL_PARTS.iter().any(|p| lower.contains(p))
+    check_network_request(uri, "", "other")
 }
 
 pub fn is_blocked_host(host: &str) -> bool {
@@ -75,6 +391,79 @@ pub fn is_blocked_host(host: &str) -> bool {
 
 fn host_of(uri: &str) -> Option<String> {
     url::Url::parse(uri).ok().and_then(|u| u.host_str().map(|h| h.to_string()))
+}
+
+/// Build JS injecting scriptlets (`nowoif`, `set-constant`) for a non-exempt http(s) frame.
+pub(crate) fn build_scriptlet_injection_js(url: &str) -> Option<String> {
+    if is_exempt_url(url) || (!url.starts_with("http://") && !url.starts_with("https://")) {
+        return None;
+    }
+    let res = engine().url_cosmetic_resources(url);
+    let script = res.injected_script.trim();
+    if script.is_empty() {
+        return None;
+    }
+    Some(format!("(() => {{\n  try {{\n{script}\n  }} catch {{}}\n}})();"))
+}
+
+const COMMON_AD_CLASSES: &[&str] = &[
+    "adsbytrafficjunky",
+    "adsbox",
+    "ad-overlay",
+    "ads-overlay",
+    "pop-overlay",
+    "popunder-overlay",
+    "exo-ipp",
+    "mgbox",
+];
+
+/// Build JS injecting cosmetic element-hiding CSS + scriptlets for a non-exempt http(s) frame.
+pub(crate) fn build_cosmetic_injection_js(url: &str) -> Option<String> {
+    if is_exempt_url(url) || (!url.starts_with("http://") && !url.starts_with("https://")) {
+        return None;
+    }
+    let eng = engine();
+    let res = eng.url_cosmetic_resources(url);
+    let mut selectors: Vec<String> = res
+        .hide_selectors
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !res.generichide {
+        selectors.extend(
+            eng.hidden_class_id_selectors(COMMON_AD_CLASSES, std::iter::empty::<&str>(), &res.exceptions)
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+        );
+    }
+    selectors.sort_unstable();
+    selectors.dedup();
+
+    let style_js = if selectors.is_empty() {
+        String::new()
+    } else {
+        let css = format!("{} {{ display: none !important; }}", selectors.join(", "));
+        let Ok(css_json) = serde_json::to_string(&css) else {
+            return None;
+        };
+        format!(
+            "if (!document.querySelector('style[data-abx-shield]')) {{ \
+               const st = document.createElement('style'); \
+               st.setAttribute('data-abx-shield', '1'); \
+               st.textContent = {css_json}; \
+               (document.head || document.documentElement).appendChild(st); \
+             }}\n"
+        )
+    };
+    let script = res.injected_script.trim();
+    if style_js.is_empty() && script.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "(() => {{\n  try {{\n{style_js}{script}\n  }} catch {{}}\n}})();"
+    ))
 }
 
 #[tauri::command]
@@ -142,6 +531,7 @@ pub fn is_sniffed_subtitle(uri: &str, ctype: &str) -> bool {
 #[cfg(windows)]
 mod win {
     use super::*;
+    use std::sync::Mutex;
     use webview2_com::{Microsoft::Web::WebView2::Win32::*, *};
     use windows::core::{Interface, BOOL, HSTRING, PWSTR};
 
@@ -149,6 +539,24 @@ mod win {
         let mut uri = PWSTR::null();
         let _ = req.Uri(&mut uri);
         take_pwstr(uri)
+    }
+
+    unsafe fn method_of_request(req: &ICoreWebView2WebResourceRequest) -> String {
+        let mut m = PWSTR::null();
+        if req.Method(&mut m).is_ok() {
+            let s = take_pwstr(m);
+            if !s.is_empty() {
+                return s;
+            }
+        }
+        "get".to_string()
+    }
+
+    unsafe fn source_of_webview(core: &ICoreWebView2) -> Option<String> {
+        let mut src = PWSTR::null();
+        core.Source(&mut src).ok()?;
+        let s = take_pwstr(src);
+        (!s.is_empty() && s != "about:blank").then_some(s)
     }
 
     unsafe fn req_header(req: &ICoreWebView2WebResourceRequest, name: &str) -> Option<String> {
@@ -161,6 +569,94 @@ mod win {
         let mut v = PWSTR::null();
         headers.GetHeader(&HSTRING::from(name), &mut v).ok()?;
         Some(take_pwstr(v))
+    }
+
+    fn map_resource_context(ctx: COREWEBVIEW2_WEB_RESOURCE_CONTEXT) -> &'static str {
+        match ctx {
+            COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT => "document",
+            COREWEBVIEW2_WEB_RESOURCE_CONTEXT_STYLESHEET => "stylesheet",
+            COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE => "image",
+            COREWEBVIEW2_WEB_RESOURCE_CONTEXT_MEDIA => "media",
+            COREWEBVIEW2_WEB_RESOURCE_CONTEXT_FONT => "font",
+            COREWEBVIEW2_WEB_RESOURCE_CONTEXT_SCRIPT => "script",
+            COREWEBVIEW2_WEB_RESOURCE_CONTEXT_XML_HTTP_REQUEST
+            | COREWEBVIEW2_WEB_RESOURCE_CONTEXT_FETCH => "xmlhttprequest",
+            COREWEBVIEW2_WEB_RESOURCE_CONTEXT_PING => "ping",
+            COREWEBVIEW2_WEB_RESOURCE_CONTEXT_WEBSOCKET => "websocket",
+            COREWEBVIEW2_WEB_RESOURCE_CONTEXT_CSP_VIOLATION_REPORT => "csp_report",
+            _ => "other",
+        }
+    }
+
+    unsafe fn exec_frame_js(frame: &ICoreWebView2Frame, js: &str) {
+        if let Ok(f2) = frame.cast::<ICoreWebView2Frame2>() {
+            let _ = f2.ExecuteScript(
+                &HSTRING::from(js),
+                &ExecuteScriptCompletedHandler::create(Box::new(|_, _| Ok(()))),
+            );
+        }
+    }
+
+    unsafe fn hook_frame_cosmetics(frame: &ICoreWebView2Frame) {
+        let frame_url = Arc::new(Mutex::new(String::new()));
+        let mut token = 0i64;
+        if let Ok(f2) = frame.cast::<ICoreWebView2Frame2>() {
+            let url_ref = Arc::clone(&frame_url);
+            let _ = f2.add_NavigationStarting(
+                &FrameNavigationStartingEventHandler::create(Box::new(move |_, args| {
+                    if let Some(args) = args {
+                        let mut uri = PWSTR::null();
+                        if args.Uri(&mut uri).is_ok() {
+                            let u = take_pwstr(uri);
+                            if let Ok(mut g) = url_ref.lock() {
+                                *g = u;
+                            }
+                        }
+                    }
+                    Ok(())
+                })),
+                &mut token,
+            );
+
+            let url_ref = Arc::clone(&frame_url);
+            let _ = f2.add_ContentLoading(
+                &FrameContentLoadingEventHandler::create(Box::new(move |sender, _| {
+                    let Some(frame) = sender else { return Ok(()) };
+                    let u = url_ref.lock().map(|g| g.clone()).unwrap_or_default();
+                    if let Some(js) = build_scriptlet_injection_js(&u) {
+                        exec_frame_js(&frame, &js);
+                    }
+                    Ok(())
+                })),
+                &mut token,
+            );
+
+            let url_ref = Arc::clone(&frame_url);
+            let _ = f2.add_DOMContentLoaded(
+                &FrameDOMContentLoadedEventHandler::create(Box::new(move |sender, _| {
+                    let Some(frame) = sender else { return Ok(()) };
+                    let u = url_ref.lock().map(|g| g.clone()).unwrap_or_default();
+                    if let Some(js) = build_cosmetic_injection_js(&u) {
+                        exec_frame_js(&frame, &js);
+                    }
+                    Ok(())
+                })),
+                &mut token,
+            );
+        }
+        if let Ok(f7) = frame.cast::<ICoreWebView2Frame7>() {
+            let _ = f7.add_FrameCreated(
+                &FrameChildFrameCreatedEventHandler::create(Box::new(|_, args| {
+                    if let Some(args) = args {
+                        if let Ok(child) = args.Frame() {
+                            hook_frame_cosmetics(&child);
+                        }
+                    }
+                    Ok(())
+                })),
+                &mut token,
+            );
+        }
     }
 
     /// Call a Chrome DevTools Protocol method on a webview (fire and forget).
@@ -181,45 +677,42 @@ mod win {
             let Ok(core) = pw.controller().CoreWebView2() else { return };
             let env = pw.environment();
 
-            // Filters: only the blocked hosts reach our request handler, so normal traffic
-            // (including every video segment) pays nothing.
+            // Single wildcard filter routes requests to the `adblock::Engine`, while
+            // `is_exempt_url` fast-paths localhost/abxs/asset/tauri requests immediately.
             let core22 = core.cast::<ICoreWebView2_22>().ok();
-            for part in BLOCKED_URL_PARTS {
-                let f = HSTRING::from(format!("*{part}*"));
-                let ok = core22.as_ref().is_some_and(|c| {
-                    c.AddWebResourceRequestedFilterWithRequestSourceKinds(&f, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL, COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL).is_ok()
-                });
-                if !ok {
-                    let _ = core.AddWebResourceRequestedFilter(&f, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
-                }
+            let all_pat = HSTRING::from("*");
+            let filter_ok = core22.as_ref().is_some_and(|c| {
+                c.AddWebResourceRequestedFilterWithRequestSourceKinds(
+                    &all_pat,
+                    COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+                    COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL,
+                )
+                .is_ok()
+            });
+            if !filter_ok {
+                let _ = core.AddWebResourceRequestedFilter(&all_pat, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
             }
-            for h in BLOCKED_HOSTS {
-                for pat in [format!("*://{h}/*"), format!("*://*.{h}/*")] {
-                    let f = HSTRING::from(pat);
-                    let ok = match &core22 {
-                        Some(c) => c
-                            .AddWebResourceRequestedFilterWithRequestSourceKinds(
-                                &f,
-                                COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
-                                COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL,
-                            )
-                            .is_ok(),
-                        None => false,
-                    };
-                    if !ok {
-                        let _ = core.AddWebResourceRequestedFilter(&f, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
-                    }
-                }
-            }
+
             let mut token = Default::default();
             let env2 = env.clone();
             let _ = core.add_WebResourceRequested(
-                &WebResourceRequestedEventHandler::create(Box::new(move |_, args| {
+                &WebResourceRequestedEventHandler::create(Box::new(move |sender, args| {
                     let Some(args) = args else { return Ok(()) };
                     let req = args.Request()?;
                     let uri = uri_of_request(&req);
                     // Other handlers (Tauri's own protocols) see these events too: only act on ours.
-                    if is_blocked_url(&uri) {
+                    if is_exempt_url(&uri) {
+                        return Ok(());
+                    }
+                    let mut ctx = COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL;
+                    let _ = args.ResourceContext(&mut ctx);
+                    let req_type = map_resource_context(ctx);
+                    let source_url = req_header(&req, "Referer")
+                        .or_else(|| req_header(&req, "Origin"))
+                        .or_else(|| sender.as_ref().and_then(|wv| source_of_webview(wv)))
+                        .unwrap_or_default();
+                    let method = method_of_request(&req);
+                    if check_network_request_with_engine(&engine(), &uri, &source_url, req_type, &method) {
                         BLOCKED.fetch_add(1, Ordering::Relaxed);
                         let resp = env2.CreateWebResourceResponse(None, 403, &HSTRING::from("Blocked"), &HSTRING::new())?;
                         args.SetResponse(&resp)?;
@@ -228,6 +721,55 @@ mod win {
                 })),
                 &mut token,
             );
+
+            // Cosmetic & scriptlet injection on embed / sniff frames (never on local app origins).
+            let _ = core.add_ContentLoading(
+                &ContentLoadingEventHandler::create(Box::new(|sender, _| {
+                    if let Some(wv) = sender {
+                        if let Some(url) = source_of_webview(&wv) {
+                            if let Some(js) = build_scriptlet_injection_js(&url) {
+                                let _ = wv.ExecuteScript(
+                                    &HSTRING::from(js),
+                                    &ExecuteScriptCompletedHandler::create(Box::new(|_, _| Ok(()))),
+                                );
+                            }
+                        }
+                    }
+                    Ok(())
+                })),
+                &mut token,
+            );
+            if let Ok(c2) = core.cast::<ICoreWebView2_2>() {
+                let _ = c2.add_DOMContentLoaded(
+                    &DOMContentLoadedEventHandler::create(Box::new(|sender, _| {
+                        if let Some(wv) = sender {
+                            if let Some(url) = source_of_webview(&wv) {
+                                if let Some(js) = build_cosmetic_injection_js(&url) {
+                                    let _ = wv.ExecuteScript(
+                                        &HSTRING::from(js),
+                                        &ExecuteScriptCompletedHandler::create(Box::new(|_, _| Ok(()))),
+                                    );
+                                }
+                            }
+                        }
+                        Ok(())
+                    })),
+                    &mut token,
+                );
+            }
+            if let Ok(c4) = core.cast::<ICoreWebView2_4>() {
+                let _ = c4.add_FrameCreated(
+                    &FrameCreatedEventHandler::create(Box::new(|_, args| {
+                        if let Some(args) = args {
+                            if let Ok(frame) = args.Frame() {
+                                hook_frame_cosmetics(&frame);
+                            }
+                        }
+                        Ok(())
+                    })),
+                    &mut token,
+                );
+            }
 
             // Pop-ups and new windows. Links the app itself opens (trailers, IMDb) go to the
             // system browser; anything a frame tries to open is dropped.
@@ -331,7 +873,7 @@ mod win {
                     let Some(args) = args else { return Ok(()) };
                     let req = args.Request()?;
                     let uri = uri_of_request(&req);
-                    if host_of(&uri).is_none_or(|h| is_blocked_host(&h)) {
+                    if host_of(&uri).is_none_or(|h| is_blocked_host(&h)) || is_blocked_url(&uri) {
                         return Ok(());
                     }
                     let status = args
@@ -506,6 +1048,7 @@ pub async fn sniff_media(
     use std::sync::atomic::AtomicUsize;
     static N: AtomicUsize = AtomicUsize::new(0);
     let target: url::Url = url.parse().map_err(|e: url::ParseError| e.to_string())?;
+    maybe_refresh_filter_cache(&app);
     let label = format!("sniff-{}", N.fetch_add(1, Ordering::Relaxed));
 
     let mut cancel_rx = if let Some(ref cid) = cancel_id {
@@ -1063,5 +1606,101 @@ mod tests {
             assert!(permit.is_none());
             let _ = cancel_task.await;
         });
+    }
+
+    #[test]
+    fn adblock_engine_blocks_ads_popunders_miners_and_anti_devtools() {
+        let embed = "https://vidsrc.example.com/embed/movie/123";
+
+        // Known ad networks & subdomains
+        assert!(check_network_request("https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js", embed, "script"));
+        assert!(check_network_request("https://sub.popads.net/pop.js", embed, "script"));
+        assert!(check_network_request("https://a.exosrv.com/ad-provider.js", embed, "script"));
+        assert!(check_network_request("https://cdn.adsterra.com/banner.js", embed, "script"));
+        assert!(check_network_request("https://ukankingwithea.com/jump/next", embed, "document"));
+        assert!(check_network_request("https://a.magsrv.com/native.js", embed, "script"));
+
+        // Crypto miners
+        assert!(check_network_request("https://coinhive.com/lib/coinhive.min.js", embed, "script"));
+        assert!(check_network_request("https://authedmine.com/lib/authedmine.min.js", embed, "script"));
+
+        // Anti-devtools / anti-adblock kits anywhere
+        assert!(check_network_request("https://cdn.example.org/assets/disable-devtool.min.js", embed, "script"));
+        assert!(is_blocked_url("https://cdn.example.org/assets/fuckadblock.js"));
+
+        // Third-party popunder & VAST/VPAID tag patterns
+        assert!(check_network_request("https://tracker.other.org/js/popunder.min.js", embed, "script"));
+        assert!(check_network_request("https://ads.other.org/tags/vast.xml", embed, "xmlhttprequest"));
+    }
+
+    #[test]
+    fn adblock_engine_allows_video_streams_segments_subtitles_and_local_origins() {
+        let embed = "https://vidsrc.example.com/embed/movie/123";
+
+        // Video streams & segments must never be blocked
+        assert!(!check_network_request("https://cdn.example.com/hls/master.m3u8", embed, "xmlhttprequest"));
+        assert!(!check_network_request("https://cdn.example.com/hls/720p/seg-001.ts", embed, "xmlhttprequest"));
+        assert!(!check_network_request("https://cdn.example.com/dash/manifest.mpd", embed, "xmlhttprequest"));
+        assert!(!check_network_request("https://cdn.example.com/video/movie_1080p.mp4", embed, "media"));
+        assert!(!check_network_request("https://cdn.example.com/download/adaptive/shadow_media/master.m3u8", embed, "xmlhttprequest"));
+        assert!(!check_network_request("https://cdn.example.com/subs/English.vtt", embed, "other"));
+
+        // Localhost, proxy & Tauri origins must always be exempt
+        assert!(!check_network_request("http://abxs.localhost/p?u=https%3A%2F%2Fcdn.example.com%2Fmaster.m3u8", "http://localhost:1420/", "xmlhttprequest"));
+        assert!(!check_network_request("http://localhost:1420/assets/index.js", "http://localhost:1420/", "script"));
+        assert!(!check_network_request("http://tauri.localhost/index.html", "", "document"));
+        assert!(!check_network_request("http://asset.localhost/poster.jpg", "http://tauri.localhost/", "image"));
+        assert!(!is_blocked_url("http://abxs.localhost/p?url=https%3A%2F%2Fdoubleclick.net%2Ftest"));
+        assert!(!is_blocked_url("about:blank"));
+    }
+
+    #[test]
+    fn cosmetic_and_scriptlet_injection_skips_local_origins_and_sanitizes_embeds() {
+        assert!(build_cosmetic_injection_js("http://localhost:1420/").is_none());
+        assert!(build_cosmetic_injection_js("http://tauri.localhost/index.html").is_none());
+        assert!(build_cosmetic_injection_js("http://abxs.localhost/p?u=1").is_none());
+        assert!(build_scriptlet_injection_js("http://localhost:1420/").is_none());
+        assert!(build_cosmetic_injection_js("about:blank").is_none());
+
+        let js = build_cosmetic_injection_js("https://vidsrc.to/embed/123")
+            .expect("embed page should receive cosmetic & scriptlet injection");
+        assert!(js.contains("data-abx-shield"));
+        assert!(js.contains("display: none !important"));
+        assert!(js.contains(".ad-overlay"));
+        assert!(js.contains("abxNoWoiF"));
+        assert!(js.contains("abxSetConstant"));
+        // Must never hide video or common player containers
+        assert!(!js.contains(".plyr"));
+        assert!(!js.contains(".vjs-"));
+
+        let early_js = build_scriptlet_injection_js("https://vidsrc.to/embed/123")
+            .expect("embed page should receive early scriptlet injection");
+        assert!(early_js.contains("abxNoWoiF"));
+        assert!(early_js.contains("abxSetConstant"));
+
+        // Generic cosmetic hide rules also apply to unlisted embed origins
+        let generic_js = build_cosmetic_injection_js("https://player.example.org/e/1")
+            .expect("generic embed should receive cosmetic CSS hide rules");
+        assert!(generic_js.contains("data-abx-shield"));
+        assert!(generic_js.contains(".ad-overlay"));
+    }
+
+    #[test]
+    fn custom_supplementary_rules_can_extend_engine() {
+        let custom = build_engine(Some("||evil-custom-rotator.example^\n"));
+        assert!(check_network_request_with_engine(
+            &custom,
+            "https://sub.evil-custom-rotator.example/pop.js",
+            "https://vidsrc.example.com/embed/1",
+            "script",
+            "get",
+        ));
+        assert!(!check_network_request_with_engine(
+            &custom,
+            "http://abxs.localhost/p?u=https%3A%2F%2Fevil-custom-rotator.example%2F",
+            "http://localhost:1420/",
+            "xmlhttprequest",
+            "get",
+        ));
     }
 }
