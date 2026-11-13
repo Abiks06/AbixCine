@@ -1,5 +1,7 @@
-import { memo, type CSSProperties } from "react";
+import type JASSUB from "jassub";
+import { memo, useEffect, useRef, useState, type CSSProperties, type RefObject } from "react";
 import type { CueAlign, CueSpan, SubPref, SubtitleCue } from "../lib/subtitles";
+import type { SubtitleFormat } from "../sources/types";
 
 export interface SubtitleOverlayProps {
   cues: readonly SubtitleCue[];
@@ -9,6 +11,16 @@ export interface SubtitleOverlayProps {
   /** Render scaled for the Settings live preview stage instead of fullscreen player viewport units. */
   preview?: boolean;
   className?: string;
+  /** Video element to attach JASSUB canvas to for native ASS/SSA rendering. */
+  videoRef?: RefObject<HTMLVideoElement | null>;
+  /** Raw ASS/SSA script text for the active primary track (when format is ass/ssa). */
+  assRaw?: string;
+  /** Format of the active primary track. */
+  assFormat?: SubtitleFormat;
+  /** Subtitle timing offset in seconds (positive delays subtitles, matching activeCuesAt). */
+  offsetSec?: number;
+  /** Whether primary subtitle rendering is enabled (false hides JASSUB even if raw text is cached). */
+  subEnabled?: boolean;
 }
 
 const HEX_OR_RGB_RX = /^(?:#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})|rgba?\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}(?:\s*,\s*(?:0|1|0?\.\d+))?\s*\))$/i;
@@ -70,14 +82,112 @@ export const SubtitleOverlay = memo(function SubtitleOverlay({
   controlsVisible,
   preview = false,
   className = "",
+  videoRef,
+  assRaw,
+  assFormat,
+  offsetSec = 0,
+  subEnabled = true,
 }: SubtitleOverlayProps) {
+  const isAssTrack = !preview && subEnabled && (assFormat === "ass" || assFormat === "ssa") && Boolean(assRaw);
+  const jassubKey = isAssTrack && assRaw ? `${assFormat}:${assRaw.length}:${assRaw.slice(0, 64)}` : "";
+
+  const jassubRef = useRef<JASSUB | null>(null);
+  const offsetRef = useRef(offsetSec);
+  offsetRef.current = offsetSec;
+
+  const [jassubState, setJassubState] = useState<{ key: string; failed: boolean }>({ key: "", failed: false });
+  const jassubFailed = jassubState.key === jassubKey && jassubState.failed;
+  const usingJassub = isAssTrack && !jassubFailed && Boolean(videoRef?.current);
+
+  useEffect(() => {
+    const videoEl = videoRef?.current;
+    if (!isAssTrack || !assRaw || !videoEl) {
+      const prev = jassubRef.current;
+      jassubRef.current = null;
+      if (prev) void prev.destroy().catch(() => {});
+      return;
+    }
+
+    let cancelled = false;
+    let instance: JASSUB | null = null;
+
+    (async () => {
+      try {
+        const [
+          { default: JassubCtor },
+          { default: workerUrl },
+          { default: wasmUrl },
+          { default: modernWasmUrl },
+          { default: wasmWorkerUrl },
+          { default: modernWasmWorkerUrl },
+          { default: defaultFontUrl },
+        ] = await Promise.all([
+          import("jassub"),
+          import("jassub/dist/worker/worker.js?worker&url"),
+          import("jassub/dist/wasm/jassub-worker.wasm?url"),
+          import("jassub/dist/wasm/jassub-worker-modern.wasm?url"),
+          import("jassub/dist/wasm/jassub-worker.js?url"),
+          import("jassub/dist/wasm/jassub-worker-modern.js?url"),
+          import("jassub/dist/default.woff2?url"),
+        ]);
+
+        if (cancelled || !videoEl.isConnected) return;
+
+        instance = new JassubCtor({
+          video: videoEl,
+          subContent: assRaw,
+          timeOffset: Number.isFinite(offsetRef.current) ? -offsetRef.current : 0,
+          workerUrl,
+          wasmUrl,
+          modernWasmUrl,
+          wasmWorkerUrl,
+          modernWasmWorkerUrl,
+          availableFonts: { "liberation sans": defaultFontUrl },
+          defaultFont: "liberation sans",
+        });
+        jassubRef.current = instance;
+
+        await instance.ready;
+        if (cancelled) {
+          if (jassubRef.current === instance) jassubRef.current = null;
+          void instance.destroy().catch(() => {});
+          return;
+        }
+        void instance.resize(true).catch(() => {});
+      } catch {
+        if (instance) {
+          if (jassubRef.current === instance) jassubRef.current = null;
+          void instance.destroy().catch(() => {});
+        }
+        if (!cancelled) {
+          setJassubState({ key: jassubKey, failed: true });
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      const active = jassubRef.current ?? instance;
+      jassubRef.current = null;
+      if (active) void active.destroy().catch(() => {});
+    };
+  }, [isAssTrack, assRaw, jassubKey, videoRef]);
+
+  useEffect(() => {
+    const inst = jassubRef.current;
+    if (!inst) return;
+    inst.timeOffset = Number.isFinite(offsetSec) ? -offsetSec : 0;
+    void inst.ready.then(() => inst.resize(true)).catch(() => {});
+  }, [offsetSec]);
+
+  const primaryCues = usingJassub ? [] : cues;
   const secList = secondaryCues ?? [];
-  if (!cues.length && !secList.length) return null;
+  if (!primaryCues.length && !secList.length) return null;
 
   const zoneMap = new Map<CueAlign, SubtitleCue[]>();
   const positioned: SubtitleCue[] = [];
 
-  for (const cue of cues) {
+  for (const cue of primaryCues) {
     if (cue.pos) {
       positioned.push(cue);
     } else {

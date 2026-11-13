@@ -1,9 +1,11 @@
 import type Hls from "hls.js";
+import type shaka from "shaka-player";
 import { convertFileSrc, invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { fmtTime } from "../lib/format";
 import { ENHANCE_MODES, startEnhancer, upscalerAvailable, type EnhanceMode, type Enhancer, type EnhancerStats } from "../lib/enhance";
+import { fetchSkipSegments, mergeSkipRanges, type SkipSegments } from "../lib/skipSegments";
 import {
   SUB_PREF_EVENT,
   activeCuesAt,
@@ -31,7 +33,7 @@ import {
 import { updateSettings, type Audio } from "../lib/settings";
 import type { Episode } from "../lib/types";
 import type { StreamCandidate, SubtitleFormat } from "../sources/types";
-import { isUrlTokenExpired } from "../sources/native";
+import { isUrlTokenExpired, native, proxyUrl, unwrapProxyUrl } from "../sources/native";
 import { initialCandidateIndex, probeHedged, verifyEmbed } from "../sources/registry";
 import { AudioToggle } from "./AudioToggle";
 import { Icon } from "./Icon";
@@ -80,6 +82,8 @@ interface Props {
     key?: string;
     tmdbId?: number;
     imdbId?: string;
+    malId?: number;
+    anilistId?: number;
     title: string;
     logo?: string;
     overview?: string;
@@ -236,6 +240,8 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
   const video = useRef<HTMLVideoElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
   const hlsRef = useRef<Hls | null>(null);
+  const shakaRef = useRef<shaka.Player | null>(null);
+  const dashHeightsRef = useRef<number[]>([]);
   const resumeAt = useRef(startAt ?? 0);
   // Servers verified from inside the player (standby ones checked on demand) replace the originals.
   const [patched, setPatched] = useState<Record<string, StreamCandidate>>({});
@@ -1255,7 +1261,7 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     const mem = subMemoryKey ? loadSubTrackMemory(subMemoryKey) : null;
     if (!cur || isEmbed || !pref.autoFetchOnline) return;
     if (mem?.enabled === false || (pref.mode === "off" && mem?.enabled !== true)) return;
-    if (cur.kind === "hls" && !hlsReady) return;
+    if ((cur.kind === "hls" || cur.kind === "dash") && !hlsReady) return;
     const wantLang = langBase(pref.lang || "en");
     const fetchKey = `${cur.url}::${wantLang}`;
     if (autoFetchedRef.current.has(fetchKey)) return;
@@ -1508,6 +1514,15 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
 
   /* ----------------------------------------------------------------- audio */
 
+  const destroyAttachedPlayers = () => {
+    hlsRef.current?.destroy();
+    hlsRef.current = null;
+    const sp = shakaRef.current;
+    shakaRef.current = null;
+    dashHeightsRef.current = [];
+    if (sp) void sp.destroy().catch(() => {});
+  };
+
   /** On a dual-audio stream, play the track that matches sub (Japanese) or dub (English). */
   const pickAudioTrack = () => {
     if (manualAudio.current) return;
@@ -1517,6 +1532,22 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
       if (i >= 0) {
         if (i !== hls.audioTrack) hls.audioTrack = i;
         setSelectedAudioTrack(i);
+      }
+      return;
+    }
+    const sp = shakaRef.current;
+    if (sp) {
+      const dashAudio = sp.getAudioTracks();
+      if (dashAudio.length > 1) {
+        const i = preferredAudioTrackIndex(
+          dashAudio.map((t) => ({ name: t.label ?? undefined, lang: t.language })),
+          audio,
+          originalLanguage,
+        );
+        if (i >= 0 && dashAudio[i]) {
+          if (!dashAudio[i].active) sp.selectAudioTrack(dashAudio[i]);
+          setSelectedAudioTrack(i);
+        }
       }
       return;
     }
@@ -1533,9 +1564,15 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
   };
   const chooseAudioTrack = (id: number) => {
     const hls = hlsRef.current;
+    const sp = shakaRef.current;
     if (hls?.audioTracks[id]) {
       manualAudio.current = true;
       hls.audioTrack = id;
+    } else if (sp) {
+      const dashAudio = sp.getAudioTracks();
+      if (!dashAudio[id]) return;
+      manualAudio.current = true;
+      sp.selectAudioTrack(dashAudio[id]);
     } else {
       const tracks = (video.current as (HTMLVideoElement & { audioTracks?: ArrayLike<{ enabled: boolean }> }) | null)?.audioTracks;
       if (!tracks?.[id]) return;
@@ -1686,8 +1723,7 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     setVideoHeight(undefined);
     setTime(0);
     setDur(0);
-    hlsRef.current?.destroy();
-    hlsRef.current = null;
+    destroyAttachedPlayers();
     refreshCtlRef.current?.abort();
     refreshCtlRef.current = null;
     if (c.kind === "embed") {
@@ -1712,6 +1748,46 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
       v.play().catch(() => {});
     };
     let cancelled = false;
+    const refreshExpiredStream = (
+      target: StreamCandidate,
+      fallbackMsg: string,
+      httpCode: number | undefined,
+      disposeCurrent: () => void,
+    ) => {
+      const targetId = candKey(target);
+      lastRefreshedAtRef.current.set(targetId, Date.now());
+      if (v.currentTime > 1) resumeAt.current = v.currentTime;
+      saveNowRef.current();
+      clearStall();
+      setWaiting(true);
+      flash(`Refreshing ${target.providerName} stream link…`);
+
+      disposeCurrent();
+
+      refreshCtlRef.current?.abort();
+      const refreshCtl = new AbortController();
+      refreshCtlRef.current = refreshCtl;
+
+      void verifyEmbed(target, refreshCtl.signal)
+        .then((refreshed) => {
+          if (cancelled || refreshCtl.signal.aborted || !mountedRef.current) return;
+          if (refreshCtlRef.current === refreshCtl) refreshCtlRef.current = null;
+          if (!refreshed.probe?.ok) {
+            failover(refreshed.probe?.error ?? (httpCode ? `HTTP ${httpCode}` : fallbackMsg));
+            return;
+          }
+          setPatched((p) => ({ ...p, [targetId]: refreshed }));
+          if (refreshed.url === target.url) {
+            attachStream(refreshed);
+            armStallRef.current();
+          }
+        })
+        .catch((err: unknown) => {
+          if (cancelled || refreshCtl.signal.aborted || !mountedRef.current) return;
+          if (refreshCtlRef.current === refreshCtl) refreshCtlRef.current = null;
+          failover(err instanceof Error ? err.message : "stream token refresh failed");
+        });
+    };
     const loadFile = (url: string) => {
       if (cancelled) return;
       v.crossOrigin = "anonymous";
@@ -1816,39 +1892,10 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
           Date.now() - lastRefresh >= 60_000
         ) {
           midStreamRefreshing = true;
-          lastRefreshedAtRef.current.set(targetId, Date.now());
-          if (v.currentTime > 1) resumeAt.current = v.currentTime;
-          saveNowRef.current();
-          clearStall();
-          setWaiting(true);
-          flash(`Refreshing ${target.providerName} stream link…`);
-
-          if (hlsRef.current === hls) hlsRef.current = null;
-          hls.destroy();
-
-          refreshCtlRef.current?.abort();
-          const refreshCtl = new AbortController();
-          refreshCtlRef.current = refreshCtl;
-
-          void verifyEmbed(target, refreshCtl.signal)
-            .then((refreshed) => {
-              if (cancelled || refreshCtl.signal.aborted || !mountedRef.current) return;
-              if (refreshCtlRef.current === refreshCtl) refreshCtlRef.current = null;
-              if (!refreshed.probe?.ok) {
-                failover(refreshed.probe?.error ?? (httpCode ? `HTTP ${httpCode}` : d.details));
-                return;
-              }
-              setPatched((p) => ({ ...p, [targetId]: refreshed }));
-              if (refreshed.url === target.url) {
-                attachStream(refreshed);
-                armStallRef.current();
-              }
-            })
-            .catch((err: unknown) => {
-              if (cancelled || refreshCtl.signal.aborted || !mountedRef.current) return;
-              if (refreshCtlRef.current === refreshCtl) refreshCtlRef.current = null;
-              failover(err instanceof Error ? err.message : "stream token refresh failed");
-            });
+          refreshExpiredStream(target, d.details, httpCode, () => {
+            if (hlsRef.current === hls) hlsRef.current = null;
+            hls.destroy();
+          });
           return;
         }
 
@@ -1857,10 +1904,137 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
       hls.loadSource(streamUrl);
       hls.attachMedia(v);
     };
+    const attachDash = (shakaMod: typeof shaka, streamUrl: string, target: StreamCandidate) => {
+      if (cancelled) return;
+      v.crossOrigin = "anonymous";
+      shakaMod.polyfill?.installAll?.();
+      if (!shakaMod.Player.isBrowserSupported()) {
+        failover("DASH playback is not supported in this browser");
+        return;
+      }
+      const player = new shakaMod.Player();
+      shakaRef.current = player;
+      player.configure({
+        streaming: {
+          bufferingGoal: 60,
+          rebufferingGoal: 2,
+          bufferBehind: 30,
+        },
+        abr: { enabled: true },
+        textDisplayFactory: () => new shakaMod.text.StubTextDisplayer(),
+      });
+
+      const syncDashTracks = () => {
+        if (cancelled || shakaRef.current !== player) return;
+        const variants = player.getVariantTracks();
+        const heights = Array.from(
+          new Set(variants.map((t) => t.height ?? 0).filter((h) => h > 0)),
+        ).sort((a, b) => a - b);
+        dashHeightsRef.current = heights;
+        setLevels(heights.map((height) => ({ height })));
+        const activeVar = variants.find((t) => t.active);
+        setActiveLevel(activeVar?.height ? heights.indexOf(activeVar.height) : -1);
+
+        const dashAudio = player.getAudioTracks();
+        setAudioTracks(
+          dashAudio.map((t, i) => ({
+            id: i,
+            label: t.label || t.language || `Track ${i + 1}`,
+            lang: t.language || "und",
+          })),
+        );
+        const activeAudioIdx = dashAudio.findIndex((t) => t.active);
+        if (activeAudioIdx >= 0) setSelectedAudioTrack(activeAudioIdx);
+      };
+
+      player.addEventListener("trackschanged", () => {
+        syncDashTracks();
+        pickAudioTrack();
+      });
+      player.addEventListener("adaptation", () => {
+        if (cancelled || shakaRef.current !== player) return;
+        const activeVar = player.getVariantTracks().find((t) => t.active);
+        const heights = dashHeightsRef.current;
+        setActiveLevel(activeVar?.height ? heights.indexOf(activeVar.height) : -1);
+      });
+
+      let dashDead = false;
+      const handleDashError = (rawErr: unknown, fromEvent: boolean) => {
+        if (cancelled || dashDead) return;
+        const err = rawErr as Partial<shaka.util.Error> | undefined;
+        const code = typeof err?.code === "number" ? err.code : undefined;
+        if (code === shakaMod.util.Error.Code.LOAD_INTERRUPTED) return;
+        if (fromEvent && err?.severity !== shakaMod.util.Error.Severity.CRITICAL) return;
+
+        const errData = Array.isArray(err?.data) ? (err.data as unknown[]) : undefined;
+        const httpCode =
+          code === shakaMod.util.Error.Code.BAD_HTTP_STATUS && errData && typeof errData[1] === "number"
+            ? errData[1]
+            : undefined;
+        const errUrl = errData && typeof errData[0] === "string" ? errData[0] : undefined;
+        const isAuthOrExpired =
+          httpCode === 401 ||
+          httpCode === 403 ||
+          httpCode === 410 ||
+          isUrlTokenExpired(target.url) ||
+          (errUrl ? isUrlTokenExpired(errUrl) : false);
+        const targetId = candKey(target);
+        const lastRefresh = lastRefreshedAtRef.current.get(targetId) ?? 0;
+
+        dashDead = true;
+        if (
+          isAuthOrExpired &&
+          target.pageUrl &&
+          Date.now() - lastRefresh >= 60_000
+        ) {
+          refreshExpiredStream(target, `DASH error ${code ?? "unknown"}`, httpCode, () => {
+            if (shakaRef.current === player) {
+              shakaRef.current = null;
+              dashHeightsRef.current = [];
+            }
+            void player.destroy().catch(() => {});
+          });
+          return;
+        }
+        failover(httpCode ? `DASH error ${code ?? "network"} (${httpCode})` : `DASH error ${code ?? "playback"}`);
+      };
+
+      player.addEventListener("error", (ev) => {
+        handleDashError((ev as Event & { detail?: unknown }).detail, true);
+      });
+
+      void (async () => {
+        try {
+          await player.attach(v);
+          if (cancelled || shakaRef.current !== player) {
+            await player.destroy().catch(() => {});
+            return;
+          }
+          await player.load(streamUrl);
+          if (cancelled || shakaRef.current !== player) return;
+          setHlsReady(true);
+          syncDashTracks();
+          seekAndPlay();
+        } catch (err: unknown) {
+          handleDashError(err, false);
+        }
+      })();
+    };
     const attachStream = (target: StreamCandidate) => {
-      // hls.js (~600 kB) is only parsed when a stream actually needs it; local files never load it.
+      // hls.js (~600 kB) and shaka-player are dynamically loaded only for HLS / DASH streams.
       if (target.kind === "hls") {
         import("hls.js").then((m) => attachHls(m.default, target.url, target), () => !cancelled && failover("player failed to load"));
+      } else if (target.kind === "dash") {
+        const isAlreadyProxied = unwrapProxyUrl(target.url).proxied;
+        const isLocalProxy = /^https?:\/\/(?:127\.0\.0\.1|localhost)(?::|\/|$)/i.test(target.url);
+        const dashUrl =
+          native && !isAlreadyProxied && !isLocalProxy && /^https?:/i.test(target.url) && (target.headers || target.pageUrl)
+            ? proxyUrl(target.url, target.headers, target.pageUrl)
+            : target.url;
+        import("shaka-player").then(
+          (m) => attachDash(((m as { default?: typeof shaka }).default ?? m) as typeof shaka, dashUrl, target),
+          () => !cancelled && failover("DASH player failed to load"),
+        );
       } else if (target.localPath) {
         setPreparingLocal(true);
         invoke<string>("prepare_local_media", { path: target.localPath })
@@ -1910,8 +2084,7 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
         if (refreshCtlRef.current === refreshCtl) refreshCtlRef.current = null;
         v.removeEventListener("loadedmetadata", seekAndPlay);
         if (v.currentTime > 1) resumeAt.current = v.currentTime;
-        hlsRef.current?.destroy();
-        hlsRef.current = null;
+        destroyAttachedPlayers();
       };
     }
     attachStream(c);
@@ -1921,8 +2094,7 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
       refreshCtlRef.current = null;
       v.removeEventListener("loadedmetadata", seekAndPlay);
       if (v.currentTime > 1) resumeAt.current = v.currentTime;
-      hlsRef.current?.destroy();
-      hlsRef.current = null;
+      destroyAttachedPlayers();
     };
   }, [cur?.url, cur?.kind, cur?.localPath, retrySeq, failover, clearStall]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -2502,10 +2674,41 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     shownQ ? (shownQ >= 2160 ? "4K" : `${shownQ}p`) : null,
     curLatency ? `${curLatency} ms` : null,
   ].filter(Boolean).join(" · ");
-  // Intro / credits skip, when the source knows where they are.
-  const sk = cur?.skip;
+
+  // Universal intro/outro skip segments: merge candidate-provided ranges with TheIntroDB v4 / AniSkip v2.
+  const [fetchedSkip, setFetchedSkip] = useState<SkipSegments | null>(null);
+  const durRef = useRef(dur);
+  durRef.current = dur;
+  useEffect(() => {
+    setFetchedSkip(null);
+    if (!cur || isEmbed) return;
+    if (cur.skip?.intro && cur.skip?.outro) return;
+    if (!media?.tmdbId && !media?.imdbId && !media?.malId) return;
+    const ctl = new AbortController();
+    fetchSkipSegments(
+      {
+        kind: media?.kind,
+        tmdbId: media?.tmdbId,
+        imdbId: media?.imdbId,
+        malId: media?.malId,
+        season: epSeason,
+        episode: epNumber,
+        durationSec: durRef.current > 0 ? durRef.current : undefined,
+      },
+      { signal: ctl.signal },
+    )
+      .then((res) => {
+        if (!ctl.signal.aborted && mountedRef.current) setFetchedSkip(res);
+      })
+      .catch(() => {});
+    return () => ctl.abort();
+  }, [cur?.url, isEmbed, cur?.skip?.intro, cur?.skip?.outro, media?.kind, media?.tmdbId, media?.imdbId, media?.malId, epSeason, epNumber]);
+
+  const sk = useMemo(() => mergeSkipRanges(cur?.skip, fetchedSkip), [cur?.skip, fetchedSkip]);
+  const outroEnd = sk?.outro ? (Number.isFinite(sk.outro[1]) ? sk.outro[1] : (dur > 0 ? dur : Infinity)) : undefined;
   const inIntro = !!sk?.intro && time >= sk.intro[0] && time < sk.intro[1] - 1.5;
-  const inOutro = !!sk?.outro && time >= sk.outro[0] && time < sk.outro[1] - 1.5;
+  const inOutro = !!sk?.outro && outroEnd != null && time >= sk.outro[0] && time < outroEnd - 1.5;
+  const isPrimAss = Boolean(primTrack && (primTrack.format === "ass" || primTrack.format === "ssa") && primTrack.raw);
   const enhMode = ENHANCE_MODES.find((m) => m.id === enhance) ?? ENHANCE_MODES[0];
   const openSheet = (s: Sheet) => setSheet((x) => (x === s ? null : s));
 
@@ -2618,6 +2821,11 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
               secondaryCues={activeSecondaryCues}
               subPref={pref}
               controlsVisible={!(hide || embedHide)}
+              videoRef={video}
+              assRaw={isPrimAss ? primTrack?.raw : undefined}
+              assFormat={isPrimAss ? primTrack?.format : undefined}
+              offsetSec={offset}
+              subEnabled={Boolean(primTrack)}
             />
           </>
         )}
@@ -2766,7 +2974,15 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
             e.stopPropagation();
             const v = video.current;
             const target = inIntro ? sk?.intro?.[1] : sk?.outro?.[1];
-            if (v && target != null) v.currentTime = target;
+            if (v && target != null) {
+              const clamped = Number.isFinite(target)
+                ? (v.duration ? Math.min(v.duration - 0.25, target) : target)
+                : (v.duration ? Math.max(0, v.duration - 0.25) : undefined);
+              if (clamped != null && Number.isFinite(clamped)) {
+                v.currentTime = clamped;
+                setTime(clamped);
+              }
+            }
           }}
         >
           {inIntro ? "Skip intro" : "Skip credits"} <Icon name="next" size={16} />
@@ -2939,8 +3155,41 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
                 <div className="ps-block">
                   <div className="ps-label">Quality</div>
                   <div className="seg3 wrap">
-                    <button className={level === -1 ? "on" : ""} onClick={() => { if (hlsRef.current) { hlsRef.current.currentLevel = -1; setLevel(-1); } }}>Auto</button>
-                    {levels.map((l, i) => <button key={i} className={level === i ? "on" : ""} onClick={() => { if (hlsRef.current) { hlsRef.current.currentLevel = i; setLevel(i); } }}>{l.height}p</button>)}
+                    <button
+                      className={level === -1 ? "on" : ""}
+                      onClick={() => {
+                        if (hlsRef.current) {
+                          hlsRef.current.currentLevel = -1;
+                          setLevel(-1);
+                        } else if (shakaRef.current) {
+                          shakaRef.current.configure("abr.enabled", true);
+                          setLevel(-1);
+                        }
+                      }}
+                    >Auto</button>
+                    {levels.map((l, i) => (
+                      <button
+                        key={i}
+                        className={level === i ? "on" : ""}
+                        onClick={() => {
+                          if (hlsRef.current) {
+                            hlsRef.current.currentLevel = i;
+                            setLevel(i);
+                          } else if (shakaRef.current) {
+                            const targetH = dashHeightsRef.current[i] ?? l.height;
+                            const match = shakaRef.current
+                              .getVariantTracks()
+                              .filter((t) => t.height === targetH)
+                              .sort((a, b) => b.bandwidth - a.bandwidth)[0];
+                            if (match) {
+                              shakaRef.current.configure("abr.enabled", false);
+                              shakaRef.current.selectVariantTrack(match, true, 2);
+                              setLevel(i);
+                            }
+                          }
+                        }}
+                      >{l.height}p</button>
+                    ))}
                   </div>
                 </div>
               )}
@@ -3077,7 +3326,7 @@ const ServerList = memo(function ServerList({
           <span className="srv-sub">{subText}</span>
         </span>
         {q && state === "ok" ? <span className="srv-tag">{q >= 2160 ? "4K" : `${q}p`}</span> : null}
-        {state === "ok" && <span className="srv-tag">{c.kind === "hls" ? "HLS" : c.kind === "file" ? "MP4" : "WEB"}</span>}
+        {state === "ok" && <span className="srv-tag">{c.kind === "hls" ? "HLS" : c.kind === "dash" ? "DASH" : c.kind === "file" ? "MP4" : "WEB"}</span>}
         {tag && <span className={`srv-tag ${tag === "JP?" ? "warn" : ""}`} title={tag === "JP?" ? "This server can't switch audio" : undefined}>{tag}</span>}
         {busy || (now && isConnecting) ? (
           <span className="mini-spin" />

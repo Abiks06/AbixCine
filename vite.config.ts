@@ -8,6 +8,12 @@ export default defineConfig({
   // Never watch the Rust side: cargo locks files in target/ and the watcher would crash.
   server: { port: 1420, strictPort: true, watch: { ignored: ["**/src-tauri/**", "**/server/**"] } },
   envPrefix: ["VITE_", "TAURI_ENV_"],
+  worker: {
+    format: "es",
+  },
+  optimizeDeps: {
+    exclude: ["jassub"],
+  },
   build: {
     target: "chrome110", // WebView2 is evergreen Chromium
     sourcemap: false,
