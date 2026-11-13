@@ -7,7 +7,7 @@
 //! come back through the proxy too. The webview only ever talks to a same-machine origin,
 //! so there are no CORS or mixed-content problems and no third-party page is ever loaded.
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
+use base64::{engine::general_purpose::{STANDARD as B64_STD, URL_SAFE_NO_PAD as B64}, Engine};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::OnceLock, time::Duration};
 use tauri::http::{header, Request, Response, StatusCode};
@@ -572,11 +572,57 @@ fn unwrap_disguised_segment(body: Vec<u8>) -> Vec<u8> {
     body
 }
 
+const MAX_FETCH_BYTES: usize = 20 * 1024 * 1024;
+
 #[derive(Serialize)]
 pub struct FetchResult {
     status: u16,
     url: String,
     body: String,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FetchBytesResult {
+    status: u16,
+    url: String,
+    body_b64: String,
+}
+
+fn validate_http_url(raw_url: &str) -> Result<url::Url, String> {
+    let parsed = url::Url::parse(raw_url).map_err(|e| format!("Invalid URL: {e}"))?;
+    match parsed.scheme() {
+        "http" | "https" => Ok(parsed),
+        other => Err(format!("Unsupported URL scheme: {other}")),
+    }
+}
+
+fn build_http_request(
+    url: &str,
+    headers: Option<HashMap<String, String>>,
+    method: Option<String>,
+    body: Option<String>,
+) -> Result<reqwest::RequestBuilder, String> {
+    let m = reqwest::Method::from_bytes(method.as_deref().unwrap_or("GET").as_bytes()).map_err(|e| e.to_string())?;
+    let mut rb = client().request(m, url).header(header::USER_AGENT, UA);
+    for (k, v) in headers.unwrap_or_default() {
+        rb = rb.header(k, v);
+    }
+    if let Some(b) = body {
+        rb = rb.body(b);
+    }
+    Ok(rb)
+}
+
+fn encode_fetch_bytes(status: u16, url: String, bytes: &[u8]) -> Result<FetchBytesResult, String> {
+    if bytes.len() > MAX_FETCH_BYTES {
+        return Err(format!("Response body exceeds {} MiB limit", MAX_FETCH_BYTES / (1024 * 1024)));
+    }
+    Ok(FetchBytesResult {
+        status,
+        url,
+        body_b64: B64_STD.encode(bytes),
+    })
 }
 
 /// Fetch a page or API as text from Rust (no CORS, any Referer). Used by direct providers.
@@ -587,19 +633,47 @@ pub async fn http_fetch(
     method: Option<String>,
     body: Option<String>,
 ) -> Result<FetchResult, String> {
-    let m = reqwest::Method::from_bytes(method.as_deref().unwrap_or("GET").as_bytes()).map_err(|e| e.to_string())?;
-    let mut rb = client().request(m, &url).header(header::USER_AGENT, UA);
-    for (k, v) in headers.unwrap_or_default() {
-        rb = rb.header(k, v);
-    }
-    if let Some(b) = body {
-        rb = rb.body(b);
-    }
+    let rb = build_http_request(&url, headers, method, body)?;
     let res = rb.send().await.map_err(|e| e.to_string())?;
     let status = res.status().as_u16();
     let url = res.url().to_string();
     let body = res.text().await.map_err(|e| e.to_string())?;
     Ok(FetchResult { status, url, body })
+}
+
+/// Fetch a remote resource as raw bytes (standard Base64 encoded, 20 MiB cap) so non-UTF-8
+/// payloads such as Windows-1252 or UTF-16 subtitles are never lossily decoded before JS sees them.
+#[tauri::command]
+pub async fn http_fetch_bytes(
+    url: String,
+    headers: Option<HashMap<String, String>>,
+    method: Option<String>,
+    body: Option<String>,
+) -> Result<FetchBytesResult, String> {
+    let parsed = validate_http_url(&url)?;
+    let rb = build_http_request(parsed.as_str(), headers, method, body)?;
+    let mut res = rb.send().await.map_err(|e| e.to_string())?;
+    validate_http_url(res.url().as_str())?;
+    if let Some(len) = res.content_length() {
+        if len > MAX_FETCH_BYTES as u64 {
+            return Err(format!("Response body exceeds {} MiB limit", MAX_FETCH_BYTES / (1024 * 1024)));
+        }
+    }
+    let status = res.status().as_u16();
+    let final_url = res.url().to_string();
+    let initial_cap = res
+        .content_length()
+        .and_then(|n| usize::try_from(n).ok())
+        .map(|n| n.min(MAX_FETCH_BYTES))
+        .unwrap_or(0);
+    let mut buf = Vec::with_capacity(initial_cap);
+    while let Some(chunk) = res.chunk().await.map_err(|e| e.to_string())? {
+        if buf.len().saturating_add(chunk.len()) > MAX_FETCH_BYTES {
+            return Err(format!("Response body exceeds {} MiB limit", MAX_FETCH_BYTES / (1024 * 1024)));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    encode_fetch_bytes(status, final_url, &buf)
 }
 
 #[cfg(test)]
@@ -714,5 +788,32 @@ mod tests {
             resolve_proxy_content_type("https://cdn.x/video.mp4", "https://cdn.x/video.mp4", "application/octet-stream"),
             Some("application/octet-stream".into())
         );
+    }
+
+    #[test]
+    fn validates_http_fetch_bytes_scheme_cap_and_standard_base64() {
+        assert!(validate_http_url("https://sub.wyzie.ru/file.srt").is_ok());
+        assert!(validate_http_url("http://example.com/sub.vtt").is_ok());
+        for bad in ["file:///etc/passwd", "ftp://example.com/a", "javascript:alert(1)", "abxs://localhost/p", "not a url"] {
+            assert!(validate_http_url(bad).is_err(), "expected error for {bad}");
+        }
+
+        // Preserve non-UTF-8 raw bytes (Win-1252 0xe9, UTF-16LE BOM 0xff 0xfe) using standard Base64 (+, /, =)
+        let raw = vec![0xff, 0xfe, 0x43, 0x00, 0xfb, 0xff, 0xbf, 0xe9];
+        let res = encode_fetch_bytes(200, "https://example.com/sub.srt".into(), &raw).unwrap();
+        let json = serde_json::to_value(&res).unwrap();
+        assert_eq!(json["status"], 200);
+        assert_eq!(json["url"], "https://example.com/sub.srt");
+        assert!(json.get("bodyB64").is_some(), "expected camelCase bodyB64 field");
+        assert!(json.get("body_b64").is_none());
+        assert!(res.body_b64.contains('+'));
+        assert!(res.body_b64.contains('/'));
+        assert!(res.body_b64.ends_with('='));
+        let decoded = B64_STD.decode(res.body_b64).unwrap();
+        assert_eq!(decoded, raw);
+
+        // Enforce 20 MiB cap
+        let oversized = vec![0u8; MAX_FETCH_BYTES + 1];
+        assert!(encode_fetch_bytes(200, "https://example.com/huge.srt".into(), &oversized).is_err());
     }
 }

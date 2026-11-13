@@ -1323,6 +1323,7 @@ pub fn run() {
             extract_local_subtitle,
             save_sidecar_subtitle,
             stream::http_fetch,
+            stream::http_fetch_bytes,
             shield::sniff_media,
             shield::cancel_sniff,
             shield::shield_stats
