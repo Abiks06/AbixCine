@@ -399,6 +399,37 @@ fn query(uri: &tauri::http::Uri) -> HashMap<String, String> {
         .collect()
 }
 
+fn subtitle_mime_for_path(url: &str) -> Option<&'static str> {
+    let path = url.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase();
+    if path.ends_with(".vtt") {
+        Some("text/vtt; charset=utf-8")
+    } else if path.ends_with(".srt") {
+        Some("application/x-subrip; charset=utf-8")
+    } else if path.ends_with(".ass") || path.ends_with(".ssa") {
+        Some("text/x-ssa; charset=utf-8")
+    } else {
+        None
+    }
+}
+
+fn resolve_proxy_content_type(target: &str, final_url: &str, upstream_ctype: &str) -> Option<String> {
+    let essence = upstream_ctype
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let is_generic = essence.is_empty()
+        || essence == "text/plain"
+        || essence == "application/octet-stream";
+    if is_generic {
+        if let Some(sub_mime) = subtitle_mime_for_path(final_url).or_else(|| subtitle_mime_for_path(target)) {
+            return Some(sub_mime.to_string());
+        }
+    }
+    (!upstream_ctype.trim().is_empty()).then(|| upstream_ctype.trim().to_string())
+}
+
 const MPD_SNIFF_WINDOW: usize = 8192;
 
 pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
@@ -511,8 +542,13 @@ pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
     }
     // Some hosts disguise MPEG-TS segments as images: strip a PNG/WebP header before the TS sync byte.
     let body = unwrap_disguised_segment(body.to_vec());
-    if !ctype.is_empty() {
-        b = b.header(header::CONTENT_TYPE, ctype);
+    let resolved_ctype = if status.is_success() {
+        resolve_proxy_content_type(&target, &final_url, &ctype)
+    } else {
+        (!ctype.trim().is_empty()).then(|| ctype.trim().to_string())
+    };
+    if let Some(resolved_ctype) = resolved_ctype {
+        b = b.header(header::CONTENT_TYPE, resolved_ctype);
     }
     if let Some(cr) = crange {
         b = b.header(header::CONTENT_RANGE, cr).header(header::ACCEPT_RANGES, "bytes");
@@ -649,5 +685,34 @@ mod tests {
         }
         b.extend(&ts);
         assert_eq!(unwrap_disguised_segment(b)[0], 0x47);
+    }
+
+    #[test]
+    fn normalizes_subtitle_content_types_for_generic_upstream_headers() {
+        assert_eq!(
+            resolve_proxy_content_type("https://cdn.x/subs/en.vtt?tok=1", "https://cdn.x/subs/en.vtt?tok=1", ""),
+            Some("text/vtt; charset=utf-8".into())
+        );
+        assert_eq!(
+            resolve_proxy_content_type("https://cdn.x/subs/en.srt", "https://cdn.x/subs/en.srt", "text/plain; charset=utf-8"),
+            Some("application/x-subrip; charset=utf-8".into())
+        );
+        assert_eq!(
+            resolve_proxy_content_type("https://cdn.x/subs/jp.ASS", "https://cdn.x/subs/jp.ASS", "application/octet-stream"),
+            Some("text/x-ssa; charset=utf-8".into())
+        );
+        assert_eq!(
+            resolve_proxy_content_type("https://cdn.x/redirect", "https://cdn.x/final/track.ssa?v=2", "TEXT/PLAIN"),
+            Some("text/x-ssa; charset=utf-8".into())
+        );
+        // Preserves explicit subtitle MIME and non-subtitle generic MIME
+        assert_eq!(
+            resolve_proxy_content_type("https://cdn.x/subs/en.vtt", "https://cdn.x/subs/en.vtt", "text/vtt; charset=iso-8859-1"),
+            Some("text/vtt; charset=iso-8859-1".into())
+        );
+        assert_eq!(
+            resolve_proxy_content_type("https://cdn.x/video.mp4", "https://cdn.x/video.mp4", "application/octet-stream"),
+            Some("application/octet-stream".into())
+        );
     }
 }

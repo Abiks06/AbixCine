@@ -101,6 +101,44 @@ pub enum Found {
     Subtitle(String),
 }
 
+pub fn is_thumbnail_subtitle_url(uri: &str) -> bool {
+    let lower = uri.to_ascii_lowercase();
+    let path = lower.split(['?', '#']).next().unwrap_or("");
+    if lower.contains("/bif/")
+        || path.contains("/thumbnails/")
+        || path.contains("/storyboard/")
+    {
+        return true;
+    }
+    let file = path.rsplit('/').next().unwrap_or(path);
+    let Some(stem) = file.strip_suffix(".vtt") else {
+        return false;
+    };
+    stem.split(|c: char| !c.is_ascii_alphanumeric()).any(|tok| {
+        let stripped = tok.trim_end_matches(|c: char| c.is_ascii_digit());
+        matches!(
+            stripped,
+            "thumbnails" | "thumbnail" | "thumbs" | "sprite" | "sprites" | "storyboard"
+        )
+    })
+}
+
+pub fn is_sniffed_subtitle(uri: &str, ctype: &str) -> bool {
+    if is_thumbnail_subtitle_url(uri) {
+        return false;
+    }
+    let path = uri.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase();
+    let ctype = ctype.to_ascii_lowercase();
+    let has_sub_ext = [".vtt", ".srt", ".ass", ".ssa"]
+        .iter()
+        .any(|ext| path.ends_with(ext));
+    let has_sub_mime = ctype.contains("text/vtt")
+        || ctype.contains("text/x-ssa")
+        || ctype.contains("text/x-ass")
+        || ctype.contains("application/x-subrip");
+    has_sub_ext || has_sub_mime
+}
+
 #[cfg(windows)]
 mod win {
     use super::*;
@@ -339,7 +377,7 @@ mod win {
                             ua: req_header(&req, "User-Agent"),
                         };
                         let _ = tx.send(Found::Media(Sniffed { url: uri, kind, headers, subtitles: vec![], verified: None, quality: None }));
-                    } else if path.ends_with(".vtt") || path.ends_with(".srt") || ctype.contains("text/vtt") {
+                    } else if is_sniffed_subtitle(&uri, &ctype) {
                         let _ = tx.send(Found::Subtitle(uri));
                     }
                     Ok(())
@@ -651,4 +689,33 @@ async fn sniff_inner(app: AppHandle, url: String, timeout_ms: Option<u64>, label
         }
     }
     Ok(fallback)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn captures_supported_subtitle_extensions_and_mimes() {
+        assert!(is_sniffed_subtitle("https://cdn.example.com/subs/en.vtt?t=1", ""));
+        assert!(is_sniffed_subtitle("https://cdn.example.com/subs/en.srt", ""));
+        assert!(is_sniffed_subtitle("https://cdn.example.com/subs/jp.ASS?sig=abc", ""));
+        assert!(is_sniffed_subtitle("https://cdn.example.com/subs/dialogue.ssa", ""));
+        assert!(is_sniffed_subtitle("https://cdn.example.com/track?id=1", "text/vtt; charset=utf-8"));
+        assert!(is_sniffed_subtitle("https://cdn.example.com/track?id=2", "text/x-ssa"));
+        assert!(is_sniffed_subtitle("https://cdn.example.com/track?id=3", "application/x-subrip"));
+        assert!(!is_sniffed_subtitle("https://cdn.example.com/video.mp4", "video/mp4"));
+    }
+
+    #[test]
+    fn ignores_thumbnail_sprite_and_bif_vtt_urls() {
+        assert!(!is_sniffed_subtitle("https://cdn.example.com/v/123/thumbnails.vtt", "text/vtt"));
+        assert!(!is_sniffed_subtitle("https://cdn.example.com/v/123/thumbs.vtt?exp=999", "text/vtt"));
+        assert!(!is_sniffed_subtitle("https://cdn.example.com/v/123/sprite.vtt", ""));
+        assert!(!is_sniffed_subtitle("https://cdn.example.com/v/123/storyboard.vtt", "text/vtt"));
+        assert!(!is_sniffed_subtitle("https://cdn.example.com/bif/preview.vtt", "text/vtt"));
+        assert!(!is_sniffed_subtitle("https://cdn.example.com/bif/track?id=1", "text/vtt"));
+        // Real subtitles must still be captured
+        assert!(is_sniffed_subtitle("https://cdn.example.com/subs/English.vtt", "text/vtt"));
+    }
 }
