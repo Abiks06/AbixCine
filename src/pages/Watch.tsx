@@ -306,6 +306,7 @@ export function Watch() {
         onNext={next ? goNext : undefined}
         nextLabel={next ? (next.label ?? `${next.s != null ? `Season ${next.s} · ` : ""}Episode ${next.e}`) : undefined}
         onRetry={() => {
+          clearResolveCache();
           setGo(false);
           reloadCatalog();
         }}
