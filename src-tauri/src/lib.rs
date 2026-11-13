@@ -1,6 +1,7 @@
 use serde::Serialize;
 mod shield;
 mod stream;
+mod torrent;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -1427,7 +1428,11 @@ pub fn run() {
             stream::http_fetch_bytes,
             shield::sniff_media,
             shield::cancel_sniff,
-            shield::shield_stats
+            shield::shield_stats,
+            torrent::torrent_is_supported,
+            torrent::torrent_start_stream,
+            torrent::torrent_status,
+            torrent::torrent_stop
         ])
         .run(tauri::generate_context!())
         .expect("error while running AbixCine");
