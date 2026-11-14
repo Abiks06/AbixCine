@@ -92,6 +92,16 @@ export function Title() {
   const [tab, setTab] = useState<Tab>("episodes");
   const [jump, setJump] = useState("");
   const [page, setPage] = useState(0);
+  // Long-running shows have more episode ranges than fit: keep the lit one in view (e.g. on resume).
+  const stripRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const strip = stripRef.current;
+    const on = strip?.querySelector<HTMLElement>("button.on");
+    if (!strip || !on) return;
+    const sr = strip.getBoundingClientRect();
+    const br = on.getBoundingClientRect();
+    if (br.left < sr.left || br.right > sr.right) strip.scrollBy({ left: br.left - sr.left - (sr.width - br.width) / 2, behavior: "smooth" });
+  }, [page, key]);
   useEffect(() => {
     setPickedSeason(null);
     setTab("episodes");
@@ -275,7 +285,7 @@ export function Title() {
               {d.year ? <span>{d.year}</span> : null}
               {d.certification && <span className="cert">{d.certification}</span>}
               {length && <span>{length}</span>}
-              {!film && d.runtime ? <span>{d.runtime}m episodes</span> : null}
+              {!film && d.runtime ? <span>{d.runtime}m per ep</span> : null}
               {d.status && <span>{nice(d.status)}</span>}
               {anime && <span className="hi">Sub · Dub</span>}
             </div>
@@ -380,7 +390,7 @@ export function Title() {
                 {(paged || epList.length > 12) && (
                   <div className="ep-tools">
                     {paged && (
-                      <div className="season-strip">
+                      <div className="season-strip" ref={stripRef}>
                         {Array.from({ length: pages }, (_, p) => (
                           <button key={p} className={p === safePage ? "on" : ""} onClick={() => setPage(p)}>{p * PAGE + 1}–{Math.min(epList.length, (p + 1) * PAGE)}</button>
                         ))}

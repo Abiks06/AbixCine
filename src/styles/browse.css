@@ -172,6 +172,8 @@ a.file:hover { box-shadow: inset 0 0 0 1px var(--line-3), 0 20px 40px -26px var(
 .drive-empty:hover { border-color: var(--tone-ink); background: color-mix(in oklab, var(--tone) 7%, transparent); }
 .drive-empty div { flex: 1; display: flex; flex-direction: column; gap: 2px; }
 .drive-empty span:not(.drive-empty-ic) { color: var(--fg2); font-size: 13px; }
+.drive-note { margin: -8px 0 18px; }
+p.muted.drive-note { margin: 0; max-width: 64ch; line-height: 1.6; }
 .drive-empty-ic { width: 46px; height: 46px; border-radius: 15px; display: grid; place-items: center; background: var(--tone); color: var(--on-tone); flex: none; }
 
 /* ---------- title page: the dossier ---------- */
@@ -245,6 +247,11 @@ a.file:hover { box-shadow: inset 0 0 0 1px var(--line-3), 0 20px 40px -26px var(
 .ep-tools { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
 .season-strip { display: flex; gap: 4px; overflow-x: auto; scrollbar-width: none; padding-bottom: 2px; flex: 1; min-width: 0; }
 .season-strip::-webkit-scrollbar { display: none; }
+/* Edges fade only on the side that has more to scroll to (a scroll-driven animation: inert when nothing overflows). */
+@property --fl { syntax: "<length>"; inherits: false; initial-value: 0px; }
+@property --fr { syntax: "<length>"; inherits: false; initial-value: 0px; }
+.season-strip { mask-image: linear-gradient(90deg, transparent, #000 var(--fl), #000 calc(100% - var(--fr)), transparent); animation: edges linear both; animation-timeline: scroll(self inline); }
+@keyframes edges { 0% { --fl: 0px; --fr: 40px; } 6% { --fl: 40px; } 94% { --fr: 40px; } 100% { --fl: 40px; --fr: 0px; } }
 .season-strip button { height: 30px; padding: 0 12px; border-radius: 999px; font: 600 11.5px var(--f-mono); color: var(--fg2); background: rgb(255 255 255 / 0.05); white-space: nowrap; flex: none; transition: background var(--fast), color var(--fast); }
 .season-strip button:hover { color: var(--fg); }
 .season-strip button.on { background: var(--fg); color: #08080b; }
@@ -402,7 +409,7 @@ a.file:hover { box-shadow: inset 0 0 0 1px var(--line-3), 0 20px 40px -26px var(
 
 /* ---------- settings ---------- */
 .settings { display: grid; grid-template-columns: 220px minmax(0, 860px); gap: 12px 56px; align-items: start; }
-.settings > .page-title { grid-column: 1 / -1; margin-bottom: 22px; animation: rise 0.5s var(--ease-out) both; }
+.settings > .set-head { grid-column: 1 / -1; margin-bottom: 22px; animation: rise 0.5s var(--ease-out) both; }
 .set-nav { position: sticky; top: calc(var(--top) + 24px); display: flex; flex-direction: column; gap: 2px; animation: rise 0.5s var(--ease-out) 60ms both; }
 .set-nav button { position: relative; display: flex; align-items: center; gap: 12px; height: 40px; padding: 0 14px; border-radius: var(--r-sm); color: var(--fg2); font-weight: 550; text-align: left; transition: background var(--fast), color var(--fast); }
 .set-nav button:hover { background: rgb(255 255 255 / 0.05); color: var(--fg); }
@@ -437,7 +444,7 @@ a.file:hover { box-shadow: inset 0 0 0 1px var(--line-3), 0 20px 40px -26px var(
 .source-head .badge { margin-left: auto; }
 .settings-sub { margin: 26px 0 12px; font: 700 18px/1 var(--f-disp); font-stretch: 84%; display: flex; align-items: baseline; gap: 10px; }
 .settings-sub .muted { font: 500 11px var(--f-mono); letter-spacing: 0.1em; text-transform: uppercase; }
-.source-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(168px, 1fr)); gap: 8px; margin-top: 10px; }
+.source-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(204px, 1fr)); gap: 8px; margin-top: 10px; }
 .source-grid > .setting-line { grid-column: 1 / -1; }
 .source-chip-toggle { display: flex; align-items: center; gap: 8px; min-height: 38px; padding: 6px 12px; border-radius: var(--r-sm); background: rgb(255 255 255 / 0.04); box-shadow: inset 0 0 0 1px var(--line); font-size: 13px; font-weight: 500; color: var(--fg2); cursor: pointer; user-select: none; transition: background var(--fast), box-shadow var(--fast), color var(--fast); }
 .source-chip-toggle:hover { background: rgb(255 255 255 / 0.08); }

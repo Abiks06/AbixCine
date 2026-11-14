@@ -487,7 +487,10 @@ export function Settings() {
 
   return (
     <div className="page settings">
-      <h1 className="page-title">Settings</h1>
+      <div className="set-head">
+        <p className="overline">Make it yours</p>
+        <h1 className="page-title">Settings</h1>
+      </div>
       <nav className="set-nav" aria-label="Settings sections">
         {SECTIONS.map((sec) => (
           <button key={sec.id} type="button" className={active === sec.id ? "on" : ""} onClick={() => jump(sec.id)}>
@@ -580,7 +583,7 @@ export function Settings() {
             {availableSources.filter((src) => !src.extra).map((src) => {
               const on = !s.disabledSources?.includes(src.id);
               return (
-                <label key={src.id} className={`source-chip-toggle ${on ? "active" : ""}`}>
+                <label key={src.id} className={`source-chip-toggle ${on ? "active" : ""}`} title={src.name}>
                   <input
                     type="checkbox"
                     checked={on}
@@ -600,7 +603,7 @@ export function Settings() {
             {availableSources.filter((src) => src.extra).map((src) => {
               const on = !s.disabledSources?.includes(src.id) && (s.enabledExtras == null || s.enabledExtras.includes(src.id));
               return (
-                <label key={src.id} className={`source-chip-toggle ${on ? "active" : ""}`}>
+                <label key={src.id} className={`source-chip-toggle ${on ? "active" : ""}`} title={src.name}>
                   <input type="checkbox" checked={on} onChange={(e) => toggleSource(src.id, e.target.checked, true)} />
                   <span>{src.name}</span>
                   {src.isFrench && <small className="badge">FR</small>}

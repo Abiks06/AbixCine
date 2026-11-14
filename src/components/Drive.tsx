@@ -54,7 +54,7 @@ export function DriveTile({ t, i = 0 }: { t: DriveTitle; i?: number }) {
 }
 
 /** "Local first": the user's own files, grouped into titles and matched to the catalog. */
-export function DriveSection({ limit, rescan = 0 }: { limit?: number; rescan?: number }) {
+export function DriveSection({ limit, rescan = 0, bare = false }: { limit?: number; rescan?: number; bare?: boolean }) {
   const s = useSettings();
   const drive = useDrive(rescan);
   const where = s.libraryPaths.length === 1 ? folderLabel(s.libraryPaths[0]) : s.libraryPaths.length ? `${s.libraryPaths.length} folders` : "your drive";
@@ -62,13 +62,25 @@ export function DriveSection({ limit, rescan = 0 }: { limit?: number; rescan?: n
 
   return (
     <section className="shelf" id="drive">
-      <SectionHead
-        eyebrow="Local first · plays instantly, no internet needed"
-        title={`From ${where}`}
-        to={limit && drive.titles.length > limit ? "/library" : undefined}
-        right={drive.files ? <span className="shelf-note">{drive.files.toLocaleString()} files · last scan {ago(drive.at)}</span> : null}
-      />
-      {s.libraryPaths.length === 0 ? (
+      {/* On its own page the page title already says where this is: just the scan note. */}
+      {bare ? (
+        drive.files ? <p className="shelf-note drive-note">{drive.files.toLocaleString()} files · last scan {ago(drive.at)}</p> : null
+      ) : (
+        <SectionHead
+          eyebrow="Local first · plays instantly, no internet needed"
+          title={`From ${where}`}
+          to={limit && drive.titles.length > limit ? "/library" : undefined}
+          right={drive.files ? <span className="shelf-note">{drive.files.toLocaleString()} files · last scan {ago(drive.at)}</span> : null}
+        />
+      )}
+      {s.libraryPaths.length === 0 && bare ? (
+        <div className="empty">
+          <span className="empty-ic"><Icon name="folder" size={26} /></span>
+          <h3>No folders yet</h3>
+          <p>Point AbixCine at the films and shows already on this PC. They're matched to the catalog automatically and play first, before any server, with no internet needed.</p>
+          <Link to="/settings#sources" className="btn play sm" viewTransition><Icon name="plus" size={16} /> Add a media folder</Link>
+        </div>
+      ) : s.libraryPaths.length === 0 ? (
         <Link to="/settings#sources" className="drive-empty" viewTransition>
           <span className="drive-empty-ic"><Icon name="folder" size={22} /></span>
           <div>
@@ -82,7 +94,7 @@ export function DriveSection({ limit, rescan = 0 }: { limit?: number; rescan?: n
       ) : drive.error || (drive.warning && !drive.titles.length) ? (
         <p className="muted">Couldn't scan: {drive.error ?? drive.warning}</p>
       ) : shown.length === 0 ? (
-        <p className="muted">No video files found in {where} yet.</p>
+        <p className="muted drive-note">No video files found in {where} yet. Names like “Movie (2021).mkv” or “Show S01E02.mp4” are picked up on the next scan.</p>
       ) : (
         <div className="drive">{shown.map((t, i) => <DriveTile key={t.id} t={t} i={i} />)}</div>
       )}

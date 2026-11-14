@@ -139,7 +139,7 @@ export function Hero({ items, label, onActive }: { items: Media[]; label: string
 
         {n > 1 && (
           <div className="hero-queue">
-            <h6><span>Tonight's programme</span><span>{pad2(cur + 1)}/{pad2(n)}</span></h6>
+            <h6><span>{label === "Tonight" ? "Tonight's programme" : `Programme · ${label}`}</span><span>{pad2(cur + 1)}/{pad2(n)}</span></h6>
             {picks.map((p, j) => (
               <button key={p.key} className={`hq ${j === cur ? "on" : ""}`} onClick={() => setI(j)} aria-label={`Show ${p.title}`} aria-current={j === cur}>
                 <span className="hq-n">{pad2(j + 1)}</span>

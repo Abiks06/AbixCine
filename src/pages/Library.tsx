@@ -20,10 +20,14 @@ export function Library() {
         {s.libraryPaths.map((p) => (
           <span key={p} className="chip" title={p}><Icon name="folder" size={14} /> {folderLabel(p)}</span>
         ))}
-        <button className="btn glass sm" onClick={() => setRescan((n) => n + 1)} disabled={!s.libraryPaths.length}><Icon name="refresh" size={16} /> Rescan</button>
-        <Link className="btn glass sm" to="/settings#sources" viewTransition><Icon name="plus" size={16} /> Add folder</Link>
+        {s.libraryPaths.length > 0 && (
+          <>
+            <button className="btn glass sm" onClick={() => setRescan((n) => n + 1)}><Icon name="refresh" size={16} /> Rescan</button>
+            <Link className="btn glass sm" to="/settings#sources" viewTransition><Icon name="plus" size={16} /> Add folder</Link>
+          </>
+        )}
       </div>
-      <DriveSection rescan={rescan} />
+      <DriveSection rescan={rescan} bare />
     </div>
   );
 }

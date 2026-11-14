@@ -44,7 +44,7 @@ export function MyList() {
           <h1 className="page-title">My <em>List</em></h1>
         </div>
         <span className="grow" />
-        <span className="shelf-note">{list.length} title{list.length === 1 ? "" : "s"} · {user ? "synced to your account" : "saved on this PC"}</span>
+        {list.length > 0 && <span className="shelf-note">{list.length} title{list.length === 1 ? "" : "s"} · {user ? "synced to your account" : "saved on this PC"}</span>}
       </div>
       {list.length === 0 ? (
         <div className="empty">
