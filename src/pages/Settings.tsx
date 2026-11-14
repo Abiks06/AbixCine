@@ -39,7 +39,8 @@ import {
   validatePluginManifest,
   type ProviderPluginManifest,
 } from "../sources/pluginRunner";
-import { availableSources, clearResolveCache, DIRECT_SOURCES, PROVIDERS } from "../sources/registry";
+import { availableSources, DIRECT_SOURCES, PROVIDERS } from "../sources/registry";
+import { invalidateSessions } from "../sources/session";
 import {
   addStremioAddon,
   fetchStremioManifest,
@@ -190,7 +191,7 @@ export function Settings() {
     try {
       await fetchStremioManifest(raw, ctl.signal);
       const addon = await addStremioAddon(raw, ctl.signal);
-      clearResolveCache();
+      invalidateSessions();
       if (!mountedRef.current || ctl.signal.aborted) return;
       refreshStremioState();
       setStremioUrl("");
@@ -205,20 +206,20 @@ export function Settings() {
 
   const handleToggleStremioAddon = (addon: StremioAddonConfig, enabled: boolean) => {
     toggleStremioAddon(addon.id, enabled);
-    clearResolveCache();
+    invalidateSessions();
     refreshStremioState();
   };
 
   const handleRemoveStremioAddon = (addon: StremioAddonConfig) => {
     removeStremioAddon(addon.id);
-    clearResolveCache();
+    invalidateSessions();
     refreshStremioState();
     setStremioMsg(`Removed ${addon.name}`);
   };
 
   const handleTorrentModeToggle = (enabled: boolean) => {
     updateStremioConfig({ torrentMode: enabled });
-    clearResolveCache();
+    invalidateSessions();
     refreshStremioState();
     setStremioMsg(enabled ? "Torrent P2P mode enabled for Stremio addons." : "Torrent P2P mode disabled.");
   };
@@ -227,7 +228,7 @@ export function Settings() {
     e.preventDefault();
     if (debridProvider === "none") {
       saveDebridConfig(null);
-      clearResolveCache();
+      invalidateSessions();
       setDebridMsg("Debrid disabled on this device.");
       return;
     }
@@ -237,13 +238,13 @@ export function Settings() {
       return;
     }
     saveDebridConfig({ provider: debridProvider, apiKey: key, enabled: true });
-    clearResolveCache();
+    invalidateSessions();
     setDebridMsg(`Saved ${debridProvider} API key locally.`);
   };
 
   const handleClearDebrid = () => {
     saveDebridConfig(null);
-    clearResolveCache();
+    invalidateSessions();
     setDebridProvider("none");
     setDebridKey("");
     setDebridMsg("Cleared local Debrid credentials.");
@@ -323,7 +324,7 @@ export function Settings() {
       if (res.status < 200 || res.status >= 300) throw new Error(`HTTP ${res.status} loading plugin`);
       const manifest = buildManifestFromInput(res.body, safeUrl);
       const installed = installPlugin(manifest);
-      clearResolveCache();
+      invalidateSessions();
       if (!mountedRef.current || ctl.signal.aborted) return;
       setPlugins(listPlugins());
       setPluginUrl("");
@@ -343,7 +344,7 @@ export function Settings() {
     try {
       const manifest = buildManifestFromInput(raw);
       const installed = installPlugin(manifest);
-      clearResolveCache();
+      invalidateSessions();
       setPlugins(listPlugins());
       setPluginPaste("");
       setPluginMsg(`Installed ${installed.name} (v${installed.version})`);
@@ -354,13 +355,13 @@ export function Settings() {
 
   const handleTogglePlugin = (plugin: ProviderPluginManifest, enabled: boolean) => {
     togglePlugin(plugin.id, enabled);
-    clearResolveCache();
+    invalidateSessions();
     setPlugins(listPlugins());
   };
 
   const handleRemovePlugin = (plugin: ProviderPluginManifest) => {
     removePlugin(plugin.id);
-    clearResolveCache();
+    invalidateSessions();
     setPlugins(listPlugins());
     setPluginMsg(`Removed ${plugin.name}`);
   };

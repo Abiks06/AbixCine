@@ -24,23 +24,19 @@ import { kisskhProvider, decryptKisskhSubtitle } from "./kisskh";
 import { localProvider, sidecarTrack } from "./local";
 import {
   availableSources,
-  candKey,
   candLine,
-  clearResolveCache,
   DIRECT_SOURCES,
   embedProviders,
   initialCandidateIndex,
   playCheck,
   probeHedged,
-  promoteCachedCandidate,
   PROVIDERS,
   quickCheck,
-  resolveSources,
   score,
   validateManifest,
   verifyEmbed,
-  type ResolveEvent,
 } from "./registry";
+import { invalidateSessions, SourceSession } from "./session";
 import { isUrlTokenExpired, normalizeHeaders, proxyUrl, unwrapProxyUrl, type Sniffed } from "./native";
 import { clearPlugins, installPlugin, pluginProvidersSource, PLUGINS_STORAGE_KEY, togglePlugin } from "./pluginRunner";
 import { saveStremioAddons, STREMIO_STORAGE_KEY, stremioProvider } from "./stremio";
@@ -91,7 +87,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  clearResolveCache();
+  invalidateSessions();
   resetHealth();
   mockHttpFetch.mockReset();
   mockInvoke.mockReset();
@@ -132,167 +128,6 @@ describe("source ranking", () => {
 
     expect(french.score).toBeLessThan(neutral.score!);
     expect(french.why).toContain("French source for non-French title");
-  });
-
-  it("checks more standby embeds when the requested verification budget increases", async () => {
-    const original = [...PROVIDERS];
-    const providers: SourceProvider[] = ["first", "second", "third", "fourth", "fifth"].map((id, i) => ({
-      id,
-      name: id,
-      category: "embed",
-      priority: 20 - i,
-      isEnabled: () => true,
-      find: async () => [candidate(id)],
-    }));
-    PROVIDERS.splice(0, PROVIDERS.length, ...providers);
-
-    try {
-      const req = request("test:verification-budget");
-      const initial = await resolveSources(req, undefined, { verifyBudget: 1, record: false });
-      const initiallyVerified = initial.filter((c) => c.probe?.ok).length;
-      expect(initiallyVerified).toBeGreaterThan(0);
-      expect(initiallyVerified).toBeLessThan(providers.length);
-      expect(initial.some((c) => !c.probe)).toBe(true);
-
-      const expanded = await resolveSources(req, undefined, { verifyBudget: 4, record: false });
-      expect(expanded.filter((c) => c.probe?.ok).length).toBeGreaterThan(initiallyVerified);
-    } finally {
-      PROVIDERS.splice(0, PROVIDERS.length, ...original);
-    }
-  });
-
-  it("starts from the first verified source without waiting for slower lookups", async () => {
-    const original = [...PROVIDERS];
-    let releaseDirect!: (response: Response) => void;
-    let releaseSlow!: (candidates: StreamCandidate[]) => void;
-    const directProbe = new Promise<Response>((resolve) => {
-      releaseDirect = resolve;
-    });
-    const slowLookup = new Promise<StreamCandidate[]>((resolve) => {
-      releaseSlow = resolve;
-    });
-    const providers: SourceProvider[] = [
-      {
-        id: "fast",
-        name: "Fast",
-        category: "embed",
-        priority: 20,
-        isEnabled: () => true,
-        find: async () => [
-          { ...candidate("fast"), url: "https://fast.example/master.m3u8", kind: "hls", via: "direct", pageUrl: undefined },
-          candidate("fast"),
-        ],
-      },
-      {
-        id: "slow",
-        name: "Slow",
-        category: "embed",
-        priority: 10,
-        isEnabled: () => true,
-        find: () => slowLookup,
-      },
-    ];
-    PROVIDERS.splice(0, PROVIDERS.length, ...providers);
-    vi.stubGlobal("fetch", () => directProbe);
-    vi.useFakeTimers();
-
-    try {
-      const pending = resolveSources(request("test:fast-first-source"), undefined, { early: true, record: false });
-      await vi.advanceTimersByTimeAsync(300);
-      const selected = await pending;
-
-      expect(selected.some((c) => c.providerId === "fast" && c.probe?.ok)).toBe(true);
-
-      releaseSlow([candidate("slow")]);
-      releaseDirect(new Response("#EXTM3U\n#EXTINF:6,\nsegment.ts", { status: 200 }));
-      await vi.runAllTimersAsync();
-    } finally {
-      vi.useRealTimers();
-      vi.unstubAllGlobals();
-      PROVIDERS.splice(0, PROVIDERS.length, ...original);
-    }
-  });
-
-  it("keeps checking later embeds when earlier captures don't find a stream", async () => {
-    const original = [...PROVIDERS];
-    const ids = ["first", "second", "third", "fourth", "fifth", "sixth", "seventh"];
-    const providers: SourceProvider[] = ids.map((id, i) => ({
-      id,
-      name: id,
-      category: "embed",
-      priority: 20 - i,
-      isEnabled: () => true,
-      find: async () => [candidate(id)],
-    }));
-    const last = candidate("seventh");
-    mockSniff.mockImplementation(async (url: string) => url === last.url ? {
-      url: "https://media.example/master.m3u8",
-      kind: "hls",
-      headers: {},
-      subtitles: [],
-      verified: true,
-      quality: 1080,
-    } : null);
-    PROVIDERS.splice(0, PROVIDERS.length, ...providers);
-
-    try {
-      const result = await resolveSources(request("test:later-embed"), undefined, { verifyBudget: 2, record: false });
-
-      expect(result.find((c) => c.providerId === "seventh")?.probe?.ok).toBe(true);
-      // Failed embeds are explicitly marked probe.ok === false instead of left as standby
-      expect(result.find((c) => c.providerId === "first")?.probe?.ok).toBe(false);
-    } finally {
-      PROVIDERS.splice(0, PROVIDERS.length, ...original);
-    }
-  });
-
-  it("tries the last working source first among queued embeds", async () => {
-    const original = [...PROVIDERS];
-    const req = request("test:last-picked-source");
-    const active = new Set(["first", "second", "third"]);
-    const pending: Record<string, (result: Sniffed | null) => void> = {};
-    const stream: Sniffed = {
-      url: "https://media.example/master.m3u8",
-      kind: "hls",
-      headers: {},
-      subtitles: [],
-      verified: true,
-      quality: 1080,
-    };
-    const providers: SourceProvider[] = ["first", "second", "third", "fourth", "fifth"].map((id, i) => ({
-      id,
-      name: id,
-      category: "embed",
-      priority: 20 - i,
-      isEnabled: () => true,
-      find: async () => [candidate(id)],
-    }));
-    mockSniff.mockImplementation((url: string) => {
-      const id = new URL(url).hostname.split(".")[0];
-      if (active.has(id)) return new Promise<Sniffed | null>((resolve) => { pending[id] = resolve; });
-      return Promise.resolve(id === "fifth" ? stream : null);
-    });
-    PROVIDERS.splice(0, PROVIDERS.length, ...providers);
-    resetHealth();
-    recordPlayback(req, candidate("fifth"), true);
-
-    try {
-      const race = resolveSources(req, undefined, { verifyBudget: 1, record: false });
-      await vi.waitFor(() => expect(mockSniff).toHaveBeenCalledTimes(3));
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      pending.first(null);
-      await vi.waitFor(() => expect(mockSniff).toHaveBeenCalledTimes(4));
-
-      expect(new URL(mockSniff.mock.calls[3][0]).hostname).toBe("fifth.example");
-
-      pending.second(null);
-      pending.third(null);
-      const result = await race;
-      expect(result.find((c) => c.providerId === "fifth")?.probe?.ok).toBe(true);
-    } finally {
-      resetHealth();
-      PROVIDERS.splice(0, PROVIDERS.length, ...original);
-    }
   });
 });
 
@@ -884,234 +719,6 @@ describe("health recovery, incremental resolve cache & embed hardening", () => {
     }
   });
 
-  it("incrementally upgrades resolveSources cache without re-sniffing already-verified winners and caps hedged concurrency at 4", async () => {
-    const original = [...PROVIDERS];
-    const findCounts = new Map<string, number>();
-    const providers: SourceProvider[] = ["first", "second", "third", "fourth", "fifth", "sixth"].map((id, i) => ({
-      id,
-      name: id,
-      category: "embed",
-      priority: 20 - i,
-      isEnabled: () => true,
-      find: async () => {
-        findCounts.set(id, (findCounts.get(id) ?? 0) + 1);
-        return [candidate(id)];
-      },
-    }));
-    PROVIDERS.splice(0, PROVIDERS.length, ...providers);
-
-    const sniffCalls: string[] = [];
-    mockSniff.mockImplementation((url: string, _ms?: number, signal?: AbortSignal) => {
-      sniffCalls.push(url);
-      const host = new URL(url).hostname.split(".")[0];
-      const stream: Sniffed = {
-        url: `https://media.example/${host}/master.m3u8`,
-        kind: "hls",
-        headers: {},
-        subtitles: [],
-        verified: true,
-        quality: 1080,
-      };
-      if (host === "first") return Promise.resolve(stream);
-      return new Promise<Sniffed | null>((resolve) => {
-        const t = setTimeout(() => resolve(stream), 15);
-        signal?.addEventListener("abort", () => {
-          clearTimeout(t);
-          resolve(null);
-        }, { once: true });
-      });
-    });
-
-    try {
-      const req = request("test:incremental-upgrade");
-      const firstPass = await resolveSources(req, undefined, { verifyBudget: 1, record: false });
-      const firstWinners = firstPass.filter((c) => c.probe?.ok);
-      expect(firstWinners.length).toBeGreaterThanOrEqual(1);
-      expect(firstPass.some((c) => c.kind === "embed" && !c.probe)).toBe(true);
-
-      const winnerPageUrls = new Set(firstWinners.map((c) => candKey(c)));
-      const sniffCountAfterFirst = sniffCalls.length;
-      expect(findCounts.get("first")).toBe(1);
-
-      // Upgrading verifyBudget from 1 -> 3 reuses cached lookups & winners, probing only standby embeds
-      const events: ResolveEvent[] = [];
-      const updates: StreamCandidate[][] = [];
-      const upgraded = await resolveSources(req, (e) => events.push(e), {
-        verifyBudget: 3,
-        record: false,
-        onUpdate: (r) => updates.push(r),
-      });
-
-      expect(upgraded.filter((c) => c.probe?.ok).length).toBeGreaterThanOrEqual(3);
-      expect(events.filter((e) => e.status === "done")).toHaveLength(providers.length);
-      expect(updates[0].some((c) => winnerPageUrls.has(candKey(c)) && c.probe?.ok)).toBe(true);
-      // Provider lookups were not repeated
-      expect(findCounts.get("first")).toBe(1);
-      // Already-verified winners were not sniffed a second time
-      const newSniffUrls = sniffCalls.slice(sniffCountAfterFirst);
-      expect(newSniffUrls.length).toBeGreaterThan(0);
-      for (const u of newSniffUrls) {
-        expect(winnerPageUrls.has(u)).toBe(false);
-      }
-
-      // Check early: true resolves after GRACE_MS while standby backups finish in background
-      clearResolveCache();
-      sniffCalls.length = 0;
-      const pendingSniffs: Record<string, (v: Sniffed | null) => void> = {};
-      mockSniff.mockImplementation((url: string, _ms?: number, signal?: AbortSignal) => {
-        sniffCalls.push(url);
-        const host = new URL(url).hostname.split(".")[0];
-        if (host === "first") {
-          return Promise.resolve({
-            url: "https://media.example/first/master.m3u8",
-            kind: "hls",
-            headers: {},
-            subtitles: [],
-            verified: true,
-            quality: 1080,
-          });
-        }
-        return new Promise<Sniffed | null>((resolve) => {
-          pendingSniffs[host] = resolve;
-          signal?.addEventListener("abort", () => resolve(null), { once: true });
-        });
-      });
-
-      vi.useFakeTimers();
-      try {
-        await resolveSources(request("test:early-upgrade"), undefined, { verifyBudget: 1, record: false });
-        const bgUpdates: StreamCandidate[][] = [];
-        const earlyPromise = resolveSources(request("test:early-upgrade"), undefined, {
-          verifyBudget: 3,
-          early: true,
-          record: false,
-          onUpdate: (r) => bgUpdates.push(r),
-        });
-        await vi.advanceTimersByTimeAsync(260);
-        const earlyOut = await earlyPromise;
-        expect(earlyOut.find((c) => c.providerId === "first")?.probe?.ok).toBe(true);
-
-        // Background probes settle and notify via onUpdate
-        pendingSniffs.second?.({
-          url: "https://media.example/second/master.m3u8",
-          kind: "hls",
-          headers: {},
-          subtitles: [],
-          verified: true,
-          quality: 720,
-        });
-        pendingSniffs.third?.({
-          url: "https://media.example/third/master.m3u8",
-          kind: "hls",
-          headers: {},
-          subtitles: [],
-          verified: true,
-          quality: 1080,
-        });
-        await vi.runAllTimersAsync();
-        expect(bgUpdates[bgUpdates.length - 1].filter((c) => c.probe?.ok).length).toBeGreaterThanOrEqual(3);
-
-        // Hedge concurrency cap is 4 (matching Rust Semaphore(4)) rather than 5
-        clearResolveCache();
-        sniffCalls.length = 0;
-        mockSniff.mockImplementation((url: string, _ms?: number, signal?: AbortSignal) => {
-          sniffCalls.push(url);
-          return new Promise<Sniffed | null>((resolve) => {
-            signal?.addEventListener("abort", () => resolve(null), { once: true });
-          });
-        });
-        const ctl = new AbortController();
-        const cappedRace = resolveSources(request("test:hedge-cap"), undefined, {
-          verifyBudget: 2,
-          record: false,
-          signal: ctl.signal,
-        });
-        await vi.advanceTimersByTimeAsync(10);
-        expect(sniffCalls).toHaveLength(3);
-        await vi.advanceTimersByTimeAsync(2600);
-        expect(sniffCalls).toHaveLength(4);
-        ctl.abort();
-        await cappedRace;
-      } finally {
-        vi.useRealTimers();
-      }
-    } finally {
-      PROVIDERS.splice(0, PROVIDERS.length, ...original);
-    }
-  });
-
-  it("preserves fresh verified state across lookups via promoteCachedCandidate and matches canonical candKey", async () => {
-    const original = [...PROVIDERS];
-    const findCalls = vi.fn(async (id: string) => [candidate(id)]);
-    const providers: SourceProvider[] = ["first", "second", "third", "fourth"].map((id, i) => ({
-      id,
-      name: id,
-      category: "embed",
-      priority: 20 - i,
-      isEnabled: () => true,
-      find: () => findCalls(id),
-    }));
-    PROVIDERS.splice(0, PROVIDERS.length, ...providers);
-    mockSniff.mockImplementation((url: string, _ms?: number, signal?: AbortSignal) => {
-      const host = new URL(url).hostname.split(".")[0];
-      const stream: Sniffed = {
-        url: `https://media.example/${host}/master.m3u8`,
-        kind: "hls",
-        headers: {},
-        subtitles: [],
-        verified: true,
-        quality: 1080,
-      };
-      if (host === "first") return Promise.resolve(stream);
-      return new Promise<Sniffed | null>((resolve) => {
-        const t = setTimeout(() => resolve(stream), 15);
-        signal?.addEventListener("abort", () => {
-          clearTimeout(t);
-          resolve(null);
-        }, { once: true });
-      });
-    });
-
-    try {
-      const req = request("test:promote-cache");
-      const initial = await resolveSources(req, undefined, { verifyBudget: 1, record: false });
-      const standby = initial.find((c) => c.providerId === "second")!;
-      expect(standby.probe).toBeUndefined();
-      expect(candKey(standby)).toBe(standby.pageUrl);
-      expect(initialCandidateIndex(initial, candKey(standby))).toBe(initial.indexOf(standby));
-
-      const sniffCallsBefore = mockSniff.mock.calls.length;
-      const findCallsBefore = findCalls.mock.calls.length;
-
-      // Promote standby candidate on demand (with sniffed direct URL & quality)
-      const promotedUrl = proxyUrl("https://cdn.example/second-direct.m3u8", { referer: "https://second.example/" });
-      promoteCachedCandidate(req, {
-        ...standby,
-        url: promotedUrl,
-        kind: "hls",
-        via: "sniffed",
-        probe: { ok: true, latencyMs: 65, quality: 1080 },
-      });
-
-      // Also verify promoting a candidate without probe.ok sets it to ok: true
-      const third = initial.find((c) => c.providerId === "third")!;
-      promoteCachedCandidate(req, { ...third, probe: { ok: false, latencyMs: 40, error: "timeout" } });
-
-      // Request budget: 2 -> first & second are already verified in cache, so zero extra sniff/find calls
-      const cachedAgain = await resolveSources(req, undefined, { verifyBudget: 2, record: false });
-      expect(findCalls.mock.calls.length).toBe(findCallsBefore);
-      expect(mockSniff.mock.calls.length).toBe(sniffCallsBefore);
-
-      const secondAgain = cachedAgain.find((c) => candKey(c) === candKey(standby));
-      expect(secondAgain?.probe).toMatchObject({ ok: true, latencyMs: 65, quality: 1080 });
-      expect(secondAgain?.url).toBe(promotedUrl);
-      expect(secondAgain?.via).toBe("sniffed");
-      expect(cachedAgain.find((c) => c.providerId === "third")?.probe?.ok).toBe(true);
-    } finally {
-      PROVIDERS.splice(0, PROVIDERS.length, ...original);
-    }
-  });
-
   it("hardens buildEmbedUrl / buildAnimeUrl against missing templates and keeps resolveTmdbId cache clean on failures and aborts", async () => {
     expect(buildEmbedUrl(undefined, "603")).toBe("");
     expect(buildEmbedUrl("", "603")).toBe("");
@@ -1362,7 +969,7 @@ describe("Phase 2 direct extractor wiring", () => {
     expect(PROVIDERS.find((p) => p.id === "vidlink-direct")!.isEnabled(embedDisabled)).toBe(false);
     expect(PROVIDERS.find((p) => p.id === "vidlink")!.isEnabled(embedDisabled)).toBe(false);
 
-    // resolveSources respects disabledSources for direct extractors
+    // A source session respects disabledSources for direct extractors
     const original = [...PROVIDERS];
     const vidrock = PROVIDERS.find((p) => p.id === "vidrock")!;
     const zxc = PROVIDERS.find((p) => p.id === "zxcstreams")!;
@@ -1372,7 +979,7 @@ describe("Phase 2 direct extractor wiring", () => {
     updateSettings({ disabledSources: ["vidrock"] });
 
     try {
-      await resolveSources(request("test:disabled-direct"), undefined, { record: false });
+      await new SourceSession(request("test:disabled-direct")).start().picked();
       expect(vidrockSpy).not.toHaveBeenCalled();
       expect(zxcSpy).toHaveBeenCalledTimes(1);
     } finally {
@@ -1390,7 +997,7 @@ describe("Phase 3 Stremio & JS plugin registry wiring", () => {
     localStorage.removeItem(PLUGINS_STORAGE_KEY);
     localStorage.removeItem("abx.settings.v1");
     clearPlugins();
-    clearResolveCache();
+    invalidateSessions();
     vi.restoreAllMocks();
   });
 
@@ -1456,15 +1063,15 @@ describe("Phase 3 Stremio & JS plugin registry wiring", () => {
     const original = [...PROVIDERS];
     PROVIDERS.splice(0, PROVIDERS.length, stremioProvider, pluginProvidersSource, fakeDirect);
     try {
-      await resolveSources(request("test:phase3-disabled"), undefined, { record: false });
+      await new SourceSession(request("test:phase3-disabled")).start().picked();
       expect(stremioSpy).not.toHaveBeenCalled();
       expect(pluginSpy).not.toHaveBeenCalled();
 
       updateSettings({ disabledSources: [] });
-      clearResolveCache();
+      invalidateSessions();
       togglePlugin("test-plugin", false);
       expect(pluginProvidersSource.isEnabled(getSettings())).toBe(false);
-      await resolveSources(request("test:phase3-stremio-only"), undefined, { record: false });
+      await new SourceSession(request("test:phase3-stremio-only")).start().picked();
       expect(stremioSpy).toHaveBeenCalledTimes(1);
       expect(pluginSpy).not.toHaveBeenCalled();
     } finally {

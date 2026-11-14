@@ -1,20 +1,13 @@
-import { getSettings } from "../lib/settings";
-import { reqKey, type PlaybackRequest } from "../lib/types";
-import type { Settings } from "../lib/settings";
+import type { PlaybackRequest } from "../lib/types";
 import { animeDirectProvider } from "./anime-direct";
 import { jellyfinProvider } from "./jellyfin";
 import {
   badUrl,
   getHealth,
   isCircuitOpen,
-  isStaleStreamUrl,
   lastPick,
-  lookupTimeout,
   recentFailureFactor,
   recentlyFailed,
-  recordLookup,
-  recordLookupFailure,
-  recordProbe,
   reliability,
   serverHealthScore,
 } from "./health";
@@ -73,7 +66,7 @@ export {
 /** Canonical candidate identifier shared across source resolution, Watch, and Player. */
 export const candKey = (c: { url: string; pageUrl?: string }): string => c.pageUrl ?? c.url;
 
-const PROVIDER_TIMEOUT = 8000;
+export const PROVIDER_TIMEOUT = 8000;
 const PROBE_TIMEOUT = 6000;
 /** Capturing a stream from an embed page: load, start, catch the playlist. Most succeed in 4–10 s. */
 const SNIFF_TIMEOUT = 10_000;
@@ -105,7 +98,7 @@ export function recordWin(providerId: string, kind: string, ok: boolean) {
   }
 }
 /** Base priority plus learned success and health circuit-breaker state for this kind of title. */
-function learnedRank(providerId: string, kind: string, base: number) {
+export function learnedRank(providerId: string, kind: string, base: number) {
   const healthBase = serverHealthScore(providerId, base);
   const w = wins[`${providerId}:${kind}`];
   if (!w) return healthBase;
@@ -114,14 +107,7 @@ function learnedRank(providerId: string, kind: string, base: number) {
   return healthBase + rate * 12 - 6 + recent;
 }
 
-export interface ResolveEvent {
-  providerId: string;
-  status: "searching" | "done" | "error" | "timeout";
-  count?: number;
-  error?: string;
-}
-
-function withTimeout<T>(p: Promise<T>, ms: number, ctl: AbortController): Promise<T> {
+export function withTimeout<T>(p: Promise<T>, ms: number, ctl: AbortController): Promise<T> {
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => {
       ctl.abort();
@@ -131,7 +117,7 @@ function withTimeout<T>(p: Promise<T>, ms: number, ctl: AbortController): Promis
   });
 }
 
-function linkSignal(parent?: AbortSignal): { ctl: AbortController; cleanup: () => void } {
+export function linkSignal(parent?: AbortSignal): { ctl: AbortController; cleanup: () => void } {
   const ctl = new AbortController();
   if (!parent) return { ctl, cleanup: () => {} };
   if (parent.aborted) {
@@ -450,7 +436,7 @@ export async function playCheck(c: StreamCandidate, signal?: AbortSignal): Promi
  * Check a direct candidate really plays and how fast it answers. Local files are trusted
  * after a header read; streams get the manifest readiness check.
  */
-async function probe(c: StreamCandidate, signal?: AbortSignal): Promise<StreamCandidate> {
+export async function probeCandidate(c: StreamCandidate, signal?: AbortSignal): Promise<StreamCandidate> {
   if (c.kind === "embed") return native ? verifyEmbed(c, signal) : { ...c, probe: { ok: true, latencyMs: 0 } };
   const t0 = performance.now();
   if (c.providerId === "local") {
@@ -538,7 +524,7 @@ export async function probeHedged(candidates: StreamCandidate[], opts: HedgedPro
         const { ctl, cleanup } = linkSignal(opts.signal);
         inFlight.add(ctl);
         running++;
-        probe(cand, ctl.signal)
+        probeCandidate(cand, ctl.signal)
           .then((probed) => {
             // If pre-empted because another candidate already won, keep as standby rather than failed.
             if (ctl.signal.aborted && (winners >= maxWinners || opts.signal?.aborted) && !probed.probe?.ok) {
@@ -596,7 +582,8 @@ export function score(c: StreamCandidate, preferred: number, priority: number, r
   const shaky = 12 * recentFailureFactor(c.providerId);
   const tripped = circuitOpen ? 25 : 0;
   const pick = lastPick(req);
-  const memory = pick && pick.providerId === c.providerId && shaky === 0 && !circuitOpen ? 8 : 0;
+  // A server the viewer chose by hand for this show outranks anything the picker merely remembers.
+  const memory = pick && pick.providerId === c.providerId && shaky === 0 && !circuitOpen ? (pick.manual ? 32 : 8) : 0;
   const own = c.via === "direct" || c.via === "sniffed" || c.providerId === "local" || c.providerId === "jellyfin" ? 25 : 0;
   const provider = PROVIDERS.find((p) => p.id === c.providerId);
   const originalLanguage = "originalLanguage" in req.media && typeof req.media.originalLanguage === "string"
@@ -612,7 +599,7 @@ export function score(c: StreamCandidate, preferred: number, priority: number, r
   if (own && c.via !== "direct") why.push("ad-free");
   if (c.via === "direct") why.push("direct stream");
   if (req.audio && (c.audio === req.audio || c.audio === "dual")) why.push(req.audio === "dub" ? "English dub" : "subtitled");
-  if (memory) why.push("played this show before");
+  if (memory) why.push(pick?.manual ? "your choice for this show" : "played this show before");
   if (languageMiss) why.push("French source for non-French title");
   if (rel > 0.8 && getHealth(c.providerId).ok > 3) why.push("reliable");
   if (shaky > 0 || circuitOpen) why.push("failed recently");
@@ -624,10 +611,8 @@ export function score(c: StreamCandidate, preferred: number, priority: number, r
   };
 }
 
-const sortByScore = (a: StreamCandidate, b: StreamCandidate) => b.score! - a.score!;
-
 /** Only ignore probe failures caused by our own AbortController cancellation. */
-function isAbortedProbe(c: StreamCandidate, signal?: AbortSignal) {
+export function isAbortedProbe(c: StreamCandidate, signal?: AbortSignal) {
   return !!signal?.aborted || /^AbortError$/i.test(c.probe?.error ?? "");
 }
 
@@ -638,350 +623,6 @@ export function initialCandidateIndex(candidates: StreamCandidate[], preferred?:
     if (selected < 0) selected = candidates.findIndex((c) => c.providerId === preferred);
   }
   return selected >= 0 ? selected : Math.max(0, candidates.findIndex((c) => c.probe?.ok !== false));
-}
-
-export interface ResolveOptions {
-  /** Called with the full ranked list each time a probe lands (including after the promise resolved). */
-  onUpdate?: (ranked: StreamCandidate[]) => void;
-  /** Resolve as soon as a verified stream exists; the rest keep checking as backups. */
-  early?: boolean;
-  /**
-   * How many embed servers to verify before leaving the rest unchecked ("standby"). Each check
-   * loads a page off-screen, so the title page asks for one, the player for a few backups.
-   */
-  verifyBudget?: number;
-  signal?: AbortSignal;
-  /** Learn from this race (health stats). Off for previews, so a title visit + Play doesn't count twice. */
-  record?: boolean;
-}
-
-/** Briefly let near-simultaneous results compete before starting the first verified stream. */
-const GRACE_MS = 250;
-
-/**
- * Finished races, kept briefly so the title page's check and the player share one round of
- * lookups and captures instead of doing the work twice.
- */
-const RESULT_TTL = 30_000;
-const results = new Map<string, { at: number; ranked: StreamCandidate[]; events: ResolveEvent[]; budget: number }>();
-const resultKey = (req: PlaybackRequest, s: Settings) =>
-  `${reqKey(req)}|${JSON.stringify([s.libraryPaths, s.jellyfin.enabled && s.jellyfin.url, s.disabledSources, s.enabledExtras, s.preferredQuality])}`;
-
-/** Forget cached races after a source is toggled or playback fails against a cached URL. */
-export const clearResolveCache = () => results.clear();
-
-const isEmbedCandidate = (c: StreamCandidate, embedProviderIds: Set<string>): boolean =>
-  c.kind === "embed" || (c.via === "sniffed" && embedProviderIds.has(c.providerId));
-
-/**
- * Update an existing fresh cached race entry in place when playback succeeds or a standby
- * candidate is verified on demand, instead of clearing the whole resolve cache.
- */
-export function promoteCachedCandidate(req: PlaybackRequest, candidate: StreamCandidate): void {
-  const s = getSettings();
-  const ck = resultKey(req, s);
-  const hit = results.get(ck);
-  if (!hit || Date.now() - hit.at >= RESULT_TTL) return;
-
-  const key = candKey(candidate);
-  const idx = hit.ranked.findIndex(
-    (x) => candKey(x) === key || x.url === candidate.url || (!!candidate.pageUrl && x.pageUrl === candidate.pageUrl),
-  );
-  if (idx < 0 && candidate.providerId === "manual") return;
-
-  const promoted: StreamCandidate = candidate.probe?.ok
-    ? candidate
-    : {
-        ...candidate,
-        probe: {
-          ok: true,
-          latencyMs: candidate.probe?.latencyMs ?? 0,
-          quality: candidate.probe?.quality ?? candidate.quality,
-        },
-      };
-  const prio = Object.fromEntries(PROVIDERS.map((p) => [p.id, p.priority]));
-  const scored = score(promoted, s.preferredQuality, prio[promoted.providerId] ?? 0, req);
-  const nextRanked = (idx >= 0 ? hit.ranked.map((x, i) => (i === idx ? scored : x)) : [...hit.ranked, scored]).sort(sortByScore);
-
-  const embedProviderIds = new Set(PROVIDERS.filter((p) => p.category === "embed").map((p) => p.id));
-  const verifiedEmbeds = nextRanked.filter((c) => c.probe?.ok && isEmbedCandidate(c, embedProviderIds)).length;
-
-  const providerCount = nextRanked.filter((c) => c.providerId === promoted.providerId).length;
-  const nextEvents = hit.events.some((e) => e.providerId === promoted.providerId)
-    ? hit.events.map((e) => (e.providerId === promoted.providerId ? { ...e, status: "done" as const, count: providerCount } : e))
-    : [...hit.events, { providerId: promoted.providerId, status: "done" as const, count: providerCount }];
-
-  results.set(ck, {
-    ...hit,
-    ranked: nextRanked,
-    events: nextEvents,
-    budget: Math.max(hit.budget, verifiedEmbeds),
-  });
-}
-
-/**
- * Ask every enabled provider in parallel. Direct candidates are probed as they arrive; embed
- * candidates are verified (captured) in priority order with hedged concurrency and AbortController
- * cancellation until `verifyBudget` of them have proved they have the title.
- */
-export function resolveSources(req: PlaybackRequest, onEvent?: (e: ResolveEvent) => void, opts: ResolveOptions = {}): Promise<StreamCandidate[]> {
-  const s = getSettings();
-  const enabled = PROVIDERS.filter((p) => p.isEnabled(s));
-  const prio = Object.fromEntries(PROVIDERS.map((p) => [p.id, p.priority]));
-  const embedProviderIds = new Set(PROVIDERS.filter((p) => p.category === "embed").map((p) => p.id));
-  const budget = opts.verifyBudget ?? 3;
-  const seen = new Set<string>();
-  const record = opts.record !== false;
-  /** Probes count once per provider per race, so a provider returning 3 files doesn't get 3 votes. */
-  const probed = new Set<string>();
-  let ranked: StreamCandidate[] = [];
-  let settled = false;
-  const ck = resultKey(req, s);
-
-  const hit = results.get(ck);
-  const isFreshHit = !!hit && Date.now() - hit.at < RESULT_TTL;
-  const refreshedHit = isFreshHit
-    ? hit.ranked.map((c) =>
-        c.probe?.ok && isStaleStreamUrl(c.url, hit.at)
-          ? { ...c, probe: { ok: false, latencyMs: c.probe.latencyMs, error: "token expired" } }
-          : c,
-      )
-    : [];
-  // Reuse a recent race only if its verified winners are still fresh (not marked bad or expired).
-  const hasUncheckedEmbeds = refreshedHit.some((c) => c.kind === "embed" && !c.probe);
-  const hitHasFreshWinner = refreshedHit.some(
-    (c) => c.probe?.ok && !isStaleStreamUrl(c.url, hit!.at) && !isCircuitOpen(c.providerId),
-  );
-  const cachedVerifiedEmbeds = refreshedHit.filter((c) => c.probe?.ok && isEmbedCandidate(c, embedProviderIds)).length;
-
-  if (isFreshHit && hitHasFreshWinner && (Math.max(hit.budget, cachedVerifiedEmbeds) >= budget || !hasUncheckedEmbeds)) {
-    const again = refreshedHit
-      .map((c) => score(c, s.preferredQuality, prio[c.providerId] ?? 0, req))
-      .sort(sortByScore);
-    if (!opts.signal?.aborted) {
-      hit.events.forEach((e) => onEvent?.(e));
-      opts.onUpdate?.(again);
-    }
-    return Promise.resolve(again);
-  }
-
-  const incrementalUpgrade = isFreshHit && hitHasFreshWinner && hit.budget < budget && hasUncheckedEmbeds;
-  if (incrementalUpgrade && opts.signal?.aborted) {
-    const again = refreshedHit
-      .map((c) => score(c, s.preferredQuality, prio[c.providerId] ?? 0, req))
-      .sort(sortByScore);
-    return Promise.resolve(again);
-  }
-
-  const finalEvents: Record<string, ResolveEvent> = {};
-  const emit = (e: ResolveEvent) => {
-    finalEvents[e.providerId] = e;
-    onEvent?.(e);
-  };
-
-  return new Promise((resolve) => {
-    let graceTimer: ReturnType<typeof setTimeout> | undefined;
-    let hedgeTimer: ReturnType<typeof setTimeout> | undefined;
-    const activeProbes = new Set<AbortController>();
-
-    const abortActiveProbes = () => {
-      clearTimeout(hedgeTimer);
-      for (const ctl of activeProbes) ctl.abort();
-      activeProbes.clear();
-    };
-
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(graceTimer);
-      resolve(ranked);
-    };
-    const upsert = (c: StreamCandidate) => {
-      if (opts.signal?.aborted) return;
-      if (c.probe && !isAbortedProbe(c, opts.signal) && record && !probed.has(c.providerId)) {
-        probed.add(c.providerId);
-        recordProbe(c);
-      }
-      const scored = score(c, s.preferredQuality, prio[c.providerId] ?? 0, req);
-      const id = candKey(c);
-      ranked = [...ranked.filter((x) => candKey(x) !== id), scored].sort(sortByScore);
-      opts.onUpdate?.(ranked);
-      if (opts.early && !settled && !graceTimer && c.probe?.ok) graceTimer = setTimeout(finish, GRACE_MS);
-    };
-
-    // Embed verification queue: highest health/learned priority first, hedged concurrency, until budget is met.
-    const queue: StreamCandidate[] = [];
-    let verified = 0;
-    let running = 0;
-    let lookupsDone = false;
-    let maxParallel = 3;
-    const kind = req.media.kind;
-    const previousPick = lastPick(req)?.providerId;
-    const rank = (c: StreamCandidate) =>
-      learnedRank(c.providerId, kind, prio[c.providerId] ?? 0) +
-      (c.providerId === previousPick && !isCircuitOpen(c.providerId) && !recentlyFailed(c.providerId) ? 20 : 0);
-
-    const scheduleHedge = () => {
-      clearTimeout(hedgeTimer);
-      if (verified === 0 && queue.length > 0 && running >= maxParallel && maxParallel < 4) {
-        hedgeTimer = setTimeout(() => {
-          if (verified === 0 && queue.length > 0 && !opts.signal?.aborted) {
-            maxParallel = 4;
-            pump();
-          }
-        }, HEDGE_DELAY_MS);
-      }
-    };
-
-    const pump = () => {
-      while (running < maxParallel && queue.length && verified < budget && !opts.signal?.aborted) {
-        queue.sort((a, b) => rank(b) - rank(a));
-        const c = queue.shift()!;
-        const { ctl: probeCtl, cleanup } = linkSignal(opts.signal);
-        activeProbes.add(probeCtl);
-        running++;
-        probe(c, probeCtl.signal)
-          .catch((e: unknown): StreamCandidate => ({
-            ...c,
-            probe: { ok: false, latencyMs: 0, error: e instanceof Error ? e.message : "probe failed" },
-          }))
-          .then((r) => {
-            // Pre-empted because budget was already met by a faster server: keep as standby.
-            if (probeCtl.signal.aborted && (verified >= budget || opts.signal?.aborted) && !r.probe?.ok) {
-              if (!opts.signal?.aborted) upsert(c);
-              return;
-            }
-            if (r.probe?.ok) {
-              verified++;
-              if (verified >= budget) {
-                for (const other of activeProbes) {
-                  if (other !== probeCtl) other.abort();
-                }
-              }
-            }
-            if (record && r.probe && !isAbortedProbe(r, opts.signal)) {
-              recordWin(r.providerId, kind, !!r.probe.ok);
-            }
-            upsert(r);
-          })
-          .finally(() => {
-            activeProbes.delete(probeCtl);
-            cleanup();
-            running--;
-            pump();
-            scheduleHedge();
-            maybeDone();
-          });
-      }
-      scheduleHedge();
-    };
-    const onAbort = () => {
-      queue.length = 0;
-      abortActiveProbes();
-      finish();
-    };
-    const cacheAt = incrementalUpgrade ? hit.at : undefined;
-    const maybeDone = () => {
-      if (!lookupsDone || running) return;
-      if (queue.length && verified < budget) return;
-      clearTimeout(hedgeTimer);
-      opts.signal?.removeEventListener("abort", onAbort);
-      // Whatever wasn't checked stays listed as standby (probe undefined).
-      for (const c of queue.splice(0)) {
-        if (!ranked.some((x) => candKey(x) === candKey(c))) upsert(c);
-      }
-      if (!opts.signal?.aborted && ranked.some((c) => c.probe?.ok)) {
-        results.set(ck, { at: cacheAt ?? Date.now(), ranked, events: Object.values(finalEvents), budget });
-      }
-      finish();
-    };
-    opts.signal?.addEventListener("abort", onAbort, { once: true });
-
-    if (incrementalUpgrade) {
-      ranked = refreshedHit
-        .map((c) => {
-          seen.add(candKey(c));
-          seen.add(c.url);
-          if (c.probe) probed.add(c.providerId);
-          return score(c, s.preferredQuality, prio[c.providerId] ?? 0, req);
-        })
-        .sort(sortByScore);
-      verified = cachedVerifiedEmbeds;
-      for (const c of refreshedHit) {
-        if (c.kind === "embed" && !c.probe) queue.push(c);
-      }
-      lookupsDone = true;
-      hit.events.forEach((ev) => emit(ev));
-      opts.onUpdate?.(ranked);
-      if (opts.early && ranked.some((c) => c.probe?.ok)) {
-        graceTimer = setTimeout(finish, GRACE_MS);
-      }
-      pump();
-      maybeDone();
-      return;
-    }
-
-    const runs = enabled.map(async (p) => {
-      emit({ providerId: p.id, status: "searching" });
-      const { ctl, cleanup } = linkSignal(opts.signal);
-      let found: StreamCandidate[];
-      const t0 = performance.now();
-      try {
-        found = await withTimeout(p.find(req, s, ctl.signal), lookupTimeout(p.id, p.timeoutMs ?? PROVIDER_TIMEOUT), ctl);
-        if (record) recordLookup(p.id, performance.now() - t0);
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : undefined;
-        const timeout = msg === "timeout";
-        const elapsed = Math.round(performance.now() - t0);
-        if (!opts.signal?.aborted && record) recordLookupFailure(p.id, elapsed);
-        emit({ providerId: p.id, status: timeout ? "timeout" : "error", error: msg });
-        return;
-      } finally {
-        cleanup();
-      }
-      const lookupMs = Math.round(performance.now() - t0);
-      const fresh = found
-        .filter((c) => {
-          const k = candKey(c);
-          if (seen.has(k)) return false;
-          seen.add(k);
-          return true;
-        })
-        .map((c) => ({ ...c, lookupMs }));
-      emit({ providerId: p.id, status: "done", count: fresh.length });
-      const embeds = fresh.filter((c) => c.kind === "embed");
-      if (embeds.length) {
-        queue.push(...embeds);
-        pump();
-      }
-      await Promise.all(
-        fresh
-          .filter((c) => c.kind !== "embed")
-          .map(async (c) => {
-            const { ctl: directCtl, cleanup: directCleanup } = linkSignal(opts.signal);
-            activeProbes.add(directCtl);
-            try {
-              const r = await probe(c, directCtl.signal).catch((e: unknown): StreamCandidate => ({
-                ...c,
-                probe: { ok: false, latencyMs: 0, error: e instanceof Error ? e.message : "probe failed" },
-              }));
-              if (record && r.probe && !isAbortedProbe(r, opts.signal)) {
-                recordWin(r.providerId, kind, !!r.probe.ok);
-              }
-              upsert(r);
-            } finally {
-              activeProbes.delete(directCtl);
-              directCleanup();
-            }
-          }),
-      );
-    });
-    Promise.all(runs).then(() => {
-      lookupsDone = true;
-      pump();
-      maybeDone();
-    });
-  });
 }
 
 /** A stream URL the user pasted (their own server, a public-domain file, etc.). */

@@ -32,6 +32,8 @@ export interface TitlePick {
   providerId: string;
   url: string;
   at: number;
+  /** The viewer picked this server by hand (rather than the picker choosing it). */
+  manual?: boolean;
 }
 
 const HKEY = "abx.health.v1";
@@ -186,7 +188,7 @@ export function isStaleStreamUrl(url: string, savedAt?: number): boolean {
 }
 
 /** Playback outcome: the strongest signal, so it counts double. */
-export function recordPlayback(req: PlaybackRequest, c: StreamCandidate, ok: boolean) {
+export function recordPlayback(req: PlaybackRequest, c: StreamCandidate, ok: boolean, opts: { manual?: boolean } = {}) {
   if (c.providerId === "manual") return;
   const existing = getHealth(c.providerId);
   const probeLat =
@@ -205,7 +207,11 @@ export function recordPlayback(req: PlaybackRequest, c: StreamCandidate, ok: boo
   bump(c.providerId, ok, latencySample);
   const k = titleKey(req);
   if (ok) {
-    const pick = { providerId: c.providerId, url: c.url, at: Date.now() };
+    // A hand-picked server stays the show's choice until the viewer picks another or it breaks;
+    // an automatic pick never overwrites it with a different provider's "manual" flag.
+    const prior = picks[k];
+    const manual = opts.manual ?? (prior?.manual && prior.providerId === c.providerId) ?? false;
+    const pick: TitlePick = { providerId: c.providerId, url: c.url, at: Date.now(), ...(manual ? { manual: true } : {}) };
     picks = { ...picks, [k]: pick, [exactKey(req)]: pick };
     const keys = Object.keys(picks);
     if (keys.length > MAX_PICKS) {

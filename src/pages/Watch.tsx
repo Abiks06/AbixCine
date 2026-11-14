@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { Player, type EpisodeNav } from "../components/Player";
 import { Art } from "../components/Art";
 import { Icon } from "../components/Icon";
 import { Ambient } from "../components/Ambient";
+import { qualityLabel, SourceBoard, viaLabel } from "../components/SourceBoard";
 import { TitleArt } from "../components/TitleArt";
 import {
   clampSeason,
@@ -23,18 +24,8 @@ import { animeEpisodes } from "../lib/anilist";
 import { reqKey, type PlaybackRequest } from "../lib/types";
 import { useAsync } from "../lib/useAsync";
 import { isUrlTokenExpired } from "../sources/native";
-import {
-  candKey,
-  candLine,
-  clearResolveCache,
-  manualCandidate,
-  promoteCachedCandidate,
-  PROVIDERS,
-  recordPlayback,
-  recordWin,
-  resolveSources,
-  type ResolveEvent,
-} from "../sources/registry";
+import { candKey } from "../sources/registry";
+import { useSourceSession } from "../sources/useSourceSession";
 import type { StreamCandidate } from "../sources/types";
 
 export function Watch() {
@@ -73,11 +64,6 @@ export function Watch() {
     const m = savedEntry?.media ?? list.find((w) => w.media.key === key || w.media.key === canonicalKey)?.media;
     return m ? { ...m, cast: [], crew: [], related: [] } : undefined;
   }, [detail.data, detail.error, key, canonicalKey, list, savedEntry]);
-  const [attempt, setAttempt] = useState(0);
-  const reloadCatalog = useCallback(() => {
-    if (detail.error) detail.reload();
-    setAttempt((n) => n + 1);
-  }, [detail]);
 
   const isAnime = key.startsWith("anilist:") || d?.kind === "anime";
   const isSeries = key.startsWith("tmdb:tv:") || d?.kind === "tv";
@@ -98,39 +84,64 @@ export function Watch() {
     () => resolvedReq ?? (d ? { media: d, season, episode, absolute, audio } : null),
     [resolvedReq, d, season, episode, absolute, audio],
   );
-  const [events, setEvents] = useState<Record<string, ResolveEvent>>({});
-  /** The ranked list at the moment the picker committed to a winner. */
-  const [cands, setCands] = useState<StreamCandidate[] | null>(null);
-  /** Everything found so far, still updating while slower sources finish. */
-  const [ranked, setRanked] = useState<StreamCandidate[]>([]);
-  const [manual, setManual] = useState("");
-  const [go, setGo] = useState(false);
-  const [allowUnverified, setAllowUnverified] = useState(false);
-  const [retry, setRetry] = useState(0);
-  /** Verify every server, not just the first few (after "check the other servers"). */
-  const [deep, setDeep] = useState(false);
 
+  /* ---------------------------------------------------------------- source */
+
+  const { session, snap, recheck } = useSourceSession(req, 3);
+  const reloadCatalog = useCallback(() => {
+    if (detail.error) detail.reload();
+    recheck();
+  }, [detail, recheck]);
+  const [manual, setManual] = useState("");
+  /** The stream to start from: the session's pick, or a server chosen here or on the title page. */
+  const [start, setStart] = useState<string | null>(null);
+  /** A server being checked because the viewer asked to play from it. */
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  const live = useRef(session);
+  live.current = session;
   useEffect(() => {
-    if (!req) return;
-    let live = true;
-    const ctl = new AbortController();
-    setCands(null);
-    setRanked([]);
-    setEvents({});
-    setGo(false);
-    setAllowUnverified(false);
-    resolveSources(req, (e) => live && setEvents((x) => ({ ...x, [e.providerId]: e })), {
-      early: true,
-      verifyBudget: deep ? 99 : 3,
-      signal: ctl.signal,
-      onUpdate: (r) => live && setRanked(r),
-    }).then((c) => live && setCands(c));
-    return () => {
-      live = false;
-      ctl.abort();
-    };
-    // Re-resolve when sources change in settings, the viewer asks to check more, or the catalog reloads.
-  }, [req && reqKey(req), settings.libraryPaths, settings.jellyfin, settings.disabledSources, settings.enabledExtras, retry, deep, attempt]); // eslint-disable-line react-hooks/exhaustive-deps
+    setStart(null);
+    setBusyKey(null);
+    setNote(null);
+  }, [session]);
+
+  /** Play from a server the viewer picked: straight away if it's ready, after a check if not. */
+  const playFrom = useCallback(
+    async (c: StreamCandidate) => {
+      if (!session) return;
+      const k = candKey(c);
+      session.choose(k);
+      if (c.probe?.ok) return setStart(k);
+      setBusyKey(k);
+      setNote(null);
+      const r = await session.verify(k);
+      if (live.current !== session) return;
+      setBusyKey(null);
+      if (r?.probe?.ok) setStart(k);
+      else setNote(r?.probe?.error && r.probe.error !== "no stream" ? `${c.providerName} couldn't play this (${r.probe.error}).` : `${c.providerName} doesn't have this one.`);
+    },
+    [session],
+  );
+
+  // A server chosen on the title page: go to it as soon as the session knows it.
+  const prefFor = useRef<unknown>(null);
+  const prefPending = !!preferred && prefFor.current !== session;
+  useEffect(() => {
+    if (!session || !snap || !preferred || prefFor.current === session) return;
+    const c = session.find(preferred);
+    if (!c && snap.busy) return;
+    prefFor.current = session;
+    if (c) void playFrom(c);
+  }, [session, snap, preferred, playFrom]);
+
+  // Hold the result on screen for a beat so you see which server won, then play.
+  const pickKey = snap?.pick ? candKey(snap.pick) : undefined;
+  useEffect(() => {
+    if (!pickKey || start || busyKey || prefPending) return;
+    const t = setTimeout(() => setStart(pickKey), settings.reduceMotion || quick ? 0 : 280);
+    return () => clearTimeout(t);
+  }, [pickKey, start, busyKey, prefPending]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const next = useMemo(() => resolveNextEpisode(d, season, episode, audio), [d, season, episode, audio]);
 
@@ -183,77 +194,12 @@ export function Watch() {
     else nav(`/title/${encodeKey(canonicalKey)}`, { replace: true, viewTransition: true });
   }, [loc.state, nav, canonicalKey]);
   useEffect(() => {
-    if (go) return;
+    if (start) return;
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && back();
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [go, back]);
+  }, [start, back]);
   const epLabel = episode != null ? `${season != null ? `Season ${season} · ` : ""}Episode ${episode}` : undefined;
-  const playable = cands?.filter((c) => c.probe?.ok);
-
-  /** A server the viewer asked for goes first; the rest keep their ranking. */
-  const [picked, setPicked] = useState<string | undefined>(preferred);
-  useEffect(() => setPicked(preferred), [preferred]);
-  // Preserve initial order for already-mounted items, upgrade standby entries in-place by
-  // canonical candKey when verified streams land, and append newly arriving backups at the end.
-  const playerCands = useMemo(() => {
-    if (!cands) return null;
-    const rankedByKey = new Map<string, StreamCandidate>();
-    for (const r of ranked) {
-      const k = candKey(r);
-      const prev = rankedByKey.get(k);
-      if (!prev || (!prev.probe?.ok && r.probe?.ok) || (!prev.probe && r.probe)) {
-        rankedByKey.set(k, r);
-      }
-    }
-    const seen = new Set<string>();
-    const base: StreamCandidate[] = [];
-    for (const c of cands) {
-      const k = candKey(c);
-      if (seen.has(k)) continue;
-      seen.add(k);
-      const r = rankedByKey.get(k);
-      base.push(r && (r.probe?.ok || !c.probe?.ok) ? r : c);
-    }
-    if (picked) {
-      let pi = base.findIndex((c) => candKey(c) === picked || c.url === picked || c.pageUrl === picked);
-      if (pi === -1) pi = base.findIndex((c) => c.providerId === picked && c.probe?.ok);
-      if (pi === -1) pi = base.findIndex((c) => c.providerId === picked);
-      if (pi > 0) base.unshift(...base.splice(pi, 1));
-    }
-    const extras: StreamCandidate[] = [];
-    for (const r of ranked) {
-      const k = candKey(r);
-      if (seen.has(k)) continue;
-      seen.add(k);
-      extras.push(r);
-    }
-    return [
-      ...base,
-      ...extras.filter((c) => c.probe?.ok),
-      ...extras.filter((c) => !c.probe),
-      ...extras.filter((c) => c.probe && !c.probe.ok),
-    ];
-  }, [cands, ranked, picked]);
-  const onSourceResult = useCallback((c: StreamCandidate, ok: boolean) => {
-    if (!req) return;
-    recordPlayback(req, c, ok);
-    // What the player saw is the strongest signal for the learned server order.
-    recordWin(c.providerId, req.media.kind, ok);
-    if (ok) {
-      promoteCachedCandidate(req, c);
-    } else {
-      clearResolveCache();
-    }
-  }, [req]);
-
-  // Hold the race result on screen for a beat so you see which server won, then play.
-  useEffect(() => {
-    if (!cands?.some((c) => c.probe?.ok)) return;
-    const t = setTimeout(() => setGo(true), settings.reduceMotion || quick || preferred ? 0 : 150);
-    return () => clearTimeout(t);
-  }, [cands]); // eslint-disable-line react-hooks/exhaustive-deps
-
   // Episode list for the in-player drawer.
   const episodes: EpisodeNav | undefined = useMemo(() => {
     if (!d || episode == null) return undefined;
@@ -273,13 +219,12 @@ export function Watch() {
     };
   }, [d, key, season, episode, next, goEp]);
 
-  if (go && playerCands && (playerCands.some((c) => c.probe?.ok) || allowUnverified) && d && req) {
+  if (start && session?.get(start) && d && req) {
     return (
       <Player
-        key={reqKey(req)}
-        candidates={playerCands}
-        initialSource={picked}
-        onSourceResult={onSourceResult}
+        key={`${reqKey(req)}:${session.createdAt}`}
+        session={session}
+        initialSource={start}
         title={d.title}
         subtitle={epLabel}
         startAt={
@@ -305,11 +250,7 @@ export function Watch() {
         autoNext={settings.autoplayNext}
         onNext={next ? goNext : undefined}
         nextLabel={next ? (next.label ?? `${next.s != null ? `Season ${next.s} · ` : ""}Episode ${next.e}`) : undefined}
-        onRetry={() => {
-          clearResolveCache();
-          setGo(false);
-          reloadCatalog();
-        }}
+        onRetry={reloadCatalog}
         onBack={back}
       />
     );
@@ -337,52 +278,20 @@ export function Watch() {
     );
   }
 
-  const enabled = PROVIDERS.filter((p) => p.isEnabled(settings));
-  const best = playable?.[0];
-  const done = Object.values(events).filter((e) => e.status !== "searching").length;
-  const laneBusy = (id: string) => {
-    const e = events[id];
-    return !e || e.status === "searching" || (e.status === "done" && (e.count ?? 0) > ranked.filter((c) => c.providerId === id).length);
-  };
-  const stillRacing = enabled.some((p) => laneBusy(p.id));
-  const readyCount = ranked.filter((c) => c.probe?.ok).length;
+  const total = snap?.lanes.length ?? 0;
+  const answered = snap?.lanes.filter((l) => l.status !== "searching").length ?? 0;
+  const pick = snap?.pick;
+  const best = snap?.candidates.find((c) => c.probe?.ok);
+  const empty = snap?.phase === "empty";
+  const awaiting = snap?.awaitingChoice ? snap.lanes.find((l) => l.providerId === snap.awaitingChoice)?.name : undefined;
+  const webPlayers = snap?.candidates.filter((c) => c.pageUrl && !c.probe?.ok).length ?? 0;
+  const unanswered = snap?.lanes.filter((l) => l.status === "timeout" || l.status === "error").length ?? 0;
   const chip = [season != null ? `S${String(season).padStart(2, "0")}` : null, episode != null ? `E${String(episode).padStart(2, "0")}` : null].filter(Boolean).join(" · ");
-  /** Start right away from a server the viewer clicked on the race screen. */
-  const playFrom = (c: StreamCandidate) => {
-    const k = candKey(c);
-    setPicked(k);
-    setAllowUnverified(!c.probe?.ok);
-    setCands((x) => {
-      const base = x ?? ranked;
-      return base.some((item) => candKey(item) === k) ? base : [c, ...base];
-    });
-    setGo(true);
-  };
-  const recheck = () => {
-    clearResolveCache();
-    setRetry((n) => n + 1);
-  };
-  const checkAll = () => {
-    if (deep) recheck();
-    else setDeep(true);
-  };
-  const fmtMs = (ms?: number) => (ms == null ? null : ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${ms} ms`);
-  const firstReady = ranked.find((c) => c.probe?.ok);
-  const firstStandby = ranked.find((c) => !c.probe);
-  const failed = !!cands && !best;
-  const standby = ranked.filter((c) => !c.probe).length;
-  const rejected = ranked.filter((c) => c.probe?.ok === false).length;
-  const failedLookups = Object.values(events).filter((e) => e.status === "timeout" || e.status === "error").length;
-  const webPlayers = ranked.filter((c) => c.pageUrl);
-  /** Last resort: play the embed pages themselves, behind the ad shield. */
-  const useWebPlayers = () => {
-    const pages = webPlayers.map((c) => ({ ...c, url: c.pageUrl!, kind: "embed" as const, via: "embed" as const, probe: { ok: true, latencyMs: 0 } }));
-    setPicked(undefined);
-    setRanked(pages);
-    setCands(pages);
-    setGo(true);
-  };
-  const pct = best ? 100 : enabled.length ? 12 + (done / enabled.length) * 78 : 30;
+  const thing = episode != null ? "episode" : "title";
+  const inAudio = audio ? ` in ${audio === "dub" ? "English dub" : "sub"}` : "";
+  const fmtMs = (ms?: number) => (ms == null || ms <= 0 ? null : ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${ms} ms`);
+  const pct = pick ? 1 : total ? 0.08 + (answered / total) * 0.8 : 0.2;
+  const hasLocal = snap?.lanes.some((l) => l.providerId === "local");
 
   return (
     <div className="race-page">
@@ -401,98 +310,103 @@ export function Watch() {
           </div>
           {d ? <TitleArt media={d} size="md" /> : <div className="title-type md">Loading</div>}
 
-          {!failed ? (
+          {!empty ? (
             <>
-              <div className="race-status">
-                <div className={`orb ${best ? "ok" : ""}`} aria-hidden>
-                  <svg viewBox="0 0 44 44"><circle cx="22" cy="22" r="19" style={{ ["--p" as any]: pct / 100 }} /></svg>
-                  {best ? <Icon name="check" size={18} /> : <span className="orb-n">{readyCount}</span>}
+              <div className="race-status" aria-live="polite">
+                <div className={`orb ${pick ? "ok" : ""}`} aria-hidden>
+                  <svg viewBox="0 0 44 44"><circle cx="22" cy="22" r="19" style={{ ["--p" as string]: pct }} /></svg>
+                  {pick ? <Icon name="check" size={18} /> : <span className="orb-n">{snap?.ready ?? 0}</span>}
                 </div>
                 <div>
                   <div className="rmsg">
-                    {best
-                      ? `Playing from ${best.providerName}`
-                      : enabled.length
-                        ? `Finding the best server`
-                        : "All servers are switched off"}
+                    {pick
+                      ? `Playing from ${pick.providerName}`
+                      : busyKey
+                        ? `Checking ${session?.get(busyKey)?.providerName ?? "that server"}`
+                        : awaiting
+                          ? `Waiting for ${awaiting}`
+                          : total
+                            ? "Finding the best stream"
+                            : snap
+                              ? "All servers are switched off"
+                              : "Loading"}
                   </div>
                   <div className="rsub">
-                    {best
-                      ? [
-                          best.probe?.quality ?? best.quality ? `${best.probe?.quality ?? best.quality}p` : null,
-                          best.via === "direct" ? "direct" : best.via === "sniffed" ? "sniffed" : "ad-free",
-                          fmtMs(best.probe?.latencyMs ?? 0),
-                          playable && playable.length > 1 ? `${playable.length - 1} backup${playable.length > 2 ? "s" : ""} ready` : null,
-                        ].filter(Boolean).join(" · ")
-                      : enabled.length
-                        ? `Checked ${done}/${enabled.length} servers · ${readyCount} ready${standby > 0 ? ` · ${standby} on standby` : ""}`
-                        : "Turn servers back on in Settings."}
+                    {pick
+                      ? [qualityLabel(pick), viaLabel(pick), fmtMs(snap?.pickMs), snap && snap.ready > 1 ? `${snap.ready - 1} backup${snap.ready > 2 ? "s" : ""} ready` : null].filter(Boolean).join(" · ")
+                      : awaiting
+                        ? `Your server for this show${best ? ` · ${best.providerName} is ready if you'd rather not wait` : ""}`
+                        : total
+                          ? `${answered}/${total} servers answered · ${snap?.ready ?? 0} ready${snap?.waiting ? ` · ${snap.waiting} on standby` : ""}`
+                          : snap
+                            ? "Turn servers back on in Settings."
+                            : ""}
                   </div>
                 </div>
               </div>
+              {note && <div className="race-note" role="status">{note}</div>}
               <div className="race-acts">
-                {best && <button className="btn play" onClick={() => setGo(true)}><Icon name="play" size={16} /> Play now</button>}
-                {!best && firstReady && (
-                  <button className="btn play" onClick={() => playFrom(firstReady)}><Icon name="play" size={16} /> Play the first ready one</button>
+                {pick && <button className="btn play" onClick={() => setStart(candKey(pick))}><Icon name="play" size={16} /> Play now</button>}
+                {!pick && best && (
+                  <button className="btn play" onClick={() => session?.pickNow()}><Icon name="play" size={16} /> Play from {best.providerName} now</button>
                 )}
               </div>
             </>
           ) : (
             <div className="resolve-empty">
               <h3>
-                {!enabled.length
+                {!total
                   ? "Every server is switched off."
-                  : standby
-                  ? `${standby} standby server${standby === 1 ? " is" : "s are"} available for this ${episode != null ? "episode" : "title"}${audio ? ` in ${audio === "dub" ? "English dub" : "sub"}` : ""}.`
-                  : rejected || failedLookups
-                    ? `AbixCine couldn't verify a playable stream for this ${episode != null ? "episode" : "title"}${audio ? ` in ${audio === "dub" ? "English dub" : "sub"}` : ""}.`
-                    : `No source returned a stream for this ${episode != null ? "episode" : "title"} this time${audio ? ` in ${audio === "dub" ? "English dub" : "sub"}` : ""}.`}
+                  : snap?.waiting
+                    ? `${snap.waiting} server${snap.waiting === 1 ? " is" : "s are"} still on standby for this ${thing}${inAudio}.`
+                    : snap?.failed || unanswered
+                      ? `No server could play this ${thing}${inAudio} just now.`
+                      : `No server has this ${thing}${inAudio} yet.`}
               </h3>
               <p>
-                {!enabled.length
+                {!total
                   ? "Turn some back on in Settings, add a media folder, or paste a direct link below."
-                  : standby
-                    ? `Preflight stopped after the initial batch. Click "Check all" to test the remaining servers, or tap any standby or failed server on the right to check & play it directly.`
-                    : rejected || failedLookups
-                      ? "A source lookup or preflight check can fail temporarily, or reject a stream the player can still open. Re-check, or tap any listed server to try it directly."
+                  : snap?.waiting
+                    ? "Check them all, or pick one on the right to check and play it."
+                    : snap?.failed || unanswered
+                      ? "Servers go down and come back. Look again, or pick one on the right to retry it."
                       : audio === "dub"
-                    ? "Dubs arrive later than subs, and only a few servers carry them."
-                    : "It may be too new to be online yet."}
+                        ? "Dubs arrive later than subs, and only a few servers carry them."
+                        : "It may be too new to be online yet."}
               </p>
-              {enabled.some((p) => p.id === "local") && episode != null && (
+              {note && <div className="race-note" role="status">{note}</div>}
+              {hasLocal && episode != null && (
                 <p className="muted hint">Looked for files named like “{d?.title} S{String(season ?? 1).padStart(2, "0")}E{String(episode).padStart(2, "0")}”, “{d?.title} - {String(absolute ?? episode).padStart(2, "0")}”, or “Season {season ?? 1}/{String(episode).padStart(2, "0")}.mkv”.</p>
               )}
               <div className="acts">
-                {!enabled.length ? (
+                {!total ? (
                   <button className="btn play" onClick={() => nav("/settings#sources", { viewTransition: true })}><Icon name="gear" size={16} /> Choose servers</button>
                 ) : (
                   <>
-                    {standby > 0 && !deep && (
-                      <button className="btn play" onClick={checkAll}><Icon name="layers" size={16} /> Check all ({standby})</button>
-                    )}
-                    <button className={`btn ${standby > 0 && !deep ? "glass" : "play"}`} onClick={recheck}>
-                      <Icon name="refresh" size={16} /> Re-check
-                    </button>
-                    {firstStandby && (
-                      <button className="btn glass" onClick={() => playFrom(firstStandby)}>
-                        <Icon name="play" size={16} /> Try {firstStandby.providerName}
-                      </button>
-                    )}
+                    {!!snap?.waiting && <button className="btn play" onClick={() => session?.checkAll()}><Icon name="layers" size={16} /> Check all ({snap.waiting})</button>}
+                    <button className={`btn ${snap?.waiting ? "glass" : "play"}`} onClick={recheck}><Icon name="refresh" size={16} /> Look again</button>
                   </>
                 )}
                 {audio && <button className="btn glass" onClick={() => switchAudio(audio === "sub" ? "dub" : "sub")}>Try {audio === "sub" ? "dub" : "sub"} instead</button>}
-                {webPlayers.length > 0 && <button className="btn glass" onClick={useWebPlayers} title="Opens the servers' own pages, with ads and pop-ups blocked">Use a web player</button>}
+                {webPlayers > 0 && (
+                  <button
+                    className="btn glass"
+                    title="Opens the servers' own pages, with ads and pop-ups blocked"
+                    onClick={() => {
+                      const first = session?.useWebPlayers();
+                      if (first) setStart(candKey(first));
+                    }}
+                  >
+                    Use a web player
+                  </button>
+                )}
               </div>
               <form
                 className="manual"
                 onSubmit={(e) => {
                   e.preventDefault();
-                  if (manual.trim()) {
-                    setPicked(undefined);
-                    setRanked([]);
-                    setCands([{ ...manualCandidate(manual.trim()), probe: { ok: true, latencyMs: 0 } }]);
-                    setGo(true);
-                  }
+                  if (!manual.trim() || !session) return;
+                  setStart(candKey(session.addManual(manual.trim())));
                 }}
               >
                 <Icon name="link" />
@@ -501,141 +415,25 @@ export function Watch() {
               </form>
             </div>
           )}
-          <div className="racebar"><i style={{ width: `${pct}%` }} /></div>
+          <div className="racebar"><i style={{ width: `${pct * 100}%` }} /></div>
         </section>
 
         <aside className="glass race-grid-wrap">
           <div className="h">
             <span><Icon name="layers" size={16} /> Servers</span>
             <span className="race-head-acts">
-              {!stillRacing && enabled.length > 0 && (
-                <button type="button" className="link-btn race-recheck" onClick={recheck} title="Clear cached results and re-check all servers">
-                  <Icon name="refresh" size={13} /> Re-check
+              {snap && !snap.busy && total > 0 && (
+                <button type="button" className="link-btn race-recheck" onClick={recheck} title="Throw away these results and look again">
+                  <Icon name="refresh" size={13} /> Look again
                 </button>
               )}
-              <span className="auto">{!cands ? "LIVE" : stillRacing ? "PICKED" : "DONE"}</span>
+              <span className={`auto ${pick ? "ok" : ""}`}>{pick ? "LOCKED" : snap?.busy ? "LIVE" : "DONE"}</span>
             </span>
           </div>
-          {(() => {
-            // One row per server that applies to this title, grouped by what we know about it.
-            type Row = { id: string; name: string; c?: StreamCandidate; state: "ready" | "checking" | "standby" | "failed"; why?: string };
-            const rows: Row[] = enabled.flatMap((p): Row[] => {
-              const e = events[p.id];
-              const mine = ranked.filter((c) => c.providerId === p.id);
-              const top = mine.find((c) => c.probe?.ok) ?? mine.find((c) => !c.probe) ?? mine[0];
-              if (top?.probe?.ok) return [{ id: p.id, name: p.name, c: top, state: "ready" }];
-              if (laneBusy(p.id)) return [{ id: p.id, name: p.name, state: "checking" }];
-              if (top && !top.probe) return [{ id: p.id, name: p.name, c: top, state: "standby" }];
-              if (top) return [{ id: p.id, name: p.name, c: top, state: "failed", why: candLine(top) }];
-              // Answered with nothing. Embed servers always apply; direct ones (HiAnime, KissKH)
-              // only cover some titles, so they're hidden when they don't.
-              if (e?.status === "done") return p.category === "embed" ? [{ id: p.id, name: p.name, state: "failed", why: "no matching stream returned" }] : [];
-              if (e?.status === "timeout" || e?.status === "error") return [{ id: p.id, name: p.name, state: "failed", why: e.status === "timeout" ? "lookup timed out" : e.error ? `lookup failed: ${e.error}` : "lookup failed" }];
-              return [];
-            });
-            const ready = rows
-              .filter((r): r is Row & { c: StreamCandidate } => r.state === "ready" && !!r.c)
-              .sort((x, y) => (y.c.score ?? 0) - (x.c.score ?? 0));
-            const checking = rows.filter((r) => r.state === "checking");
-            const standby = rows.filter((r) => r.state === "standby");
-            const failed = rows.filter((r) => r.state === "failed");
-            const tag = (c?: StreamCandidate) => (c?.audio === "dub" ? "DUB" : c?.audio === "sub" ? "SUB" : c?.audio === "dual" ? "DUAL" : null);
-            return (
-              <div className="rlist">
-                {ready.length > 0 && <div className="rgroup-h">Ready to play · {ready.length}</div>}
-                {ready.map((r, i) => {
-                  const q = r.c.probe?.quality ?? r.c.quality;
-                  const lat = fmtMs(r.c.probe?.latencyMs);
-                  const win = !!best && candKey(r.c) === candKey(best);
-                  return (
-                    <button key={candKey(r.c)} className={`rrow ready ${win ? "win" : ""}`} style={{ ["--i" as any]: i }} onClick={() => playFrom(r.c)} title={`Play from ${r.name}`}>
-                      <span className="rdot" />
-                      <span className="rname">{r.name}{win && <em className="rt-pick">PICK</em>}</span>
-                      <span className="rmeta">
-                        {q ? <b>{q >= 2160 ? "4K" : `${q}p`}</b> : null}
-                        {tag(r.c) && <b>{tag(r.c)}</b>}
-                        <b className="rb-via">{r.c.via === "direct" ? "DIRECT" : r.c.via === "sniffed" ? "SNIFFED" : "WEB"}</b>
-                        {lat && <span>{lat}</span>}
-                      </span>
-                      <span className="rt-play"><Icon name="play" size={12} /></span>
-                    </button>
-                  );
-                })}
-                {checking.length > 0 && <div className="rgroup-h">Checking · {checking.length}</div>}
-                {checking.map((r) => (
-                  <div key={r.id} className="rrow checking">
-                    <span className="mini-spin" />
-                    <span className="rname">{r.name}</span>
-                    <span className="rmeta"><span>looking for the stream…</span></span>
-                  </div>
-                ))}
-                {standby.length > 0 && (
-                  <div className="rgroup-h">
-                    On standby · {standby.length}
-                    {!stillRacing && !deep && <button type="button" className="link-btn" onClick={checkAll}>Check all</button>}
-                  </div>
-                )}
-                {standby.map((r) => (
-                  <button
-                    key={r.id}
-                    className="rrow standby"
-                    onClick={() => r.c && playFrom(r.c)}
-                    title={`Check and play from ${r.name}`}
-                  >
-                    <span className="rdot" />
-                    <span className="rname">{r.name}</span>
-                    <span className="rmeta">
-                      {tag(r.c) && <b>{tag(r.c)}</b>}
-                      <span>standby · tap to check &amp; play</span>
-                    </span>
-                    <span className="rt-play"><Icon name="play" size={12} /></span>
-                  </button>
-                ))}
-                {failed.length > 0 && (
-                  <details className="rfailed" open={ready.length === 0 && checking.length === 0}>
-                    <summary className="rgroup-h">Preflight failed · {failed.length}</summary>
-                    {failed.map((r) => {
-                      const ev = events[r.id];
-                      const canRetryLookup = !r.c && (ev?.status === "timeout" || ev?.status === "error");
-                      const clickable = !!r.c || canRetryLookup;
-                      return (
-                        <button
-                          key={r.id}
-                          className="rrow failed"
-                          disabled={!clickable}
-                          onClick={() => {
-                            if (r.c) playFrom(r.c);
-                            else if (canRetryLookup) recheck();
-                          }}
-                          title={
-                            r.c
-                              ? `Try ${r.name} in the player anyway (${r.why})`
-                              : canRetryLookup
-                                ? `Re-check ${r.name}`
-                                : r.why
-                          }
-                        >
-                          <span className="rdot" />
-                          <span className="rname">{r.name}</span>
-                          <span className="rmeta">
-                            {tag(r.c) && <b>{tag(r.c)}</b>}
-                            <span>{r.why}{r.c ? " · tap to try" : canRetryLookup ? " · tap to re-check" : ""}</span>
-                          </span>
-                          {clickable && <span className="rt-play"><Icon name={r.c ? "play" : "refresh"} size={12} /></span>}
-                        </button>
-                      );
-                    })}
-                  </details>
-                )}
-              </div>
-            );
-          })()}
+          {snap && <SourceBoard snap={snap} busyKey={busyKey} onPick={(c) => void playFrom(c)} />}
           <div className="rlog">
-            {best ? (
-              <>
-                → <b>{best.providerName}</b>{best.why?.length ? ` · ${best.why.join(", ")}` : ""}
-                {stillRacing ? " · others keep checking as backups" : ""}
-              </>
+            {pick ? (
+              <>→ <b>{pick.providerName}</b>{pick.why?.length ? ` · ${pick.why.join(", ")}` : ""}{snap?.busy ? " · backups keep checking" : ""}</>
             ) : (
               "Every server plays in AbixCine's own player: no ads, no pop-ups"
             )}

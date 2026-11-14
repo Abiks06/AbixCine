@@ -22,7 +22,7 @@ export function Browse({ kind }: { kind: "movie" | "tv" }) {
   );
   const d = data.data;
   return (
-    <div className="page page-flush">
+    <div className="page-flush">
       <Hero items={d?.[1] ?? []} label={kind === "movie" ? "Popular movie" : "Popular series"} />
       <div className="rows pad">
         {feeds.map((f, i) => (
@@ -40,7 +40,7 @@ export function Anime() {
   const fresh = useFreshness();
   const data = useAsync(() => Promise.all(ANIME_FEEDS.map(loadAnimeFeed)), [fresh], { keepPrevious: true });
   return (
-    <div className="page page-flush">
+    <div className="page-flush">
       <Hero items={data.data?.[1] ?? []} label="This season" />
       <div className="rows pad">
         {ANIME_FEEDS.map((f, i) =>

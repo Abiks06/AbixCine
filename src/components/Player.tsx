@@ -2,7 +2,7 @@ import type Hls from "hls.js";
 import type shaka from "shaka-player";
 import { convertFileSrc, invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { fmtTime } from "../lib/format";
 import { ENHANCE_MODES, startEnhancer, upscalerAvailable, type EnhanceMode, type Enhancer, type EnhancerStats } from "../lib/enhance";
 import { fetchSkipSegments, mergeSkipRanges, type SkipSegments } from "../lib/skipSegments";
@@ -34,7 +34,8 @@ import { getSettings, updateSettings, type Audio } from "../lib/settings";
 import type { Episode } from "../lib/types";
 import type { StreamCandidate, SubtitleFormat } from "../sources/types";
 import { isUrlTokenExpired, native, proxyUrl, unwrapProxyUrl } from "../sources/native";
-import { initialCandidateIndex, probeHedged, verifyEmbed } from "../sources/registry";
+import type { SessionSnapshot, SourceSession } from "../sources/session";
+import { SourceBoard } from "./SourceBoard";
 import { AudioToggle } from "./AudioToggle";
 import { Icon } from "./Icon";
 import { SubtitleOverlay } from "./SubtitleOverlay";
@@ -57,10 +58,10 @@ export interface EpisodeNav {
 }
 
 interface Props {
-  candidates: StreamCandidate[];
+  /** The shared source session: the one list of servers, and where playback results are reported. */
+  session: SourceSession;
+  /** candKey of the stream to start from (the session's pick when omitted). */
   initialSource?: string;
-  /** Told when a source starts playing or dies, so the picker learns. */
-  onSourceResult?: (c: StreamCandidate, ok: boolean) => void;
   title: string;
   subtitle?: string;
   startAt?: number;
@@ -183,19 +184,6 @@ function cueSignature(cues: readonly SubtitleCue[]): string {
 }
 
 const candKey = (c: { url: string; pageUrl?: string }): string => c.pageUrl ?? c.url;
-const kindOf = (c: StreamCandidate) =>
-  c.kind === "embed"
-    ? "Online"
-    : /^magnet:/i.test(c.url)
-      ? "Torrent"
-      : c.providerId === "local"
-        ? "This PC"
-        : c.providerId === "jellyfin"
-          ? "Jellyfin"
-          : "Direct";
-const audioTag = (c: StreamCandidate) =>
-  c.audio === "dub" ? "DUB" : c.audio === "sub" ? "SUB" : c.audio === "dual" ? "DUAL" : c.audio === "unknown" ? "JP?" : null;
-
 /** Append a "start at" parameter so an embed resumes where we left off. */
 function withStart(url: string, param: string | undefined, at: number) {
   if (!param || at < 5) return url;
@@ -243,7 +231,7 @@ function loadEnhance(): EnhanceMode {
   }
 }
 
-export function Player({ candidates: given, initialSource, onSourceResult, title, subtitle, startAt, onProgress, onEnded, onNext, autoNext, nextLabel, onBack, onRetry, audio, onAudio, originalLanguage, episodes, media, season, episode }: Props) {
+export function Player({ session, initialSource, title, subtitle, startAt, onProgress, onEnded, onNext, autoNext, nextLabel, onBack, onRetry, audio, onAudio, originalLanguage, episodes, media, season, episode }: Props) {
   const wrap = useRef<HTMLDivElement>(null);
   const video = useRef<HTMLVideoElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
@@ -251,38 +239,15 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
   const shakaRef = useRef<shaka.Player | null>(null);
   const dashHeightsRef = useRef<number[]>([]);
   const resumeAt = useRef(startAt ?? 0);
-  // Servers verified from inside the player (standby ones checked on demand) replace the originals.
-  const [patched, setPatched] = useState<Record<string, StreamCandidate>>({});
-  const [liveVerifiedIds, setLiveVerifiedIds] = useState<Set<string>>(() => new Set());
-  const liveVerifiedIdsRef = useRef(liveVerifiedIds);
-  liveVerifiedIdsRef.current = liveVerifiedIds;
-  const candidates = useMemo(
-    () =>
-      given.map((orig) => {
-        const key = candKey(orig);
-        const base = patched[key] ?? orig;
-        if (liveVerifiedIds.has(key) && !base.probe?.ok) {
-          return {
-            ...base,
-            probe: {
-              ok: true,
-              latencyMs: base.probe?.latencyMs ?? 0,
-              quality: base.probe?.quality ?? base.quality,
-            },
-          };
-        }
-        return base;
-      }),
-    [given, patched, liveVerifiedIds],
-  );
+  // One list of servers, owned by the session and shared with the screens before this one.
+  const snap = useSyncExternalStore(session.subscribe, session.getSnapshot);
+  const candidates = snap.candidates;
+  /** A server being checked because the viewer picked it. */
   const [checking, setChecking] = useState<string | null>(null);
-  const [activeId, setActiveId] = useState<string>(() => {
-    const initIdx = initialCandidateIndex(given, initialSource);
-    return given[initIdx] ? candKey(given[initIdx]) : "";
-  });
+  const [activeId, setActiveId] = useState<string>(
+    () => initialSource ?? (snap.pick ? candKey(snap.pick) : candidates[0] ? candKey(candidates[0]) : ""),
+  );
   const [retrySeq, setRetrySeq] = useState(0);
-  const [probingStandby, setProbingStandby] = useState(false);
-  const [standbyProgress, setStandbyProgress] = useState<{ done: number; total: number } | null>(null);
   const [playing, setPlaying] = useState(false);
   const [hasStarted, setHasStarted] = useState(false);
   const [liveStreamId, setLiveStreamId] = useState<string | null>(null);
@@ -323,14 +288,7 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
   const [timeLeft, setTimeLeft] = useState(() => localStorage.getItem(TIME_LEFT_KEY) === "1");
   const [keysOpen, setKeysOpen] = useState(false);
 
-  const idx = useMemo(() => {
-    if (!candidates.length) return -1;
-    if (activeId) {
-      const found = candidates.findIndex((c) => candKey(c) === activeId);
-      if (found >= 0) return found;
-    }
-    return initialCandidateIndex(candidates, initialSource);
-  }, [candidates, activeId, initialSource]);
+  const idx = useMemo(() => candidates.findIndex((c) => candKey(c) === activeId), [candidates, activeId]);
   const cur = idx >= 0 ? candidates[idx] : undefined;
   const isEmbed = cur?.kind === "embed";
   const activeKey = cur ? candKey(cur) : activeId;
@@ -345,8 +303,6 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
   // new backup never re-runs the attach effect (which would restart the stream).
   const candsRef = useRef(candidates);
   candsRef.current = candidates;
-  const resultRef = useRef(onSourceResult);
-  resultRef.current = onSourceResult;
   const curRef = useRef(cur);
   curRef.current = cur;
   const activeIdRef = useRef(activeKey);
@@ -359,8 +315,6 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
   const mountedRef = useRef(true);
   const verifyCtlRef = useRef<AbortController | null>(null);
   const verifyGenRef = useRef(0);
-  const standbyCtlRef = useRef<AbortController | null>(null);
-  const standbyGenRef = useRef(0);
   const refreshCtlRef = useRef<AbortController | null>(null);
   const activeSessionRef = useRef(0);
   const failedSessionRef = useRef(-1);
@@ -376,8 +330,6 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
       mountedRef.current = false;
       verifyCtlRef.current?.abort();
       verifyCtlRef.current = null;
-      standbyCtlRef.current?.abort();
-      standbyCtlRef.current = null;
       refreshCtlRef.current?.abort();
       refreshCtlRef.current = null;
       clearTimeout(toastTimer.current);
@@ -411,7 +363,7 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
   const clearStall = useCallback(() => clearTimeout(stallTimer.current), []);
   const reported = useRef(new Set<string>());
 
-  // Try the next candidate when the current one dies, keeping the playhead.
+  // The current stream died: tell the session, and play whatever it hands back at the same spot.
   const failover = useCallback((why: string) => {
     if (!mountedRef.current) return;
     if (failedSessionRef.current === activeSessionRef.current) return;
@@ -424,151 +376,50 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     started.current = false;
     setLiveStreamId(null);
 
-    const list = candsRef.current;
-    const dead = curRef.current;
-    const deadId = dead ? candKey(dead) : activeIdRef.current;
-
-    if (dead) {
-      reported.current.delete(deadId);
-      resultRef.current?.(dead, false);
-      setLiveVerifiedIds((prev) => {
-        if (!prev.has(deadId)) return prev;
-        const next = new Set(prev);
-        next.delete(deadId);
-        return next;
-      });
-      // Show it as failed in the server list so failover moves past it cleanly.
-      setPatched((prev) => ({
-        ...prev,
-        [deadId]: {
-          ...dead,
-          probe: { ok: false, latencyMs: dead.probe?.latencyMs ?? 0, error: why || "won't play" },
-        },
-      }));
-    }
+    const deadId = activeIdRef.current;
+    reported.current.delete(deadId);
+    session.report(deadId, false, { error: why || "won't play" });
 
     verifyCtlRef.current?.abort();
-    verifyCtlRef.current = null;
-    standbyCtlRef.current?.abort();
-    standbyCtlRef.current = null;
     refreshCtlRef.current?.abort();
     refreshCtlRef.current = null;
     setChecking(null);
-    setProbingStandby(false);
-    setStandbyProgress(null);
 
-    const curIndex = list.findIndex((c) => candKey(c) === deadId);
-    // Only servers that passed the playability check; prefer the ones ranked after this one.
-    const usable = (c: StreamCandidate) => candKey(c) !== deadId && !!c.probe?.ok && c.kind !== "embed";
-    const nextAfter = curIndex >= 0 ? list.find((c, j) => j > curIndex && usable(c)) : undefined;
-    const nextCand = nextAfter ?? list.find(usable);
+    const ctl = new AbortController();
+    verifyCtlRef.current = ctl;
+    const gen = ++verifyGenRef.current;
+    setWaiting(true);
+    const backupReady = session.getSnapshot().candidates.some((c) => candKey(c) !== deadId && c.probe?.ok && c.kind !== "embed");
+    if (!backupReady) flash(`Checking backup servers (${why})…`);
+    void session.failover(deadId, ctl.signal).then((next) => {
+      if (!mountedRef.current || ctl.signal.aborted || gen !== verifyGenRef.current) return;
+      if (verifyCtlRef.current === ctl) verifyCtlRef.current = null;
+      if (next) {
+        const nextId = candKey(next);
+        activeIdRef.current = nextId;
+        setActiveId(nextId);
+        flash(`Switched to ${next.providerName} (${why})`);
+        return;
+      }
+      setWaiting(false);
+      flash(`Playback failed: ${why}`);
+      setSheet("servers");
+    });
+  }, [clearStall, session]); // eslint-disable-line react-hooks/exhaustive-deps
 
-    if (nextCand) {
-      ++verifyGenRef.current;
-      const nextId = candKey(nextCand);
-      activeIdRef.current = nextId;
-      setActiveId(nextId);
-      flash(`Switched to ${nextCand.providerName} (${why})`);
-      return;
-    }
-
-    const standbys = list.filter((c) => candKey(c) !== deadId && !c.probe && c.kind === "embed");
-    if (standbys.length > 0) {
-      const ctl = new AbortController();
-      verifyCtlRef.current = ctl;
-      const gen = ++verifyGenRef.current;
-      setWaiting(true);
-      flash(`Checking backup servers (${why})…`);
-      void probeHedged(standbys.slice(0, 6), {
-        concurrency: 3,
-        maxWinners: 1,
-        signal: ctl.signal,
-        onCandidate: (r) => {
-          if (!mountedRef.current || ctl.signal.aborted || gen !== verifyGenRef.current) return;
-          setPatched((prev) => {
-            const k = candKey(r);
-            if (liveVerifiedIdsRef.current.has(k) && !r.probe?.ok) return prev;
-            return { ...prev, [k]: r };
-          });
-        },
-      })
-        .then((checked) => {
-          if (!mountedRef.current || ctl.signal.aborted || gen !== verifyGenRef.current) return;
-          if (verifyCtlRef.current === ctl) verifyCtlRef.current = null;
-          const winner = checked.find((r) => r.probe?.ok);
-          if (winner) {
-            const wid = candKey(winner);
-            if (candsRef.current.some((x) => candKey(x) === wid)) {
-              activeIdRef.current = wid;
-              setActiveId(wid);
-              flash(`Switched to ${winner.providerName} (${why})`);
-              return;
-            }
-          }
-          setWaiting(false);
-          flash(`Playback failed: ${why}`);
-          setSheet("servers");
-        })
-        .catch(() => {
-          if (!mountedRef.current || ctl.signal.aborted || gen !== verifyGenRef.current) return;
-          if (verifyCtlRef.current === ctl) verifyCtlRef.current = null;
-          setWaiting(false);
-          flash(`Playback failed: ${why}`);
-          setSheet("servers");
-        });
-      return;
-    }
-
-    setWaiting(false);
-    flash(`Playback failed: ${why}`);
-    setSheet("servers");
-  }, [clearStall]);
-
-  // First frame from a source counts as a successful play and promotes it to Ready immediately.
+  // First frame from a source is the proof it plays: the session marks it ready and learns from it.
   const onPlaying = useCallback(() => {
     const c = curRef.current;
     if (!c) return;
     const key = candKey(c);
     setLiveStreamId(key);
-    const connectLatencyMs = Math.max(1, Math.round(performance.now() - attachStartRef.current));
-    const liveHeight = video.current?.videoHeight || videoHeightRef.current;
-    const resolvedQuality = c.probe?.quality ?? liveHeight ?? c.quality;
-    const resolvedLatency =
-      c.probe?.ok && typeof c.probe.latencyMs === "number" && c.probe.latencyMs > 0
-        ? c.probe.latencyMs
-        : connectLatencyMs;
-    const promoted: StreamCandidate = {
-      ...c,
-      quality: resolvedQuality ?? c.quality,
-      probe: {
-        ok: true,
-        latencyMs: resolvedLatency,
-        quality: resolvedQuality,
-      },
-    };
-    setLiveVerifiedIds((prev) => {
-      if (prev.has(key)) return prev;
-      const next = new Set(prev);
-      next.add(key);
-      return next;
+    if (reported.current.has(key)) return;
+    reported.current.add(key);
+    session.report(key, true, {
+      latencyMs: Math.max(1, Math.round(performance.now() - attachStartRef.current)),
+      quality: video.current?.videoHeight || videoHeightRef.current,
     });
-    setPatched((prev) => {
-      const existing = prev[key];
-      if (
-        existing?.probe?.ok &&
-        existing.url === promoted.url &&
-        existing.probe.latencyMs === promoted.probe?.latencyMs &&
-        existing.probe.quality === promoted.probe?.quality
-      ) {
-        return prev;
-      }
-      return { ...prev, [key]: promoted };
-    });
-    if (!reported.current.has(key)) {
-      reported.current.add(key);
-      resultRef.current?.(promoted, true);
-    }
-  }, []);
+  }, [session]);
 
   /* -------------------------------------------------------------- subtitles */
 
@@ -1802,15 +1653,15 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
       const refreshCtl = new AbortController();
       refreshCtlRef.current = refreshCtl;
 
-      void verifyEmbed(target, refreshCtl.signal)
+      void session
+        .refresh(targetId, refreshCtl.signal)
         .then((refreshed) => {
           if (cancelled || refreshCtl.signal.aborted || !mountedRef.current) return;
           if (refreshCtlRef.current === refreshCtl) refreshCtlRef.current = null;
-          if (!refreshed.probe?.ok) {
-            failover(refreshed.probe?.error ?? (httpCode ? `HTTP ${httpCode}` : fallbackMsg));
+          if (!refreshed?.probe?.ok) {
+            failover(refreshed?.probe?.error ?? (httpCode ? `HTTP ${httpCode}` : fallbackMsg));
             return;
           }
-          setPatched((p) => ({ ...p, [targetId]: refreshed }));
           if (refreshed.url === target.url) {
             attachStream(refreshed);
             armStallRef.current();
@@ -2155,13 +2006,14 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
       lastRefreshedAtRef.current.set(candidateId, Date.now());
       const refreshCtl = new AbortController();
       refreshCtlRef.current = refreshCtl;
-      void verifyEmbed(c, refreshCtl.signal)
+      // The session swaps in the fresh link, which re-runs this effect with the new URL.
+      void session
+        .refresh(candidateId, refreshCtl.signal)
         .then((refreshed) => {
           if (cancelled || refreshCtl.signal.aborted || !mountedRef.current) return;
           if (refreshCtlRef.current === refreshCtl) refreshCtlRef.current = null;
-          setPatched((p) => ({ ...p, [candidateId]: refreshed }));
-          if (!refreshed.probe?.ok) {
-            failover(refreshed.probe?.error ?? "expired stream");
+          if (!refreshed?.probe?.ok) {
+            failover(refreshed?.probe?.error ?? "expired stream");
             return;
           }
           if (refreshed.url === c.url) {
@@ -2426,48 +2278,35 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     onBack();
   };
 
-  const switchTo = async (i: number, opts?: { demoteCurrent?: boolean }) => {
-    const list = candsRef.current;
-    let c = list[i];
+  /**
+   * Play from another server. One the viewer picked by hand is remembered as this show's server
+   * once it plays; `auto` is for moves the viewer didn't choose a server for.
+   */
+  const switchTo = async (id: string, opts?: { demoteCurrent?: boolean; auto?: boolean }) => {
+    let c = session.get(id);
     if (!c) return;
-    const id = candKey(c);
-    const prevCur = curRef.current;
     const prevId = activeIdRef.current;
-    const isSameActive = id === prevId;
-    if (isSameActive && c.probe?.ok !== false) return;
+    if (id === prevId && c.probe?.ok !== false) return;
 
     verifyCtlRef.current?.abort();
     verifyCtlRef.current = null;
-    standbyCtlRef.current?.abort();
-    standbyCtlRef.current = null;
     refreshCtlRef.current?.abort();
     refreshCtlRef.current = null;
-    setProbingStandby(false);
-    setStandbyProgress(null);
     const gen = ++verifyGenRef.current;
+    if (!opts?.auto) session.choose(id);
 
-    // Unchecked standby embeds or previously failed embed/sniffed candidates get verified first.
+    // A server on standby, or one from a page whose check failed earlier, is checked first.
     if ((!c.probe || !c.probe.ok) && (c.kind === "embed" || Boolean(c.pageUrl))) {
       const ctl = new AbortController();
       verifyCtlRef.current = ctl;
       setChecking(id);
-      let r: StreamCandidate;
-      try {
-        r = await verifyEmbed(c, ctl.signal);
-      } catch (err) {
-        if (!mountedRef.current || ctl.signal.aborted || gen !== verifyGenRef.current) return;
-        if (verifyCtlRef.current === ctl) verifyCtlRef.current = null;
-        setChecking(null);
-        flash(`Couldn't verify ${c.providerName}: ${err instanceof Error ? err.message : "check failed"}`);
-        return;
-      }
+      const r = await session.verify(id, ctl.signal);
       if (!mountedRef.current || ctl.signal.aborted || gen !== verifyGenRef.current) return;
       if (verifyCtlRef.current === ctl) verifyCtlRef.current = null;
       setChecking(null);
-      setPatched((p) => ({ ...p, [id]: r }));
-      if (!r.probe?.ok) {
+      if (!r?.probe?.ok) {
         flash(
-          r.probe?.error && r.probe.error !== "no stream"
+          r?.probe?.error && r.probe.error !== "no stream"
             ? `${c.providerName}: ${r.probe.error}`
             : `${c.providerName} doesn't have this one`,
         );
@@ -2478,17 +2317,10 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
       setChecking(null);
     }
     if (!mountedRef.current || gen !== verifyGenRef.current) return;
-    if (!candsRef.current.some((x) => candKey(x) === id)) return;
 
-    if (opts?.demoteCurrent && prevCur && prevId && prevId !== id) {
+    if (opts?.demoteCurrent && prevId && prevId !== id) {
       reported.current.delete(prevId);
-      setLiveVerifiedIds((prev) => {
-        if (!prev.has(prevId)) return prev;
-        const next = new Set(prev);
-        next.delete(prevId);
-        return next;
-      });
-      resultRef.current?.(prevCur, false);
+      session.report(prevId, false, { error: "wasn't playing right" });
     }
 
     saveNowRef.current();
@@ -2507,57 +2339,6 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     flash(`Now playing from ${c.providerName}${resumeAt.current > 5 ? ` at ${fmtTime(resumeAt.current)}` : ""}`);
   };
 
-  /** Probe up to 6 standby embed servers in the background while keeping playback uninterrupted. */
-  const checkStandbys = useCallback(() => {
-    if (standbyCtlRef.current) {
-      standbyCtlRef.current.abort();
-      standbyCtlRef.current = null;
-      standbyGenRef.current += 1;
-      setProbingStandby(false);
-      setStandbyProgress(null);
-      return;
-    }
-    const standbys = candsRef.current.filter((c) => !c.probe && c.kind === "embed").slice(0, 6);
-    if (!standbys.length) return;
-    const ctl = new AbortController();
-    standbyCtlRef.current = ctl;
-    const gen = ++standbyGenRef.current;
-    setProbingStandby(true);
-    setStandbyProgress({ done: 0, total: standbys.length });
-    void probeHedged(standbys, {
-      concurrency: 3,
-      maxWinners: standbys.length,
-      signal: ctl.signal,
-      onCandidate: (r) => {
-        if (!mountedRef.current || ctl.signal.aborted || gen !== standbyGenRef.current) return;
-        setStandbyProgress((p) => (p ? { ...p, done: Math.min(p.total, p.done + 1) } : null));
-        setPatched((prev) => {
-          const k = candKey(r);
-          if (liveVerifiedIdsRef.current.has(k) && !r.probe?.ok) return prev;
-          return { ...prev, [k]: r };
-        });
-      },
-    })
-      .then((checked) => {
-        if (!mountedRef.current || ctl.signal.aborted || gen !== standbyGenRef.current) return;
-        if (standbyCtlRef.current === ctl) standbyCtlRef.current = null;
-        setProbingStandby(false);
-        setStandbyProgress(null);
-        const readyCount = checked.filter((r) => r.probe?.ok).length;
-        flash(
-          readyCount > 0
-            ? `${readyCount} standby server${readyCount === 1 ? "" : "s"} ready`
-            : "No standby servers responded",
-        );
-      })
-      .catch(() => {
-        if (!mountedRef.current || ctl.signal.aborted || gen !== standbyGenRef.current) return;
-        if (standbyCtlRef.current === ctl) standbyCtlRef.current = null;
-        setProbingStandby(false);
-        setStandbyProgress(null);
-      });
-  }, []);
-
   const refreshServerList = useCallback(() => {
     if (!onRetry) return;
     saveNowRef.current();
@@ -2565,18 +2346,12 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     onRetry();
   }, [onRetry]);
 
-  /** "Not playing right?": cycle to the next alternative server (verified first, then standby, then any other). */
+  /** "Not playing right?": move to the next server (ready first, then standby, then any other). */
   const nextServer = () => {
-    if (candidates.length <= 1) return flash("No other server available");
-    const findNext = (pred: (c: StreamCandidate, j: number) => boolean) => {
-      const after = candidates.findIndex((c, j) => j > idx && pred(c, j));
-      return after >= 0 ? after : candidates.findIndex((c, j) => j !== idx && pred(c, j));
-    };
-    let i = findNext((c) => !!c.probe?.ok);
-    if (i === -1) i = findNext((c) => !c.probe);
-    if (i === -1) i = findNext((_, j) => j !== idx);
-    if (i === -1) return flash("No other server available");
-    void switchTo(i, { demoteCurrent: true });
+    const others = candidates.filter((c) => candKey(c) !== activeKey);
+    const to = others.find((c) => c.probe?.ok) ?? others.find((c) => !c.probe) ?? others[0];
+    if (!to) return flash("No other server available");
+    void switchTo(candKey(to), { demoteCurrent: true, auto: true });
   };
   const changeAudio = (a: Audio) => {
     saveNow();
@@ -2691,10 +2466,11 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
   }, [title, subtitle, media?.backdrop, hasNext]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Stable callbacks for the side sheet, so its lists don't re-render with every playhead tick.
-  const latest = useRef({ switchTo, saveNow, episodes, checkStandbys });
-  latest.current = { switchTo, saveNow, episodes, checkStandbys };
-  const pickServer = useCallback((i: number) => void latest.current.switchTo(i), []);
-  const triggerCheckStandbys = useCallback(() => latest.current.checkStandbys(), []);
+  const latest = useRef({ switchTo, saveNow, episodes });
+  latest.current = { switchTo, saveNow, episodes };
+  const pickServer = useCallback((c: StreamCandidate) => void latest.current.switchTo(candKey(c)), []);
+  const triggerCheckStandbys = useCallback(() => void session.checkAll(), [session]);
+  const stopChecking = useCallback(() => session.stopBackground(), [session]);
   const pickEpisode = useCallback((s: number | undefined, e: number) => {
     latest.current.saveNow();
     latest.current.episodes?.go(s, e);
@@ -2761,7 +2537,7 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
     ? "live"
     : isConnecting
       ? "wait"
-      : checking || probingStandby
+      : checking
         ? "busy"
         : !cur || cur.probe?.ok === false
           ? "off"
@@ -3119,16 +2895,14 @@ export function Player({ candidates: given, initialSource, onSourceResult, title
 
         <div className="ps-body" key={sheet ?? "none"}>
           {sheet === "servers" && (
-            <ServerList
-              candidates={candidates}
-              idx={idx}
-              checking={checking}
-              isStreaming={isActivelyStreaming}
-              isConnecting={isConnecting}
-              probingStandby={probingStandby}
-              standbyProgress={standbyProgress}
+            <ServerSheet
+              snap={snap}
+              playingKey={isActivelyStreaming ? activeKey : undefined}
+              busyKey={checking ?? (isConnecting ? activeKey : null)}
+              busyNote={checking ? "Checking…" : "Connecting…"}
               onPick={pickServer}
-              onCheckStandbys={triggerCheckStandbys}
+              onCheckAll={triggerCheckStandbys}
+              onStop={stopChecking}
               onRefreshList={onRetry ? refreshServerList : undefined}
             />
           )}
@@ -3347,145 +3121,61 @@ function bufferedAhead(v: HTMLVideoElement) {
 
 /* ------------------------------------------------------------------ servers */
 
-const ServerList = memo(function ServerList({
-  candidates,
-  idx,
-  checking,
-  isStreaming,
-  isConnecting,
-  probingStandby,
-  standbyProgress,
+const ServerSheet = memo(function ServerSheet({
+  snap,
+  playingKey,
+  busyKey,
+  busyNote,
   onPick,
-  onCheckStandbys,
+  onCheckAll,
+  onStop,
   onRefreshList,
 }: {
-  candidates: StreamCandidate[];
-  idx: number;
-  checking: string | null;
-  isStreaming: boolean;
-  isConnecting: boolean;
-  probingStandby: boolean;
-  standbyProgress: { done: number; total: number } | null;
-  onPick: (i: number) => void;
-  onCheckStandbys: () => void;
+  snap: SessionSnapshot;
+  /** The stream on screen, once it is actually playing. */
+  playingKey?: string;
+  busyKey: string | null;
+  busyNote: string;
+  onPick: (c: StreamCandidate) => void;
+  onCheckAll: () => void;
+  onStop: () => void;
   onRefreshList?: () => void;
 }) {
-  const entries = candidates.map((c, i) => {
-    const now = i === idx;
-    const state: "ok" | "standby" | "off" =
-      c.probe?.ok || (now && isStreaming) ? "ok" : !c.probe ? "standby" : "off";
-    return { c, i, now, state };
-  });
-  const ok = entries
-    .filter((x) => x.state === "ok")
-    .sort((a, b) => (a.now ? -1 : b.now ? 1 : 0));
-  const standby = entries.filter((x) => x.state === "standby");
-  const missing = entries.filter((x) => x.state === "off");
-  const standbyEmbedCount = candidates.filter((c) => !c.probe && c.kind === "embed").length;
-  const best = ok.reduce(
-    (m, { c }) => Math.min(m, c.probe?.latencyMs && c.probe.latencyMs > 0 ? c.probe.latencyMs : Infinity),
-    Infinity,
-  );
-  const row = ({ c, i, now, state }: { c: StreamCandidate; i: number; now: boolean; state: "ok" | "standby" | "off" }) => {
-    const key = candKey(c);
-    const busy = checking === key;
-    const ms = c.probe?.latencyMs;
-    const bars = state !== "ok" || ms == null || ms <= 0 ? (state === "ok" ? 3 : 0) : ms < 1500 ? 3 : ms < 5000 ? 2 : 1;
-    const tag = audioTag(c);
-    const q = c.probe?.quality ?? c.quality;
-    const subText = busy
-      ? "Checking this server…"
-      : now && isStreaming
-        ? [
-            "Playing now",
-            c.via === "direct" ? "Direct" : c.via === "sniffed" ? "Ad-free" : kindOf(c),
-            ms && ms === best ? "fastest" : ms ? `${ms} ms` : null,
-          ].filter(Boolean).join(" · ")
-        : now && isConnecting
-          ? "Connecting to server…"
-          : state === "standby"
-            ? "Not checked yet · tap to check and play"
-            : state === "off"
-              ? c.probe?.error === "no stream" || c.probe?.error === "not found"
-                ? "No stream found · Tap to retry"
-                : `Preflight failed${c.probe?.error ? ` (${c.probe.error})` : ""} · Tap to retry`
-              : [
-                  c.via === "direct" ? "Direct" : c.via === "sniffed" ? "Ad-free" : kindOf(c),
-                  ms && ms === best ? "fastest" : ms ? `${ms} ms` : null,
-                ].filter(Boolean).join(" · ");
-    return (
-      <button
-        key={key}
-        type="button"
-        className={`srv ${now ? "now" : ""} ${state}`}
-        disabled={busy}
-        onClick={() => onPick(i)}
-        style={{ ["--i" as any]: Math.min(i, 12) }}
-      >
-        <span className={`srv-sig b${bars}`} aria-hidden><i /><i /><i /></span>
-        <span className="srv-main">
-          <span className="srv-name">
-            {c.providerName}
-            {i === 0 && state === "ok" && <em className="srv-auto">AUTO</em>}
-          </span>
-          <span className="srv-sub">{subText}</span>
-        </span>
-        {q && state === "ok" ? <span className="srv-tag">{q >= 2160 ? "4K" : `${q}p`}</span> : null}
-        {state === "ok" && <span className="srv-tag">{c.kind === "hls" ? "HLS" : c.kind === "dash" ? "DASH" : c.kind === "file" ? "MP4" : "WEB"}</span>}
-        {tag && <span className={`srv-tag ${tag === "JP?" ? "warn" : ""}`} title={tag === "JP?" ? "This server can't switch audio" : undefined}>{tag}</span>}
-        {busy || (now && isConnecting) ? (
-          <span className="mini-spin" />
-        ) : now ? (
-          <span className="eq" aria-label="Playing"><i /><i /><i /><i /></span>
-        ) : state === "off" ? (
-          <Icon name="refresh" size={13} />
-        ) : (
-          <Icon name="play" size={13} />
-        )}
-      </button>
-    );
-  };
+  const checkingMore = snap.busy && snap.checking.size > 0;
   return (
     <div className="ps-section">
-      <p className="ps-note">Every server below plays in AbixCine's own player, so there are no ads. Switching keeps your place.</p>
-      {(standbyEmbedCount > 0 || probingStandby || onRefreshList) && (
+      <p className="ps-note">Every server plays in AbixCine's own player, so there are no ads. Switching keeps your place, and a server you pick here stays this show's server.</p>
+      {(snap.waiting > 0 || checkingMore || onRefreshList) && (
         <div className="srv-actions">
-          {(standbyEmbedCount > 0 || probingStandby) && (
+          {(snap.waiting > 0 || checkingMore) && (
             <button
               type="button"
-              className={`srv-act ${probingStandby ? "busy" : ""}`}
-              onClick={onCheckStandbys}
-              title={probingStandby ? "Cancel standby check" : "Check up to 6 standby servers in the background"}
+              className={`srv-act ${checkingMore ? "busy" : ""}`}
+              onClick={checkingMore ? onStop : onCheckAll}
+              title={checkingMore ? "Stop checking" : "Check the servers on standby without interrupting playback"}
             >
-              {probingStandby ? (
+              {checkingMore ? (
                 <>
                   <span className="mini-spin" />
-                  <span>Checking standby ({standbyProgress?.done ?? 0}/{standbyProgress?.total ?? 0})…</span>
+                  <span>Checking {snap.checking.size}… stop</span>
                 </>
               ) : (
                 <>
                   <Icon name="layers" size={14} />
-                  <span>Check standby servers</span>
+                  <span>Check standby servers ({snap.waiting})</span>
                 </>
               )}
             </button>
           )}
           {onRefreshList && (
-            <button
-              type="button"
-              className="srv-act"
-              onClick={onRefreshList}
-              title="Re-run source discovery for all servers"
-            >
+            <button type="button" className="srv-act" onClick={onRefreshList} title="Throw the list away and look for servers again">
               <Icon name="refresh" size={14} />
-              <span>Refresh server list</span>
+              <span>Look again</span>
             </button>
           )}
         </div>
       )}
-      {ok.length > 0 && <div className="srv-group"><div className="ps-label">Ready · {ok.length}</div><div className="srv-list">{ok.map(row)}</div></div>}
-      {standby.length > 0 && <div className="srv-group"><div className="ps-label">On standby · {standby.length}</div><div className="srv-list">{standby.map(row)}</div></div>}
-      {missing.length > 0 && <div className="srv-group"><div className="ps-label">Unavailable · {missing.length}</div><div className="srv-list">{missing.map(row)}</div></div>}
+      <SourceBoard snap={snap} playingKey={playingKey} busyKey={busyKey} busyNote={busyNote} onPick={onPick} />
     </div>
   );
 });

@@ -5,6 +5,10 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
 import "./styles.css";
+import "./aurora.css";
+import { installPointerLight } from "./lib/pointerLight";
+
+installPointerLight();
 
 // Dev-only hooks for the native test harness (src-tauri/src/lib.rs, ABX_JS_TEST).
 if (import.meta.env.DEV) {

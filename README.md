@@ -7,8 +7,8 @@ A Windows desktop app for movies, series and anime. Tauri 2 (Rust) shell, React 
 - **Accounts from day one.** Sign up / sign in; watch progress, My List and playback preferences sync to your account. Library folders stay on each PC.
 - **Catalog.** TMDB for movies and series (through your AbixCine server, or your own key), AniList for anime. Cached so browsing is instant.
 - **Anime is one entry.** Each show has a Sub/Dub switch on its page, in the player, and as a default in Settings. Files tagged `Dub` / `Dual Audio` are matched to Dub.
-- **Sources.** Local folders first. Unsupported local audio/container formats are prepared with the bundled LGPL FFmpeg tools and cached for playback; no separate FFmpeg install is required. External servers (Jellyfin today) are an optional add-on, and new ones plug in through `src/sources/`. Providers are queried in parallel; the picker checks candidates until it finds enough playable streams, prioritizing one that previously worked for the same title. The player fails over if a stream drops.
-- **Design.** Floating pill nav, launch intro, page morphs (View Transitions), ambient color from the featured artwork, Top 10 shelves that rise in as you scroll, cinematic loading screen, undoable toasts.
+- **Sources.** Local folders first. Unsupported local audio/container formats are prepared with the bundled LGPL FFmpeg tools and cached for playback; no separate FFmpeg install is required. External servers (Jellyfin today) are an optional add-on, and new ones plug in through `src/sources/`. Providers are queried in parallel into one shared source session that the title page, the loading screen and the player all use. Direct streams are checked first and embed pages are only captured when needed; the pick's first segment is fetched before it is committed; backups are checked quietly once playback is under way. A server you pick by hand becomes that show's server. The player fails over if a stream drops.
+- **Design.** Floating pill nav, launch intro, page morphs (View Transitions), a drifting aurora and edge-lit glass, cards that catch the light under the pointer, ambient color from the featured artwork, Top 10 shelves that rise in as you scroll, cinematic loading screen, undoable toasts.
 - **Search.** Ctrl+K or `/` opens the command palette from anywhere (Ctrl+Enter plays a result straight away). Both catalogs are searched at once, a typo is forgiven ("jujutu kaisen"), and a trailing year narrows it ("Dune 2021").
 - **Player.** Press `?` for every shortcut: 0–9 to jump, Shift+arrows for 30s, mouse wheel for volume, `<` `>` for speed, `P` for picture-in-picture. Hardware media keys work, and intro/credits are marked on the timeline when the server knows them.
 
@@ -80,4 +80,4 @@ The player's Picture panel runs [Anime4K](https://github.com/bloc97/Anime4K) thr
 
 ## Adding a source
 
-Implement `SourceProvider` (`src/sources/types.ts`) and add it to `PROVIDERS` in `src/sources/registry.ts`. Set `category: "external"` for anything that isn't on this PC.
+Implement `SourceProvider` (`src/sources/types.ts`) and add it to `PROVIDERS` in `src/sources/registry.ts`. Set `category: "external"` for anything that isn't on this PC, and `"embed"` for a web player whose page has to be captured. How providers are raced and picked is described in `ARCHITECTURE.md` (source sessions).
