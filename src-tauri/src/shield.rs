@@ -389,6 +389,23 @@ pub fn is_blocked_host(host: &str) -> bool {
     BLOCKED_HOSTS.iter().any(|b| host == *b || host.ends_with(&format!(".{b}")))
 }
 
+/// Where the main window may navigate: the app itself and blank documents, nothing else.
+/// The old test passed every URI without a host (`javascript:`, `data:`, `file:`, custom OS
+/// handlers) and any `*.localhost`, which included the stream proxy's own origin.
+pub(crate) fn is_app_navigation(uri: &str) -> bool {
+    let Ok(u) = url::Url::parse(uri) else { return false };
+    match u.scheme() {
+        "tauri" => true,
+        "about" => matches!(u.as_str(), "about:blank" | "about:srcdoc"),
+        "http" | "https" => match u.host_str() {
+            Some("tauri.localhost") => true,
+            Some("localhost") | Some("127.0.0.1") => cfg!(debug_assertions),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 fn host_of(uri: &str) -> Option<String> {
     url::Url::parse(uri).ok().and_then(|u| u.host_str().map(|h| h.to_string()))
 }
@@ -809,9 +826,7 @@ mod win {
                         let mut uri = PWSTR::null();
                         args.Uri(&mut uri)?;
                         let uri = take_pwstr(uri);
-                        let ours = host_of(&uri).is_none_or(|h| h == "localhost" || h.ends_with(".localhost"))
-                            || uri.starts_with("about:")
-                            || uri.starts_with("tauri:");
+                        let ours = is_app_navigation(&uri);
                         if !ours {
                             BLOCKED.fetch_add(1, Ordering::Relaxed);
                             args.SetCancel(true)?;
@@ -1086,7 +1101,10 @@ pub async fn sniff_media(
     };
 
     let budget = std::time::Duration::from_millis(timeout_ms.unwrap_or(14_000) + 6_000);
-    let fut = tokio::time::timeout(budget, sniff_inner(app.clone(), target, timeout_ms, label.clone()));
+    // Shared with sniff_inner, which releases it as soon as its window is gone. If the sniff times
+    // out or is cancelled first, it is still released below, after this window is destroyed.
+    let slot = Arc::new(std::sync::Mutex::new(Some(permit)));
+    let fut = tokio::time::timeout(budget, sniff_inner(app.clone(), target, timeout_ms, label.clone(), slot.clone()));
 
     let res = match cancel_rx.as_mut() {
         Some(rx) => {
@@ -1122,11 +1140,13 @@ pub async fn sniff_media(
             Ok(None)
         }
     };
-    drop(permit);
+    slot.lock().unwrap_or_else(|e| e.into_inner()).take();
     out
 }
 
-async fn sniff_inner(app: AppHandle, target: url::Url, timeout_ms: Option<u64>, label: String) -> Result<Option<Sniffed>, String> {
+type PermitSlot = Arc<std::sync::Mutex<Option<tokio::sync::SemaphorePermit<'static>>>>;
+
+async fn sniff_inner(app: AppHandle, target: url::Url, timeout_ms: Option<u64>, label: String, slot: PermitSlot) -> Result<Option<Sniffed>, String> {
     let t0 = std::time::Instant::now();
     let _ = t0; // only read by the debug timing log
     let dbg = |what: &str| {
@@ -1248,6 +1268,9 @@ async fn sniff_inner(app: AppHandle, target: url::Url, timeout_ms: Option<u64>, 
         let _ = w.destroy();
         dbg("destroyed");
     }
+    // The browser slot is free once the window is gone. Checking the playlists below is plain HTTP:
+    // holding the permit through it kept other titles' sniffs queued for no reason.
+    slot.lock().unwrap_or_else(|e| e.into_inner()).take();
     if candidates.is_empty() {
         return Ok(None);
     }
@@ -1702,5 +1725,20 @@ mod tests {
             "xmlhttprequest",
             "get",
         ));
+    }
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::is_app_navigation;
+
+    #[test]
+    fn main_window_stays_on_the_app() {
+        assert!(is_app_navigation("http://tauri.localhost/#/title/x"));
+        assert!(is_app_navigation("tauri://localhost/"));
+        assert!(is_app_navigation("about:blank"));
+        for bad in ["javascript:alert(1)", "data:text/html,hi", "file:///C:/Windows/win.ini", "http://abxs.localhost/p?u=x", "https://example.com/", "ms-settings:privacy"] {
+            assert!(!is_app_navigation(bad), "{bad} must be blocked");
+        }
     }
 }

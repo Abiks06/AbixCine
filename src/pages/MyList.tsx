@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { Card } from "../components/Card";
 import { Icon } from "../components/Icon";
+import { useAuth } from "../lib/account";
 import type { MediaKind } from "../lib/types";
 import { useWatchlist } from "../lib/watchlist";
 
@@ -21,6 +22,7 @@ type Sort = (typeof SORTS)[number]["id"];
 
 export function MyList() {
   const list = useWatchlist();
+  const { user } = useAuth();
   const [kind, setKind] = useState<Kind>("all");
   const [sort, setSort] = useState<Sort>("recent");
   const count = (k: Kind) => (k === "all" ? list.length : list.filter((e) => e.media.kind === k).length);
@@ -38,17 +40,18 @@ export function MyList() {
     <div className="page">
       <div className="page-head">
         <div>
-          <h5>Saved for later</h5>
-          <h1 className="page-title">My List</h1>
+          <p className="overline">Saved for later</p>
+          <h1 className="page-title">My <em>List</em></h1>
         </div>
-        <span className="muted">{list.length} title{list.length === 1 ? "" : "s"} · synced to your account</span>
+        <span className="grow" />
+        <span className="shelf-note">{list.length} title{list.length === 1 ? "" : "s"} · {user ? "synced to your account" : "saved on this PC"}</span>
       </div>
       {list.length === 0 ? (
         <div className="empty">
           <span className="empty-ic"><Icon name="bookmark" size={26} /></span>
           <h3>Nothing saved yet</h3>
-          <p>Press the <b>+</b> on any title and it shows up here, on every device you sign in to.</p>
-          <Link to="/" className="btn glass sm" viewTransition>Find something to watch</Link>
+          <p>Press the <b>+</b> on any title and it shows up here{user ? ", on every device you sign in to" : ""}.</p>
+          <Link to="/" className="btn play sm" viewTransition>Find something to watch</Link>
         </div>
       ) : (
         <>
@@ -67,7 +70,7 @@ export function MyList() {
               ))}
             </div>
           </div>
-          <div className="grid" key={`${active}-${sort}`}>{shown.map((e, i) => <Card key={e.media.key} media={e.media} index={i} />)}</div>
+          <div className="grid">{shown.map((e, i) => <Card key={e.media.key} media={e.media} index={i} />)}</div>
         </>
       )}
     </div>

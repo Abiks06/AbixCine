@@ -82,11 +82,16 @@ export const getHealth = (providerId: string): ProviderHealth => {
   return lat != null ? { ...raw, latency: lat, latencyMs: lat } : raw;
 };
 
-function bump(providerId: string, ok: boolean, latencyMs?: number) {
+/**
+ * `weight` is how much one event counts toward reliability (a playback result is worth two probe
+ * results). It never multiplies the failure streak: one failure is one step toward the circuit
+ * breaker, however heavily it is weighted.
+ */
+function bump(providerId: string, ok: boolean, latencyMs?: number, weight = 1) {
   const h = { ...getHealth(providerId) };
   const now = Date.now();
-  h.ok = h.ok * DECAY + (ok ? 1 : 0);
-  h.fail = h.fail * DECAY + (ok ? 0 : 1);
+  h.ok = h.ok * DECAY + (ok ? weight : 0);
+  h.fail = h.fail * DECAY + (ok ? 0 : weight);
   const prevLat = h.latencyMs ?? h.latency;
   if (ok) {
     h.lastOk = now;
@@ -203,8 +208,9 @@ export function recordPlayback(req: PlaybackRequest, c: StreamCandidate, ok: boo
         : 500
       : undefined;
   const latencySample = ok ? (probeLat ?? fallbackLat) : probeLat;
-  bump(c.providerId, ok, latencySample);
-  bump(c.providerId, ok, latencySample);
+  // Counted double for reliability, once for the streak: a single stalled episode used to add
+  // two to the streak and, with one earlier probe miss, trip the breaker on its own.
+  bump(c.providerId, ok, latencySample, 2);
   const k = titleKey(req);
   if (ok) {
     // A hand-picked server stays the show's choice until the viewer picks another or it breaks;
@@ -227,9 +233,13 @@ export function recordPlayback(req: PlaybackRequest, c: StreamCandidate, ok: boo
     }
   } else {
     picks = { ...picks };
-    for (const key of [k, exactKey(req)]) {
-      if (picks[key]?.url === c.url || picks[key]?.providerId === c.providerId) delete picks[key];
-    }
+    // This episode's pick goes, and so does an automatic show-wide pick for the same provider.
+    // A server the viewer chose by hand for the series survives one bad episode: it is only
+    // dropped when the failure is on the exact stream it points at.
+    const exact = exactKey(req);
+    const same = (p?: TitlePick) => !!p && (p.url === c.url || p.providerId === c.providerId);
+    if (same(picks[exact])) delete picks[exact];
+    if (k !== exact && same(picks[k]) && (!picks[k].manual || picks[k].url === c.url)) delete picks[k];
     const now = Date.now();
     badUrls = Object.fromEntries(
       Object.entries({ ...badUrls, [c.url]: now })

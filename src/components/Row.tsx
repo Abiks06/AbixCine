@@ -1,11 +1,11 @@
-import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { rankMoves } from "../lib/ranks";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { rankMoves, type Move } from "../lib/ranks";
 import type { Media } from "../lib/types";
 import { Card, CardSkeleton, type CardVariant } from "./Card";
 import { Icon } from "./Icon";
 import { SectionHead } from "./SectionHead";
 
-/** A shelf: eyebrow, title, and a snap-scrolling track with arrow paging. */
+/** A shelf: title, caption, and a snap-scrolling track that bleeds to the window edge. */
 export const Row = memo(function Row({
   title,
   eyebrow,
@@ -33,41 +33,50 @@ export const Row = memo(function Row({
   id?: string;
 }) {
   const ref = useRef<HTMLDivElement>(null);
-  const [edges, setEdges] = useState({ left: false, right: true });
+  const [edges, setEdges] = useState({ left: false, right: false });
   const list = useMemo(() => (ranked ? items?.slice(0, 10) : items), [ranked, items]);
-  const moves = useMemo(() => (ranked && chart && list?.length ? rankMoves(chart, list) : null), [ranked, chart, list]);
+  // rankMoves writes today's chart to storage, so it belongs in an effect, not in render.
+  const [moves, setMoves] = useState<Record<string, Move> | null>(null);
+  useEffect(() => {
+    setMoves(ranked && chart && list?.length ? rankMoves(chart, list) : null);
+  }, [ranked, chart, list]);
 
   // Scroll fires dozens of times a second: measure once per frame, and only re-render when an edge flips.
   const frame = useRef(0);
+  const measure = () => {
+    const el = ref.current;
+    if (!el) return;
+    const left = el.scrollLeft > 4;
+    const right = el.scrollLeft + el.clientWidth < el.scrollWidth - 4;
+    setEdges((e) => (e.left === left && e.right === right ? e : { left, right }));
+  };
   const update = () => {
     if (frame.current) return;
     frame.current = requestAnimationFrame(() => {
       frame.current = 0;
-      const el = ref.current;
-      if (!el) return;
-      const left = el.scrollLeft > 4;
-      const right = el.scrollLeft + el.clientWidth < el.scrollWidth - 4;
-      setEdges((e) => (e.left === left && e.right === right ? e : { left, right }));
+      measure();
     });
   };
   useEffect(() => () => cancelAnimationFrame(frame.current), []);
-  useEffect(() => {
-    update();
-    // Resizing the window changes whether the shelf overflows.
+  // Before paint, from real geometry: the arrows never flash enabled on a shelf that doesn't overflow.
+  useLayoutEffect(() => {
+    measure();
     const el = ref.current;
     if (!el) return;
+    // Resizing the window changes whether the shelf overflows.
     const ro = new ResizeObserver(update);
     ro.observe(el);
     return () => ro.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [items, loading]);
 
   const page = (dir: 1 | -1) => {
-    ref.current?.scrollBy({ left: dir * ref.current.clientWidth * 0.85, behavior: "smooth" });
+    ref.current?.scrollBy({ left: dir * ref.current.clientWidth * 0.82, behavior: "smooth" });
   };
 
   if (!loading && !children && !items?.length) return null;
   return (
-    <section className="sec" id={id}>
+    <section className="shelf" id={id}>
       <SectionHead
         eyebrow={ranked && chart ? `${eyebrow ?? "Trending today"}${moves ? " · movement since yesterday" : ""}` : eyebrow}
         title={title}
@@ -75,14 +84,16 @@ export const Row = memo(function Row({
         right={
           <>
             {right}
-            <div className="row-nav">
-              <button className="nav-btn" disabled={!edges.left} onClick={() => page(-1)} aria-label="Scroll left"><Icon name="chevL" size={16} /></button>
-              <button className="nav-btn" disabled={!edges.right} onClick={() => page(1)} aria-label="Scroll right"><Icon name="chevR" size={16} /></button>
-            </div>
+            {(edges.left || edges.right) && (
+              <div className="shelf-nav">
+                <button className="nav-btn" disabled={!edges.left} onClick={() => page(-1)} aria-label="Scroll left"><Icon name="chevL" size={16} /></button>
+                <button className="nav-btn" disabled={!edges.right} onClick={() => page(1)} aria-label="Scroll right"><Icon name="chevR" size={16} /></button>
+              </div>
+            )}
           </>
         }
       />
-      <div className={`track ${ranked ? "ranked" : ""} ${edges.left ? "fade-l" : ""} ${edges.right ? "fade-r" : ""}`} ref={ref} onScroll={update}>
+      <div className={`track ${ranked ? "ranked" : ""}`} ref={ref} onScroll={update}>
         {children ??
           (loading
             ? Array.from({ length: 8 }, (_, i) => <CardSkeleton key={i} variant={ranked ? "rank" : variant} />)

@@ -39,11 +39,12 @@ export const qualityLabel = (c: StreamCandidate) => {
 export const audioLabel = (c: StreamCandidate) =>
   c.audio === "dub" ? "DUB" : c.audio === "sub" ? "SUB" : c.audio === "dual" ? "DUAL" : c.audio === "unknown" ? "JP?" : null;
 
-/** 0-3 bars from how quickly the stream answered. */
+/** 0-3 bars from how quickly the stream answered. An unmeasured stream gets two, not a full house it didn't earn. */
 const bars = (c: StreamCandidate) => {
   const ms = c.probe?.latencyMs;
   if (!c.probe?.ok) return 0;
-  return ms == null || ms <= 0 || ms < 1500 ? 3 : ms < 5000 ? 2 : 1;
+  if (ms == null || ms <= 0) return 2;
+  return ms < 1500 ? 3 : ms < 5000 ? 2 : 1;
 };
 
 export function boardRows(snap: SessionSnapshot, playingKey?: string): BoardRow[] {
@@ -102,10 +103,12 @@ interface Props {
   limit?: number;
   /** Group headings (off for the compact title-page card). */
   grouped?: boolean;
+  /** Rows the parent already derived from this snapshot, so they aren't built twice per render. */
+  rows?: BoardRow[];
 }
 
-export function SourceBoard({ snap, playingKey, busyKey, busyNote = "Checking…", onPick, limit, grouped = true }: Props) {
-  const all = boardRows(snap, playingKey);
+export function SourceBoard({ snap, playingKey, busyKey, busyNote = "Checking…", onPick, limit, grouped = true, rows: given }: Props) {
+  const all = given ?? boardRows(snap, playingKey);
   const pickKey = snap.pick ? candKey(snap.pick) : undefined;
   const order: RowState[] = ["playing", "ready", "checking", "searching", "waiting", "failed"];
   const sorted = [...all].sort((a, b) => order.indexOf(a.state) - order.indexOf(b.state));

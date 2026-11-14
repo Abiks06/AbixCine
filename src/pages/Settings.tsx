@@ -86,8 +86,46 @@ const PREVIEW_SECONDARY_CUES: SubtitleCue[] = [
   },
 ];
 
+const SECTIONS = [
+  { id: "account", label: "Account", icon: "user" },
+  { id: "sources", label: "Servers", icon: "layers" },
+  { id: "extensions", label: "Addons & plugins", icon: "puzzle" },
+  { id: "playback", label: "Playback", icon: "play" },
+  { id: "subtitles", label: "Subtitles", icon: "subtitles" },
+  { id: "catalog", label: "Catalog", icon: "film" },
+  { id: "about", label: "About", icon: "info" },
+] as const;
+
 export function Settings() {
   const s = useSettings();
+  // Section nav: highlights whichever panel is nearest the top of the viewport.
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const [active, setActive] = useState<string>("account");
+  useEffect(() => {
+    const root = bodyRef.current?.closest(".main");
+    const panels = [...(bodyRef.current?.querySelectorAll<HTMLElement>(":scope > section[id]") ?? [])];
+    if (!root || !panels.length) return;
+    let frame = 0;
+    const pick = () => {
+      frame = 0;
+      const top = root.getBoundingClientRect().top + 120;
+      let cur = panels[0].id;
+      for (const el of panels) if (el.getBoundingClientRect().top <= top) cur = el.id;
+      // At the very bottom the last panel can never reach the top line: give it the highlight anyway.
+      if (root.scrollTop + root.clientHeight >= root.scrollHeight - 4) cur = panels[panels.length - 1].id;
+      setActive((a) => (a === cur ? a : cur));
+    };
+    const onScroll = () => {
+      if (!frame) frame = requestAnimationFrame(pick);
+    };
+    pick();
+    root.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      root.removeEventListener("scroll", onScroll);
+      cancelAnimationFrame(frame);
+    };
+  }, []);
+  const jump = (id: string) => document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
   const { user, tmdbProxy, online } = useAuth();
   const loc = useLocation();
   const sourcesRef = useRef<HTMLElement>(null);
@@ -392,7 +430,11 @@ export function Settings() {
   };
 
   useEffect(() => {
-    if (loc.hash === "#sources") sourcesRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    const id = loc.hash.replace(/^#/, "");
+    if (!id) return;
+    // Wait a frame: on first arrival the page hasn't laid out yet.
+    const raf = requestAnimationFrame(() => document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" }));
+    return () => cancelAnimationFrame(raf);
   }, [loc.hash]);
 
   const addFolder = async () => {
@@ -446,9 +488,17 @@ export function Settings() {
   return (
     <div className="page settings">
       <h1 className="page-title">Settings</h1>
+      <nav className="set-nav" aria-label="Settings sections">
+        {SECTIONS.map((sec) => (
+          <button key={sec.id} type="button" className={active === sec.id ? "on" : ""} onClick={() => jump(sec.id)}>
+            <Icon name={sec.icon} size={16} /> {sec.label}
+          </button>
+        ))}
+      </nav>
+      <div className="set-body" ref={bodyRef}>
 
       {!user && (
-        <section className="panel">
+        <section className="panel" id="account">
           <h2>Account</h2>
           <div className="account-row">
             <div className="account-info">
@@ -460,7 +510,7 @@ export function Settings() {
         </section>
       )}
       {user && (
-        <section className="panel">
+        <section className="panel" id="account">
           <h2>Account</h2>
           <div className="account-row">
             <button className="avatar-cycle" title="Change color" onClick={() => updateProfile({ avatarHue: (user.avatarHue + 47) % 360 }).catch((e) => mountedRef.current && setProfileMsg(errorMessage(e)))}>
@@ -864,7 +914,7 @@ export function Settings() {
         </div>
       </section>
 
-      <section className="panel">
+      <section className="panel" id="playback">
         <h2>Playback</h2>
         <div className="setting-line">
           <div><strong>Anime audio</strong><span className="muted">Default for every show. You can still flip it per show or mid-episode.</span></div>
@@ -1181,7 +1231,7 @@ export function Settings() {
         </div>
       </section>
 
-      <section className="panel">
+      <section className="panel" id="catalog">
         <h2>Catalog</h2>
         <p className="muted">
           {tmdbProxy ? "Movies and series come through your AbixCine server, no key needed. " : "Movies and series come from TMDB. "}
@@ -1195,7 +1245,7 @@ export function Settings() {
           </div>
         </label>
       </section>
-      <section className="panel">
+      <section className="panel" id="about">
         <h2>About</h2>
         <div className="setting-line">
           <div>
@@ -1221,6 +1271,7 @@ export function Settings() {
         </div>
         <p className="muted">Picture enhancement uses <a href="https://github.com/bloc97/Anime4K" target="_blank" rel="noreferrer">Anime4K</a> by bloc97 (MIT), through its WebGPU port.</p>
       </section>
+      </div>
     </div>
   );
 }

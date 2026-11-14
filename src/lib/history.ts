@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from "react";
+import { registerSync } from "./account";
 import type { Media } from "./types";
 
 /**
@@ -61,6 +62,9 @@ export function rememberTitle(m: Media) {
 
 export const forgetQuery = (q: string) => save({ ...state, queries: state.queries.filter((x) => x.q !== q) });
 export const clearHistory = () => save({ queries: [], titles: [] });
+
+// Signing out hands the PC to someone else: their search box shouldn't open on your searches.
+registerSync({ clear: clearHistory });
 
 export function useSearchHistory(): History {
   return useSyncExternalStore(

@@ -6,7 +6,7 @@ const mem = new Map<string, { at: number; value: unknown }>();
 const inflight = new Map<string, Promise<unknown>>();
 const PREFIX = "abx.cache.";
 /** How long to wait for fresh data before showing the stale copy (the refresh still lands in the cache). */
-const STALE_WAIT_MS = 4000;
+const STALE_WAIT_MS = 1500;
 /** The catalog cache must never crowd out progress, My List or settings in localStorage. */
 const MAX_DISK = 300;
 const MAX_MEM = 500;
@@ -32,26 +32,46 @@ function cacheKeys() {
   return out.sort((a, b) => a.at - b.at);
 }
 
-/** Drop the oldest catalog entries until at most `keep` remain. */
+/** Drop the oldest catalog entries until at most `keep` remain. Returns how many were removed. */
 function evict(keep: number) {
   const keys = cacheKeys();
-  for (const { k } of keys.slice(0, Math.max(0, keys.length - keep))) localStorage.removeItem(k);
+  const drop = keys.slice(0, Math.max(0, keys.length - keep));
+  for (const { k } of drop) localStorage.removeItem(k);
+  return drop.length;
+}
+
+/**
+ * Make room in storage by throwing away catalog entries, oldest first. Halves what is actually
+ * there each time (a fixed "keep 150" removed nothing when fewer than 150 entries held all the
+ * space). Progress, My List, settings and sign-in call this before giving up on a save: their
+ * data matters, the catalog can always be fetched again.
+ */
+export function freeCatalogCache(all = false): boolean {
+  try {
+    const n = cacheKeys().length;
+    if (!n) return false;
+    return evict(all ? 0 : Math.floor(n / 2)) > 0;
+  } catch {
+    return false;
+  }
 }
 
 function persist(key: string, entry: unknown) {
   const v = JSON.stringify(entry);
-  try {
-    localStorage.setItem(PREFIX + key, v);
-  } catch {
-    // Quota: make room by halving the catalog cache, then try once more.
+  // A single huge answer isn't worth evicting everything else for.
+  if (v.length > 400_000) return;
+  for (let attempt = 0; attempt < 6; attempt++) {
     try {
-      evict(Math.floor(MAX_DISK / 2));
       localStorage.setItem(PREFIX + key, v);
+      return;
     } catch {
-      /* memory cache still works */
+      // Quota: halve the catalog cache and try again, until it fits or there is nothing left to drop.
+      if (!freeCatalogCache()) return; // memory cache still works
     }
   }
 }
+
+let writesSinceTrim = 0;
 
 // Boot: forget entries nobody has needed for two weeks, and keep the count bounded.
 try {
@@ -77,6 +97,10 @@ function readEntry(key: string) {
     } catch {
       /* ignore */
     }
+  } else {
+    // Recently read means recently used: move it to the young end so eviction is LRU, not FIFO.
+    mem.delete(key);
+    mem.set(key, hit);
   }
   return hit;
 }
@@ -90,6 +114,15 @@ function writeEntry<T>(key: string, value: T, at = Date.now()): void {
     if (!oldest.done) mem.delete(oldest.value);
   }
   persist(key, entry);
+  // Keep the on-disk count bounded during a long session, not only at boot.
+  if (++writesSinceTrim >= 40) {
+    writesSinceTrim = 0;
+    try {
+      evict(MAX_DISK);
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 export function peekCache<T>(key: string, ttlMs: number): T | undefined {
@@ -130,7 +163,7 @@ export async function cached<T>(key: string, ttlMs: number, fetcher: () => Promi
     return Promise.race([
       bg,
       new Promise<T>((resolve) => {
-        timer = window.setTimeout(() => resolve(staleValue), STALE_WAIT_MS);
+        timer = setTimeout(() => resolve(staleValue), STALE_WAIT_MS) as unknown as number;
       }),
     ])
       .catch(() => staleValue)

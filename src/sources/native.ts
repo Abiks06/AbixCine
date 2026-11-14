@@ -30,7 +30,13 @@ export interface Sniffed {
   quality: number | null;
 }
 
-const b64 = (s: string) => btoa(String.fromCharCode(...new TextEncoder().encode(s))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+/** Chunked: spreading a long string's bytes into one call overflows the argument stack (RangeError). */
+const binary = (bytes: Uint8Array) => {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return bin;
+};
+const b64 = (s: string) => btoa(binary(new TextEncoder().encode(s))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 
 function unb64(s: string): string | null {
   try {

@@ -72,11 +72,11 @@ export function Auth() {
   };
 
   // 28 tiles; until posters arrive (or offline) they're tinted glass in the brand hues.
-  const wall = Array.from({ length: 28 }, (_, i) => ({ poster: posters.length ? posters[i % posters.length] : undefined, hue: (i * 47) % 360 }));
+  const wall = Array.from({ length: 49 }, (_, i) => ({ poster: posters.length ? posters[i % posters.length] : undefined, hue: (i * 47) % 360 }));
   return (
     <div className="auth">
       <div className="auth-wall" aria-hidden>
-        {[0, 1, 2, 3].map((col) => (
+        {[0, 1, 2, 3, 4, 5, 6].map((col) => (
           <div key={col} className="auth-col" style={{ ["--d" as any]: `${col % 2 ? -1 : 1}`, ["--t" as any]: `${60 + col * 9}s` }}>
             {[...wall.slice(col * 7, col * 7 + 7), ...wall.slice(col * 7, col * 7 + 7)].map((m, i) => (
               <div key={i} className={`auth-tile ${m.poster ? "img" : ""}`} style={{ ["--h" as any]: m.hue, ...(m.poster ? { backgroundImage: `url(${m.poster})` } : {}) }} />
@@ -86,9 +86,19 @@ export function Auth() {
       </div>
       <div className="auth-scrim" />
 
+      <div className="auth-pitch">
+        <h2>Every screen.<br />One <em>cinema.</em></h2>
+        <ul>
+          <li>Films · series · anime</li>
+          <li>No ads, ever</li>
+          <li>Your own files first</li>
+          <li>Sub &amp; dub in one tap</li>
+        </ul>
+      </div>
+
       <form className="auth-card" onSubmit={submit}>
         <div className="auth-brand">
-          <LogoMark size={44} />
+          <LogoMark size={40} />
           <Wordmark />
         </div>
         <h1>{mode === "up" ? "Create your account" : "Welcome back"}</h1>
@@ -125,11 +135,11 @@ export function Auth() {
           </div>
         )}
 
-        <button className="btn btn-ion wide" disabled={busy}>
+        <button className="btn play wide" disabled={busy}>
           {busy ? <span className="mini-spin" /> : <>{mode === "up" ? "Create account" : "Sign in"} <Icon name="arrowR" size={16} /></>}
         </button>
 
-        <button type="button" className="btn btn-glass wide guest" onClick={continueAsGuest}>
+        <button type="button" className="btn glass wide guest" onClick={continueAsGuest}>
           Continue without an account
         </button>
         <p className="auth-fine">Your folders and Jellyfin work offline. Progress stays on this PC until you sign in.</p>

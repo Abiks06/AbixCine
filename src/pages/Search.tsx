@@ -5,7 +5,7 @@ import { peekSearch, searchAll } from "../lib/search";
 import { clearHistory, forgetQuery, rememberQuery, rememberTitle, useSearchHistory } from "../lib/history";
 import type { Media } from "../lib/types";
 import { Art } from "../components/Art";
-import { Card, CardSkeleton, kindLabel, tagForMorph } from "../components/Card";
+import { Card, CardSkeleton, kindLabel, seedState, tagForMorph } from "../components/Card";
 import { Icon } from "../components/Icon";
 
 const TABS = [
@@ -85,7 +85,7 @@ export function Search() {
   return (
     <div className="page">
       <div className="search-box">
-        <Icon name="search" size={22} />
+        <Icon name="search" size={30} />
         <input
           ref={input}
           value={q}
@@ -94,7 +94,7 @@ export function Search() {
             if (e.key === "Escape" && q) setQ("");
             else if (e.key === "Enter" && top) {
               opened(top);
-              nav(`/title/${encodeKey(top.key)}`, { viewTransition: true });
+              nav(`/title/${encodeKey(top.key)}`, { viewTransition: true, state: seedState(top) });
             }
           }}
           placeholder="Search films, series and anime"
@@ -158,14 +158,14 @@ export function Search() {
       ) : (
         <div className={`results ${busy ? "stale" : ""}`}>
           {top?.backdrop && (
-            <Link className="top-hit" to={`/title/${encodeKey(top.key)}`} viewTransition onClick={(e) => (tagForMorph(e), opened(top))} key={top.key}>
+            <Link className="top-hit" to={`/title/${encodeKey(top.key)}`} state={seedState(top)} viewTransition onClick={(e) => (tagForMorph(e), opened(top))} key={top.key}>
               <div className="art-wrap"><Art media={top} variant="backdrop" eager /></div>
               <div className="th-shade" />
               <div className="th-copy">
                 <span className="th-eyebrow">Top result</span>
                 <strong>{top.title}</strong>
                 <span className="meta">
-                  <span className="badge">{kindLabel(top.kind).toUpperCase()}</span>
+                  <span className="badge">{kindLabel(top.kind)}</span>
                   {top.seasonCount ? "All seasons" : top.year}
                   {top.rating ? <span className="star">★ {top.rating.toFixed(1)}</span> : null}
                   {top.genres.slice(0, 2).join(" · ")}
@@ -177,9 +177,7 @@ export function Search() {
           )}
           <div className="grid" key={`${active}`}>
             {rest.map((m, i) => (
-              <div key={m.key} style={{ display: "contents" }} onClickCapture={() => opened(m)}>
-                <Card media={m} index={i} sub={m.seasonCount ? <><span className="badge">SERIES</span>All seasons</> : undefined} />
-              </div>
+              <Card key={m.key} media={m} index={i} onOpen={() => opened(m)} sub={m.seasonCount ? <><span className="badge">Series</span>All seasons</> : undefined} />
             ))}
           </div>
         </div>

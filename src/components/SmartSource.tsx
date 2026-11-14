@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import type { PlaybackRequest } from "../lib/types";
 import { candKey } from "../sources/registry";
@@ -13,15 +13,22 @@ import { boardRows, qualityLabel, SourceBoard } from "./SourceBoard";
 export function SmartSource({ req, what, onPlay }: { req: PlaybackRequest; what: string; onPlay: (server?: string) => void }) {
   const { snap, recheck } = useSourceSession(req, 1);
   const [all, setAll] = useState(false);
-  if (!snap) return null;
+  const rows = useMemo(() => (snap ? boardRows(snap) : []), [snap]);
+  if (!snap) {
+    return (
+      <aside className="smart" aria-busy>
+        <div className="h"><span><Icon name="layers" size={16} /> Servers</span><span className="auto">WARMING</span></div>
+        <div className="smart-note">Finding {what}…</div>
+      </aside>
+    );
+  }
 
   const enabled = snap.lanes.length;
-  const rows = boardRows(snap);
   const pick = snap.pick;
   const q = pick ? qualityLabel(pick) : null;
 
   return (
-    <aside className="glass smart">
+    <aside className="smart">
       <div className="h">
         <span><Icon name="layers" size={16} /> Servers</span>
         <span className="smart-acts">
@@ -53,7 +60,7 @@ export function SmartSource({ req, what, onPlay }: { req: PlaybackRequest; what:
               `No server has ${what} right now.`
             )}
           </div>
-          <SourceBoard snap={snap} grouped={false} limit={all ? undefined : 5} onPick={(c) => onPlay(candKey(c))} />
+          <SourceBoard snap={snap} rows={rows} grouped={false} limit={all ? undefined : 5} onPick={(c) => onPlay(candKey(c))} />
           {rows.length > 5 && (
             <button className="smart-more" onClick={() => setAll((x) => !x)}>
               {all ? "Show fewer" : `Show all ${rows.length}`}

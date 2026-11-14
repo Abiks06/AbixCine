@@ -16,13 +16,31 @@ const archivePath = path.join(cacheDir, archiveName);
 const targetDir = path.join(root, "src-tauri", "resources", "ffmpeg");
 
 if (process.platform !== "win32" || process.arch !== "x64") {
-  throw new Error("The bundled FFmpeg build currently supports Windows x64 only.");
+  // Not fatal: the app falls back to an FFmpeg on PATH. Builds elsewhere just skip bundling.
+  console.warn("Skipping bundled FFmpeg: the pinned build is Windows x64 only (the app will use FFmpeg from PATH).");
+  process.exit(0);
 }
 
 await mkdir(cacheDir, { recursive: true });
 
 async function sha256(file) {
   return createHash("sha256").update(await readFile(file)).digest("hex");
+}
+
+const licenseCache = path.join(cacheDir, "COPYING.LGPLv3");
+const stampPath = path.join(targetDir, ".prepared");
+const stamp = `${archiveSha256}\n`;
+
+// Already prepared from this exact archive: nothing to do (this used to re-extract on every start).
+try {
+  if ((await readFile(stampPath, "utf8")) === stamp) {
+    await access(path.join(targetDir, "ffmpeg.exe"));
+    await access(path.join(targetDir, "ffprobe.exe"));
+    console.log("Bundled FFmpeg is already prepared.");
+    process.exit(0);
+  }
+} catch {
+  // Not prepared yet, or incomplete: build it below.
 }
 
 let archiveReady = false;
@@ -72,32 +90,57 @@ try {
   const executables = [ffmpeg, ffprobe];
   const libraries = allFiles.filter((file) => path.dirname(file) === binDir && path.extname(file).toLowerCase() === ".dll");
 
-  await mkdir(targetDir, { recursive: true });
-  for (const entry of await readdir(targetDir)) {
-    if (entry !== ".keep") await rm(path.join(targetDir, entry), { recursive: true, force: true });
+  // Everything that can fail (the license download included) happens before the working copy
+  // is touched: running this offline used to delete a good FFmpeg and then fail to replace it.
+  let licenseOk = false;
+  try {
+    licenseOk = (await sha256(licenseCache)) === licenseSha256;
+  } catch {
+    /* not cached yet */
   }
-  for (const file of [...executables, ...libraries]) {
-    await copyFile(file, path.join(targetDir, path.basename(file)));
+  if (!licenseOk) {
+    const licenseUrl = "https://www.gnu.org/licenses/lgpl-3.0.txt";
+    const pending = `${licenseCache}.download`;
+    execFileSync(
+      "curl.exe",
+      ["--fail", "--location", "--retry", "5", "--retry-all-errors", "--retry-delay", "2", "--connect-timeout", "30", "--output", pending, licenseUrl],
+      { stdio: "inherit" },
+    );
+    if ((await sha256(pending)) !== licenseSha256) {
+      await rm(pending, { force: true });
+      throw new Error("The LGPLv3 text checksum did not match the pinned license.");
+    }
+    await rm(licenseCache, { force: true });
+    await rename(pending, licenseCache);
   }
 
-  const licenseUrl = "https://www.gnu.org/licenses/lgpl-3.0.txt";
-  const licensePath = path.join(targetDir, "COPYING.LGPLv3");
-  execFileSync(
-    "curl.exe",
-    ["--fail", "--location", "--retry", "5", "--retry-all-errors", "--retry-delay", "2", "--connect-timeout", "30", "--output", licensePath, licenseUrl],
-    { stdio: "inherit" },
-  );
-  if ((await sha256(licensePath)) !== licenseSha256) {
-    throw new Error("The LGPLv3 text checksum did not match the pinned license.");
+  // Assemble the new folder next to the old one, then swap them.
+  const staging = `${targetDir}.staging`;
+  await rm(staging, { recursive: true, force: true });
+  await mkdir(staging, { recursive: true });
+  await writeFile(path.join(staging, ".keep"), "");
+  for (const file of [...executables, ...libraries]) {
+    await copyFile(file, path.join(staging, path.basename(file)));
   }
+  await copyFile(licenseCache, path.join(staging, "COPYING.LGPLv3"));
   await writeFile(
-    path.join(targetDir, "NOTICE.txt"),
+    path.join(staging, "NOTICE.txt"),
     `AbixCine bundles FFmpeg 8.1.3 (LGPL shared build) from BtbN/FFmpeg-Builds.\n` +
       `FFmpeg source: ${sourceUrl}\n` +
       `Build archive: ${archiveUrl}\n` +
       "The bundled FFmpeg programs and libraries are licensed under LGPL version 3 or later; see COPYING.LGPLv3.\n",
     "utf8",
   );
+  await writeFile(path.join(staging, ".prepared"), stamp);
+  const previous = `${targetDir}.previous`;
+  await rm(previous, { recursive: true, force: true });
+  try {
+    await rename(targetDir, previous);
+  } catch {
+    /* no previous copy */
+  }
+  await rename(staging, targetDir);
+  await rm(previous, { recursive: true, force: true });
   await access(path.join(targetDir, "ffmpeg.exe"));
   console.log("Prepared the pinned LGPL FFmpeg tools and runtime libraries.");
 } finally {

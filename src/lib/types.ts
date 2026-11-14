@@ -29,7 +29,12 @@ export interface Media {
   hue?: number;
   /** ISO 639-1 original language code (e.g. "en", "ja", "ko"). */
   originalLanguage?: string;
+  /** AniList format ("TV", "MOVIE", "OVA"…). An anime film keeps kind "anime" for source lookup but plays as a film. */
+  format?: string;
 }
+
+/** A feature film, whether it came from TMDB or is an AniList anime film. */
+export const isFilm = (m: Pick<Media, "kind" | "format"> | undefined | null) => !!m && (m.kind === "movie" || m.format?.toUpperCase() === "MOVIE");
 
 /** A single cour or split part within a canonical anime season. */
 export interface SeasonCour {

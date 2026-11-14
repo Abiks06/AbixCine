@@ -1,10 +1,17 @@
-const ALLOWED = /^(trending\/(all|movie|tv)\/(day|week)|movie\/(popular|top_rated|now_playing|upcoming|\d+)|tv\/(popular|top_rated|on_the_air|airing_today|\d+)|tv\/\d+\/season\/\d+|discover\/(movie|tv)|search\/(multi|movie|tv))$/;
+const ALLOWED = /^(trending\/(all|movie|tv)\/(day|week)|movie\/(popular|top_rated|now_playing|upcoming|\d+)|tv\/(popular|top_rated|on_the_air|airing_today|\d+)|tv\/\d+\/season\/\d+|collection\/\d+|discover\/(movie|tv)|search\/(multi|movie|tv))$/;
 /** Only parameters the app actually sends. Anything else would just be a cache-buster. */
 const PARAMS = new Set([
   "page", "language", "query", "region", "include_adult", "with_genres", "sort_by", "year", "first_air_date_year",
   "primary_release_year", "with_original_language", "append_to_response", "vote_count.gte", "with_keywords",
   "include_image_language", "with_origin_country",
+  // Date windows behind "New releases", "New series" and "Coming soon". Without them those shelves
+  // silently came back as plain popularity lists.
+  "primary_release_date.gte", "primary_release_date.lte", "first_air_date.gte", "first_air_date.lte",
+  "release_date.gte", "release_date.lte", "air_date.gte", "air_date.lte", "with_release_type", "without_genres",
+  "vote_average.gte", "with_runtime.gte", "with_runtime.lte", "with_status", "with_type", "timezone",
 ]);
+/** Identical requests arriving together share one upstream call instead of each paying for it. */
+const inflight = new Map();
 const cache = new Map();
 const TTL = 30 * 60_000;
 const MAX = 500;
@@ -23,29 +30,42 @@ export async function tmdbProxy(req, reply) {
 
   const ck = url.pathname + url.search;
   const hit = cache.get(ck);
-  if (hit && Date.now() - hit.at < TTL) return reply.header("x-cache", "hit").send(hit.body);
+  if (hit && Date.now() - hit.at < TTL) {
+    // Refresh recency so the cache evicts what is least used, not merely what was stored first.
+    cache.delete(ck);
+    cache.set(ck, hit);
+    return reply.header("x-cache", "hit").send(hit.body);
+  }
   if (hit) cache.delete(ck);
 
   const headers = { accept: "application/json" };
   if (key.length > 60) headers.Authorization = `Bearer ${key}`;
   else url.searchParams.set("api_key", key);
 
-  let res, text;
-  try {
-    res = await fetch(url, { headers, signal: AbortSignal.timeout(8000) });
-    text = await res.text();
-  } catch {
-    return reply.code(504).send({ error: "upstream_timeout" });
+  let call = inflight.get(ck);
+  if (!call) {
+    call = (async () => {
+      let res, text;
+      try {
+        res = await fetch(url, { headers, signal: AbortSignal.timeout(8000) });
+        text = await res.text();
+      } catch {
+        return { status: 504, body: { error: "upstream_timeout" } };
+      }
+      let body;
+      try {
+        body = JSON.parse(text);
+      } catch {
+        return { status: 502, body: { error: "upstream_error" } };
+      }
+      if (res.ok && text.length < MAX_BODY) {
+        while (cache.size >= MAX) cache.delete(cache.keys().next().value);
+        cache.set(ck, { at: Date.now(), body });
+      }
+      return { status: res.status, body };
+    })().finally(() => inflight.delete(ck));
+    inflight.set(ck, call);
   }
-  let body;
-  try {
-    body = JSON.parse(text);
-  } catch {
-    return reply.code(502).send({ error: "upstream_error" });
-  }
-  if (res.ok && text.length < MAX_BODY) {
-    while (cache.size >= MAX) cache.delete(cache.keys().next().value);
-    cache.set(ck, { at: Date.now(), body });
-  }
-  return reply.code(res.status).send(body);
+  const out = await call;
+  return reply.code(out.status).send(out.body);
 }

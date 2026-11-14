@@ -1,4 +1,4 @@
-import { memo, useState } from "react";
+import { memo, useCallback, useState } from "react";
 import type { Media } from "../lib/types";
 
 /** sm: thumbnails · md: shelf cards · lg: full-bleed stages (hero, title page, player). */
@@ -20,14 +20,15 @@ export function sized(url: string | undefined, size: string) {
 export const Art = memo(function Art({
   media,
   variant = "poster",
-  size = "md",
+  size,
   hd,
   priority = false,
   eager = false,
   className = "",
 }: {
-  media: Media;
+  media: Pick<Media, "key" | "title" | "poster" | "backdrop" | "hue">;
   variant?: "poster" | "backdrop";
+  /** Explicit rendition. Left out, `hd` picks the stage size and everything else gets a card size. */
   size?: ArtSize;
   hd?: boolean;
   /** Above-the-fold stage image: load now, ahead of everything else. */
@@ -47,10 +48,19 @@ export const Art = memo(function Art({
   const loaded = loadedSrc === src;
   const failed = failedSrc === src;
   const hue = media.hue ?? hash(media.key) % 360;
+  // Already in the HTTP cache: `load` may have fired before React attached the handler, so the
+  // picture would sit invisible. Adopt it as soon as the element exists.
+  const adopt = useCallback(
+    (img: HTMLImageElement | null) => {
+      if (img && img.complete && img.naturalWidth > 0) setLoadedSrc(src);
+    },
+    [src],
+  );
   return (
     <div className={`art art-${variant} ${className}`} style={{ ["--h" as string]: hue }}>
       {src && !failed ? (
         <img
+          ref={adopt}
           src={src}
           srcSet={srcSet}
           sizes={srcSet ? "100vw" : undefined}

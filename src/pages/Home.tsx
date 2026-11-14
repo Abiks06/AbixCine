@@ -15,7 +15,7 @@ import { toast } from "../lib/toast";
 import { watchHref } from "../lib/play";
 import { useSettings } from "../lib/settings";
 import { FEEDS, hasTmdb, loadFeed, TOP10 } from "../lib/tmdb";
-import type { Media } from "../lib/types";
+import { isFilm, type Media } from "../lib/types";
 import { useAsync } from "../lib/useAsync";
 
 export function Home() {
@@ -35,32 +35,35 @@ export function Home() {
   const d = feeds.data;
   const loading = feeds.loading && !d;
   const pool = useMemo(() => (d ? [...d[4].slice(0, 6), ...d[1].slice(0, 6), ...d[2].slice(0, 4), ...d[3].slice(0, 2)] : []), [d]);
+  // A stable array, so the hero doesn't restart its slide every time an unrelated store updates.
+  const stage = useMemo(() => (d?.[0]?.length ? d[0] : (animeTrending.data ?? []).filter((m) => m.backdrop)), [d, animeTrending.data]);
+  const catalog = hasTmdb();
 
   return (
     <div className="page-flush">
-      <Hero items={d?.[0]?.length ? d[0] : (animeTrending.data ?? []).filter((m) => m.backdrop)} label="tonight" />
-      <div className="rows pad">
-        {!hasTmdb() && (
-          <Link to="/settings" className="notice" viewTransition>
+      <Hero items={stage} label="Tonight" />
+      <div className="shelves pad">
+        {!catalog && (
+          <Link to="/settings#catalog" className="notice" viewTransition>
             <Icon name="info" />
-            <span>Movies and series need the AbixCine server or your own TMDB key. Anime works either way. Open Settings to connect.</span>
+            <span>Films and series need the AbixCine server or your own TMDB key. Anime works either way. Open Settings to connect.</span>
             <Icon name="chevR" />
           </Link>
         )}
         {cont.length > 0 && (
-          <section className="sec">
+          <section className="shelf">
             <SectionHead eyebrow="Pick up where you left off" title="Continue watching" />
             <div className="track">
               {cont.map((p, i) => {
                 const left = Math.max(1, Math.round((p.duration - p.position) / 60));
-                const ep = p.episode != null ? `${p.season != null ? `S${p.season} · ` : ""}E${p.episode}` : null;
+                const ep = p.episode != null && !isFilm(p.media) ? `${p.season != null ? `S${p.season} · ` : ""}E${p.episode}` : null;
                 const where = [p.upNext ? `Up next${ep ? ` ${ep}` : ""}` : ep, p.audio ? (p.audio === "dub" ? "Dub" : "Sub") : null, p.upNext ? null : `${left}m left`].filter(Boolean).join(" · ");
                 return (
                   <Card
                     key={p.media.key}
                     media={p.media}
                     index={i}
-                    progress={p.upNext ? undefined : (p.position / p.duration) * 100}
+                    progress={p.upNext || !(p.duration > 0) ? undefined : (p.position / p.duration) * 100}
                     sub={where}
                     right={<span />}
                     to={watchHref(p.media.key, p.season, p.episode, p.audio)}
@@ -75,17 +78,18 @@ export function Home() {
             </div>
           </section>
         )}
-        <FitsTonight pool={pool} />
-        <Row eyebrow="Trending today" title="Top 10 films right now" ranked chart={TOP10.movie.id} items={d?.[7]} loading={loading} />
-        <Row eyebrow="In the last six weeks" title="New releases" to="/movies" items={d?.[4]} loading={loading} />
+        {catalog && <FitsTonight pool={pool} loading={loading} />}
+        <Row eyebrow="Trending today" title="Top 10 films right now" ranked chart={TOP10.movie.id} items={d?.[7]} loading={catalog && loading} />
+        <Row eyebrow="In the last six weeks" title="New releases" to="/movies" items={d?.[4]} loading={catalog && loading} />
         <Row eyebrow="One entry per show · switch sub and dub any time" title="Anime this season" to="/anime" items={anime.data} loading={anime.loading && !anime.data} />
+        {!catalog && <Row eyebrow="Everyone's watching" title="Trending anime" to="/anime" items={animeTrending.data} loading={animeTrending.loading && !animeTrending.data} />}
         <DriveSection limit={6} />
-        <Row eyebrow="Out now" title="Popular films" to="/movies" items={d?.[1]} loading={loading} />
-        <Row eyebrow="Trending today" title="Top 10 series right now" ranked chart={TOP10.tv.id} items={d?.[8]} loading={loading} />
-        <Row eyebrow="Premiered recently" title="New series" to="/series" items={d?.[5]} loading={loading} />
-        <Row eyebrow="Out now" title="Popular series" to="/series" items={d?.[2]} loading={loading} />
-        <Row eyebrow="In the next two months" title="Coming soon" items={d?.[6]} loading={loading} />
-        <Row eyebrow="The best of the best" title="Critically acclaimed" items={d?.[3]} loading={loading} />
+        <Row eyebrow="Out now" title="Popular films" to="/movies" items={d?.[1]} loading={catalog && loading} />
+        <Row eyebrow="Trending today" title="Top 10 series right now" ranked chart={TOP10.tv.id} items={d?.[8]} loading={catalog && loading} />
+        <Row eyebrow="Premiered recently" title="New series" to="/series" items={d?.[5]} loading={catalog && loading} />
+        <Row eyebrow="Out now" title="Popular series" to="/series" items={d?.[2]} loading={catalog && loading} />
+        <Row eyebrow="In the next two months" title="Coming soon" items={d?.[6]} loading={catalog && loading} />
+        <Row eyebrow="The best of the best" title="Critically acclaimed" items={d?.[3]} loading={catalog && loading} />
       </div>
     </div>
   );

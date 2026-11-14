@@ -112,27 +112,21 @@ async function tryPortal(portal: string, signal?: AbortSignal): Promise<string> 
   return verifyBase(finalOrigin, signal);
 }
 
-async function discoverBase(signal?: AbortSignal): Promise<string> {
-  const portalResults = await Promise.allSettled(PORTALS.map((p) => tryPortal(p, signal)));
-  for (const r of portalResults) {
-    if (r.status === "fulfilled") return r.value;
-  }
-  if (signal?.aborted) return cachedBase;
-
-  const subResults = await Promise.allSettled(
-    PROBE_SUBDOMAINS.map((sub) => verifyBase(`https://${sub}.zxcstream.xyz`, signal)),
-  );
-  for (const r of subResults) {
-    if (r.status === "fulfilled") return r.value;
-  }
-  return cachedBase;
+/** A working base, or null when none could be verified (the old base is then kept, unstamped). */
+async function discoverBase(): Promise<string | null> {
+  const portal = await Promise.any(PORTALS.map((p) => tryPortal(p))).catch(() => null);
+  if (portal) return portal;
+  return Promise.any(PROBE_SUBDOMAINS.map((sub) => verifyBase(`https://${sub}.zxcstream.xyz`))).catch(() => null);
 }
 
 async function getBase(signal?: AbortSignal): Promise<string> {
   if (Date.now() - baseValidatedAt <= BASE_TTL_MS) return cachedBase;
   if (!discoveryPromise) {
-    discoveryPromise = discoverBase(signal)
+    // Shared by every caller, so it must not run on any one caller's signal: the first caller
+    // cancelling used to abort it for all, and the failure was then cached as "validated" for ten minutes.
+    discoveryPromise = discoverBase()
       .then((base) => {
+        if (!base) return cachedBase;
         cachedBase = base;
         baseValidatedAt = Date.now();
         return base;
@@ -141,7 +135,14 @@ async function getBase(signal?: AbortSignal): Promise<string> {
         discoveryPromise = null;
       });
   }
-  return discoveryPromise;
+  if (!signal) return discoveryPromise;
+  return Promise.race([
+    discoveryPromise,
+    new Promise<string>((_, reject) => {
+      if (signal.aborted) reject(new DOMException("Aborted", "AbortError"));
+      signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+    }),
+  ]);
 }
 
 async function requestServerToken(

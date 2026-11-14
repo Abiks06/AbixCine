@@ -406,3 +406,34 @@ describe("Debrid config storage", () => {
     expect(loadDebridConfig()).toBeNull();
   });
 });
+
+describe("resolution hygiene", () => {
+  const ok = (body: unknown, status = 200) => ({ status, url: "x", body: JSON.stringify(body) });
+
+  it("deletes the torrent it added when Real-Debrid doesn't have it cached", async () => {
+    mockHttpFetch
+      .mockResolvedValueOnce(ok({ id: "TOR9" }, 201))
+      .mockResolvedValueOnce(ok({ id: "TOR9", status: "downloading", files: [] }))
+      .mockResolvedValue(ok({}, 204));
+    await expect(resolveDebridStream("realdebrid", "key", HASH_A)).rejects.toMatchObject({ code: "UNCACHED" });
+    await new Promise((r) => setTimeout(r, 0));
+    const urls = mockHttpFetch.mock.calls.map((c) => [c[0], c[2]?.method]);
+    expect(urls).toContainEqual(["https://api.real-debrid.com/rest/1.0/torrents/delete/TOR9", "DELETE"]);
+  });
+
+  it("plays the requested episode from an already-downloaded Real-Debrid torrent, not link 0", async () => {
+    const files = [
+      { id: 1, path: "/Show/S01E01.mkv", bytes: 900, selected: 1 },
+      { id: 2, path: "/Show/S01E02.mkv", bytes: 800, selected: 1 },
+      { id: 3, path: "/Show/S01E03.mkv", bytes: 700, selected: 1 },
+    ];
+    mockHttpFetch
+      .mockResolvedValueOnce(ok({ id: "T" }, 201))
+      .mockResolvedValueOnce(ok({ id: "T", status: "downloaded", files, links: ["L1", "L2", "L3"] }))
+      .mockResolvedValueOnce(ok({ download: "https://dl/ep3.mkv", filename: "S01E03.mkv" }));
+    const r = await resolveDebridStream("realdebrid", "key", HASH_A, 2);
+    expect(r.url).toBe("https://dl/ep3.mkv");
+    const unrestrict = mockHttpFetch.mock.calls.find((c) => String(c[0]).endsWith("/unrestrict/link"));
+    expect(unrestrict?.[2]?.body).toBe("link=L3");
+  });
+});

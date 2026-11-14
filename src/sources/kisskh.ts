@@ -324,7 +324,8 @@ export const kisskhProvider: SourceProvider = {
   timeoutMs: 26_000,
   isEnabled: (s) => native && !s.disabledSources?.includes("kisskh"),
   async find(req: PlaybackRequest, _s, signal): Promise<StreamCandidate[]> {
-    const lang = (req.media as MediaDetail).originalLanguage;
+    // "zh-CN", "ZH" and "zh" are all Chinese.
+    const lang = (req.media as MediaDetail).originalLanguage?.toLowerCase().split(/[-_]/)[0];
     if (!lang || !ASIAN.has(lang) || req.media.kind === "anime" || signal.aborted) return [];
     const want = normTitle(req.media.title);
     const season = req.season ?? 1;
@@ -335,14 +336,17 @@ export const kisskhProvider: SourceProvider = {
     ]);
     if (signal.aborted) return [];
     const hits = primaryHits.concat(altHits);
+    const seasonForms = season > 1 ? [`${want} ${season}`, `${want}${season}`, `${want} season ${season}`] : [want];
+    // No blind fallback to the first hit: a show that isn't on KissKH must come back empty, not
+    // as whatever the search happened to list first.
     const hit =
-      hits.find((h) => normTitle(h.title) === want + (season > 1 ? String(season) : "")) ??
-      hits.find((h) => normTitle(h.title).startsWith(want)) ??
-      hits[0];
+      hits.find((h) => seasonForms.includes(normTitle(h.title))) ??
+      (season > 1 ? undefined : hits.find((h) => normTitle(h.title).startsWith(want)));
     if (!hit) return [];
     const d = await drama(hit.id);
     const epNo = req.media.kind === "movie" ? 1 : req.episode ?? 1;
-    const ep = d?.episodes.find((e) => Math.round(e.number) === epNo);
+    // Exact first. Rounding is only for "12.0"-style numbers; it used to turn a 0.5 preview into episode 1.
+    const ep = d?.episodes.find((e) => e.number === epNo) ?? d?.episodes.find((e) => e.number >= 1 && Math.round(e.number) === epNo);
     if (!d || !ep || signal.aborted) return [];
     const page = `${HOST}/Drama/${slug(d.title)}/Episode-${epNo}?id=${d.id}&ep=${ep.id}&page=0&pageSize=100`;
     const t0 = performance.now();

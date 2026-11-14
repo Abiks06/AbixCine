@@ -64,7 +64,14 @@ export {
 } from "./health";
 
 /** Canonical candidate identifier shared across source resolution, Watch, and Player. */
-export const candKey = (c: { url: string; pageUrl?: string }): string => c.pageUrl ?? c.url;
+/**
+ * A stream that reaches us through a page (a web player, or one captured from it) is identified
+ * by that page, so it keeps its identity when its tokenised stream URL is refreshed. A direct
+ * stream is identified by its own URL: several direct extractors stamp every server and quality
+ * with the same site address as `pageUrl`, and keying on that silently dropped all but the first.
+ */
+export const candKey = (c: { url: string; pageUrl?: string; kind?: string; via?: string }): string =>
+  c.kind === "embed" || c.via === "embed" || c.via === "sniffed" || (c.via == null && c.kind == null) ? (c.pageUrl ?? c.url) : c.url;
 
 export const PROVIDER_TIMEOUT = 8000;
 const PROBE_TIMEOUT = 6000;

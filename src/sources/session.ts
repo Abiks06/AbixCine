@@ -168,6 +168,10 @@ export class SourceSession {
   private backupTimer?: ReturnType<typeof setTimeout>;
   private idleTimer?: ReturnType<typeof setTimeout>;
   private backupsHeld = false;
+  /** Nobody is watching this session: nothing new starts until a screen comes back for it. */
+  private backgroundStopped = false;
+  /** Dropped from the session table while a screen still held it: disposed when that screen lets go. */
+  private invalidated = false;
   private root = new AbortController();
 
   private refs = 0;
@@ -258,12 +262,30 @@ export class SourceSession {
   retain() {
     this.refs++;
     clearTimeout(this.idleTimer);
+    this.resume();
+  }
+
+  /** Lift a background stop (a screen is using the session again). */
+  private resume() {
+    if (!this.backgroundStopped) return;
+    this.backgroundStopped = false;
+    if (this.started && !this.disposed) {
+      this.target = Math.max(this.target, 1);
+      this.pump();
+    }
+  }
+
+  /** The session table let go of it. In use: finish serving that screen, then clean up. */
+  invalidate() {
+    if (this.refs > 0) this.invalidated = true;
+    else this.dispose();
   }
 
   release() {
     this.refs = Math.max(0, this.refs - 1);
     if (this.refs > 0) return;
     clearTimeout(this.idleTimer);
+    if (this.invalidated) return this.dispose();
     // Leaving a page and arriving on the next releases then retains within a frame; only a
     // session nobody came back to stops working.
     this.idleTimer = setTimeout(() => this.refs === 0 && this.stopBackground(), IDLE_STOP_MS);
@@ -313,6 +335,7 @@ export class SourceSession {
 
   /** Raise the number of ready streams to aim for (never lowers it). */
   want(n: number) {
+    this.resume();
     if (n > this.target) {
       this.target = n;
       if (this.started) {
@@ -325,6 +348,7 @@ export class SourceSession {
 
   /** Check every server that hasn't been checked. */
   checkAll() {
+    this.backgroundStopped = false;
     this.autoDirect = -Infinity;
     this.backupsHeld = false;
     this.captureOpen = true;
@@ -333,7 +357,13 @@ export class SourceSession {
 
   /** Stop background checks (ones the viewer asked for keep going). */
   stopBackground() {
-    this.target = Math.max(1, this.readyCount());
+    // The flag is what actually stops it. Lowering the target alone wasn't enough: with nothing
+    // ready the target stayed at 1, every aborted check went back on its queue, and pump()
+    // relaunched it at once, forever.
+    this.backgroundStopped = true;
+    this.target = this.readyCount();
+    for (const t of [this.holdTimer, this.hedgeTimer, this.backupTimer]) clearTimeout(t);
+    this.backupsHeld = false;
     for (const f of this.inflight.values()) if (!f.user) f.ctl.abort();
     this.changed();
   }
@@ -431,7 +461,7 @@ export class SourceSession {
   }
 
   private pump() {
-    if (this.disposed || !this.started) return;
+    if (this.disposed || !this.started || this.backgroundStopped) return;
     const wantMore = () => this.readyCount() < this.target;
 
     // Direct streams: cheap, so check them as they arrive, best first.
@@ -667,6 +697,7 @@ export class SourceSession {
     if (this.readyCount() < this.target && this.captureQueue.length) {
       this.backupsHeld = true;
       this.captureOpen = true;
+      clearTimeout(this.backupTimer);
       this.backupTimer = setTimeout(() => {
         this.backupsHeld = false;
         this.pump();
@@ -733,8 +764,9 @@ export class SourceSession {
         const i = q.indexOf(key);
         if (i >= 0) q.splice(i, 1);
       }
-      // A failed stream that came from a page is re-captured from the page, not re-fetched.
-      const recapture = !isEmbed(c) && !!c.pageUrl && !!c.probe && !c.probe.ok;
+      // A failed stream that was captured from a page is re-captured from that page, not
+      // re-fetched. Only captured ones: a direct extractor's `pageUrl` is just its site address.
+      const recapture = !isEmbed(c) && c.via === "sniffed" && !!c.pageUrl && !!c.probe && !c.probe.ok;
       if (c.probe && !c.probe.ok) this.put({ ...c, probe: undefined });
       void this.launch(key, true, recapture);
       f = this.inflight.get(key)!;
@@ -816,6 +848,7 @@ export class SourceSession {
         .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))[0];
     const now = usable();
     if (now) return now;
+    this.backgroundStopped = false;
     this.backupsHeld = false;
     clearTimeout(this.backupTimer);
     this.captureOpen = true;
@@ -843,7 +876,8 @@ export class SourceSession {
   useWebPlayers() {
     let first: StreamCandidate | undefined;
     for (const c of [...this.cands.values()]) {
-      if (!c.pageUrl || c.probe?.ok) continue;
+      // Only real player pages: a direct extractor's site address is not something to play in a frame.
+      if (!c.pageUrl || c.probe?.ok || !(isEmbed(c) || c.via === "sniffed")) continue;
       const web = this.put({ ...c, url: c.pageUrl, kind: "embed", via: "embed", probe: { ok: true, latencyMs: 0 } });
       this.confirmed.add(candKey(web));
       first ??= web;
@@ -863,7 +897,9 @@ let epoch = 0;
 
 /** Same title, episode, audio and source settings share a session. */
 export const sessionKey = (req: PlaybackRequest, s: Settings = getSettings()) =>
-  `${reqKey(req)}|${JSON.stringify([s.libraryPaths, s.jellyfin.enabled && s.jellyfin.url, s.disabledSources, s.enabledExtras, s.preferredQuality])}|${epoch}`;
+  // The resolved request (cour episode, absolute number, mapped ids) is part of the identity: a
+  // session started from the provisional request must not be reused once the real one is known.
+  `${reqKey(req)}|${JSON.stringify([req.courEpisode ?? null, req.absolute ?? null, req.media.malId ?? null, req.media.anilistId ?? null, req.media.tmdbId ?? null])}|${JSON.stringify([s.libraryPaths, s.jellyfin.enabled && s.jellyfin.url, s.disabledSources, s.enabledExtras, s.preferredQuality])}|${epoch}`;
 
 /** The live session for a request, or a new one when there is none or it has gone stale. */
 export function acquireSession(req: PlaybackRequest): SourceSession {
@@ -886,7 +922,7 @@ export function acquireSession(req: PlaybackRequest): SourceSession {
 export function invalidateSessions() {
   epoch++;
   for (const [k, s] of sessions) {
-    if (!s.inUse) s.dispose();
+    s.invalidate();
     sessions.delete(k);
   }
 }

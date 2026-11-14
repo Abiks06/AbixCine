@@ -50,6 +50,9 @@ const P: Record<string, string> = {
   sliders: "M4 7h10M18 7h2M14 5v4M4 12h4M12 12h8M8 10v4M4 17h11M19 17h1M15 15v4",
   pip: "M3 5h18v14H3zM12 12h6v4h-6z",
   keys: "M3 6h18v12H3zM7 10h.01M11 10h.01M15 10h.01M7 14h10",
+  grid: "M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z",
+  rows: "M3 5h7v5H3zM13 6h8M13 9h5M3 14h7v5H3zM13 15h8M13 18h5",
+  puzzle: "M9 4h4v2.5a1.5 1.5 0 1 0 3 0V4h4v5h-2.5a1.5 1.5 0 1 0 0 3H20v8h-5v-2.5a1.5 1.5 0 1 0-3 0V20H4v-6h2.5a1.5 1.5 0 1 0 0-3H4V4z",
 };
 
 const FILLED = new Set(["play", "pause", "star", "next", "rew", "fwd", "bookmarkOn"]);

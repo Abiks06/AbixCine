@@ -184,3 +184,36 @@ test("subtitlePref sync validates, sanitizes, and enforces size limits", async (
   const afterUnsafe = (await call("GET", "/sync", null, t)).json();
   assert.deepEqual(afterUnsafe.settings.subtitlePref, { size: "m" });
 });
+
+test("failed logins for one account never lock anyone else out", async () => {
+  const from = (ip, body) => app.inject({ method: "POST", url: "/auth/login", payload: body, remoteAddress: ip });
+  const victim = `victim${Date.now()}@example.com`;
+  let last;
+  for (let i = 0; i < 9; i++) last = await from("10.9.0.1", { email: victim, password: "wrong pass" });
+  assert.equal(last.statusCode, 429, "the guesser is limited");
+  // A different person on a different address signs in normally.
+  const r = await from("10.9.0.2", { email, password: "correct horse" });
+  assert.equal(r.statusCode, 200);
+  // And a request with no body at all is rejected as bad credentials, not counted against everyone.
+  assert.equal((await from("10.9.0.3", undefined)).statusCode, 401);
+});
+
+test("progress rows must carry their title", async () => {
+  const t = tokens.accessToken;
+  let r = await call("PUT", "/progress/anilist:77", { position: 10, duration: 100, updatedAt: Date.now() }, t);
+  assert.equal(r.statusCode, 400);
+  r = await call("PUT", "/progress/anilist:77", { media: { key: "anilist:77", kind: "anime", title: "Y", genres: [], overview: "" }, position: -5, duration: 100 }, t);
+  assert.equal(r.statusCode, 400);
+});
+
+test("settings sync drops malformed fields and keeps source toggles", async () => {
+  const t = tokens.accessToken;
+  const r = await call("PUT", "/settings", { preferredQuality: "huge", animeAudio: "dub", disabledSources: ["vidlink"], enabledExtras: null, junk: 1 }, t);
+  assert.equal(r.statusCode, 200);
+  const s = (await call("GET", "/sync", null, t)).json().settings;
+  assert.equal(s.animeAudio, "dub");
+  assert.deepEqual(s.disabledSources, ["vidlink"]);
+  assert.equal(s.enabledExtras, null);
+  assert.ok(!("junk" in s));
+  assert.notEqual(s.preferredQuality, "huge");
+});

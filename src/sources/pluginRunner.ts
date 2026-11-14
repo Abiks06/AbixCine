@@ -524,7 +524,15 @@ const BLOCKED_WORKER_GLOBALS = [
   "SharedWorker",
   "caches",
   "indexedDB",
+  // Network and storage the original list missed: QUIC streams bypass the host's URL checks,
+  // and the others let a plugin keep data or coordinate across runs.
+  "WebTransport",
+  "WebSocketStream",
+  "FileReaderSync",
 ] as const;
+
+/** navigator members a plugin has no use for (persistent storage, cross-context locks, beacons). */
+const BLOCKED_NAVIGATOR = ["sendBeacon", "storage", "locks", "serviceWorker"] as const;
 
 const LOCKED_RPC_GLOBALS = [
   "postMessage",
@@ -544,6 +552,7 @@ const LOCKED_RPC_GLOBALS = [
 export function buildSandboxWorkerScript(pluginScript: string): string {
   const blockedList = JSON.stringify(BLOCKED_WORKER_GLOBALS);
   const rpcList = JSON.stringify(LOCKED_RPC_GLOBALS);
+  const navList = JSON.stringify(BLOCKED_NAVIGATOR);
   return `(function() {
   "use strict";
   const __global = typeof globalThis !== "undefined" ? globalThis : self;
@@ -570,15 +579,24 @@ export function buildSandboxWorkerScript(pluginScript: string): string {
     }
   }
 
-  try {
-    if (__global.navigator && "sendBeacon" in __global.navigator) {
-      Object.defineProperty(__global.navigator, "sendBeacon", {
-        value: undefined,
-        writable: false,
-        configurable: false,
-      });
+  for (const __nav of ${navList}) {
+    try {
+      if (__global.navigator && __nav in __global.navigator) {
+        Object.defineProperty(__global.navigator, __nav, { value: undefined, writable: false, configurable: false });
+      }
+    } catch {}
+  }
+
+  // The message channel is locked before any plugin code runs (it used to be locked after, so a
+  // plugin's top level could take the raw postMessage/addEventListener for itself). The bootstrap
+  // already holds bound copies in __post and __addListener.
+  for (const __rpcProp of ${rpcList}) {
+    try {
+      Object.defineProperty(__global, __rpcProp, { value: undefined, writable: false, configurable: false, enumerable: false });
+    } catch {
+      try { __global[__rpcProp] = undefined; } catch {}
     }
-  } catch {}
+  }
 
   const __host = Object.freeze({
     httpFetch: function(url, opts) {
@@ -702,19 +720,6 @@ ${pluginScript}
       }
     }
   });
-
-  for (const __rpcProp of ${rpcList}) {
-    try {
-      Object.defineProperty(__global, __rpcProp, {
-        value: undefined,
-        writable: false,
-        configurable: false,
-        enumerable: false,
-      });
-    } catch {
-      try { __global[__rpcProp] = undefined; } catch {}
-    }
-  }
 
   __post({ type: "ready" });
 })();

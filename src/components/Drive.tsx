@@ -38,7 +38,8 @@ export function DriveTile({ t, i = 0 }: { t: DriveTitle; i?: number }) {
     <Link
       to={`/title/${encodeKey(matchedMedia.key)}`}
       className="file"
-      style={{ ["--i" as any]: i }}
+      style={{ ["--i" as any]: Math.min(i, 10) }}
+      state={{ seed: matchedMedia }}
       viewTransition
       onMouseEnter={() => previewLight(matchedMedia)}
       onMouseLeave={() => previewLight(null)}
@@ -46,7 +47,7 @@ export function DriveTile({ t, i = 0 }: { t: DriveTitle; i?: number }) {
       {body}
     </Link>
   ) : (
-    <div className="file" style={{ ["--i" as any]: i }} title="AbixCine couldn't match this file to a title yet. Renaming it to “Title (Year)” helps.">
+    <div className="file" style={{ ["--i" as any]: Math.min(i, 10) }} title="AbixCine couldn't match this file to a title yet. Renaming it to “Title (Year)” helps.">
       {body}
     </div>
   );
@@ -60,12 +61,12 @@ export function DriveSection({ limit, rescan = 0 }: { limit?: number; rescan?: n
   const shown = limit ? drive.titles.slice(0, limit) : drive.titles;
 
   return (
-    <section className="sec" id="drive">
+    <section className="shelf" id="drive">
       <SectionHead
         eyebrow="Local first · plays instantly, no internet needed"
         title={`From ${where}`}
         to={limit && drive.titles.length > limit ? "/library" : undefined}
-        right={drive.files ? <span className="hd-note">{drive.files.toLocaleString()} files · last scan {ago(drive.at)}</span> : null}
+        right={drive.files ? <span className="shelf-note">{drive.files.toLocaleString()} files · last scan {ago(drive.at)}</span> : null}
       />
       {s.libraryPaths.length === 0 ? (
         <Link to="/settings#sources" className="drive-empty" viewTransition>

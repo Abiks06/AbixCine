@@ -140,11 +140,31 @@ function inferUserSubLang(filename: string): string {
   return m ? langBase(m[1]) : "und";
 }
 
+/**
+ * Converted cue lists, per text track. The cue engine runs every 60 ms while subtitles are on;
+ * rebuilding (and re-parsing every styled cue of) the whole track each time cost real CPU, and the
+ * fresh array also defeated activeCuesAt's index cache, which is keyed on the array itself.
+ * Rebuilt only when the track's cue list actually changes (HLS appends cues as segments load).
+ */
+const trackCueMemo = new WeakMap<TextTrack, { sig: string; prefix: string; cues: SubtitleCue[] }>();
+
 function textTrackToCues(track: TextTrack, prefix: string): { cues: SubtitleCue[]; usingActiveFallback: boolean } {
   const full = track.cues;
   const usingActiveFallback = !(full && full.length > 0);
-  const list = usingActiveFallback ? track.activeCues : full;
+  if (!usingActiveFallback && full) {
+    const sig = `${full.length}:${full[0].startTime}:${full[full.length - 1].endTime}`;
+    const hit = trackCueMemo.get(track);
+    if (hit && hit.sig === sig && hit.prefix === prefix) return { cues: hit.cues, usingActiveFallback };
+    const built = convertCues(full, prefix);
+    trackCueMemo.set(track, { sig, prefix, cues: built });
+    return { cues: built, usingActiveFallback };
+  }
+  const list = track.activeCues;
   if (!list || list.length === 0) return { cues: [], usingActiveFallback };
+  return { cues: convertCues(list, prefix), usingActiveFallback };
+}
+
+function convertCues(list: TextTrackCueList, prefix: string): SubtitleCue[] {
   const out: SubtitleCue[] = [];
   for (let i = 0; i < list.length; i++) {
     const c = list[i] as VTTCue | (TextTrackCue & { text?: string });
@@ -175,7 +195,7 @@ function textTrackToCues(track: TextTrack, prefix: string): { cues: SubtitleCue[
       });
     }
   }
-  return { cues: out, usingActiveFallback };
+  return out;
 }
 
 function cueSignature(cues: readonly SubtitleCue[]): string {
@@ -254,10 +274,16 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
   const [time, setTime] = useState(0);
   const [dur, setDur] = useState(0);
   const [buffered, setBuffered] = useState(0);
-  // Never start silent: a saved volume of zero (or an unreadable one) comes back as full.
+  // Never start silent: a saved volume of zero (or an unreadable one) comes back as full. A quiet
+  // one is kept as it was: turning a deliberate 4% into 100% on the next launch is a jump scare.
   const [vol, setVol] = useState(() => {
-    const v = Number(localStorage.getItem("abx.vol"));
-    return Number.isFinite(v) && v > 0.05 ? Math.min(1, v) : 1;
+    let v = NaN;
+    try {
+      v = Number(localStorage.getItem("abx.vol"));
+    } catch {
+      /* storage blocked */
+    }
+    return Number.isFinite(v) && v > 0 ? Math.min(1, v) : 1;
   });
   const [muted, setMuted] = useState(false);
   const [speed, setSpeed] = useState(1);
@@ -2219,13 +2245,16 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     clearTimeout(bumpTimer.current);
     bumpTimer.current = window.setTimeout(() => setBump(null), 750);
   };
+  const volRef = useRef(vol);
+  volRef.current = vol;
   const changeVol = (d: number) => {
+    // Worked out here rather than inside the state updater: updaters must be pure (StrictMode
+    // runs them twice, which fired the toast twice).
+    const n = Math.max(0, Math.min(1, +(volRef.current + d).toFixed(2)));
+    volRef.current = n;
     setMuted(false);
-    setVol((x) => {
-      const n = Math.max(0, Math.min(1, +(x + d).toFixed(2)));
-      flash(`Volume ${Math.round(n * 100)}%`);
-      return n;
-    });
+    setVol(n);
+    flash(`Volume ${Math.round(n * 100)}%`);
   };
   const changeSpeed = (dir: 1 | -1) => {
     const i = SPEEDS.indexOf(speed);
@@ -2247,7 +2276,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
 
   // Fullscreen: in the desktop app the window itself goes fullscreen (WebView2's element
   // fullscreen only fills the webview); in a browser, the player element does.
-  const win = isTauri() ? getCurrentWindow() : null;
+  const win = useMemo(() => (isTauri() ? getCurrentWindow() : null), []);
   const setFull = async (on: boolean) => {
     try {
       if (win) {
@@ -2269,8 +2298,28 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
   // The player remounts on every episode; pick up the window's state so fullscreen carries over.
   // (Leaving the watch screen altogether exits fullscreen: see the app shell.)
   useEffect(() => {
-    win?.isFullscreen().then(setIsFull).catch(() => {});
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    if (!win) return;
+    let live = true;
+    let off: (() => void) | undefined;
+    const sync = () => win.isFullscreen().then((f) => live && setIsFull(f)).catch(() => {});
+    void sync();
+    // Fullscreen can change without us (F11, a snap layout, another screen): follow the window.
+    win
+      .onResized(() => void sync())
+      .then((un) => (live ? (off = un) : un()))
+      .catch(() => {});
+    return () => {
+      live = false;
+      off?.();
+    };
+  }, [win]);
+  // Picture-in-picture must not outlive the player that owns the video.
+  useEffect(
+    () => () => {
+      if (document.pictureInPictureElement) void document.exitPictureInPicture().catch(() => {});
+    },
+    [],
+  );
   const leave = () => {
     // The 5-second progress timer may not have fired yet: save where you actually stopped.
     saveNow();
@@ -2363,6 +2412,20 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
   const clock = isEmbed ? embedClock : { time, duration: dur };
   const remaining = clock.duration ? clock.duration - clock.time : Infinity;
   const [upNextDismissed, setUpNextDismissed] = useState(false);
+  const upNextDismissedRef = useRef(false);
+  upNextDismissedRef.current = upNextDismissed;
+  /** Every way of moving to the next episode saves the playhead first (it used to lose up to 5 s). */
+  const goNext = () => {
+    if (!onNext) return;
+    saveNowRef.current();
+    onNext();
+  };
+  const goNextRef = useRef(goNext);
+  goNextRef.current = goNext;
+  // Single click toggles play, double click toggles fullscreen: without a short wait the double
+  // click also paused and resumed, which stutters the picture.
+  const clickTimer = useRef<number>();
+  useEffect(() => () => clearTimeout(clickTimer.current), []);
   const showUpNext = !!onNext && !upNextDismissed && remaining <= UP_NEXT_AT && remaining > 0.5 && clock.duration > 120;
 
   // Keyboard shortcuts (bound once via ref so timeupdate ticks don't re-bind the window listener).
@@ -2377,12 +2440,26 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     ) return;
     // Ctrl+K and friends belong to the app, not the player (Ctrl+K used to pause as well).
     if (e.ctrlKey || e.metaKey || e.altKey) return;
-    poke();
+    // A modal on top (the command palette) owns the keyboard until it closes.
+    if (document.querySelector('[aria-modal="true"]')) return;
     // Letters work with Caps Lock on.
     const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
-    if (keysOpen && k !== "?") {
-      setKeysOpen(false);
-      if (k === "Escape") return;
+    // The shortcuts card is modal too: Escape or ? closes it, and nothing else leaks through to
+    // the video underneath (closing it with Space used to pause as well).
+    if (keysOpen) {
+      e.preventDefault();
+      if (k === "Escape" || k === "?") setKeysOpen(false);
+      return;
+    }
+    // A focused control keeps its own Space/Enter: pressing Space on "Next server" must press that
+    // button, not pause the film.
+    const onControl = !!el?.closest?.('button, a[href], [role="tab"], [role="slider"], [role="radio"], [role="option"]');
+    if (onControl && (k === " " || k === "Enter")) return;
+    poke();
+    // Speed: Shift+comma / Shift+period by physical key, so it works on layouts where < and > live elsewhere.
+    if (e.shiftKey && (e.code === "Comma" || e.code === "Period")) {
+      changeSpeed(e.code === "Period" ? 1 : -1);
+      return;
     }
     if (k >= "0" && k <= "9" && k.length === 1) {
       const v = video.current;
@@ -2420,7 +2497,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
       }
       case "f": toggleFull(); break;
       case "p": void togglePip(); break;
-      case "n": onNext?.(); break;
+      case "n": goNext(); break;
       case "?": setKeysOpen((x) => !x); break;
       case "Escape":
         if (sheet) setSheet(null);
@@ -2458,7 +2535,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     set("pause", () => video.current?.pause());
     set("seekbackward", () => seek(-10));
     set("seekforward", () => seek(10));
-    set("nexttrack", hasNext ? () => nextRef.current?.() : null);
+    set("nexttrack", hasNext ? () => goNextRef.current() : null);
     return () => {
       (["play", "pause", "seekbackward", "seekforward", "nexttrack"] as MediaSessionAction[]).forEach((a) => set(a, null));
       ms.metadata = null;
@@ -2566,7 +2643,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
         malId: media?.malId,
         season: epSeason,
         episode: epNumber,
-        durationSec: durRef.current > 0 ? durRef.current : undefined,
+        durationSec: dur > 0 ? dur : undefined,
       },
       { signal: ctl.signal },
     )
@@ -2575,7 +2652,9 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
       })
       .catch(() => {});
     return () => ctl.abort();
-  }, [cur?.url, isEmbed, cur?.skip?.intro, cur?.skip?.outro, media?.kind, media?.tmdbId, media?.imdbId, media?.malId, epSeason, epNumber]);
+    // Asked again once the duration is known (rounded, so live duration jitter doesn't refetch):
+    // AniSkip matches on episode length, and the first ask happens before metadata arrives.
+  }, [cur?.url, isEmbed, cur?.skip?.intro, cur?.skip?.outro, media?.kind, media?.tmdbId, media?.imdbId, media?.malId, epSeason, epNumber, Math.round(dur / 10)]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const sk = useMemo(() => mergeSkipRanges(cur?.skip, fetchedSkip), [cur?.skip, fetchedSkip]);
   const outroEnd = sk?.outro ? (Number.isFinite(sk.outro[1]) ? sk.outro[1] : (dur > 0 ? dur : Infinity)) : undefined;
@@ -2588,7 +2667,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
   return (
     <div
       ref={wrap}
-      className={`player ${isEmbed ? "is-embed" : ""} ${hide || embedHide ? "idle" : ""} ${isFull ? "is-full" : ""} ${sheet ? "has-sheet" : ""}`}
+      className={`player ${isEmbed ? "is-embed" : ""} ${hide || embedHide ? "idle" : ""} ${isFull ? "is-full" : ""} ${sheet ? "has-sheet" : ""} ${!isEmbed && !playing && !waiting ? "is-paused" : ""}`}
       onMouseMove={poke}
       onDragEnter={(e) => {
         if (isEmbed || !e.dataTransfer?.types?.includes("Files")) return;
@@ -2616,8 +2695,19 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     >
       <div
         className="screen"
-        onClick={() => (sheet ? setSheet(null) : toggle())}
-        onDoubleClick={() => !isEmbed && toggleFull()}
+        onClick={(e) => {
+          if (sheet) return setSheet(null);
+          if (isEmbed) return toggle();
+          clearTimeout(clickTimer.current);
+          // detail > 1 is the second click of a double click: let onDoubleClick have it.
+          if (e.detail > 1) return;
+          clickTimer.current = window.setTimeout(toggle, 220);
+        }}
+        onDoubleClick={() => {
+          if (isEmbed) return;
+          clearTimeout(clickTimer.current);
+          toggleFull();
+        }}
         onWheel={(e) => {
           if (isEmbed || !e.deltaY) return;
           poke();
@@ -2685,8 +2775,17 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
               }}
               onProgress={(e) => setBuffered(bufferedAhead(e.currentTarget))}
               onDurationChange={(e) => setDur(e.currentTarget.duration)}
-              onEnded={() => { const v = video.current; if (v) onProgress?.(v.duration, v.duration); onEnded?.(); }}
-              onError={() => cur?.kind === "file" && failover("unsupported or unreachable file")}
+              onEnded={() => {
+                const v = video.current;
+                if (v) onProgress?.(v.duration, v.duration);
+                // "Keep watching" means stay here: don't auto-advance behind the viewer's back.
+                if (!upNextDismissedRef.current) onEnded?.();
+              }}
+              onError={() => {
+                // hls.js and Shaka report their own errors. A plain <video> (a file, or HLS played
+                // natively) has no one else to notice: without this it sat silent until a 20 s timeout.
+                if (cur && cur.kind !== "embed" && !hlsRef.current && !shakaRef.current) failover("unsupported or unreachable stream");
+              }}
             />
             <canvas key={`${enhance}:${cur?.url ?? ""}`} ref={canvas} className={`enhance-canvas ${enhancing === "on" ? "on" : ""}`} aria-hidden />
             <SubtitleOverlay
@@ -2784,7 +2883,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
                 <span className="buf" style={{ width: `${dur ? (buffered / dur) * 100 : 0}%` }} />
                 {hover && <span className="ghost" style={{ width: hover.x }} />}
                 <i style={{ width: `${pct}%` }} />
-                {dur > 0 && sk?.intro && <span className="part" style={{ left: `${(sk.intro[0] / dur) * 100}%`, width: `${((sk.intro[1] - sk.intro[0]) / dur) * 100}%` }} />}
+                {dur > 0 && sk?.intro && sk.intro[0] < dur && <span className="part" style={{ left: `${(sk.intro[0] / dur) * 100}%`, width: `${((Math.min(dur, sk.intro[1]) - sk.intro[0]) / dur) * 100}%` }} />}
                 {dur > 0 && sk?.outro && <span className="part" style={{ left: `${(sk.outro[0] / dur) * 100}%`, width: `${((Math.min(dur, sk.outro[1]) - sk.outro[0]) / dur) * 100}%` }} />}
               </div>
               <span className="knob" style={{ left: `${pct}%` }} />
@@ -2800,7 +2899,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
                 <button className="pbtn round big" onClick={toggle} aria-label={playing ? "Pause" : "Play"}><Icon name={playing ? "pause" : "play"} size={20} /></button>
                 <button className="pbtn icon" onClick={() => seek(-10)} aria-label="Back 10 seconds"><Icon name="replay10" size={20} /></button>
                 <button className="pbtn icon" onClick={() => seek(10)} aria-label="Forward 10 seconds"><Icon name="fwd10" size={20} /></button>
-                {onNext && <button className="pbtn icon" onClick={onNext} aria-label="Next episode" title="Next episode (N)"><Icon name="next" size={20} /></button>}
+                {onNext && <button className="pbtn icon" onClick={goNext} aria-label="Next episode" title="Next episode (N)"><Icon name="next" size={20} /></button>}
                 <div className="vol">
                   <button className="pbtn icon" onClick={() => setMuted((m) => !m)} aria-label="Mute"><Icon name={muted || vol === 0 ? "mute" : "vol"} size={20} /></button>
                   <input type="range" min={0} max={1} step={0.02} value={muted ? 0 : vol} style={{ ["--v" as any]: `${(muted ? 0 : vol) * 100}%` }} onChange={(e) => { setMuted(false); setVol(Number(e.target.value)); }} aria-label="Volume" />
@@ -2876,12 +2975,13 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
           still={media?.backdrop}
           seconds={Math.ceil(remaining)}
           auto={!!autoNext}
-          onPlay={() => onNext?.()}
+          onPlay={goNext}
           onDismiss={() => setUpNextDismissed(true)}
         />
       )}
 
-      <aside className={`psheet ${sheet ? "open" : ""}`} aria-hidden={!sheet} onMouseMove={poke}>
+      {/* inert while closed: off-screen controls must not take focus or be read out. */}
+      <aside className={`psheet ${sheet ? "open" : ""}`} aria-hidden={!sheet} {...(sheet ? {} : { inert: "" })} onMouseMove={poke}>
         <div className="ps-head">
           <div className="ps-tabs" role="tablist">
             <button role="tab" className={sheet === "servers" ? "on" : ""} onClick={() => setSheet("servers")}>Servers</button>

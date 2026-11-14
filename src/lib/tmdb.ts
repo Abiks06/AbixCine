@@ -131,9 +131,18 @@ function toMedia(r: TmdbRawMedia, fallbackKind?: "movie" | "tv"): Media | null {
     rating: r.vote_average ? Math.round(r.vote_average * 10) / 10 : undefined,
     poster: img(r.poster_path, "w500"),
     backdrop: img(r.backdrop_path, "w1280"),
-    genres: (r.genres ?? []).map((g) => g.name),
+    // Detail records carry { id, name } objects; lists and search only carry ids.
+    genres: r.genres?.length ? r.genres.map((g) => g.name) : (r.genre_ids ?? []).map((id) => GENRES[id]).filter(Boolean),
   };
 }
+
+/** TMDB's genre ids (movie and TV share one numbering). Stable for years, so no extra request per launch. */
+const GENRES: Record<number, string> = {
+  28: "Action", 12: "Adventure", 16: "Animation", 35: "Comedy", 80: "Crime", 99: "Documentary", 18: "Drama", 10751: "Family",
+  14: "Fantasy", 36: "History", 27: "Horror", 10402: "Music", 9648: "Mystery", 10749: "Romance", 878: "Sci-Fi", 10770: "TV Movie",
+  53: "Thriller", 10752: "War", 37: "Western", 10759: "Action & Adventure", 10762: "Kids", 10763: "News", 10764: "Reality",
+  10765: "Sci-Fi & Fantasy", 10766: "Soap", 10767: "Talk", 10768: "War & Politics",
+};
 
 const list = (rows: TmdbRawMedia[] | undefined, kind?: "movie" | "tv") => (rows ?? []).map((r) => toMedia(r, kind)).filter(Boolean) as Media[];
 
@@ -197,7 +206,11 @@ export async function searchTmdb(q: string): Promise<Media[]> {
 const CREW_JOBS = ["Director", "Creator", "Screenplay", "Writer", "Story", "Novel", "Original Music Composer", "Director of Photography", "Producer"];
 
 /** The user's region, for age ratings and release dates ("GB" from "en-GB"); US as the fallback. */
-const region = () => (typeof navigator !== "undefined" && navigator.language ? navigator.language.split("-")[1] ?? "US" : "US").toUpperCase();
+/** "en-GB" → GB, "zh-Hant-TW" → TW (the region is the two-letter subtag, wherever it sits), "en" → US. */
+const region = () => {
+  const tags = typeof navigator !== "undefined" && navigator.language ? navigator.language.split("-").slice(1) : [];
+  return (tags.find((t) => /^[a-z]{2}$/i.test(t)) ?? "US").toUpperCase();
+};
 
 export async function tmdbDetail(key: string): Promise<MediaDetail> {
   const [, kind, id] = key.split(":") as [string, "movie" | "tv", string];
@@ -246,7 +259,8 @@ export async function tmdbDetail(key: string): Promise<MediaDetail> {
       ...base,
       backdrop: img(r.backdrop_path, "original") ?? base.backdrop,
       logo: img((r.images?.logos?.find((l) => l.iso_639_1 === "en") ?? r.images?.logos?.[0])?.file_path, "w500"),
-      runtime: r.runtime ?? r.episode_run_time?.[0] ?? r.last_episode_to_air?.runtime ?? undefined,
+      // TMDB reports an unknown runtime as 0, which would read as "0m" and pass every "fits tonight" filter.
+      runtime: [r.runtime, r.episode_run_time?.[0], r.last_episode_to_air?.runtime].find((n) => typeof n === "number" && n > 0),
       tagline: r.tagline || undefined,
       status: r.status,
       seasons: normalizedSeasons?.seasons.length ? normalizedSeasons.seasons : undefined,

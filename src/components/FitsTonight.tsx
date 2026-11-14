@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { getDetail } from "../lib/catalog";
 import { fmtRuntime } from "../lib/format";
 import type { Media } from "../lib/types";
-import { Card, kindLabel } from "./Card";
+import { Card, CardSkeleton, kindLabel } from "./Card";
 import { SectionHead } from "./SectionHead";
 
 const clock = (d: Date) => d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
@@ -30,11 +30,13 @@ function cutoffs(now: Date) {
  * "Fits tonight": what you can finish before you need to sleep. Movies by runtime,
  * series by one episode, with the end time worked out from the clock.
  */
-export function FitsTonight({ pool }: { pool: Media[] }) {
+export function FitsTonight({ pool, loading }: { pool: Media[]; loading?: boolean }) {
   const [now, setNow] = useState(() => new Date());
   const opts = useMemo(() => cutoffs(now), [now.getHours() * 60 + now.getMinutes()]); // eslint-disable-line react-hooks/exhaustive-deps
   const [sel, setSel] = useState(0);
   const [runtimes, setRuntimes] = useState<Record<string, number>>({});
+  /** The pool whose runtimes have been looked up (found or not). */
+  const [settled, setSettled] = useState("");
   const keys = pool.map((m) => m.key).join("|");
 
   useEffect(() => {
@@ -47,6 +49,7 @@ export function FitsTonight({ pool }: { pool: Media[] }) {
     // One state update for the whole pool instead of a re-render per title.
     Promise.all(pool.slice(0, 18).map((m) => getDetail(m.key).then((d) => [m.key, d.runtime] as const).catch(() => [m.key, undefined] as const))).then((all) => {
       if (!live) return;
+      setSettled(keys);
       const found = Object.fromEntries(all.filter(([, rt]) => rt)) as Record<string, number>;
       if (Object.keys(found).length) setRuntimes((r) => ({ ...r, ...found }));
     });
@@ -60,17 +63,20 @@ export function FitsTonight({ pool }: { pool: Media[] }) {
     .filter((m, i, a) => runtimes[m.key] && runtimes[m.key] <= max && a.findIndex((x) => x.key === m.key) === i)
     .sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0))
     .slice(0, 10);
-  if (!Object.keys(runtimes).length) return null;
+  // The shelf holds its place from the first frame: a section that appeared after 18 lookups
+  // used to shove everything below it down by a row.
+  const pending = loading || (pool.length > 0 && settled !== keys && !Object.keys(runtimes).length);
+  if (!pending && (!pool.length || !Object.keys(runtimes).length)) return null;
 
   return (
-    <section className="sec">
+    <section className="shelf">
       <SectionHead
         eyebrow="Built around your evening"
         title="Fits tonight"
         right={
           <div className="fit">
             <span className="fit-now">It’s {clock(now)} · finish</span>
-            <div className="seg-pills" role="radiogroup">
+            <div className="seg-pills" role="radiogroup" aria-label="Finish by">
               {opts.map((o, i) => (
                 <button key={o.label} role="radio" aria-checked={i === sel} className={i === sel ? "on" : ""} onClick={() => setSel(i)}>
                   {o.label}
@@ -81,7 +87,8 @@ export function FitsTonight({ pool }: { pool: Media[] }) {
         }
       />
       <div className="track">
-        {fits.length === 0 && <div className="track-empty">Nothing short enough. Try a later finish.</div>}
+        {pending && Array.from({ length: 6 }, (_, i) => <CardSkeleton key={i} />)}
+        {!pending && fits.length === 0 && <div className="track-empty">Nothing short enough. Try a later finish.</div>}
         {fits.map((m, i) => {
           const rt = runtimes[m.key];
           const end = clock(new Date(now.getTime() + rt * 60000));
@@ -99,7 +106,7 @@ export function FitsTonight({ pool }: { pool: Media[] }) {
               }
               sub={
                 <>
-                  <span className="badge">{kindLabel(m.kind).toUpperCase()}</span>
+                  <span className="badge">{kindLabel(m.kind)}</span>
                   {fmtRuntime(rt)}
                   {m.kind !== "movie" ? " per episode" : ""}
                 </>

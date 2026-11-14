@@ -325,6 +325,13 @@ export const anikotoProvider: SourceProvider = {
 
       for (const base of MIRRORS) {
         if (signal.aborted) return [];
+        // One mirror throwing must not cost the rest their turn.
+        const found = await tryMirror(base).catch(() => null);
+        if (found) return [found];
+      }
+      return [];
+
+      async function tryMirror(base: string): Promise<StreamCandidate | null> {
         const searchRes = await fetchWithAbort(
           `${base}/filter?keyword=${encodeURIComponent(query)}`,
           { Referer: `${base}/`, "User-Agent": DEFAULT_UA },
@@ -332,11 +339,11 @@ export const anikotoProvider: SourceProvider = {
           signal,
           7_000,
         ).catch(() => null);
-        if (!searchRes || searchRes.status < 200 || searchRes.status >= 300) continue;
+        if (!searchRes || searchRes.status < 200 || searchRes.status >= 300) return null;
 
         const cards = parseAnikotoSearchCards(searchRes.body, base);
         const card = pickBestCard(cards, req, wantDub);
-        if (!card) continue;
+        if (!card) return null;
 
         const pageRes = await fetchWithAbort(
           card.href,
@@ -345,12 +352,15 @@ export const anikotoProvider: SourceProvider = {
           signal,
           7_000,
         );
-        if (signal.aborted || pageRes.status < 200 || pageRes.status >= 300) continue;
+        if (signal.aborted || pageRes.status < 200 || pageRes.status >= 300) return null;
 
+        // The id lives on #watch-main, with its attributes in either order. Only then fall back to
+        // the first data-id on the page (which can belong to an unrelated element).
         const seriesId =
-          pageRes.body.match(/id="watch-main"[^>]*\bdata-id="(\d+)"/i)?.[1] ??
+          pageRes.body.match(/<[^>]*\bid="watch-main"[^>]*\bdata-id="(\d+)"/i)?.[1] ??
+          pageRes.body.match(/<[^>]*\bdata-id="(\d+)"[^>]*\bid="watch-main"/i)?.[1] ??
           pageRes.body.match(/\bdata-id="(\d+)"/i)?.[1];
-        if (!seriesId) continue;
+        if (!seriesId) return null;
 
         const ajaxHeaders = {
           Referer: `${base}/`,
@@ -364,11 +374,11 @@ export const anikotoProvider: SourceProvider = {
           signal,
           7_000,
         );
-        if (signal.aborted || !epListRes.data?.result) continue;
+        if (signal.aborted || !epListRes.data?.result) return null;
 
         const episodes = parseAnikotoEpisodes(epListRes.data.result);
         const epNode = episodes.find((e) => e.num === ep && (wantDub ? e.hasDub : e.hasSub));
-        if (!epNode) continue;
+        if (!epNode) return null;
 
         const srvListRes = await fetchJsonWithAbort<{ status?: number; result?: string }>(
           `${base}/ajax/server/list?servers=${encodeURIComponent(epNode.dataIds)}`,
@@ -377,27 +387,27 @@ export const anikotoProvider: SourceProvider = {
           signal,
           7_000,
         );
-        if (signal.aborted || !srvListRes.data?.result) continue;
+        if (signal.aborted || !srvListRes.data?.result) return null;
 
         const servers = parseAnikotoServers(srvListRes.data.result, wantDub ? ["dub"] : ["sub", "hsub"]);
         for (const srv of servers) {
-          if (signal.aborted) return [];
+          if (signal.aborted) return null;
           const srvRes = await fetchJsonWithAbort<{ status?: number; result?: { url?: string } }>(
             `${base}/ajax/server?get=${encodeURIComponent(srv.linkId)}`,
             ajaxHeaders,
             undefined,
             signal,
             7_000,
-          );
+          ).catch(() => null);
+          if (!srvRes) continue;
           const embedUrl = srvRes.data?.result?.url;
           if (!embedUrl || !/^https?:\/\//i.test(embedUrl)) continue;
 
           const cand = await resolveEmbedUrlToCandidate(embedUrl, srv.name, audio, `${base}/`, signal).catch(() => null);
-          if (cand) return [cand];
+          if (cand) return cand;
         }
+        return null;
       }
-
-      return [];
     } catch (err) {
       if (isAbortError(err)) return [];
       return [];

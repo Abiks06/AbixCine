@@ -276,9 +276,11 @@ interface SelectableFile {
 function selectBestFile<T extends SelectableFile>(files: T[], fileIdx?: number): T | undefined {
   if (!files.length) return undefined;
   if (fileIdx != null && Number.isInteger(fileIdx) && fileIdx >= 0) {
-    if (fileIdx < files.length) return files[fileIdx];
-    const byId = files.find((f) => f.id === fileIdx || f.id === fileIdx + 1);
-    if (byId) return byId;
+    // `fileIdx` is the file's position in the torrent. Trust a match only when it lands on a
+    // video: providers that list a filtered subset (AllDebrid's links) shift every position.
+    const byId = files.find((f) => f.id === fileIdx + 1) ?? files.find((f) => f.id === fileIdx);
+    const byPos = files.find((f) => f.index === fileIdx);
+    for (const hit of [byPos, byId]) if (hit && VIDEO_EXT_RX.test(hit.filename)) return hit;
   }
 
   const videos = files.filter((f) => VIDEO_EXT_RX.test(f.filename));
@@ -360,11 +362,37 @@ interface RdTorrentInfo {
   links?: string[];
 }
 
+/**
+ * Run a resolution that created something on the provider's side. If it ends without a stream
+ * (not cached, cancelled, failed), delete what it created: otherwise every miss left a torrent
+ * in the account, and TorBox's three active slots filled up after three tries.
+ */
+async function withCleanup<T>(work: (track: (cleanup: () => Promise<unknown>) => void) => Promise<T>): Promise<T> {
+  let cleanup: (() => Promise<unknown>) | undefined;
+  try {
+    return await work((c) => (cleanup = c));
+  } catch (err) {
+    // Not tied to the caller's signal: it is usually the abort that got us here.
+    if (cleanup) void cleanup().catch(() => {});
+    throw err;
+  }
+}
+
 async function rdResolveStream(
   apiKey: string,
   magnetUri: string,
   fileIdx?: number,
   signal?: AbortSignal,
+): Promise<ResolvedDebridStream> {
+  return withCleanup((track) => rdResolve(apiKey, magnetUri, fileIdx, signal, track));
+}
+
+async function rdResolve(
+  apiKey: string,
+  magnetUri: string,
+  fileIdx: number | undefined,
+  signal: AbortSignal | undefined,
+  track: (cleanup: () => Promise<unknown>) => void,
 ): Promise<ResolvedDebridStream> {
   const added = await requestJson<{ id?: string }>(
     "realdebrid",
@@ -376,6 +404,8 @@ async function rdResolveStream(
   if (!added.id) {
     throw new DebridError("HTTP_ERROR", "realdebrid", "Real-Debrid did not return a torrent ID");
   }
+  const rdId = added.id;
+  track(() => fetchDebrid("realdebrid", `${RD_BASE}/torrents/delete/${encodeURIComponent(rdId)}`, bearerHeaders(apiKey), { method: "DELETE" }));
 
   let info = await requestJson<RdTorrentInfo>(
     "realdebrid",
@@ -433,9 +463,18 @@ async function rdResolveStream(
     throw new DebridError("UNCACHED", "realdebrid", `Torrent is not cached on Real-Debrid (${info.status})`);
   }
 
+  // RD's links line up with the *selected* files. An already-downloaded torrent skips file
+  // selection, so the choice is made here too; it used to fall back to link 0 whatever was asked.
+  const selectedFiles: SelectableFile[] = (info.files ?? [])
+    .map((f, index) => ({ id: f.id, filename: f.path.replace(/^\/+/, ""), sizeBytes: f.bytes, index, selected: f.selected }))
+    .filter((f) => f.selected === 1);
+  if (!chosenFile || !selectedFiles.some((f) => f.id === chosenFile!.id)) {
+    const all: SelectableFile[] = (info.files ?? []).map((f, index) => ({ id: f.id, filename: f.path.replace(/^\/+/, ""), sizeBytes: f.bytes, index }));
+    const wanted = selectBestFile(all, fileIdx);
+    chosenFile = wanted && selectedFiles.some((f) => f.id === wanted.id) ? wanted : selectBestFile(selectedFiles);
+  }
   let linkIndex = 0;
-  if (chosenFile?.id != null && info.files?.length) {
-    const selectedFiles = info.files.filter((f) => f.selected === 1);
+  if (chosenFile?.id != null) {
     const pos = selectedFiles.findIndex((f) => f.id === chosenFile!.id);
     if (pos >= 0 && pos < info.links.length) linkIndex = pos;
   }
@@ -556,6 +595,16 @@ async function tbResolveStream(
   fileIdx?: number,
   signal?: AbortSignal,
 ): Promise<ResolvedDebridStream> {
+  return withCleanup((track) => tbResolve(apiKey, magnetUri, fileIdx, signal, track));
+}
+
+async function tbResolve(
+  apiKey: string,
+  magnetUri: string,
+  fileIdx: number | undefined,
+  signal: AbortSignal | undefined,
+  track: (cleanup: () => Promise<unknown>) => void,
+): Promise<ResolvedDebridStream> {
   const createdEnv = await requestJson<TorBoxEnvelope<{ torrent_id?: number; id?: number }>>(
     "torbox",
     `${TB_BASE}/torrents/createtorrent`,
@@ -568,6 +617,12 @@ async function tbResolveStream(
   if (torrentId == null) {
     throw new DebridError("HTTP_ERROR", "torbox", "TorBox did not return a torrent ID");
   }
+  track(() =>
+    fetchDebrid("torbox", `${TB_BASE}/torrents/controltorrent`, bearerHeaders(apiKey, { "Content-Type": "application/json" }), {
+      method: "POST",
+      body: JSON.stringify({ torrent_id: torrentId, operation: "delete" }),
+    }),
+  );
 
   const listEnv = await requestJson<TorBoxEnvelope<TorBoxTorrentItem | TorBoxTorrentItem[]>>(
     "torbox",
@@ -712,6 +767,16 @@ async function adResolveStream(
   fileIdx?: number,
   signal?: AbortSignal,
 ): Promise<ResolvedDebridStream> {
+  return withCleanup((track) => adResolve(apiKey, magnetUri, fileIdx, signal, track));
+}
+
+async function adResolve(
+  apiKey: string,
+  magnetUri: string,
+  fileIdx: number | undefined,
+  signal: AbortSignal | undefined,
+  track: (cleanup: () => Promise<unknown>) => void,
+): Promise<ResolvedDebridStream> {
   const uploadEnv = await requestJson<
     AllDebridEnvelope<{
       magnets?: Array<{ id?: number; ready?: boolean; error?: { code?: string; message?: string } }>;
@@ -734,6 +799,8 @@ async function adResolveStream(
   if (uploaded?.id == null) {
     throw new DebridError("HTTP_ERROR", "alldebrid", "AllDebrid did not return a magnet ID");
   }
+  const adId = uploaded.id;
+  track(() => fetchDebrid("alldebrid", `${AD_BASE}/magnet/delete?agent=${encodeURIComponent(AD_AGENT)}&id=${encodeURIComponent(String(adId))}`, bearerHeaders(apiKey)));
   if (uploaded.ready === false) {
     throw new DebridError("UNCACHED", "alldebrid", "Torrent is not cached on AllDebrid");
   }

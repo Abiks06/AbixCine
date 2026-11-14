@@ -241,6 +241,9 @@ registerSync({
     fetchSync()
       .then((s) => applyRemoteSettings(s.settings))
       .catch(() => {}),
+  // Per-show sub/dub choices belong to the account that made them. Device settings (quality,
+  // motion, folders, servers) stay, so signing out doesn't reconfigure the PC.
+  clear: () => apply({ audioByTitle: {} }),
 });
 
 export function useSettings(): Settings {

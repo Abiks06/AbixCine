@@ -63,3 +63,5 @@ jobs:
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: true
+          # Torrent streaming is behind a cargo feature; without this the installer shipped the stub.
+          args: --features torrent

@@ -120,6 +120,9 @@ function buildCacheKey(q: SkipSegmentsQuery): string | null {
   const season = toNonNegInt(q.season);
   const episode = toNonNegInt(q.episode);
   if (!tvdb && !tmdb && !imdb && !mal) return null;
+  // AniSkip answers per episode length, so a lookup made without one (before the video's duration
+  // was known) must not be served for a lookup that has it.
+  const len = typeof q.durationSec === "number" && q.durationSec > 0 ? Math.round(q.durationSec / 10) : "";
   return [
     kind,
     tvdb ?? "",
@@ -128,6 +131,7 @@ function buildCacheKey(q: SkipSegmentsQuery): string | null {
     mal ?? "",
     season ?? "",
     episode ?? "",
+    len,
   ].join("|");
 }
 
@@ -491,7 +495,9 @@ export async function fetchSkipSegments(
     }
   }
 
-  if (cacheKey && (cacheable || combined.intro || combined.outro || combined.recap || combined.preview)) {
+  // Only a complete answer is remembered. A partial one (a provider timed out) is still returned
+  // for this playback, but caching it hid the missing intro or credits for a week.
+  if (cacheKey && cacheable) {
     setCached(cacheKey, combined);
   }
   return combined;

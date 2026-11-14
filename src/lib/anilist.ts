@@ -101,6 +101,7 @@ function toMedia(m: AnilistMediaItem): Media {
     backdrop: m.bannerImage ?? undefined,
     genres: m.genres ?? [],
     color: m.coverImage?.color ?? undefined,
+    ...(m.format ? { format: m.format } : {}),
   };
 }
 

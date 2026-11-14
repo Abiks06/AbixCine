@@ -3,17 +3,18 @@ import { Link, useNavigate } from "react-router-dom";
 import { encodeKey } from "../lib/catalog";
 import { fmtRuntime } from "../lib/format";
 import { useFeatured, type Featured } from "../lib/useLogos";
-import { toggleList, useWatchlist } from "../lib/watchlist";
+import { toggleList, useSaved } from "../lib/watchlist";
 import { playHref } from "../lib/play";
 import { setStageLight } from "../lib/light";
 import { useSettings } from "../lib/settings";
 import type { Media } from "../lib/types";
 import { Art } from "./Art";
-import { kindLabel } from "./Card";
+import { kindLabel, seedState } from "./Card";
 import { Icon } from "./Icon";
 import { TitleArt } from "./TitleArt";
 
-const SLIDE_MS = 8000;
+const SLIDE_MS = 9000;
+const pad2 = (n: number) => String(n).padStart(2, "0");
 
 const length = (m: Featured) =>
   m.kind === "movie"
@@ -24,16 +25,19 @@ const length = (m: Featured) =>
         ? `${m.episodeCount} episode${m.episodeCount === 1 ? "" : "s"}`
         : "";
 
-/** Rotating spotlight: title art, chips, actions, a progress timeline and an "Up next" strip. */
+/**
+ * The living stage: a rotating spotlight with the title's own art, a ruled line of facts, the
+ * actions, a timeline of slides, and the whole programme listed down the right-hand side.
+ */
 export function Hero({ items, label, onActive }: { items: Media[]; label: string; onActive?: (m: Media) => void }) {
   const picks = useFeatured(items.filter((m) => m.backdrop || m.hue != null).slice(0, 6));
   const [i, setI] = useState(0);
   const [paused, setPaused] = useState(false);
   const nav = useNavigate();
-  const list = useWatchlist();
   const n = picks.length;
   const cur = n ? i % n : 0;
   const m = picks[cur];
+  const saved = useSaved(m?.key);
 
   // Don't rotate while the window is in the background or the hero is scrolled away.
   const root = useRef<HTMLElement>(null);
@@ -57,8 +61,8 @@ export function Hero({ items, label, onActive }: { items: Media[]; label: string
   }, [ready]);
   const hold = paused || away;
 
-  // The slide advances when its progress bar finishes (onAnimationEnd below), so pausing on hover,
-  // focus or visibility keeps bar and slide in step. Reduced motion: no autoplay at all (WCAG 2.2.2).
+  // The slide advances when its timeline tick finishes (onAnimationEnd below), so pausing on hover,
+  // focus or visibility keeps tick and slide in step. Reduced motion: no autoplay at all (WCAG 2.2.2).
   const still = useSettings().reduceMotion || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
   const advance = () => n > 1 && setI((x) => (x + 1) % n);
 
@@ -75,15 +79,15 @@ export function Hero({ items, label, onActive }: { items: Media[]; label: string
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [m?.key, m?.backdrop]);
 
-  if (!m) return <section className="hero hero-skeleton" ref={root} />;
-  const saved = list.some((e) => e.media.key === m.key);
-  const upNext = [1, 2, 3].map((k) => picks[(cur + k) % n]).filter((x) => x && x.key !== m.key);
+  if (!m) return <section className="hero hero-skeleton" ref={root} aria-busy />;
   const len = length(m);
 
   return (
     <section
       className="hero"
       ref={root}
+      aria-roledescription="carousel"
+      aria-label={`Featured ${label}`}
       onMouseEnter={() => setPaused(true)}
       onMouseLeave={() => setPaused(false)}
       onFocus={() => setPaused(true)}
@@ -101,52 +105,65 @@ export function Hero({ items, label, onActive }: { items: Media[]; label: string
           </div>
         ))}
       </div>
-      <div className="shade" />
-      <div className="copy pad" key={m.key}>
-        <div className="eyebrow">
-          <span className="tag"><Icon name="spark" size={12} /> #{cur + 1} {label}</span>
-          {[kindLabel(m.kind), m.year, ...m.genres.slice(0, 2)].filter(Boolean).join(" · ")}
+      <div className="hero-scrim" />
+
+      <div className="hero-body pad">
+        <div className="hero-copy" key={m.key}>
+          <div className="kicker">
+            <b>N°{pad2(cur + 1)}</b>
+            <i />
+            <em>{label}</em>
+          </div>
+          <TitleArt media={m} />
+          <div className="specs">
+            {m.rating ? <span className="star">★ {m.rating.toFixed(1)}</span> : null}
+            <span>{kindLabel(m.kind)}</span>
+            {m.year ? <span>{m.year}</span> : null}
+            {len && <span>{len}</span>}
+            {m.genres.length > 0 && <span>{m.genres.slice(0, 3).join(" · ")}</span>}
+            {m.kind === "anime" && <span className="hi">Sub · Dub</span>}
+          </div>
+          <p className="desc">{m.overview}</p>
+          <div className="acts">
+            <button className="btn play" onClick={() => nav(playHref(m), { viewTransition: true, state: { from: "app" } })}>
+              <Icon name="play" size={16} /> Play
+            </button>
+            <Link className="btn glass" to={`/title/${encodeKey(m.key)}`} state={seedState(m)} viewTransition>
+              <Icon name="info" size={18} /> Details
+            </Link>
+            <button className={`btn glass icon ${saved ? "on" : ""}`} onClick={() => toggleList(m)} aria-label={saved ? "Remove from My List" : "Add to My List"} aria-pressed={saved} title={saved ? "In My List" : "Add to My List"}>
+              <Icon name={saved ? "check" : "plus"} size={20} />
+            </button>
+          </div>
         </div>
-        <TitleArt media={m} />
-        <div className="meta">
-          {m.rating ? <span className="chip score">★ {m.rating.toFixed(1)}</span> : null}
-          {len && <span className="chip">{len}</span>}
-          {m.kind === "anime" && <span className="chip hi">SUB | DUB</span>}
-          {m.genres[2] && <span className="chip">{m.genres[2]}</span>}
-        </div>
-        <p className="desc">{m.overview}</p>
-        <div className="acts">
-          <button className="btn play" onClick={() => nav(playHref(m), { viewTransition: true, state: { from: "app" } })}>
-            <Icon name="play" size={16} /> Play
-          </button>
-          <Link className="btn glass" to={`/title/${encodeKey(m.key)}`} viewTransition>
-            <Icon name="info" size={18} /> Details
-          </Link>
-          <button className={`btn glass icon ${saved ? "on" : ""}`} onClick={() => toggleList(m)} aria-label={saved ? "Remove from My List" : "Add to My List"}>
-            <Icon name={saved ? "check" : "plus"} size={20} />
-          </button>
-        </div>
-      </div>
-      <div className="heroNav pad">
-        {picks.map((p, j) => (
-          <button key={p.key} className={j === cur ? "on" : j < cur ? "done" : ""} onClick={() => setI(j)} aria-label={`Show ${p.title}`}>
-            {j === cur && !still && (
-              <i key={cur} onAnimationEnd={advance} style={{ animationPlayState: hold ? "paused" : "running", animationDuration: `${SLIDE_MS}ms` }} />
-            )}
-          </button>
-        ))}
-      </div>
-      {upNext.length > 0 && (
-        <div className="next">
-          <h6>Up next</h6>
-          <div className="row3">
-            {upNext.map((p) => (
-              <button key={p.key} className="mini" onClick={() => setI(picks.indexOf(p))}>
+
+        {n > 1 && (
+          <div className="hero-queue">
+            <h6><span>Tonight's programme</span><span>{pad2(cur + 1)}/{pad2(n)}</span></h6>
+            {picks.map((p, j) => (
+              <button key={p.key} className={`hq ${j === cur ? "on" : ""}`} onClick={() => setI(j)} aria-label={`Show ${p.title}`} aria-current={j === cur}>
+                <span className="hq-n">{pad2(j + 1)}</span>
                 <Art media={p} variant="backdrop" size="sm" />
-                <span className="lt">{p.title}</span>
+                <span>
+                  <span className="hq-t">{p.title}</span>
+                  <span className="hq-m">{[kindLabel(p.kind), p.year, p.genres[0]].filter(Boolean).join(" · ")}</span>
+                </span>
               </button>
             ))}
           </div>
+        )}
+      </div>
+
+      {n > 1 && (
+        <div className="hero-ticks pad">
+          {picks.map((p, j) => (
+            <button key={p.key} className={j === cur ? "on" : j < cur ? "done" : ""} onClick={() => setI(j)} aria-label={`Show ${p.title}`} tabIndex={-1}>
+              {j === cur && !still && (
+                <i key={cur} onAnimationEnd={advance} style={{ animationPlayState: hold ? "paused" : "running", animationDuration: `${SLIDE_MS}ms` }} />
+              )}
+            </button>
+          ))}
+          <span className="hero-count"><b>{pad2(cur + 1)}</b> / {pad2(n)}</span>
         </div>
       )}
     </section>

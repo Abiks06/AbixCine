@@ -481,6 +481,43 @@ fn media_needs_audio_conversion(path: &Path, probe: &serde_json::Value) -> bool 
     }
 }
 
+/// FNV-1a over a list of parts. Cache file names must stay the same across Rust releases:
+/// `DefaultHasher` makes no such promise, and a toolchain update would orphan every cached file.
+fn stable_hash(parts: &[&[u8]]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for part in parts {
+        for b in part.iter().chain(std::iter::once(&0xffu8)) {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// The audio codecs a browser plays inside MP4 (these can be copied instead of re-encoded).
+fn mp4_audio_compatible(probe: &serde_json::Value) -> bool {
+    let codecs: Vec<&str> = probe
+        .get("streams")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|s| s.get("codec_type").and_then(serde_json::Value::as_str) == Some("audio"))
+        .filter_map(|s| s.get("codec_name").and_then(serde_json::Value::as_str))
+        .collect();
+    !codecs.is_empty() && codecs.iter().all(|c| ["aac", "mp3"].contains(c))
+}
+
+/// Remove conversions that never finished (the app was closed mid-way).
+fn sweep_partials(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        if name.to_string_lossy().contains(".partial.") {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
 fn compatible_subtitle_indices(probe: &serde_json::Value) -> Vec<u64> {
     probe
         .get("streams")
@@ -860,13 +897,13 @@ fn prepare_local_media_file(
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|time| time.as_nanos())
         .unwrap_or_default();
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    use std::hash::{Hash, Hasher};
-    canonical.hash(&mut hasher);
-    metadata.len().hash(&mut hasher);
-    modified.hash(&mut hasher);
-    "abixcine-local-mp4-aac-v1".hash(&mut hasher);
-    let output = cache_dir.join(format!("{:016x}.mp4", hasher.finish()));
+    let key = stable_hash(&[
+        canonical.to_string_lossy().as_bytes(),
+        &metadata.len().to_le_bytes(),
+        &modified.to_le_bytes(),
+        b"abixcine-local-mp4-aac-v2",
+    ]);
+    let output = cache_dir.join(format!("{key:016x}.mp4"));
     if output.metadata().map(|m| m.len() > 0).unwrap_or(false) {
         return Ok(output.to_string_lossy().into_owned());
     }
@@ -881,7 +918,14 @@ fn prepare_local_media_file(
     for index in &subtitle_indices {
         command.arg("-map").arg(format!("0:{index}"));
     }
-    command.args(["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-map_metadata", "0", "-dn"]);
+    // Audio the browser already plays is copied (a remux takes seconds, not minutes). Anything
+    // else becomes stereo AAC: 5.1 squeezed into 192k sounded thin, and browsers downmix
+    // multichannel AAC unpredictably.
+    if mp4_audio_compatible(&probe) {
+        command.args(["-c:v", "copy", "-c:a", "copy", "-map_metadata", "0", "-dn"]);
+    } else {
+        command.args(["-c:v", "copy", "-c:a", "aac", "-ac", "2", "-b:a", "192k", "-map_metadata", "0", "-dn"]);
+    }
     if !subtitle_indices.is_empty() {
         command.args(["-c:s", "mov_text"]);
     }
@@ -1046,15 +1090,14 @@ fn extracted_sub_format_and_codec(codec: &str) -> (&'static str, &'static str) {
 }
 
 fn extracted_sub_cache_key(canonical: &Path, size: u64, modified_nanos: u128, stream_index: u64, format: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    canonical.hash(&mut hasher);
-    size.hash(&mut hasher);
-    modified_nanos.hash(&mut hasher);
-    stream_index.hash(&mut hasher);
-    format.hash(&mut hasher);
-    "abixcine-local-sub-v1".hash(&mut hasher);
-    hasher.finish()
+    stable_hash(&[
+        canonical.to_string_lossy().as_bytes(),
+        &size.to_le_bytes(),
+        &modified_nanos.to_le_bytes(),
+        &stream_index.to_le_bytes(),
+        format.as_bytes(),
+        b"abixcine-local-sub-v2",
+    ])
 }
 
 fn extract_local_subtitle_sync(
@@ -1316,6 +1359,9 @@ pub fn run() {
             tauri::async_runtime::spawn(async move { responder.respond(stream::handle(req).await) });
         })
         .setup(|app| {
+            if let Ok(cache) = app.path().app_cache_dir() {
+                std::thread::spawn(move || sweep_partials(&cache.join("local-media")));
+            }
             // Ad, tracker and pop-up shield on the main window, covering every embedded frame.
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.with_webview(|pw| shield::install(&pw, true, None));

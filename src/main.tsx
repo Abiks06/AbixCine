@@ -1,11 +1,14 @@
 import "@fontsource-variable/geist";
-import "@fontsource-variable/sora";
+import "@fontsource-variable/bricolage-grotesque/standard.css";
+import "@fontsource/instrument-serif/400.css";
+import "@fontsource/instrument-serif/400-italic.css";
 import "@fontsource-variable/jetbrains-mono";
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
-import "./styles.css";
-import "./aurora.css";
+import "./styles/base.css";
+import "./styles/browse.css";
+import "./styles/player.css";
 import { installPointerLight } from "./lib/pointerLight";
 
 installPointerLight();

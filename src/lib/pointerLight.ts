@@ -2,7 +2,7 @@ import { getSettings } from "./settings";
 
 /**
  * Cards catch the light where the pointer is and lean a few degrees toward it. One listener for
- * the whole app writes four CSS variables on the card under the pointer (see aurora.css); a card
+ * the whole app writes four CSS variables on the card under the pointer (see styles/browse.css); a card
  * the pointer has left gets them removed, so it settles back flat.
  */
 const VARS = ["--mx", "--my", "--rx", "--ry"] as const;
@@ -17,6 +17,7 @@ export function installPointerLight() {
   const clear = () => {
     if (!lit) return;
     for (const v of VARS) lit.style.removeProperty(v);
+    lit.classList.remove("lit");
     lit = null;
   };
 
@@ -28,6 +29,8 @@ export function installPointerLight() {
     if (el !== lit) clear();
     if (!el) return;
     lit = el;
+    // Track the pointer 1:1 while it steers the tilt; the spring only plays on release (styles/browse.css).
+    el.classList.add("lit");
     const r = el.getBoundingClientRect();
     if (!r.width || !r.height) return;
     const x = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));

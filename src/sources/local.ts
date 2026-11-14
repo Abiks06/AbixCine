@@ -29,13 +29,33 @@ export interface ScanError {
 export const scanErrors = () => index?.errors ?? [];
 
 /** Scan the library folders (Rust side walks the disk) with a 5 minute cache. */
+let scanning: { key: string; p: Promise<LibFile[]> } | null = null;
 export async function scanLibrary(paths: string[], force = false): Promise<LibFile[]> {
   if (!isTauri() || !paths.length) return [];
   const key = paths.join("|");
   if (!force && index && index.key === key && Date.now() - index.at < 300_000) return index.files;
-  const r = await invoke<{ files: LibFile[]; errors: ScanError[] }>("scan_library", { paths });
-  index = { at: Date.now(), key, files: r.files, errors: r.errors };
-  return r.files;
+  // Every source and screen asking at once shares one walk of the disk.
+  if (scanning && scanning.key === key && !force) return scanning.p;
+  const p = invoke<{ files: LibFile[]; errors: ScanError[] }>("scan_library", { paths })
+    .then((r) => {
+      // A scan where every folder failed (drive unplugged) isn't cached: plugging it back in works at once.
+      const allFailed = !r.files.length && r.errors.length > 0;
+      index = { at: allFailed ? 0 : Date.now(), key, files: r.files, errors: r.errors };
+      return r.files;
+    })
+    .finally(() => {
+      if (scanning?.p === p) scanning = null;
+    });
+  scanning = { key, p };
+  return p;
+}
+
+/** The part of a path below whichever library folder holds it ("D:\Media\Show\01.mkv" → "Show\01.mkv"). */
+export function relativeToLibrary(path: string, roots: string[]) {
+  const norm = (s: string) => s.replace(/[\\/]+$/, "").toLowerCase();
+  const lower = path.toLowerCase();
+  const root = roots.map(norm).filter((r) => lower.startsWith(r + "\\") || lower.startsWith(r + "/")).sort((a, b) => b.length - a.length)[0];
+  return root ? path.slice(root.length + 1) : path;
 }
 
 /** Strip a real video extension only ("Dune.2021" is a stem, not "Dune" + ".2021"). */
@@ -83,7 +103,9 @@ export function titleMatches(hay: string, req: Pick<PlaybackRequest, "media">) {
     .filter((t): t is string => Boolean(t))
     .some((t) => {
       const n = normTitle(t);
-      return n.length > 1 && f.includes(` ${n} `);
+      if (!n) return false;
+      // One-letter titles ("X", "M") would match any stray letter: require them to lead the name.
+      return n.length > 1 ? f.includes(` ${n} `) : f.startsWith(` ${n} `);
     });
 }
 
@@ -179,7 +201,8 @@ export const localProvider: SourceProvider = {
     const matched: { file: LibFile; audio: "sub" | "dub" | "dual" }[] = [];
     for (const f of files) {
       // Match against the file name plus its parent folders, since many libraries are "Show/Season 1/01.mkv".
-      const hay = f.path.split(/[\\/]/).slice(-3).join(" ");
+      // Only folders inside the library count: the library's own location ("D:\\Home\\…") is not a title.
+      const hay = relativeToLibrary(f.path, s.libraryPaths).split(/[\\/]/).slice(-3).join(" ");
       if (!titleMatches(hay, req)) continue;
       const ep = parseEpisode(f.name, f.path);
       if (req.episode != null) {

@@ -431,6 +431,9 @@ function startWebGL2Enhancer(
     const vw = video.videoWidth;
     const vh = video.videoHeight;
     if (!vw || !vh) return false;
+    // A frame larger than the GPU's biggest texture can't be uploaded at all (texImage2D throws):
+    // report "can't enhance" and let the caller fall back to the native picture.
+    if (vw > maxDim || vh > maxDim) return false;
     w = vw;
     h = vh;
     const target = computeTargetSize(canvas, w, h, maxDim);
@@ -641,6 +644,9 @@ export async function startEnhancer(
   let chain = "";
   let w = 0;
   let h = 0;
+  /** The video's own size at the last setup. `w`/`h` are clamped to the GPU limit, so they can't be compared against it. */
+  let rawW = 0;
+  let rawH = 0;
   let inflight = 0;
   const retired: { pipes: Pipe[]; input: GPUTexture | null }[] = [];
   const maxDim = device.limits?.maxTextureDimension2D ?? 4096;
@@ -679,6 +685,8 @@ export async function startEnhancer(
     if (!vw || !vh) return false;
     // New shaders compile on their first frames: judge the chain only after it settles.
     graceUntil = performance.now() + 2500;
+    rawW = vw;
+    rawH = vh;
     w = Math.min(vw, maxDim);
     h = Math.min(vh, maxDim);
     const target = computeTargetSize(canvas, w, h, maxDim);
@@ -694,7 +702,14 @@ export async function startEnhancer(
     });
     const built = buildChain(A, device, input, mode as Exclude<EnhanceMode, "off">, { width: w, height: h }, target);
     if (!built.pipes.length) {
+      // Nothing was built: the texture just created for it would otherwise leak until GC.
       releaseResources(oldPipes, oldInput);
+      try {
+        input.destroy();
+      } catch {
+        /* already gone with a lost device */
+      }
+      input = null;
       return false;
     }
     pipes = built.pipes;
@@ -765,7 +780,10 @@ export async function startEnhancer(
   let winStartMedia = 0;
   let frames = 0;
   /** Budget per frame from the video's own frame rate (falls back to 24 fps). */
+  /** Wall-clock milliseconds available per frame (shrinks as playback speeds up). */
   let frameBudget = 1000 / 24;
+  /** Media-time milliseconds between frames (the stream's own frame interval, whatever the speed). */
+  let mediaFrame = 1000 / 24;
   let lastMediaTime = 0;
   let consecutiveErrors = 0;
 
@@ -781,7 +799,9 @@ export async function startEnhancer(
     const vh = video.videoHeight;
     if (video.readyState < 2 || !vw || !vh) return;
     // Sync immediately when stream resolution changes mid-playback (e.g., HLS/DASH ABR switch).
-    if (vw !== w || vh !== h) {
+    // Compared against the unclamped size: with a source wider than the GPU limit, comparing to
+    // the clamped one was true on every frame and rebuilt the whole shader chain 60 times a second.
+    if (vw !== rawW || vh !== rawH) {
       if (!setup()) return;
     }
     try {
@@ -907,11 +927,17 @@ export async function startEnhancer(
       if (span > 30 || span < 0) (winStartMedia = mt), (winFrames = winSkips = 0);
       return;
     }
-    const expected = (span * 1000) / frameBudget;
+    // `span` is media time, so it must be divided by the media frame interval. Dividing by the
+    // wall-clock budget doubled the expected count at 2× speed and downgraded a chain that was keeping up.
+    const expected = (span * 1000) / mediaFrame;
     const ratio = winFrames / Math.max(1, expected);
+    const winFramesSeen = winFrames + winSkips;
+    const winSkipsSeen = winSkips;
     winStartMedia = mt;
     winFrames = winSkips = 0;
-    const behind = ratio < 0.8;
+    const skipShare = winFramesSeen > 0 ? winSkipsSeen / winFramesSeen : 0;
+    const gpuOver = timing && gpuEma > 0 && gpuEma > frameBudget * 0.95;
+    const behind = ratio < 0.8 || skipShare > 0.35 || gpuOver;
     if (!behind) return;
     // At most one step down every 10 s: give the new chain a fair chance.
     if (performance.now() - lastStep < 10_000) return;
@@ -934,7 +960,10 @@ export async function startEnhancer(
     if (!running) return;
     if (lastMediaTime && meta.mediaTime > lastMediaTime) {
       const dt = (meta.mediaTime - lastMediaTime) * 1000;
-      if (dt > 8 && dt < 70) frameBudget = frameBudget * 0.9 + (dt / (video.playbackRate || 1)) * 0.1;
+      if (dt > 8 && dt < 70) {
+        mediaFrame = mediaFrame * 0.9 + dt * 0.1;
+        frameBudget = mediaFrame / (video.playbackRate || 1);
+      }
     }
     lastMediaTime = meta.mediaTime;
     // Hidden window: nothing to show. Busy GPU: drop this frame rather than queue it.

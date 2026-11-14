@@ -1,4 +1,5 @@
 import { httpFetch, native } from "../sources/native";
+import { idbAvailable, idbDelete, idbGet, idbSet } from "./idb";
 import type { MediaKind, PlaybackRequest, SeasonCour } from "./types";
 
 export const FRIBB_MINI_URL = "https://raw.githubusercontent.com/Fribb/anime-lists/master/anime-list-mini.json";
@@ -389,7 +390,15 @@ function addAnibridgeToIndex(idx: MappingIndex, data: CompactAnibridgeData, load
   }
 }
 
-function readStorageJson<T>(key: string): T | null {
+/*
+ * Storage. The two mapping tables are megabytes of JSON: kept in localStorage they crowded out
+ * progress, My List and settings (all of which share its ~5 MB). They live in IndexedDB now, read
+ * into memory in the background at startup. localStorage is only read to migrate an old copy, and
+ * as the store where IndexedDB doesn't exist (tests).
+ */
+const idbStore = idbAvailable();
+
+function readLegacyJson<T>(key: string): T | null {
   try {
     if (typeof localStorage === "undefined") return null;
     const raw = localStorage.getItem(key);
@@ -400,13 +409,68 @@ function readStorageJson<T>(key: string): T | null {
   }
 }
 
+function readStorageJson<T>(key: string): T | null {
+  // With IndexedDB the persisted copy arrives through hydrateFromIdb(); this sync path only sees
+  // a not-yet-migrated localStorage copy.
+  return readLegacyJson<T>(key);
+}
+
 function writeStorageJson(key: string, value: unknown): void {
+  if (idbStore) {
+    void idbSet(key, value).then((ok) => {
+      if (!ok) return;
+      try {
+        localStorage.removeItem(key); // migrated: free the space
+      } catch {
+        /* ignore */
+      }
+    });
+    return;
+  }
   try {
     if (typeof localStorage === "undefined") return;
     localStorage.setItem(key, JSON.stringify(value));
   } catch {
     // QuotaExceededError or restricted storage: in-memory index remains active.
   }
+}
+
+/** Bumped on every clear, so a hydration that started before it can't resurrect cleared data. */
+let loadEpoch = 0;
+let hydrating: Promise<void> | null = null;
+
+/** Read the persisted tables from IndexedDB into the in-memory index (once per epoch). */
+function hydrateFromIdb(): Promise<void> {
+  if (!idbStore) return Promise.resolve();
+  if (hydrating) return hydrating;
+  const epoch = loadEpoch;
+  hydrating = (async () => {
+    const [fribb, anibridge] = await Promise.all([
+      idbGet<CompactFribbPayload>(STORAGE_FRIBB_KEY),
+      idbGet<CompactAnibridgePayload>(STORAGE_ANIBRIDGE_KEY),
+    ]);
+    if (epoch !== loadEpoch) return;
+    const legacyF = fribb ? null : readLegacyJson<CompactFribbPayload>(STORAGE_FRIBB_KEY);
+    const legacyA = anibridge ? null : readLegacyJson<CompactAnibridgePayload>(STORAGE_ANIBRIDGE_KEY);
+    const f = fribb ?? legacyF;
+    const a = anibridge ?? legacyA;
+    const idx = memIndex ?? createEmptyIndex();
+    // Only fill what memory doesn't already have fresher.
+    if (f && typeof f.at === "number" && Array.isArray(f.rows) && f.at > idx.fribbLoadedAt) addFribbRowsToIndex(idx, f.rows, f.at);
+    if (a && typeof a.at === "number" && a.data && typeof a.data === "object" && a.at > idx.anibridgeLoadedAt) addAnibridgeToIndex(idx, a.data, a.at);
+    if (idx.fribbLoadedAt > 0 || idx.anibridgeLoadedAt > 0) memIndex = idx;
+    // One-time move of an old localStorage copy into IndexedDB.
+    if (legacyF) writeStorageJson(STORAGE_FRIBB_KEY, legacyF);
+    if (legacyA) writeStorageJson(STORAGE_ANIBRIDGE_KEY, legacyA);
+  })().catch(() => {});
+  return hydrating;
+}
+
+// Warm the index as soon as the module loads, off the critical path.
+if (idbStore && typeof window !== "undefined") {
+  const start = () => void hydrateFromIdb();
+  if ("requestIdleCallback" in window) window.requestIdleCallback(start, { timeout: 3000 });
+  else setTimeout(start, 500);
 }
 
 function hydrateIndexFromStorage(ttlMs = DEFAULT_TTL_MS): {
@@ -519,6 +583,8 @@ export async function loadAnimeMappings(signal?: AbortSignal, ttlMs = DEFAULT_TT
   if (signal?.aborted) {
     return memIndex ?? createEmptyIndex();
   }
+  // Read what is stored before deciding to download it again.
+  await raceWithAbort(hydrateFromIdb(), signal);
 
   const state = getOrHydrateMemIndex(ttlMs);
   const now = Date.now();
@@ -530,6 +596,7 @@ export async function loadAnimeMappings(signal?: AbortSignal, ttlMs = DEFAULT_TT
   }
 
   if (!inflightLoad) {
+    const epoch = loadEpoch;
     inflightLoad = (async () => {
       const idx = memIndex ?? state.index;
       const tasks: Promise<void>[] = [];
@@ -567,7 +634,8 @@ export async function loadAnimeMappings(signal?: AbortSignal, ttlMs = DEFAULT_TT
       }
 
       await Promise.allSettled(tasks);
-      memIndex = idx;
+      // Cleared while downloading: don't put the old index back.
+      if (epoch === loadEpoch) memIndex = idx;
       return idx;
     })().finally(() => {
       inflightLoad = null;
@@ -612,8 +680,14 @@ export function seedAnimeMappings(opts: {
 
 /** Clear in-memory and localStorage mapping caches (for testing or forced refresh). */
 export function clearAnimeMappingCache(): void {
+  loadEpoch++;
+  hydrating = null;
   memIndex = null;
   inflightLoad = null;
+  if (idbStore) {
+    void idbDelete(STORAGE_FRIBB_KEY);
+    void idbDelete(STORAGE_ANIBRIDGE_KEY);
+  }
   fribbFailedAt = 0;
   anibridgeFailedAt = 0;
   try {

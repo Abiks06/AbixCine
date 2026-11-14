@@ -824,8 +824,11 @@ export async function resolveStremioStreams(
         .sort((a, b) => (b.quality ?? 0) - (a.quality ?? 0))
         .slice(0, DEBRID_MAX_CANDIDATES);
 
+      // A bad key or a rate limit applies to every remaining item: stop asking instead of
+      // spending each one on the same refusal (and deepening the rate limit).
+      let blocked = false;
       const resolved = await mapWithConcurrency(cachedItems, DEBRID_RESOLVE_CONCURRENCY, async (item) => {
-        if (signal?.aborted) return null;
+        if (signal?.aborted || blocked) return null;
         try {
           const res = await resolveDebridStream(
             debrid.provider,
@@ -837,6 +840,8 @@ export async function resolveStremioStreams(
           return { item, res };
         } catch (err) {
           if (signal?.aborted || isAbortErr(err)) throw err;
+          const code = (err as { code?: string } | null)?.code;
+          if (code === "INVALID_KEY" || code === "RATE_LIMIT") blocked = true;
           return null;
         }
       });

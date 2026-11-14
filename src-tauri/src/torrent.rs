@@ -178,7 +178,11 @@ pub(crate) fn parse_http_range_header(header_val: &str, total_len: u64) -> Resul
     if total_len == 0 {
         return Err(());
     }
-    let spec = header_val.trim().strip_prefix("bytes=").ok_or(())?.trim();
+    let trimmed = header_val.trim();
+    if !trimmed.as_bytes().get(..6).is_some_and(|b| b.eq_ignore_ascii_case(b"bytes=")) {
+        return Err(());
+    }
+    let spec = trimmed[6..].trim();
     if spec.contains(',') {
         return Err(());
     }
@@ -249,9 +253,11 @@ mod enabled {
         AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, Session,
         SessionOptions, TorrentStatsState,
     };
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::io::SeekFrom;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::Duration;
+    use tokio::sync::{Notify, Semaphore};
     use tauri::Manager;
     use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -263,6 +269,38 @@ mod enabled {
     }
 
     static TORRENT_RUNTIME: OnceCell<Arc<TorrentRuntime>> = OnceCell::const_new();
+
+    /// One open-ended response never pins a file reader for longer than this many bytes: the
+    /// player simply asks for the next window. librqbit has a small fixed pool of readers, and a
+    /// reader held to end-of-file by an abandoned request used to exhaust it after a few seeks.
+    const MAX_WINDOW: u64 = 16 * 1024 * 1024;
+    /// A reader waiting this long for pieces that never come is released.
+    const READ_STALL: Duration = Duration::from_secs(90);
+    const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+    const MAX_CONNECTIONS: usize = 24;
+
+    /// Wakes every response streaming from a torrent when it is stopped.
+    fn stop_signal(id: usize) -> Arc<Notify> {
+        static MAP: OnceLock<Mutex<HashMap<usize, Arc<Notify>>>> = OnceLock::new();
+        let mut m = MAP.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner());
+        m.entry(id).or_insert_with(|| Arc::new(Notify::new())).clone()
+    }
+
+    fn app_origin() -> &'static str {
+        if cfg!(debug_assertions) {
+            "http://localhost:1420"
+        } else if cfg!(windows) {
+            "http://tauri.localhost"
+        } else {
+            "tauri://localhost"
+        }
+    }
+
+    /// True once the client has hung up. Data instead (a pipelined request) means it is still there.
+    async fn client_gone(socket: &TcpStream) -> bool {
+        let mut probe = [0u8; 1];
+        matches!(socket.peek(&mut probe).await, Ok(0) | Err(_))
+    }
 
     async fn get_or_init_runtime(app: &tauri::AppHandle) -> Result<Arc<TorrentRuntime>, String> {
         TORRENT_RUNTIME
@@ -313,13 +351,21 @@ mod enabled {
     }
 
     async fn run_stream_server(listener: TcpListener, session: Arc<Session>) {
+        let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         loop {
-            let Ok((socket, _)) = listener.accept().await else {
-                continue;
+            let (socket, _) = match listener.accept().await {
+                Ok(c) => c,
+                Err(_) => {
+                    // e.g. out of file handles: back off instead of spinning a core.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
             };
+            let Ok(slot) = slots.clone().acquire_owned().await else { return };
             let session = session.clone();
             tauri::async_runtime::spawn(async move {
                 let _ = handle_http_connection(socket, session).await;
+                drop(slot);
             });
         }
     }
@@ -347,12 +393,14 @@ mod enabled {
         let head = format!(
             "HTTP/1.1 {status}\r\n\
              Content-Length: {}\r\n\
-             Access-Control-Allow-Origin: *\r\n\
+             Access-Control-Allow-Origin: {origin}\r\n\
+             Vary: Origin\r\n\
              Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n\
              Access-Control-Allow-Headers: Range, Content-Type\r\n\
              Cache-Control: no-store\r\n\
              {extra_headers}\r\n",
-            body.len()
+            body.len(),
+            origin = app_origin()
         );
         socket.write_all(head.as_bytes()).await?;
         if !body.is_empty() {
@@ -378,7 +426,11 @@ mod enabled {
                     return Ok(());
                 }
                 let mut tmp = [0u8; 1024];
-                let n = socket.read(&mut tmp).await?;
+                // An idle or dribbling client can't hold a connection slot forever.
+                let n = match tokio::time::timeout(HEADER_TIMEOUT, socket.read(&mut tmp)).await {
+                    Ok(r) => r?,
+                    Err(_) => return Ok(()),
+                };
                 if n == 0 {
                     return Ok(());
                 }
@@ -448,38 +500,36 @@ mod enabled {
                 continue;
             };
 
-            let file_name = handle
+            let Some((file_name, total_len)) = handle
                 .with_metadata(|m| {
                     m.file_infos
                         .get(file_idx)
-                        .map(|f| f.relative_filename.to_string_lossy().into_owned())
+                        .map(|f| (f.relative_filename.to_string_lossy().into_owned(), f.len))
                 })
                 .ok()
                 .flatten()
-                .unwrap_or_default();
+            else {
+                write_simple_response(&mut socket, "404 Not Found", "", b"no such file").await?;
+                if close_conn {
+                    return Ok(());
+                }
+                continue;
+            };
             let mime = video_mime_type(&file_name);
 
-            let mut stream = match handle.stream(file_idx).await {
-                Ok(s) => s,
-                Err(_) => {
-                    write_simple_response(&mut socket, "404 Not Found", "", b"stream unavailable")
-                        .await?;
-                    if close_conn {
-                        return Ok(());
-                    }
-                    continue;
-                }
-            };
-
-            let total_len = stream.len();
+            // Everything below is answered from metadata, before a file reader is opened: HEAD
+            // probes and bad ranges used to take one of librqbit's few readers and never give it back.
             let (status_line, start, end, content_range_hdr) = if let Some(ref r) = range_hdr {
                 match parse_http_range_header(r, total_len) {
-                    Ok((s, e)) => (
+                    Ok((s, e)) => {
+                        let e = if r.trim_end().ends_with('-') { e.min(s.saturating_add(MAX_WINDOW - 1)) } else { e };
+                        (
                         "206 Partial Content",
                         s,
                         e,
                         Some(format!("Content-Range: bytes {s}-{e}/{total_len}\r\n")),
-                    ),
+                    )
+                    }
                     Err(()) => {
                         let hdr = format!("Content-Range: bytes */{total_len}\r\n");
                         write_simple_response(&mut socket, "416 Range Not Satisfiable", &hdr, b"")
@@ -497,7 +547,21 @@ mod enabled {
             };
 
             let content_len = if total_len == 0 { 0 } else { end - start + 1 };
-            if !is_head && start > 0 {
+            let mut stream = if is_get && content_len > 0 {
+                match handle.stream(file_idx).await {
+                    Ok(s) => Some(s),
+                    Err(_) => {
+                        write_simple_response(&mut socket, "404 Not Found", "", b"stream unavailable").await?;
+                        if close_conn {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(stream) = stream.as_mut().filter(|_| start > 0) {
                 if let Err(err) = stream.seek(SeekFrom::Start(start)).await {
                     let msg = format!("seek error: {err}");
                     write_simple_response(
@@ -523,24 +587,48 @@ mod enabled {
                  Accept-Ranges: bytes\r\n\
                  Content-Length: {content_len}\r\n\
                  {cr}\
-                 Access-Control-Allow-Origin: *\r\n\
+                 Access-Control-Allow-Origin: {origin}\r\n\
+                 Vary: Origin\r\n\
                  Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n\
                  Access-Control-Allow-Headers: Range, Content-Type\r\n\
                  Cache-Control: no-store\r\n\
-                 {conn_hdr}\r\n"
+                 {conn_hdr}\r\n",
+                origin = app_origin()
             );
             socket.write_all(head.as_bytes()).await?;
 
-            if is_get && content_len > 0 {
+            if let Some(mut stream) = stream {
+                let stopped = stop_signal(torrent_id);
                 let mut remaining = content_len;
                 let mut chunk = vec![0u8; 64 * 1024];
+                let mut watch_client = true;
                 while remaining > 0 {
                     let to_read = (remaining as usize).min(chunk.len());
-                    let n = stream.read(&mut chunk[..to_read]).await?;
+                    // A read can wait a long time for pieces. Meanwhile the player may have
+                    // seeked away (closing this connection) or the torrent been stopped: either
+                    // way, give the reader back now rather than when the pieces finally arrive.
+                    let n = tokio::select! {
+                        biased;
+                        _ = stopped.notified() => return Ok(()),
+                        gone = client_gone(&socket), if watch_client => {
+                            if gone {
+                                return Ok(());
+                            }
+                            watch_client = false; // pipelined bytes, not a hang-up: stop polling for it
+                            continue;
+                        }
+                        r = tokio::time::timeout(READ_STALL, stream.read(&mut chunk[..to_read])) => match r {
+                            Ok(r) => r?,
+                            Err(_) => return Ok(()),
+                        },
+                    };
                     if n == 0 {
                         return Ok(());
                     }
-                    socket.write_all(&chunk[..n]).await?;
+                    tokio::select! {
+                        _ = stopped.notified() => return Ok(()),
+                        r = socket.write_all(&chunk[..n]) => r?,
+                    }
                     remaining -= n as u64;
                 }
             }
@@ -675,6 +763,8 @@ mod enabled {
         let rt = TORRENT_RUNTIME
             .get()
             .ok_or_else(|| "Torrent session is not initialized".to_string())?;
+        // Release any reader still serving this torrent before its files go away.
+        stop_signal(id).notify_waiters();
         rt.session
             .delete(TorrentIdOrHash::Id(id), true)
             .await

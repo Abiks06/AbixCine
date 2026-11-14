@@ -172,12 +172,25 @@ pub(crate) fn is_retryable_status(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 504)
 }
 
+/// The largest index <= `max` that falls on a char boundary, so a byte window over untrusted
+/// text can never split a multi-byte character (which panics).
+pub(crate) fn floor_char_boundary(s: &str, max: usize) -> usize {
+    if max >= s.len() {
+        return s.len();
+    }
+    let mut i = max;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 fn is_valid_m3u8_body(text: &str) -> bool {
     let trimmed = text.trim_start_matches('\u{feff}').trim();
     if !trimmed.starts_with("#EXTM3U") {
         return false;
     }
-    let lower = trimmed[..trimmed.len().min(2048)].to_ascii_lowercase();
+    let lower = trimmed[..floor_char_boundary(trimmed, 2048)].to_ascii_lowercase();
     if lower.contains("<!doctype") || lower.contains("<html") || lower.contains("<script") || lower.contains("cf-browser-verification") || lower.contains("captcha") {
         return false;
     }
@@ -226,7 +239,19 @@ pub fn client() -> &'static reqwest::Client {
             .pool_max_idle_per_host(16)
             .pool_idle_timeout(Duration::from_secs(90))
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(45))
+            // A stalled socket gives up quickly; a slow but steady large read still finishes.
+            .read_timeout(Duration::from_secs(20))
+            .timeout(Duration::from_secs(120))
+            // Every hop is re-checked: an allowed http(s) URL must not bounce us to another scheme.
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= 8 {
+                    attempt.error("too many redirects")
+                } else if !matches!(attempt.url().scheme(), "http" | "https") {
+                    attempt.stop()
+                } else {
+                    attempt.follow()
+                }
+            }))
             // No transparent decompression: some media hosts label raw bytes as gzip, and
             // video gains nothing from it anyway.
             .build()
@@ -505,13 +530,38 @@ fn rewrite_mpd(text: &str, manifest_url: &str, h: &Hdrs, base: &str) -> String {
     out
 }
 
+/// The only page that should read proxied media: AbixCine's own window.
+fn app_origin() -> &'static str {
+    if cfg!(debug_assertions) {
+        "http://localhost:1420"
+    } else if cfg!(windows) {
+        "http://tauri.localhost"
+    } else {
+        "tauri://localhost"
+    }
+}
+
 fn cors(b: tauri::http::response::Builder) -> tauri::http::response::Builder {
-    b.header("Access-Control-Allow-Origin", "*")
+    b.header("Access-Control-Allow-Origin", app_origin())
+        .header("Vary", "Origin")
         .header("Access-Control-Allow-Headers", "*")
         .header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
         .header("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges")
         .header("Cross-Origin-Resource-Policy", "cross-origin")
         .header("Timing-Allow-Origin", "*")
+        // Whatever upstream sends, it is media to us: never sniffed into a document, never run.
+        .header("X-Content-Type-Options", "nosniff")
+        .header("Content-Security-Policy", "default-src 'none'; sandbox")
+}
+
+/// Content types a browser would render or execute. The proxy forwards bytes for a media
+/// player; served as one of these, an upstream page would run with the proxy's origin.
+fn is_active_document_type(ct: &str) -> bool {
+    let base = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    matches!(
+        base.as_str(),
+        "text/html" | "application/xhtml+xml" | "image/svg+xml" | "application/javascript" | "text/javascript" | "application/ecmascript" | "text/xml" | "application/xml"
+    )
 }
 
 fn fail(code: StatusCode, msg: &str) -> Response<Vec<u8>> {
@@ -572,7 +622,8 @@ fn is_video_extension(target: &str) -> bool {
 
 pub(crate) fn parse_byte_range(header: &str) -> Option<(u64, Option<u64>)> {
     let trimmed = header.trim();
-    if trimmed.len() < 6 || !trimmed[..6].eq_ignore_ascii_case("bytes=") {
+    // Compared as bytes: slicing the str at 6 panicked when a multi-byte character straddled it.
+    if !trimmed.as_bytes().get(..6).is_some_and(|b| b.eq_ignore_ascii_case(b"bytes=")) {
         return None;
     }
     let spec = trimmed[6..].trim();
@@ -788,7 +839,7 @@ pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
     let looks_dash = target_lower.contains(".mpd");
     if let Some((final_url, body)) = cached_playlist(&target) {
         let text = String::from_utf8_lossy(&body);
-        let head = &text[..text.len().min(MPD_SNIFF_WINDOW)];
+        let head = &text[..floor_char_boundary(&text, MPD_SNIFF_WINDOW)];
         if looks_dash || head.contains("<MPD") {
             let out = rewrite_mpd(&text, &final_url, &h, base);
             return cors(Response::builder().status(200))
@@ -803,6 +854,30 @@ pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
             .header(header::CACHE_CONTROL, "no-cache")
             .body(out.into_bytes())
             .unwrap();
+    }
+
+    // A HEAD probe asks for the headers only. It used to be sent upstream as a GET, which
+    // downloaded (and returned) a whole chunk of media just to learn its length.
+    if req.method() == tauri::http::Method::HEAD {
+        return match apply(client().head(&target), &h).send().await {
+            Ok(r) => {
+                let mut b = cors(Response::builder().status(r.status().as_u16()));
+                for name in [header::CONTENT_LENGTH, header::ACCEPT_RANGES, header::CONTENT_RANGE] {
+                    if let Some(v) = r.headers().get(&name).and_then(|v| v.to_str().ok()) {
+                        b = b.header(name, v);
+                    }
+                }
+                let ct = r.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+                if !ct.is_empty() {
+                    b = b.header(header::CONTENT_TYPE, if is_active_document_type(ct) { "application/octet-stream" } else { ct });
+                }
+                b.body(Vec::new()).unwrap()
+            }
+            Err(e) => fail(StatusCode::BAD_GATEWAY, &e.to_string()),
+        };
+    }
+    if req.method() != tauri::http::Method::GET {
+        return fail(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
 
     let raw_range = req.headers().get(header::RANGE).and_then(|v| v.to_str().ok());
@@ -960,7 +1035,9 @@ pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
         resolve_proxy_content_type(&target, &final_url, &ctype)
     } else {
         (!ctype.trim().is_empty()).then(|| ctype.trim().to_string())
-    };
+    }
+    // Segments are often mislabelled text/html by CDNs: keep the bytes, drop the label.
+    .map(|ct| if is_active_document_type(&ct) { "application/octet-stream".to_string() } else { ct });
     build_media_response(
         status,
         synthetically_chunked,
@@ -1051,11 +1128,24 @@ pub async fn http_fetch(
     method: Option<String>,
     body: Option<String>,
 ) -> Result<FetchResult, String> {
+    validate_http_url(&url)?;
     let rb = build_http_request(&url, headers, method, body)?;
-    let res = rb.send().await.map_err(|e| e.to_string())?;
+    let mut res = rb.send().await.map_err(|e| e.to_string())?;
     let status = res.status().as_u16();
     let url = res.url().to_string();
-    let body = res.text().await.map_err(|e| e.to_string())?;
+    if res.content_length().is_some_and(|n| n as usize > MAX_FETCH_BYTES) {
+        return Err(format!("Response body exceeds {} MiB limit", MAX_FETCH_BYTES / (1024 * 1024)));
+    }
+    // Read in chunks against the cap: a server that lies about (or omits) its length can't make
+    // us buffer an unbounded body.
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = res.chunk().await.map_err(|e| e.to_string())? {
+        if buf.len() + chunk.len() > MAX_FETCH_BYTES {
+            return Err(format!("Response body exceeds {} MiB limit", MAX_FETCH_BYTES / (1024 * 1024)));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    let body = String::from_utf8_lossy(&buf).into_owned();
     Ok(FetchResult { status, url, body })
 }
 
@@ -1404,5 +1494,40 @@ mod tests {
         assert!(cached_playlist_at(&stale_url, now_ms).is_none());
         assert!(cached_playlist_at(nested_stale_url, now_ms).is_none());
         assert!(is_url_token_expired_at(&format!("https://cdn.example.com/exp/{stale_exp}/master.m3u8"), now_ms));
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    #[test]
+    fn byte_windows_never_split_a_character() {
+        // "é" is two bytes; put its second byte exactly on each window edge.
+        let mut s = "#EXTM3U\n".to_string();
+        while s.len() < 2047 {
+            s.push('a');
+        }
+        s.push('é');
+        s.push_str("\n#EXTINF:1,\nseg.ts\n");
+        assert!(!s.is_char_boundary(2048));
+        assert!(is_valid_m3u8_body(&s));
+        assert_eq!(floor_char_boundary(&s, 2048), 2047);
+        assert_eq!(floor_char_boundary("abc", 10), 3);
+    }
+
+    #[test]
+    fn range_header_with_multibyte_prefix_is_rejected_not_a_panic() {
+        assert_eq!(parse_byte_range("bytéé=0-1"), None);
+        assert_eq!(parse_byte_range("BYTES=5-"), Some((5, None)));
+        assert_eq!(parse_byte_range("bytes=2-9"), Some((2, Some(9))));
+    }
+
+    #[test]
+    fn active_documents_are_recognised() {
+        assert!(is_active_document_type("text/html; charset=utf-8"));
+        assert!(is_active_document_type("image/svg+xml"));
+        assert!(!is_active_document_type("video/mp2t"));
+        assert!(!is_active_document_type("application/vnd.apple.mpegurl"));
     }
 }

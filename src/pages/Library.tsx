@@ -13,8 +13,8 @@ export function Library() {
     <div className="page">
       <div className="page-head">
         <div>
-          <h5>Local first</h5>
-          <h1 className="page-title">Your drive</h1>
+          <p className="overline">Local first</p>
+          <h1 className="page-title">Your <em>drive</em></h1>
         </div>
         <div className="grow" />
         {s.libraryPaths.map((p) => (

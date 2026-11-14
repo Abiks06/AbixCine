@@ -21,10 +21,11 @@ import { getEntry, getProgress, saveProgress } from "../lib/progress";
 import { useWatchlist } from "../lib/watchlist";
 import { audioFor, setAudioFor, useSettings, type Audio } from "../lib/settings";
 import { animeEpisodes } from "../lib/anilist";
-import { reqKey, type PlaybackRequest } from "../lib/types";
+import { isFilm, reqKey, type PlaybackRequest } from "../lib/types";
 import { useAsync } from "../lib/useAsync";
 import { isUrlTokenExpired } from "../sources/native";
 import { candKey } from "../sources/registry";
+import type { SourceSession } from "../sources/session";
 import { useSourceSession } from "../sources/useSourceSession";
 import type { StreamCandidate } from "../sources/types";
 
@@ -94,14 +95,18 @@ export function Watch() {
   }, [detail, recheck]);
   const [manual, setManual] = useState("");
   /** The stream to start from: the session's pick, or a server chosen here or on the title page. */
-  const [start, setStart] = useState<string | null>(null);
+  // Tied to the session it was chosen for. As plain state it was cleared by an effect, i.e. one
+  // render late: switching sub/dub or episode onto an already-cached session mounted the player
+  // with the previous session's choice for a frame and tore it down again.
+  const [startState, setStartState] = useState<{ session: SourceSession; key: string } | null>(null);
+  const start = startState && startState.session === session ? startState.key : null;
+  const setStart = useCallback((key: string | null) => setStartState(key && session ? { session, key } : null), [session]);
   /** A server being checked because the viewer asked to play from it. */
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const live = useRef(session);
   live.current = session;
   useEffect(() => {
-    setStart(null);
     setBusyKey(null);
     setNote(null);
   }, [session]);
@@ -121,7 +126,7 @@ export function Watch() {
       if (r?.probe?.ok) setStart(k);
       else setNote(r?.probe?.error && r.probe.error !== "no stream" ? `${c.providerName} couldn't play this (${r.probe.error}).` : `${c.providerName} doesn't have this one.`);
     },
-    [session],
+    [session, setStart],
   );
 
   // A server chosen on the title page: go to it as soon as the session knows it.
@@ -199,7 +204,7 @@ export function Watch() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [start, back]);
-  const epLabel = episode != null ? `${season != null ? `Season ${season} · ` : ""}Episode ${episode}` : undefined;
+  const epLabel = episode != null && !isFilm(d) ? `${season != null ? `Season ${season} · ` : ""}Episode ${episode}` : undefined;
   // Episode list for the in-player drawer.
   const episodes: EpisodeNav | undefined = useMemo(() => {
     if (!d || episode == null) return undefined;
@@ -304,11 +309,12 @@ export function Watch() {
 
       <div className="race2 pad">
         <section className="race-hero">
-          <div className="eyebrow">
-            <span className="tag">Abix<b>Cine</b></span>
-            {[chip, audio ? (audio === "dub" ? "English dub" : "Japanese · subtitled") : null, !chip && d?.year].filter(Boolean).join(" · ")}
+          <div className="kicker">
+            <b>{chip || "Now showing"}</b>
+            <i />
+            <span>{[audio ? (audio === "dub" ? "English dub" : "Japanese · subtitled") : null, d?.year].filter(Boolean).join(" · ") || "AbixCine"}</span>
           </div>
-          {d ? <TitleArt media={d} size="md" /> : <div className="title-type md">Loading</div>}
+          {d ? <TitleArt media={d} size="md" /> : <div className="title-wait sk" aria-hidden />}
 
           {!empty ? (
             <>
@@ -415,10 +421,10 @@ export function Watch() {
               </form>
             </div>
           )}
-          <div className="racebar"><i style={{ width: `${pct * 100}%` }} /></div>
+          <div className="racebar"><i style={{ transform: `scaleX(${pct})` }} /></div>
         </section>
 
-        <aside className="glass race-grid-wrap">
+        <aside className="race-grid-wrap">
           <div className="h">
             <span><Icon name="layers" size={16} /> Servers</span>
             <span className="race-head-acts">

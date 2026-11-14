@@ -64,21 +64,50 @@ function load(): AuthState {
   }
   try {
     const raw = localStorage.getItem(KEY);
-    if (raw) return { tmdbProxy: false, online: true, ...JSON.parse(raw) };
+    // `online` is a live reading, not a setting: a timeout once saved "offline" for good.
+    if (raw) return { tmdbProxy: false, ...JSON.parse(raw), online: true };
   } catch {
     /* ignore */
   }
   return { user: null, accessToken: null, refreshToken: null, tmdbProxy: false, online: true };
 }
 
+function persisted(): Partial<AuthState> | null {
+  try {
+    const raw = localStorage.getItem(KEY);
+    return raw ? (JSON.parse(raw) as Partial<AuthState>) : null;
+  } catch {
+    return null;
+  }
+}
+
 function set(patch: Partial<AuthState>) {
   state = { ...state, ...patch };
   try {
-    if (state.user?.id !== "preview") localStorage.setItem(KEY, JSON.stringify(state));
+    if (state.user?.id !== "preview") {
+      const { online: _online, ...keep } = state;
+      localStorage.setItem(KEY, JSON.stringify(keep));
+    }
   } catch {
     /* ignore */
   }
   listeners.forEach((l) => l());
+}
+
+// Another window signed in, signed out or rotated the tokens: adopt its state, so this one
+// never presents a refresh token that has already been spent.
+if (typeof window !== "undefined") {
+  window.addEventListener("storage", (e) => {
+    if (e.key !== KEY || state.user?.id === "preview") return;
+    const next = persisted();
+    const signedOut = !next?.user && !!state.user;
+    state = { ...state, user: next?.user ?? null, accessToken: next?.accessToken ?? null, refreshToken: next?.refreshToken ?? null, guest: next?.guest };
+    if (signedOut) {
+      syncCache = null;
+      syncHooks.forEach((h) => h.clear?.());
+    }
+    listeners.forEach((l) => l());
+  });
 }
 
 export const getAuth = () => state;
@@ -107,6 +136,15 @@ const MESSAGES: Record<string, string> = {
   bad_server: "The server address must start with https://",
   waking: "The AbixCine server is waking up. This takes up to a minute on free hosting.",
   network: "Can't reach the AbixCine server. Check the server address or your connection.",
+  timeout: "The AbixCine server took too long to answer. Try again in a moment.",
+  rate_limited: "Too many attempts. Wait a few minutes and try again.",
+  http_429: "Too many attempts. Wait a few minutes and try again.",
+  invalid_refresh: "Your session expired. Sign in again.",
+  unauthorized: "Your session expired. Sign in again.",
+  watchlist_full: "My List is full. Remove a few titles to add more.",
+  bad_request: "The server didn't accept that. Update AbixCine and try again.",
+  not_found: "That account no longer exists.",
+  server_error: "The AbixCine server hit a problem. Try again in a moment.",
 };
 export const errorMessage = (e: unknown) =>
   e instanceof ApiError ? MESSAGES[e.code] ?? `Something went wrong (${e.code}).` : MESSAGES.network;
@@ -157,29 +195,62 @@ async function raw(path: string, init: RequestInit = {}, token?: string | null, 
   return res.json();
 }
 
+/** Take the tokens another window has already rotated to, if they are newer than ours. */
+function adoptStored(): boolean {
+  const stored = persisted();
+  if (!stored?.refreshToken || !stored.user || stored.refreshToken === state.refreshToken) return false;
+  state = { ...state, user: stored.user, accessToken: stored.accessToken ?? null, refreshToken: stored.refreshToken };
+  listeners.forEach((l) => l());
+  return true;
+}
+
+/** Runs `fn` while holding a lock shared by every AbixCine window (falls through where locks don't exist). */
+function withAuthLock<T>(fn: () => Promise<T>): Promise<T> {
+  const locks = typeof navigator !== "undefined" ? navigator.locks : undefined;
+  return locks?.request ? (locks.request("abx.auth.refresh", fn) as Promise<T>) : fn();
+}
+
 let refreshing: Promise<boolean> | null = null;
-async function refresh(): Promise<boolean> {
+/**
+ * Refresh tokens are single-use. Two windows refreshing at once used to mean the slower one
+ * presented a spent token, got a 401, and signed the user out everywhere. Now only one window
+ * refreshes at a time, the others pick up its result, and a 401 only signs out if nobody else
+ * has rotated the token in the meantime.
+ */
+async function refresh(failedToken?: string | null): Promise<boolean> {
   if (!state.refreshToken) return false;
-  refreshing ??= raw("/auth/refresh", { method: "POST", body: JSON.stringify({ refreshToken: state.refreshToken }) })
-    .then((r) => {
+  refreshing ??= withAuthLock(async () => {
+    // Someone else refreshed while we waited for the lock (or before we noticed the 401).
+    if (adoptStored()) return true;
+    if (failedToken && state.accessToken && state.accessToken !== failedToken) return true;
+    const sent = state.refreshToken;
+    if (!sent) return false;
+    try {
+      const r = await raw("/auth/refresh", { method: "POST", body: JSON.stringify({ refreshToken: sent }) });
       set({ user: r.user, accessToken: r.accessToken, refreshToken: r.refreshToken });
       return true;
-    })
-    .catch((e) => {
+    } catch (e) {
       // Only sign out when the server rejects the token, not when we're offline.
-      if (e instanceof ApiError && e.status === 401) set({ user: null, accessToken: null, refreshToken: null });
+      if (e instanceof ApiError && e.status === 401) {
+        if (adoptStored()) return true;
+        if (state.refreshToken === sent) {
+          set({ user: null, accessToken: null, refreshToken: null });
+          syncCache = null;
+        }
+      }
       return false;
-    })
-    .finally(() => (refreshing = null));
+    }
+  }).finally(() => (refreshing = null));
   return refreshing;
 }
 
 /** Authenticated request with one transparent refresh on 401. */
 export async function api<T = any>(path: string, init: RequestInit = {}): Promise<T> {
+  const used = state.accessToken;
   try {
-    return await raw(path, init, state.accessToken);
+    return await raw(path, init, used);
   } catch (e) {
-    if (e instanceof ApiError && e.status === 401 && (await refresh())) return raw(path, init, state.accessToken);
+    if (e instanceof ApiError && e.status === 401 && (await refresh(used))) return raw(path, init, state.accessToken);
     throw e;
   }
 }
@@ -191,7 +262,10 @@ async function finishAuth(r: { user: User; accessToken: string; refreshToken: st
   } catch {
     /* ignore */
   }
+  syncCache = null;
   await checkServer();
+  // Anything saved while signed out (or as a guest) goes up before the server's copy comes down.
+  await flushOutbox();
   syncHooks.forEach((h) => h.pull?.());
 }
 
@@ -249,6 +323,8 @@ export async function wakeServer(onTick?: (secs: number) => void, maxMs = 90_000
 export async function signOut() {
   const rt = state.refreshToken;
   set({ user: null, accessToken: null, refreshToken: null, guest: false });
+  // The next account to sign in on this PC must never be handed this one's /sync answer.
+  syncCache = null;
   clearOutbox();
   syncHooks.forEach((h) => h.clear?.());
   if (rt) raw("/auth/logout", { method: "POST", body: JSON.stringify({ refreshToken: rt }) }).catch(() => {});
@@ -284,9 +360,8 @@ export function fetchSync() {
   if (!syncCache) {
     const p = api("/sync").then(
       (res) => {
-        setTimeout(() => {
-          if (syncCache === p) syncCache = null;
-        }, 2000);
+        // Shared only by stores pulling in the same tick; never held past the answer.
+        if (syncCache === p) syncCache = null;
         return res;
       },
       (err) => {
@@ -304,18 +379,24 @@ export function fetchSync() {
 // so a watchlist removal made offline isn't undone by the server's older copy.
 const OUTBOX = "abx.outbox.v1";
 type Pending = { method: "PUT" | "DELETE"; body?: unknown; at: number };
+/** Held in memory too, so a full disk doesn't silently drop writes for the rest of the session. */
+let outboxMem: Record<string, Pending> | null = null;
 const readOutbox = (): Record<string, Pending> => {
+  if (outboxMem) return { ...outboxMem };
   try {
-    return JSON.parse(localStorage.getItem(OUTBOX) || "{}");
+    const parsed = JSON.parse(localStorage.getItem(OUTBOX) || "{}");
+    outboxMem = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
   } catch {
-    return {};
+    outboxMem = {};
   }
+  return { ...outboxMem };
 };
 const writeOutbox = (o: Record<string, Pending>) => {
+  outboxMem = o;
   try {
     localStorage.setItem(OUTBOX, JSON.stringify(o));
   } catch {
-    /* ignore */
+    /* storage full or blocked: the in-memory copy still replays this session */
   }
 };
 function clearOutbox() {
@@ -335,9 +416,17 @@ export function push(path: string, method: "PUT" | "DELETE", body?: unknown) {
       writeOutbox(o);
     }
   };
-  api(path, { method, body: body ? JSON.stringify(body) : undefined }).then(settle, (e) => {
-    if (!retryable(e)) settle();
-  });
+  const send = () =>
+    api(path, { method, body: body ? JSON.stringify(body) : undefined }).then(settle, (e) => {
+      if (!retryable(e)) settle();
+    });
+  // A replay in progress goes first: otherwise an older queued write could land after this one.
+  if (flushing) {
+    void flushing.then(() => {
+      if (readOutbox()[path]?.at === at) void send();
+    });
+  }
+  else void send();
 }
 
 let flushing: Promise<void> | null = null;
@@ -361,12 +450,17 @@ export function flushOutbox() {
   return flushing;
 }
 
-export async function bootAccount() {
-  const up = await checkServer();
+/** Queued writes first, then the server's copy: pulling first would undo what was done offline. */
+async function resync() {
   if (!state.user) return;
-  if (up) await flushOutbox();
+  await flushOutbox();
   syncHooks.forEach((h) => h.pull?.());
 }
 
-// Coming back online: replay queued writes.
-if (typeof window !== "undefined") window.addEventListener("online", () => void checkServer().then((up) => (up ? flushOutbox() : undefined)));
+export async function bootAccount() {
+  const up = await checkServer();
+  if (up) await resync();
+}
+
+// Coming back online: replay queued writes, then catch up with other devices.
+if (typeof window !== "undefined") window.addEventListener("online", () => void checkServer().then((up) => (up ? resync() : undefined)));
