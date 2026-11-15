@@ -1,179 +1,84 @@
 import type { Settings } from "../../lib/settings";
 import type { PlaybackRequest } from "../../lib/types";
-import { DEFAULT_UA, normalizeHeaders, proxyUrl } from "../native";
+import { DEFAULT_UA, proxyUrl, type StreamHeaders } from "../native";
 import type { SourceProvider, StreamCandidate } from "../types";
 import {
-  buildStreamHeaders,
   fetchJsonWithAbort,
-  fetchWithAbort,
   inferStreamKind,
   isAbortError,
   isAnimeRequest,
   isDirectExtractorEnabled,
+  isMovieRequest,
   normalizeQuality,
+  openSslAes256CbcDecrypt,
+  resolveExtractorStreamHeaders,
   resolveMediaIds,
-  sha512Hex,
 } from "./common";
 
-const PORTALS = ["https://zxcstream.xyz", "https://zxcprime.xyz"] as const;
-const INITIAL_BASE = "https://r1.zxcstream.xyz";
-const SALT = "3435443433";
-const SERVERS = ["icarus", "berkas", "orion", "athena"] as const;
-const PROBE_SUBDOMAINS = ["r1", "r2", "r3", "r4", "r5", "r6", "v4", "cdn", "api", "stream"] as const;
+export const ZXC_BASE_URLS = ["https://zxcstream.cc", "https://zxcstream.com"] as const;
+const SERVERS = ["ursa", "alatreon", "valstrax", "orion"] as const;
+const ZXC_PASSPHRASE = "7f4c9e2a81d63b05c4f7a9e8126d3b50e1a8c7f23d9465ab0c6e9f1d4a7b832c";
 const BASE_TTL_MS = 10 * 60_000;
 
-const FIELD = {
-  id: "rgrwsdsdfgwrwrwwr",
-  fToken: "xfgdfgdsffgrwgrwyjhkjt",
-  ts: "rdghhdghhfssft",
-  token: "ZDDVHJFGHYRHG",
-  title: "TUKTHFSSFGDGHJS",
-  year: "53653TRFG647GF",
-  season: "adkljfhdahfladhfjahfjlahfhfljkadfdf",
-  episode: "546745ygy46ytfgty",
-  imdbId: "564745ygtuy5yi75yuy",
+export const ZXC_FIELD = {
+  id: "a7f39c821d604e5b91e57b",
+  fToken: "e83c4b719a5210579c1635a",
+  ts: "61d9a5274c8e3b2f38291e6",
+  token: "c492f7a183d01e36c538a716d",
+  title: "5e28c9147a06de29f3674b392a1",
+  year: "b731e6c94f867f8341c306e",
+  season: "d8427b5c382f957c3613e85b",
+  episode: "91c6ea75d1f785c92346b713d",
+  imdbId: "f35a8194265e871c4933a725f",
+  path: "6b491e258392e7561a9384c",
+  mediaType: "c81306d28147a35632e816b",
+  date: "e16493139e5814b3027",
+  latestDate: "e953416ad739e5814b3027",
 } as const;
 
 const SERVER_LABELS: Record<(typeof SERVERS)[number], string> = {
-  icarus: "Icarus",
-  berkas: "Berkas",
+  ursa: "Ursa",
+  alatreon: "Alatreon",
+  valstrax: "Valstrax",
   orion: "Orion",
-  athena: "Athena",
 };
 
-interface ZxcTokenResponse {
+interface AndromedaTokenResponse {
+  ts?: number | string;
+  token?: string;
   [key: string]: unknown;
 }
 
 interface ZxcLink {
   link?: string;
   type?: string;
-  resolution?: number | string;
+  resolution?: number | string | null;
   source?: string;
   size?: number | string;
 }
 
-interface ZxcServerResponse {
+interface ZxcSourceResponse {
   success?: boolean;
   links?: ZxcLink[];
 }
 
-let cachedBase = INITIAL_BASE;
+let cachedBase: string = ZXC_BASE_URLS[0];
 let baseValidatedAt = 0;
-let discoveryPromise: Promise<string> | null = null;
 
-/** Reset cached ZXCStreams discovered base URL (intended for tests). */
+/** Reset cached ZXCStreams active domain (intended for tests). */
 export function clearZxcBaseCache(): void {
-  cachedBase = INITIAL_BASE;
+  cachedBase = ZXC_BASE_URLS[0];
   baseValidatedAt = 0;
-  discoveryPromise = null;
 }
 
-/** Generate ZXCStreams SHA-512 frontend token for a TMDB ID and timestamp. */
-export async function generateZxcFrontendToken(tmdbId: string, rt = Date.now()): Promise<{ xt: string; rt: number }> {
-  const hash = await sha512Hex(`${rt}:${SALT}:${tmdbId}`);
-  return { xt: hash.slice(0, 64), rt };
-}
-
-async function verifyBase(base: string, signal?: AbortSignal): Promise<string> {
-  const { xt, rt } = await generateZxcFrontendToken("550");
-  const res = await fetchJsonWithAbort<ZxcTokenResponse>(
-    `${base}/backend/token`,
-    {
-      "User-Agent": DEFAULT_UA,
-      Accept: "application/json, text/plain, */*",
-      Origin: base,
-      Referer: `${base}/player/movie/550`,
-      "Content-Type": "application/json",
-    },
-    {
-      method: "POST",
-      body: JSON.stringify({ [FIELD.id]: "550", [FIELD.fToken]: xt, [FIELD.ts]: rt }),
-    },
-    signal,
-    6_000,
-  );
-  if (res.data && res.data[FIELD.token]) return base;
-  throw new Error(`ZXCStreams verify failed (${res.status}) for ${base}`);
-}
-
-async function tryPortal(portal: string, signal?: AbortSignal): Promise<string> {
-  const res = await fetchWithAbort(
-    portal,
-    { "User-Agent": DEFAULT_UA },
-    undefined,
-    signal,
-    8_000,
-  );
-  const finalOrigin = new URL(res.url || portal).origin;
-  if (finalOrigin === new URL(portal).origin) {
-    throw new Error(`Portal ${portal} did not redirect`);
-  }
-  return verifyBase(finalOrigin, signal);
-}
-
-/** A working base, or null when none could be verified (the old base is then kept, unstamped). */
-async function discoverBase(): Promise<string | null> {
-  const portal = await Promise.any(PORTALS.map((p) => tryPortal(p))).catch(() => null);
-  if (portal) return portal;
-  return Promise.any(PROBE_SUBDOMAINS.map((sub) => verifyBase(`https://${sub}.zxcstream.xyz`))).catch(() => null);
-}
-
-async function getBase(signal?: AbortSignal): Promise<string> {
-  if (Date.now() - baseValidatedAt <= BASE_TTL_MS) return cachedBase;
-  if (!discoveryPromise) {
-    // Shared by every caller, so it must not run on any one caller's signal: the first caller
-    // cancelling used to abort it for all, and the failure was then cached as "validated" for ten minutes.
-    discoveryPromise = discoverBase()
-      .then((base) => {
-        if (!base) return cachedBase;
-        cachedBase = base;
-        baseValidatedAt = Date.now();
-        return base;
-      })
-      .finally(() => {
-        discoveryPromise = null;
-      });
-  }
-  if (!signal) return discoveryPromise;
-  return Promise.race([
-    discoveryPromise,
-    new Promise<string>((_, reject) => {
-      if (signal.aborted) reject(new DOMException("Aborted", "AbortError"));
-      signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
-    }),
-  ]);
-}
-
-async function requestServerToken(
-  base: string,
-  tmdbId: string,
-  referer: string,
-  signal?: AbortSignal,
-): Promise<{ serverToken: string; serverTs: string; xt: string }> {
-  const { xt, rt } = await generateZxcFrontendToken(tmdbId);
-  const res = await fetchJsonWithAbort<ZxcTokenResponse>(
-    `${base}/backend/token`,
-    {
-      "User-Agent": DEFAULT_UA,
-      Accept: "application/json, text/plain, */*",
-      Origin: base,
-      Referer: referer,
-      "Content-Type": "application/json",
-    },
-    {
-      method: "POST",
-      body: JSON.stringify({ [FIELD.id]: tmdbId, [FIELD.fToken]: xt, [FIELD.ts]: rt }),
-    },
-    signal,
-    8_000,
-  );
-  const token = res.data?.[FIELD.token];
-  const ts = res.data?.[FIELD.ts];
-  if (typeof token !== "string" || !token || ts == null) {
-    throw new Error(`ZXCStreams token failed (${res.status})`);
-  }
-  return { serverToken: token, serverTs: String(ts), xt };
+/** Decrypt an encrypted `links[].link` value returned by `/backend_/sources/...`. */
+export async function decryptZxcLink(rawLink: string): Promise<string | null> {
+  const trimmed = rawLink.trim();
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  if (!trimmed.startsWith("U2FsdGVkX1")) return null;
+  const plain = await openSslAes256CbcDecrypt(trimmed, ZXC_PASSPHRASE);
+  const url = plain?.trim() ?? "";
+  return /^https?:\/\//i.test(url) ? url : null;
 }
 
 function formatSize(raw?: number | string): string {
@@ -184,9 +89,158 @@ function formatSize(raw?: number | string): string {
   return `${Math.round(n / 1e3)} KB`;
 }
 
+function zxcCandidateHeaders(streamUrl: string, apiBase: string): { headers: StreamHeaders; fallback?: string } {
+  // hakunaymatata.com CDN (Orion MP4) returns 429 with Referer/Origin and 428 with browser UAs.
+  const { headers, fallbackReferer } = resolveExtractorStreamHeaders(streamUrl, `${apiBase}/`, apiBase);
+  return fallbackReferer ? { headers, fallback: fallbackReferer } : { headers };
+}
+
+async function fetchServerToken(
+  base: string,
+  tmdbId: string,
+  mediaType: "movie" | "tv",
+  server: (typeof SERVERS)[number],
+  season: number | undefined,
+  episode: number | undefined,
+  signal: AbortSignal,
+): Promise<{ ts: string; token: string } | null> {
+  const payload: Record<string, unknown> = {
+    [ZXC_FIELD.id]: tmdbId,
+    [ZXC_FIELD.mediaType]: mediaType,
+    [ZXC_FIELD.path]: server,
+  };
+  if (mediaType === "tv" && season != null && episode != null) {
+    payload[ZXC_FIELD.season] = Number(season);
+    payload[ZXC_FIELD.episode] = Number(episode);
+  }
+
+  const res = await fetchJsonWithAbort<AndromedaTokenResponse>(
+    `${base}/backend/andromeda`,
+    {
+      "User-Agent": DEFAULT_UA,
+      Accept: "application/json, text/plain, */*",
+      Origin: base,
+      Referer: `${base}/`,
+      "Content-Type": "application/json",
+    },
+    { method: "POST", body: JSON.stringify(payload) },
+    signal,
+    8_000,
+  );
+  const token = typeof res.data?.token === "string" ? res.data.token.trim() : "";
+  const ts = res.data?.ts != null ? String(res.data.ts).trim() : "";
+  if (!token || !ts) return null;
+  return { ts, token };
+}
+
+async function resolveFromBase(
+  base: string,
+  meta: Awaited<ReturnType<typeof resolveMediaIds>>,
+  mediaType: "movie" | "tv",
+  season: number | undefined,
+  episode: number | undefined,
+  anime: boolean,
+  signal: AbortSignal,
+): Promise<StreamCandidate[]> {
+  const apiHeaders = {
+    "User-Agent": DEFAULT_UA,
+    Accept: "application/json, text/plain, */*",
+    Origin: base,
+    Referer: `${base}/`,
+  };
+
+  const settled = await Promise.allSettled(
+    SERVERS.map(async (server): Promise<StreamCandidate[]> => {
+      const tok = await fetchServerToken(base, meta.tmdbId!, mediaType, server, season, episode, signal);
+      if (!tok || signal.aborted) return [];
+
+      const params = new URLSearchParams({
+        [ZXC_FIELD.id]: meta.tmdbId!,
+        [ZXC_FIELD.path]: server,
+        [ZXC_FIELD.mediaType]: mediaType,
+        [ZXC_FIELD.ts]: tok.ts,
+        [ZXC_FIELD.token]: tok.token,
+        [ZXC_FIELD.title]: meta.title || "",
+        [ZXC_FIELD.year]: meta.year ? String(meta.year) : "",
+        [ZXC_FIELD.date]: meta.releaseDate || "",
+      });
+      if (meta.imdbId && /^tt\d+$/i.test(meta.imdbId)) {
+        params.set(ZXC_FIELD.imdbId, meta.imdbId);
+      }
+      if (mediaType === "tv" && season != null && episode != null) {
+        params.set(ZXC_FIELD.season, String(season));
+        params.set(ZXC_FIELD.episode, String(episode));
+      }
+
+      const res = await fetchJsonWithAbort<ZxcSourceResponse>(
+        `${base}/backend_/sources/${server}?${params.toString()}`,
+        apiHeaders,
+        undefined,
+        signal,
+        9_000,
+      );
+      if (!Array.isArray(res.data?.links) || res.data.links.length === 0) return [];
+
+      const resolved = await Promise.all(
+        res.data.links.map(async (l): Promise<StreamCandidate | null> => {
+          if (typeof l?.link !== "string") return null;
+          const decryptedUrl = await decryptZxcLink(l.link);
+          if (!decryptedUrl) return null;
+
+          const kind = inferStreamKind(decryptedUrl, l.type);
+          const quality = normalizeQuality(l.resolution ?? l.source);
+          const size = formatSize(l.size);
+          const { headers, fallback } = zxcCandidateHeaders(decryptedUrl, base);
+          const labelParts = [
+            SERVER_LABELS[server],
+            quality ? `${quality}p` : undefined,
+            kind.toUpperCase(),
+            size || undefined,
+          ].filter(Boolean);
+
+          return {
+            providerId: "zxcstreams",
+            providerName: "ZXCStreams",
+            label: labelParts.join(" · "),
+            url: fallback ? proxyUrl(decryptedUrl, headers, fallback) : proxyUrl(decryptedUrl, headers),
+            kind,
+            via: "direct" as const,
+            headers,
+            ...(quality ? { quality } : {}),
+            ...(anime ? { audio: "sub" as const } : {}),
+          } satisfies StreamCandidate;
+        }),
+      );
+
+      return resolved.filter((c): c is StreamCandidate => c !== null);
+    }),
+  );
+
+  const rejectedCount = settled.filter((r) => r.status === "rejected").length;
+  const out: StreamCandidate[] = [];
+  const seen = new Set<string>();
+  for (const item of settled) {
+    if (item.status !== "fulfilled") continue;
+    for (const cand of item.value) {
+      if (seen.has(cand.url)) continue;
+      seen.add(cand.url);
+      out.push(cand);
+    }
+  }
+
+  if (out.length === 0 && rejectedCount === SERVERS.length) {
+    const firstErr = settled.find((r): r is PromiseRejectedResult => r.status === "rejected")?.reason;
+    throw firstErr instanceof Error ? firstErr : new Error("ZXCStreams servers unreachable");
+  }
+
+  // Rank explicit higher quality first, preferring HLS > MP4 > DASH on quality ties.
+  const kindRank: Record<StreamCandidate["kind"], number> = { hls: 3, file: 2, dash: 1, embed: 0 };
+  return out.sort((a, b) => (b.quality ?? 0) - (a.quality ?? 0) || kindRank[b.kind] - kindRank[a.kind]);
+}
+
 /**
- * Direct ZXCStreams extractor (`zxcstream.xyz` / `zxcprime.xyz`) with local SHA-512 signing
- * across Icarus, Berkas, Orion, and Athena servers.
+ * Direct ZXCStreams extractor (`zxcstream.cc` / `zxcstream.com`) using `/backend/andromeda`
+ * token signing and OpenSSL AES-256-CBC link decryption across Ursa, Alatreon, Valstrax, and Orion.
  */
 export const zxcstreamsProvider: SourceProvider = {
   id: "zxcstreams",
@@ -203,109 +257,39 @@ export const zxcstreamsProvider: SourceProvider = {
 
     try {
       const meta = await resolveMediaIds(req, signal);
-      if (signal.aborted || !meta.tmdbId || !meta.title || !meta.imdbId || !/^tt\d+$/i.test(meta.imdbId)) {
-        return [];
-      }
+      if (signal.aborted || !meta.tmdbId) return [];
 
-      const type = req.media.kind === "movie" ? "movie" : "tv";
-      const season = type === "tv" ? req.season ?? 1 : undefined;
-      const episode = type === "tv" ? req.episode ?? 1 : undefined;
-      const buildReferer = (b: string) =>
-        `${b}/player/${type}/${meta.tmdbId}${season != null ? `/${season}/${episode}` : ""}`;
+      const mediaType = isMovieRequest(req) ? "movie" : "tv";
+      const season = mediaType === "tv" ? req.season ?? 1 : undefined;
+      const episode = mediaType === "tv" ? req.episode ?? 1 : undefined;
 
-      let base = await getBase(signal);
-      if (signal.aborted) return [];
+      const freshCache = Date.now() - baseValidatedAt <= BASE_TTL_MS;
+      const bases = freshCache
+        ? [cachedBase, ...ZXC_BASE_URLS.filter((b) => b !== cachedBase)]
+        : [...ZXC_BASE_URLS];
 
-      let referer = buildReferer(base);
-      let tokenData: { serverToken: string; serverTs: string; xt: string };
-      try {
-        tokenData = await requestServerToken(base, meta.tmdbId, referer, signal);
-      } catch (err) {
-        if (isAbortError(err) || signal.aborted) return [];
-        baseValidatedAt = 0;
-        base = await getBase(signal);
+      let lastErr: unknown;
+      for (const base of bases) {
         if (signal.aborted) return [];
-        referer = buildReferer(base);
-        tokenData = await requestServerToken(base, meta.tmdbId, referer, signal);
-      }
-      if (signal.aborted) return [];
-
-      const params = new URLSearchParams({
-        [FIELD.id]: meta.tmdbId,
-        b: type,
-        [FIELD.ts]: tokenData.serverTs,
-        [FIELD.token]: tokenData.serverToken,
-        [FIELD.fToken]: tokenData.xt,
-        [FIELD.title]: meta.title,
-        [FIELD.year]: meta.year ? String(meta.year) : "",
-        date: meta.releaseDate,
-        [FIELD.imdbId]: meta.imdbId,
-      });
-      if (season != null && episode != null) {
-        params.set(FIELD.season, String(season));
-        params.set(FIELD.episode, String(episode));
-      }
-
-      const qs = params.toString();
-      const streamHeaders = buildStreamHeaders(referer, base);
-      const settled = await Promise.allSettled(
-        SERVERS.map(async (server) => {
-          const res = await fetchJsonWithAbort<ZxcServerResponse>(
-            `${base}/backend_/servers/${server}?${qs}`,
-            {
-              "User-Agent": DEFAULT_UA,
-              Accept: "application/json, text/plain, */*",
-              Origin: base,
-              Referer: referer,
-            },
-            undefined,
-            signal,
-            9_000,
-          );
-          if (!res.data?.success || !Array.isArray(res.data.links)) return [];
-          return res.data.links
-            .filter((l): l is ZxcLink & { link: string } => typeof l?.link === "string" && /^https?:\/\//i.test(l.link))
-            .map((l) => {
-              const kind = inferStreamKind(l.link, l.type);
-              const quality = normalizeQuality(l.resolution ?? l.source);
-              const size = formatSize(l.size);
-              const labelParts = [
-                SERVER_LABELS[server],
-                quality ? `${quality}p` : undefined,
-                kind.toUpperCase(),
-                size || undefined,
-              ].filter(Boolean);
-              return {
-                providerId: "zxcstreams",
-                providerName: "ZXCStreams",
-                label: labelParts.join(" · "),
-                url: proxyUrl(l.link, streamHeaders, referer),
-                kind,
-                via: "direct" as const,
-                pageUrl: referer,
-                headers: normalizeHeaders(streamHeaders, referer),
-                ...(quality ? { quality } : {}),
-                ...(anime ? { audio: "sub" as const } : {}),
-              } satisfies StreamCandidate;
-            });
-        }),
-      );
-
-      if (signal.aborted) return [];
-      const seen = new Set<string>();
-      const out: StreamCandidate[] = [];
-      for (const item of settled) {
-        if (item.status !== "fulfilled") continue;
-        for (const cand of item.value) {
-          if (seen.has(cand.url)) continue;
-          seen.add(cand.url);
-          out.push(cand);
+        try {
+          const out = await resolveFromBase(base, meta, mediaType, season, episode, anime, signal);
+          if (out.length > 0) {
+            cachedBase = base;
+            baseValidatedAt = Date.now();
+            return out;
+          }
+        } catch (err) {
+          if (isAbortError(err) || signal.aborted) return [];
+          lastErr = err;
         }
       }
-      return out.sort((a, b) => (b.quality ?? 0) - (a.quality ?? 0));
-    } catch (err) {
-      if (isAbortError(err)) return [];
+
+      if (lastErr) throw lastErr;
       return [];
+    } catch (err) {
+      if (isAbortError(err) || signal.aborted) return [];
+      // Unreachable or changed is an error, not "no results": the server's health has to see it.
+      throw err;
     }
   },
 };

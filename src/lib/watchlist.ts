@@ -81,8 +81,18 @@ registerSync({
       .then((s) => {
         const remote: Entry[] = (Array.isArray(s.watchlist) ? s.watchlist : []).filter((e: Entry) => e?.media?.key);
         const remoteKeys = new Set(remote.map((e) => e.media.key));
-        // Keep local-only items (e.g. added while offline) and push them up.
-        const localOnly = list.filter((e) => !remoteKeys.has(e.media.key));
+        const deletedAt = new Map<string, number>(
+          (Array.isArray(s.watchlistDeleted) ? s.watchlistDeleted : [])
+            .filter((t: { key?: unknown; deletedAt?: unknown }) => typeof t?.key === "string" && typeof t?.deletedAt === "number")
+            .map((t: { key: string; deletedAt: number }) => [t.key, t.deletedAt]),
+        );
+        // Keep local-only items (e.g. added while offline) and push them up, unless another
+        // device removed the title after it was added here: then the removal wins.
+        const localOnly = list.filter((e) => {
+          if (remoteKeys.has(e.media.key)) return false;
+          const gone = deletedAt.get(e.media.key);
+          return gone == null || e.addedAt > gone;
+        });
         localOnly.forEach((e) => push(`/watchlist/${encodeURIComponent(e.media.key)}`, "PUT", { media: e.media }));
         list = [...localOnly, ...remote].sort((a, b) => b.addedAt - a.addedAt);
         save();

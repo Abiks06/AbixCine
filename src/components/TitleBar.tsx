@@ -34,13 +34,30 @@ function useServerCount(s: Settings) {
   const [exact, setExact] = useState<number | null>(null);
   useEffect(() => {
     let live = true;
-    import("../sources/registry")
-      .then((r) => live && setExact(r.PROVIDERS.filter((p) => p.isEnabled(s)).length))
-      .catch(() => {});
+    const count = () =>
+      import("../sources/registry")
+        .then((r) => live && setExact(r.PROVIDERS.filter((p) => p.isEnabled(s)).length))
+        .catch(() => {});
+    // Once loaded (by Watch, Settings or an earlier count) recounting is free; the first load
+    // waits for idle time so the 166 KB registry stays off the startup path.
+    if (exact !== null) {
+      void count();
+      return () => {
+        live = false;
+      };
+    }
+    const w = window as Window & {
+      requestIdleCallback?: (cb: () => void, o?: { timeout: number }) => number;
+      cancelIdleCallback?: (id: number) => void;
+    };
+    const idle = w.requestIdleCallback ? w.requestIdleCallback(() => void count(), { timeout: 5000 }) : undefined;
+    const timer = idle === undefined ? window.setTimeout(() => void count(), 3000) : undefined;
     return () => {
       live = false;
+      if (idle !== undefined) w.cancelIdleCallback?.(idle);
+      if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [s]);
+  }, [s]); // eslint-disable-line react-hooks/exhaustive-deps
   return exact ?? quick;
 }
 
@@ -56,6 +73,8 @@ export function TitleBar({ onOpenPalette }: { onOpenPalette: () => void }) {
   const s = useSettings();
   const [menu, setMenu] = useState(false);
   const w = useMemo(() => (isTauri() ? getCurrentWindow() : null), []);
+  // The dev design preview draws the window buttons too, so it lays out exactly like the desktop app.
+  const showWin = !!w || (import.meta.env.DEV && location.search.includes("preview"));
 
   // The pill: measured from the active link, re-measured when the dock reflows (labels collapse on narrow windows).
   const dock = useRef<HTMLElement>(null);
@@ -149,11 +168,11 @@ export function TitleBar({ onOpenPalette }: { onOpenPalette: () => void }) {
         ) : (
           <button className="btn glass sm" onClick={leaveGuest}>Sign in</button>
         )}
-        {w ? (
+        {showWin ? (
           <div className="win">
-            <button aria-label="Minimize" onClick={() => w.minimize()}><Icon name="min" size={14} /></button>
-            <button aria-label="Maximize" onClick={() => w.toggleMaximize()}><Icon name="max" size={12} /></button>
-            <button aria-label="Close" className="close" onClick={() => w.close()}><Icon name="x" size={14} /></button>
+            <button aria-label="Minimize" onClick={() => w?.minimize()}><Icon name="min" size={14} /></button>
+            <button aria-label="Maximize" onClick={() => w?.toggleMaximize()}><Icon name="max" size={12} /></button>
+            <button aria-label="Close" className="close" onClick={() => w?.close()}><Icon name="x" size={14} /></button>
           </div>
         ) : (
           <span style={{ width: 14 }} />

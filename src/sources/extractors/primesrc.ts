@@ -11,6 +11,7 @@ import {
   isDirectExtractorEnabled,
   normalizeQuality,
   resolveMediaIds,
+  isMovieRequest,
 } from "./common";
 
 const PRIMESRC_API = "https://primesrc.me";
@@ -51,7 +52,7 @@ export const primesrcProvider: SourceProvider = {
       const meta = await resolveMediaIds(req, signal);
       if (signal.aborted || !meta.imdbId || !/^tt\d+$/i.test(meta.imdbId)) return [];
 
-      const isTv = req.media.kind !== "movie";
+      const isTv = !isMovieRequest(req);
       const season = req.season ?? 1;
       const episode = req.episode ?? 1;
       const params = new URLSearchParams({
@@ -106,7 +107,6 @@ export const primesrcProvider: SourceProvider = {
             url: proxyUrl(rawLink, streamHeaders, PRIMESRC_API),
             kind: inferStreamKind(rawLink),
             via: "direct" as const,
-            pageUrl: `${PRIMESRC_API}/`,
             headers: streamHeaders,
             ...(quality ? { quality } : {}),
             ...(anime ? { audio: "sub" as const } : {}),
@@ -125,8 +125,9 @@ export const primesrcProvider: SourceProvider = {
       }
       return out.sort((a, b) => (b.quality ?? 0) - (a.quality ?? 0));
     } catch (err) {
-      if (isAbortError(err)) return [];
-      return [];
+      if (isAbortError(err) || signal.aborted) return [];
+      // Unreachable or changed is an error, not "no results": the server's health has to see it.
+      throw err;
     }
   },
 };

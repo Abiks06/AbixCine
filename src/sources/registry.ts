@@ -13,7 +13,7 @@ import {
 } from "./health";
 import { kisskhProvider } from "./kisskh";
 import { localProvider } from "./local";
-import { isUrlTokenExpired, native, normalizeHeaders, proxyUrl, sniff } from "./native";
+import { DEFAULT_UA, httpFetch, isUrlTokenExpired, native, normalizeHeaders, proxyUrl, sniff, unwrapProxyUrl } from "./native";
 import { availableSources, embedProviders } from "./embeds";
 import { DIRECT_EXTRACTORS } from "./extractors";
 import { pluginProvidersSource } from "./pluginRunner";
@@ -40,11 +40,16 @@ export const DIRECT_SOURCES = [
   { id: "vidrock", name: "Vidrock", note: "Movies & TV · direct stream" },
   { id: "zxcstreams", name: "ZXCStreams", note: "Movies & TV · direct stream" },
   { id: "vixsrc", name: "VixSrc", note: "Movies & TV · direct stream with subtitles" },
-  { id: "vaplayer", name: "VaPlayer", note: "Movies & TV · direct stream" },
-  { id: "primesrc", name: "PrimeSrc", note: "Movies & TV · direct stream with subtitles" },
+  { id: "castle", name: "Castle", note: "Movies & TV · direct encrypted HLS streams" },
+  { id: "hexa-direct", name: "Hexa", note: "Movies & TV · direct HLS streams (via enc-dec.app)" },
+  { id: "vidup", name: "Vidup", note: "Movies & TV · direct HLS streams (via enc-dec.app)" },
+  { id: "cinejoy", name: "Cinejoy", note: "Movies & TV · direct HLS/MKV streams with subtitles (via enc-dec.app)" },
+  { id: "meowtv", name: "MeowTV", note: "Movies & TV · direct HLS stream with subtitles (via enc-dec.app)" },
+  { id: "megaplay", name: "MegaPlay", note: "Anime · direct stream with sub/dub, subtitles and intro skip" },
   { id: "anizone", name: "AniZone", note: "Anime · direct stream with sub/dub and subtitles" },
   { id: "kickassanime", name: "KickAssAnime", note: "Anime · direct stream with sub/dub and subtitles" },
   { id: "anikoto", name: "Anikoto", note: "Anime · direct stream with sub/dub and subtitles" },
+  { id: "animeheaven", name: "AnimeHeaven", note: "Anime · direct MP4 streams" },
   { id: "onetouchtv", name: "OneTouchTV", note: "Asian dramas · direct stream with subtitles" },
   { id: "stremio", name: "Stremio Addons", note: "External addons · direct HTTP, Debrid & optional torrent streams" },
   { id: "plugins", name: "JS Plugins", note: "Sandboxed JS plugins · custom user-installed stream providers" },
@@ -153,7 +158,8 @@ const BAD_SEGMENT_RX = /(?:^|[\/_.-])(?:404|error|expired|denied|captcha|blank)\
  * Cloudflare/captcha challenge, or expired token URL.
  */
 export function validateManifest(text: string, url?: string, contentType?: string): ManifestValidation {
-  if (url && isUrlTokenExpired(url)) {
+  const targetUrl = url ? (unwrapProxyUrl(url)?.url ?? url) : undefined;
+  if (targetUrl && isUrlTokenExpired(targetUrl)) {
     return { ok: false, error: "token expired" };
   }
   const trimmed = text.replace(/^\uFEFF/, "").trim();
@@ -169,7 +175,7 @@ export function validateManifest(text: string, url?: string, contentType?: strin
   }
 
   // DASH (.mpd) manifest validation
-  const isDash = ct.includes("dash+xml") || (url && /\.mpd(\?|$)/i.test(url)) || /^<\?xml[\s\S]*<MPD[\s>]|^<MPD[\s>]/i.test(trimmed);
+  const isDash = ct.includes("dash+xml") || (targetUrl && /\.mpd(\?|$)/i.test(targetUrl)) || /^<\?xml[\s\S]*<MPD[\s>]|^<MPD[\s>]/i.test(trimmed);
   if (isDash) {
     if (!/<MPD[\s>]/i.test(trimmed) || !/<\/MPD>/i.test(trimmed)) {
       return { ok: false, error: "invalid DASH manifest" };
@@ -213,25 +219,29 @@ export function validateManifest(text: string, url?: string, contentType?: strin
       }
       continue;
     }
-    if (/^(?:javascript:|data:text\/html|<)/i.test(line) || /\.html?(\?|$)/i.test(line)) {
+    if (/^(?:javascript:|data:text\/html|<)/i.test(line)) {
       return { ok: false, error: "invalid URI in playlist" };
     }
     let resolvedUri = line;
-    if (url) {
+    if (targetUrl) {
       try {
-        resolvedUri = new URL(line, url).toString();
+        resolvedUri = new URL(line, targetUrl).toString();
       } catch {
         /* keep raw line */
       }
     }
-    if (isUrlTokenExpired(resolvedUri)) {
+    const unwrappedUri = unwrapProxyUrl(resolvedUri)?.url ?? resolvedUri;
+    if (/^(?:javascript:|data:text\/html|<)/i.test(unwrappedUri)) {
+      return { ok: false, error: "invalid URI in playlist" };
+    }
+    if (isUrlTokenExpired(unwrappedUri)) {
       return { ok: false, error: "token expired" };
     }
     if (expectVariantUri) {
       variantCount++;
       expectVariantUri = false;
     } else if (expectSegmentUri) {
-      if (BAD_SEGMENT_RX.test(line)) {
+      if (BAD_SEGMENT_RX.test(unwrappedUri)) {
         return { ok: false, error: "error segment in playlist" };
       }
       segmentCount++;
@@ -252,6 +262,53 @@ export function validateManifest(text: string, url?: string, contentType?: strin
   };
 }
 
+/** Embed hosts that didn't answer at all lately: their captures are skipped until this time. */
+const deadHosts = new Map<string, number>();
+const DEAD_HOST_MS = 10 * 60_000;
+const PREFLIGHT_MS = 5000;
+/** The page is gone for this title. */
+const PAGE_GONE = new Set([404, 410]);
+/** The whole server is down (Cloudflare's 521/522/523/530 mean its origin can't be reached). */
+const HOST_DOWN = new Set([500, 502, 504, 521, 522, 523, 530]);
+const hostOf = (u: string) => {
+  try {
+    return new URL(u).host;
+  } catch {
+    return "";
+  }
+};
+
+/**
+ * Is an embed page's server there at all? Only a plain "no" counts: no connection, the page gone,
+ * the origin down. A 403 or 503 is often a browser check the real capture passes, and a slow
+ * answer is just slow; both leave the capture running.
+ */
+async function preflightEmbed(page: string): Promise<{ error: string; hostDown: boolean } | null> {
+  if (!native) return null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const res = await Promise.race([
+      httpFetch(page, { "User-Agent": DEFAULT_UA, Accept: "text/html,*/*" }),
+      new Promise<null>((resolve) => (timer = setTimeout(() => resolve(null), PREFLIGHT_MS))),
+    ]);
+    if (!res) return null;
+    if (PAGE_GONE.has(res.status)) return { error: `not on this server (HTTP ${res.status})`, hostDown: false };
+    if (HOST_DOWN.has(res.status)) return { error: `server down (HTTP ${res.status})`, hostDown: true };
+    return null;
+  } catch (e: unknown) {
+    // Our own limits (a huge page, a URL the fetcher won't take) aren't the server being down.
+    if (/exceeds|limit|not allowed|invalid|scheme/i.test(String(e))) return null;
+    return { error: "server unreachable", hostDown: true };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Forget which embed hosts were down. */
+export function clearDeadHosts() {
+  deadHosts.clear();
+}
+
 /**
  * Turn an embed into a direct stream by capturing what its page plays. Success is the proof
  * the title is really there.
@@ -262,15 +319,32 @@ export async function verifyEmbed(c: StreamCandidate, signal?: AbortSignal): Pro
   if (signal?.aborted) {
     return { ...c, pageUrl: page, probe: { ok: false, latencyMs: 0, error: "AbortError" } };
   }
-  const got = await sniff(page, SNIFF_TIMEOUT, signal).catch(() => null);
+  const host = hostOf(page);
+  const deadUntil = deadHosts.get(host);
+  if (deadUntil && deadUntil > Date.now()) {
+    return { ...c, pageUrl: page, probe: { ok: false, latencyMs: 0, error: "server unreachable" } };
+  }
+  // A capture holds one of only a few hidden pages for up to SNIFF_TIMEOUT. Ask the page's server
+  // in parallel whether it is there at all, and give the slot back the moment it plainly isn't.
+  const { ctl: sniffCtl, cleanup } = linkSignal(signal);
+  let refused: string | null = null;
+  void preflightEmbed(page).then((verdict) => {
+    if (!verdict || sniffCtl.signal.aborted) return;
+    refused = verdict.error;
+    if (verdict.hostDown) deadHosts.set(host, Date.now() + DEAD_HOST_MS);
+    sniffCtl.abort();
+  });
+  const got = await sniff(page, SNIFF_TIMEOUT, sniffCtl.signal).catch(() => null);
+  cleanup();
   const latencyMs = Math.round(performance.now() - t0);
   if (!got) {
     return {
       ...c,
       pageUrl: page,
-      probe: { ok: false, latencyMs, error: signal?.aborted ? "AbortError" : "no stream" },
+      probe: { ok: false, latencyMs, error: refused ?? (signal?.aborted ? "AbortError" : "no stream") },
     };
   }
+  deadHosts.delete(host);
   if (isUrlTokenExpired(got.url)) {
     return {
       ...c,
@@ -329,8 +403,9 @@ export async function quickCheck(c: StreamCandidate, signal?: AbortSignal): Prom
   }
 }
 
-/** Real video bytes? MPEG-TS sync, an MP4 / fragmented-MP4 box, an ID3-tagged TS, or ADTS audio. */
+/** Real video bytes? WebM/MKV EBML, MPEG-TS sync, an MP4 / fragmented-MP4 box, an ID3-tagged TS, or ADTS audio. */
 export function looksLikeMedia(b: Uint8Array) {
+  if (b.length >= 4 && b[0] === 0x1a && b[1] === 0x45 && b[2] === 0xdf && b[3] === 0xa3) return true; // WebM / MKV EBML
   if (b.length < 8) return false;
   if (b[0] === 0x47 && (b.length < 377 || (b[188] === 0x47 && b[376] === 0x47))) return true;
   const box = String.fromCharCode(b[4], b[5], b[6], b[7]);
@@ -364,8 +439,16 @@ async function fetchRetry(url: string, init: RequestInit): Promise<Response> {
 }
 
 async function readHead(url: string, signal: AbortSignal): Promise<{ status: number; bytes: Uint8Array }> {
-  const res = await fetchRetry(url, { signal, headers: { Range: "bytes=0-65535" } });
-  if (!res.ok && res.status !== 206) return { status: res.status, bytes: new Uint8Array() };
+  let res = await fetchRetry(url, { signal, headers: { Range: "bytes=0-65535" } });
+  // Some CDNs reject Range requests (400/403); retry once without Range and cancel after 64 KB.
+  if (res.status === 400 || res.status === 403) {
+    res.body?.cancel().catch(() => {});
+    res = await fetchRetry(url, { signal });
+  }
+  if (!res.ok && res.status !== 206) {
+    res.body?.cancel().catch(() => {});
+    return { status: res.status, bytes: new Uint8Array() };
+  }
   const reader = res.body?.getReader();
   if (!reader) return { status: res.status, bytes: new Uint8Array(await res.arrayBuffer()).slice(0, 65536) };
   // Some hosts ignore Range: stop after 64 KB instead of downloading the whole segment.
@@ -374,8 +457,9 @@ async function readHead(url: string, signal: AbortSignal): Promise<{ status: num
   while (n < 65536) {
     const { done, value } = await reader.read();
     if (done || !value) break;
-    parts.push(value);
-    n += value.length;
+    const take = Math.min(value.length, 65536 - n);
+    parts.push(take < value.length ? value.subarray(0, take) : value);
+    n += take;
   }
   reader.cancel().catch(() => {});
   const out = new Uint8Array(n);
@@ -399,8 +483,7 @@ export async function playCheck(c: StreamCandidate, signal?: AbortSignal): Promi
   try {
     if (c.kind === "file") {
       const { status, bytes } = await readHead(c.url, ctl.signal);
-      const webm = bytes[0] === 0x1a && bytes[1] === 0x45 && bytes[2] === 0xdf && bytes[3] === 0xa3;
-      return looksLikeMedia(bytes) || webm ? { ok: true } : { ok: false, error: status >= 400 ? `HTTP ${status}` : "not a video file" };
+      return looksLikeMedia(bytes) ? { ok: true } : { ok: false, error: status >= 400 ? `HTTP ${status}` : "not a video file" };
     }
     if (c.kind !== "hls" && c.kind !== "dash") return { ok: true };
     const res = await fetchRetry(c.url, { signal: ctl.signal });

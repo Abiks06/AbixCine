@@ -68,7 +68,7 @@ export function Watch() {
 
   const isAnime = key.startsWith("anilist:") || d?.kind === "anime";
   const isSeries = key.startsWith("tmdb:tv:") || d?.kind === "tv";
-  const isEpisodicAnime = isAnime && d?.kind !== "movie";
+  const isEpisodicAnime = isAnime && !isFilm(d);
   const hasCanonicalSeasons = !!d?.seasons?.length || !!d?.specials?.length;
   const prelimSeason = rawSeason ?? (isSeries || hasCanonicalSeasons ? (savedEntry?.season ?? d?.initialSeason ?? 1) : undefined);
   const prelimEpisode = rawEpisode ?? (isSeries || isEpisodicAnime ? (savedEntry?.episode ?? 1) : undefined);
@@ -200,7 +200,11 @@ export function Watch() {
   }, [loc.state, nav, canonicalKey]);
   useEffect(() => {
     if (start) return;
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && back();
+    // A dialog on top (the command palette) owns Escape; only a bare Escape leaves the race.
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || e.defaultPrevented || document.querySelector('[aria-modal="true"]')) return;
+      back();
+    };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [start, back]);

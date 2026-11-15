@@ -12,6 +12,8 @@ import {
   isCircuitHalfOpen,
   isCircuitOpen,
   lastPick,
+  lookupTimeout,
+  recordLookup,
   recordLookupFailure,
   recordPlayback,
   recordProbe,
@@ -35,6 +37,7 @@ import {
   score,
   validateManifest,
   verifyEmbed,
+  clearDeadHosts,
 } from "./registry";
 import { invalidateSessions, SourceSession } from "./session";
 import { isUrlTokenExpired, normalizeHeaders, proxyUrl, unwrapProxyUrl, type Sniffed } from "./native";
@@ -89,6 +92,7 @@ beforeEach(() => {
 afterEach(() => {
   invalidateSessions();
   resetHealth();
+  clearDeadHosts();
   mockHttpFetch.mockReset();
   mockInvoke.mockReset();
   mockIsTauri.mockReturnValue(false);
@@ -1099,5 +1103,51 @@ describe("Phase 3 Stremio & JS plugin registry wiring", () => {
     applyRemoteSettings({ preferredQuality: "720p", subdlApiKey: "should-not-sync" } as Record<string, unknown>);
     expect(getSettings().preferredQuality).toBe("720p");
     expect(getSettings().subdlApiKey).toBe("subdl-local-secret");
+  });
+});
+
+describe("dead servers don't hold up the race", () => {
+  /** A capture that runs until it is cancelled, like a page that never plays. */
+  const hangingSniff = () =>
+    mockSniff.mockImplementation((_u: string, _t: number, signal?: AbortSignal) => new Promise((resolve) => signal?.addEventListener("abort", () => resolve(null), { once: true })));
+
+  it("gives the capture slot back as soon as an embed host can't be reached, then skips that host", async () => {
+    hangingSniff();
+    mockHttpFetch.mockRejectedValue(new Error("error sending request: dns error: No such host is known"));
+    const t0 = Date.now();
+    const first = await verifyEmbed(candidate("deadhost"));
+    expect(first.probe).toMatchObject({ ok: false, error: "server unreachable" });
+    expect(Date.now() - t0).toBeLessThan(2000);
+    expect(mockSniff).toHaveBeenCalledTimes(1);
+
+    // Another title on the same host: no hidden page is spent on it.
+    const second = await verifyEmbed({ ...candidate("deadhost"), url: "https://deadhost.example/tv/1", pageUrl: "https://deadhost.example/tv/1" });
+    expect(second.probe).toMatchObject({ ok: false, error: "server unreachable" });
+    expect(mockSniff).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails just this title when the page is gone, without writing the host off", async () => {
+    hangingSniff();
+    mockHttpFetch.mockResolvedValue({ status: 404, url: "", body: "not found" });
+    const gone = await verifyEmbed(candidate("missing"));
+    expect(gone.probe?.error).toMatch(/not on this server/);
+    mockSniff.mockReset();
+    mockSniff.mockResolvedValue({ url: "https://media.example/master.m3u8", kind: "hls", headers: {}, subtitles: [], verified: true, quality: 720 });
+    mockHttpFetch.mockResolvedValue({ status: 200, url: "", body: "<html>" });
+    const other = await verifyEmbed({ ...candidate("missing"), pageUrl: "https://missing.example/other" });
+    expect(other.probe?.ok).toBe(true);
+  });
+
+  it("lets the capture run when the page answers with a browser check (403)", async () => {
+    mockHttpFetch.mockResolvedValue({ status: 403, url: "", body: "Just a moment..." });
+    const ok = await verifyEmbed(candidate("cfcheck"));
+    expect(ok.probe?.ok).toBe(true);
+    expect(ok.via).toBe("sniffed");
+  });
+
+  it("never cuts a provider's lookup below 60% of its own budget", () => {
+    for (let i = 0; i < 10; i++) recordLookup("quick-srv", 200);
+    expect(lookupTimeout("quick-srv", 26_000)).toBeGreaterThanOrEqual(15_600);
+    expect(lookupTimeout("quick-srv", 10_000)).toBeGreaterThanOrEqual(6_000);
   });
 });

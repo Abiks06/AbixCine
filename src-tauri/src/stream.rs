@@ -95,6 +95,18 @@ pub(crate) fn is_url_token_expired_at(raw_url: &str, now_ms: u64) -> bool {
     false
 }
 
+fn find_next_uri_attr(s: &str) -> Option<usize> {
+    let mut offset = 0;
+    while let Some(rel) = s[offset..].find("URI=\"") {
+        let idx = offset + rel;
+        if idx == 0 || matches!(s.as_bytes()[idx - 1], b':' | b',' | b' ' | b'\t') {
+            return Some(idx);
+        }
+        offset = idx + 5;
+    }
+    None
+}
+
 fn playlist_body_has_expired_token(body: &[u8], base_url: &str, now_ms: u64) -> bool {
     let Ok(base) = url::Url::parse(base_url) else {
         return false;
@@ -104,13 +116,13 @@ fn playlist_body_has_expired_token(body: &[u8], base_url: &str, now_ms: u64) -> 
         return false;
     }
     for line in text.lines() {
-        let l = line.trim();
+        let l = line.trim().trim_start_matches('\u{feff}').trim();
         if l.is_empty() {
             continue;
         }
         if l.starts_with('#') {
             let mut rest = l;
-            while let Some(i) = rest.find("URI=\"") {
+            while let Some(i) = find_next_uri_attr(rest) {
                 let after = &rest[i + 5..];
                 let Some(end) = after.find('"') else {
                     break;
@@ -160,10 +172,66 @@ fn cached_playlist_at(url: &str, now_ms: u64) -> Option<(String, Vec<u8>)> {
     Some((final_url.clone(), body.clone()))
 }
 
+const MAX_PLAYLIST_CACHE: usize = 64;
+
+fn url_path_lower(url: &str) -> String {
+    if let Ok(u) = url::Url::parse(url) {
+        return u.path().to_ascii_lowercase();
+    }
+    url.split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+pub(crate) fn looks_like_hls_url(url: &str) -> bool {
+    let path = url_path_lower(url);
+    path.ends_with(".m3u8") || path.contains(".m3u8/")
+}
+
+pub(crate) fn looks_like_dash_url(url: &str) -> bool {
+    let path = url_path_lower(url);
+    path.ends_with(".mpd") || path.contains(".mpd/")
+}
+
+pub(crate) fn is_extm3u_bytes(body: &[u8]) -> bool {
+    let stripped = body.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(body);
+    let idx = stripped.iter().position(|b| !b.is_ascii_whitespace());
+    idx.is_some_and(|i| stripped[i..].starts_with(b"#EXTM3U"))
+}
+
+fn looks_like_binary_media_path(url: &str) -> bool {
+    let path = url_path_lower(url);
+    matches!(
+        path.rsplit('.').next(),
+        Some("ts" | "m4s" | "mp4" | "m4v" | "m4a" | "aac" | "mp3" | "webm" | "mkv" | "avi" | "mov" | "vtt" | "srt" | "ass")
+    ) && !path.ends_with(".m3u8")
+        && !path.ends_with(".mpd")
+}
+
+fn looks_like_html_doc(text: &str) -> bool {
+    let trimmed = text.trim_start_matches('\u{feff}').trim();
+    let lower = trimmed[..floor_char_boundary(trimmed, 2048)].to_ascii_lowercase();
+    lower.contains("<!doctype")
+        || lower.contains("<html")
+        || lower.contains("<script")
+        || lower.contains("cf-browser-verification")
+        || lower.contains("captcha")
+}
+
 fn cache_playlist(url: &str, final_url: &str, body: &[u8]) {
     if let Ok(mut g) = PLAYLISTS.lock() {
         let map = g.get_or_insert_with(HashMap::new);
         map.retain(|_, (at, _, _)| at.elapsed() < PLAYLIST_TTL);
+        if map.len() >= MAX_PLAYLIST_CACHE && !map.contains_key(url) {
+            if let Some(oldest_key) = map
+                .iter()
+                .max_by_key(|(_, (at, _, _))| at.elapsed())
+                .map(|(k, _)| k.clone())
+            {
+                map.remove(&oldest_key);
+            }
+        }
         map.insert(url.to_string(), (std::time::Instant::now(), final_url.to_string(), body.to_vec()));
     }
 }
@@ -187,11 +255,7 @@ pub(crate) fn floor_char_boundary(s: &str, max: usize) -> usize {
 
 fn is_valid_m3u8_body(text: &str) -> bool {
     let trimmed = text.trim_start_matches('\u{feff}').trim();
-    if !trimmed.starts_with("#EXTM3U") {
-        return false;
-    }
-    let lower = trimmed[..floor_char_boundary(trimmed, 2048)].to_ascii_lowercase();
-    if lower.contains("<!doctype") || lower.contains("<html") || lower.contains("<script") || lower.contains("cf-browser-verification") || lower.contains("captcha") {
+    if !trimmed.starts_with("#EXTM3U") || looks_like_html_doc(trimmed) {
         return false;
     }
     let has_tag = trimmed.contains("#EXT-X-STREAM-INF") || trimmed.contains("#EXTINF");
@@ -242,16 +306,22 @@ pub fn client() -> &'static reqwest::Client {
             // A stalled socket gives up quickly; a slow but steady large read still finishes.
             .read_timeout(Duration::from_secs(20))
             .timeout(Duration::from_secs(120))
-            // Every hop is re-checked: an allowed http(s) URL must not bounce us to another scheme.
+            // Every hop is re-checked against the same rules as the first URL (see the SSRF guard).
             .redirect(reqwest::redirect::Policy::custom(|attempt| {
                 if attempt.previous().len() >= 8 {
-                    attempt.error("too many redirects")
-                } else if !matches!(attempt.url().scheme(), "http" | "https") {
-                    attempt.stop()
-                } else {
-                    attempt.follow()
+                    return attempt.error("too many redirects");
+                }
+                let verdict = match attempt.previous().first() {
+                    Some(first) => redirect_allowed(first, attempt.url()),
+                    None => check_target_host(attempt.url()).map_err(|_| "redirect to a blocked address"),
+                };
+                match verdict {
+                    Ok(()) => attempt.follow(),
+                    Err(why) => attempt.error(why),
                 }
             }))
+            // Public names may not resolve into the LAN, on the first request or any redirect hop.
+            .dns_resolver(GuardedResolver)
             // No transparent decompression: some media hosts label raw bytes as gzip, and
             // video gains nothing from it anyway.
             .build()
@@ -346,7 +416,7 @@ fn rewrite_playlist(text: &str, playlist_url: &str, h: &Hdrs, base: &str) -> Str
     let Ok(pu) = url::Url::parse(playlist_url) else { return text.to_string() };
     let mut out = String::with_capacity(text.len() + 1024);
     for line in text.lines() {
-        let l = line.trim();
+        let l = line.trim().trim_start_matches('\u{feff}').trim();
         if l.is_empty() {
             out.push('\n');
             continue;
@@ -354,14 +424,18 @@ fn rewrite_playlist(text: &str, playlist_url: &str, h: &Hdrs, base: &str) -> Str
         if l.starts_with('#') {
             // URI="..." attributes: keys, media renditions, I-frame playlists, maps (may appear more than once per line).
             let mut rest = l;
-            while let Some(i) = rest.find("URI=\"") {
+            while let Some(i) = find_next_uri_attr(rest) {
                 let start = i + 5;
                 out.push_str(&rest[..start]);
                 let after_prefix = &rest[start..];
                 if let Some(len) = after_prefix.find('"') {
                     let uri = &after_prefix[..len];
-                    let p = proxied(base, &resolve(&pu, uri), h);
-                    out.push_str(&p);
+                    if uri.is_empty() || uri.starts_with("http://abxs.localhost") || uri.starts_with("abxs://localhost") {
+                        out.push_str(uri);
+                    } else {
+                        let p = proxied(base, &resolve(&pu, uri), h);
+                        out.push_str(&p);
+                    }
                     out.push('"');
                     rest = &after_prefix[len + 1..];
                 } else {
@@ -370,6 +444,8 @@ fn rewrite_playlist(text: &str, playlist_url: &str, h: &Hdrs, base: &str) -> Str
                 }
             }
             out.push_str(rest);
+        } else if l.starts_with("http://abxs.localhost") || l.starts_with("abxs://localhost") {
+            out.push_str(l);
         } else {
             out.push_str(&proxied(base, &resolve(&pu, l), h));
         }
@@ -824,6 +900,9 @@ pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
         }
         None => raw_target,
     };
+    if let Err(e) = validate_proxy_target(&target) {
+        return fail(StatusCode::FORBIDDEN, &e);
+    }
     let h: Hdrs = q
         .get("h")
         .and_then(|v| B64.decode(v).ok())
@@ -834,13 +913,12 @@ pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
     // and a playlist pointing at abxs:// would be unloadable there.
     let base = PROXY_BASE;
 
-    let target_lower = target.to_ascii_lowercase();
-    let looks_playlist = target_lower.contains(".m3u8");
-    let looks_dash = target_lower.contains(".mpd");
+    let looks_playlist = looks_like_hls_url(&target);
+    let looks_dash = looks_like_dash_url(&target);
     if let Some((final_url, body)) = cached_playlist(&target) {
         let text = String::from_utf8_lossy(&body);
         let head = &text[..floor_char_boundary(&text, MPD_SNIFF_WINDOW)];
-        if looks_dash || head.contains("<MPD") {
+        if looks_dash || (!is_extm3u_bytes(&body) && head.contains("<MPD")) {
             let out = rewrite_mpd(&text, &final_url, &h, base);
             return cors(Response::builder().status(200))
                 .header(header::CONTENT_TYPE, "application/dash+xml")
@@ -999,12 +1077,13 @@ pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
     };
 
     if !synthetically_chunked && status.is_success() {
-        let is_playlist = looks_playlist
-            || ctype_lower.contains("mpegurl")
-            || body.starts_with(b"#EXTM3U")
-            || body.get(..3) == Some(b"\xEF\xBB\xBF") && body[3..].starts_with(b"#EXTM3U");
+        let magic_m3u8 = is_extm3u_bytes(&body);
+        let is_playlist = magic_m3u8 || (!looks_like_binary_media_path(&target) && (looks_playlist || ctype_lower.contains("mpegurl")));
         if is_playlist {
             let text = String::from_utf8_lossy(&body);
+            if magic_m3u8 && !looks_like_html_doc(&text) {
+                cache_playlist(&target, &final_url, &body);
+            }
             let out = rewrite_playlist(&text, &final_url, &h, base);
             return cors(Response::builder().status(status.as_u16()))
                 .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
@@ -1012,14 +1091,21 @@ pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
                 .body(out.into_bytes())
                 .unwrap();
         }
-        let is_dash = looks_dash
-            || ctype_lower.contains("dash+xml")
-            || {
-                let head = String::from_utf8_lossy(&body[..body.len().min(MPD_SNIFF_WINDOW)]);
-                head.contains("<MPD")
-            };
+        let non_binary_media = !ctype_lower.starts_with("video/")
+            && !ctype_lower.starts_with("audio/")
+            && !looks_like_binary_media_path(&target);
+        let is_dash = non_binary_media
+            && (looks_dash
+                || ctype_lower.contains("dash+xml")
+                || {
+                    let head = String::from_utf8_lossy(&body[..body.len().min(MPD_SNIFF_WINDOW)]);
+                    head.contains("<MPD")
+                });
         if is_dash {
             let text = String::from_utf8_lossy(&body);
+            if !looks_like_html_doc(&text) && text.contains("<MPD") {
+                cache_playlist(&target, &final_url, &body);
+            }
             let out = rewrite_mpd(&text, &final_url, &h, base);
             return cors(Response::builder().status(status.as_u16()))
                 .header(header::CONTENT_TYPE, "application/dash+xml")
@@ -1084,19 +1170,184 @@ pub struct FetchBytesResult {
     body_b64: String,
 }
 
+/* ------------------------------------------------------------------ */
+/* Outbound request guard (SSRF)                                       */
+/* ------------------------------------------------------------------ */
+//
+// Policy, applied to the first URL, every redirect hop and every DNS answer:
+// - Never: link-local (incl. the 169.254.169.254 cloud-metadata address), unspecified, multicast,
+//   broadcast, and the app's own `*.localhost` WebView hosts.
+// - Loopback / private only when asked for explicitly: the URL names a private IP, `localhost`, or
+//   a LAN-style name (`nas.local`, `mybox`). Self-hosted Stremio addons depend on this.
+// - No pivots: a public site can't redirect into the LAN, and a public domain can't resolve to a
+//   private address (DNS rebinding).
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AddrClass {
+    Public,
+    Private,
+    Loopback,
+    Forbidden,
+}
+
+fn classify_v4(v4: std::net::Ipv4Addr) -> AddrClass {
+    let o = v4.octets();
+    if v4.is_loopback() {
+        AddrClass::Loopback
+    } else if v4.is_unspecified() || v4.is_link_local() || v4.is_broadcast() || v4.is_multicast() || o[0] == 0 {
+        AddrClass::Forbidden
+    } else if v4.is_private() || (o[0] == 100 && (o[1] & 0xc0) == 64) {
+        // RFC 1918 plus CGNAT 100.64.0.0/10 (Tailscale and friends).
+        AddrClass::Private
+    } else {
+        AddrClass::Public
+    }
+}
+
+pub(crate) fn classify_ip(ip: std::net::IpAddr) -> AddrClass {
+    match ip {
+        std::net::IpAddr::V4(v4) => classify_v4(v4),
+        std::net::IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return classify_v4(v4);
+            }
+            let seg0 = v6.segments()[0];
+            if v6.is_loopback() {
+                AddrClass::Loopback
+            } else if v6.is_unspecified() || v6.is_multicast() || (seg0 & 0xffc0) == 0xfe80 {
+                AddrClass::Forbidden
+            } else if (seg0 & 0xfe00) == 0xfc00 {
+                AddrClass::Private
+            } else {
+                AddrClass::Public
+            }
+        }
+    }
+}
+
+/// A name someone types for a machine on their own network.
+fn is_local_name(host: &str) -> bool {
+    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    h == "localhost"
+        || !h.contains('.')
+        || h.ends_with(".local")
+        || h.ends_with(".lan")
+        || h.ends_with(".home.arpa")
+        || h.ends_with(".internal")
+}
+
+/// The WebView's own scheme hosts (`tauri.`, `abxs.`, `asset.localhost`): never a fetch target.
+fn is_app_internal_name(host: &str) -> bool {
+    host.trim_end_matches('.').to_ascii_lowercase().ends_with(".localhost")
+}
+
+/// The address class a URL names directly (an IP literal or a local name), if any.
+fn literal_class(u: &url::Url) -> Option<AddrClass> {
+    match u.host()? {
+        url::Host::Ipv4(ip) => Some(classify_v4(ip)),
+        url::Host::Ipv6(ip) => Some(classify_ip(std::net::IpAddr::V6(ip))),
+        url::Host::Domain(d) if d.eq_ignore_ascii_case("localhost") => Some(AddrClass::Loopback),
+        url::Host::Domain(d) if is_local_name(d) => Some(AddrClass::Private),
+        url::Host::Domain(_) => None,
+    }
+}
+
+/// Points into the user's own machine or network (by literal address or LAN-style name).
+fn targets_local_network(u: &url::Url) -> bool {
+    matches!(literal_class(u), Some(AddrClass::Private | AddrClass::Loopback))
+}
+
+fn check_target_host(u: &url::Url) -> Result<(), String> {
+    match u.host() {
+        None => Err("URL has no host".into()),
+        Some(url::Host::Domain(d)) if is_app_internal_name(d) => Err(format!("Blocked internal host: {d}")),
+        _ if literal_class(u) == Some(AddrClass::Forbidden) => Err("Blocked address (link-local, unspecified or multicast)".into()),
+        _ => Ok(()),
+    }
+}
+
+/// May a redirect go from `from` to `to`? Same rules as the first URL, plus no public → local pivot.
+fn redirect_allowed(from: &url::Url, to: &url::Url) -> Result<(), &'static str> {
+    if !matches!(to.scheme(), "http" | "https") {
+        return Err("redirect to a non-http(s) URL");
+    }
+    if check_target_host(to).is_err() {
+        return Err("redirect to a blocked address");
+    }
+    if !targets_local_network(from) && targets_local_network(to) {
+        return Err("redirect from a public site into the local network");
+    }
+    Ok(())
+}
+
+/// DNS with the rebinding guard: a public name may only resolve to public addresses; LAN-style
+/// names may also resolve to private/loopback ones. Forbidden ranges are never returned.
+struct GuardedResolver;
+
+impl reqwest::dns::Resolve for GuardedResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let local = is_local_name(&host);
+            let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await?
+                .filter(|a| match classify_ip(a.ip()) {
+                    AddrClass::Public => true,
+                    AddrClass::Private | AddrClass::Loopback => local,
+                    AddrClass::Forbidden => false,
+                })
+                .collect();
+            if addrs.is_empty() {
+                return Err(format!("{host} resolves only to blocked addresses").into());
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
 fn validate_http_url(raw_url: &str) -> Result<url::Url, String> {
     let parsed = url::Url::parse(raw_url).map_err(|e| format!("Invalid URL: {e}"))?;
     match parsed.scheme() {
-        "http" | "https" => Ok(parsed),
-        other => Err(format!("Unsupported URL scheme: {other}")),
+        "http" | "https" => {}
+        other => return Err(format!("Unsupported URL scheme: {other}")),
     }
+    check_target_host(&parsed)?;
+    Ok(parsed)
+}
+
+#[cfg(test)]
+thread_local! {
+    // Proxy tests run a mock upstream on 127.0.0.1; they opt in per thread.
+    static TEST_ALLOW_LOOPBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn loopback_allowed_for_tests() -> bool {
+    #[cfg(test)]
+    {
+        TEST_ALLOW_LOOPBACK.with(|c| c.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// The stream proxy plays remote media only. Loopback is refused outright: nothing the player
+/// streams lives there (local files use the asset protocol, torrents are played directly), so a
+/// `localhost` URL arriving from an extractor's response is never legitimate.
+fn validate_proxy_target(raw_url: &str) -> Result<url::Url, String> {
+    let parsed = validate_http_url(raw_url)?;
+    if literal_class(&parsed) == Some(AddrClass::Loopback) && !loopback_allowed_for_tests() {
+        return Err("Blocked loopback stream target".into());
+    }
+    Ok(parsed)
 }
 
 fn build_http_request(
     url: &str,
     headers: Option<HashMap<String, String>>,
     method: Option<String>,
-    body: Option<String>,
+    body: Option<Vec<u8>>,
 ) -> Result<reqwest::RequestBuilder, String> {
     let m = reqwest::Method::from_bytes(method.as_deref().unwrap_or("GET").as_bytes()).map_err(|e| e.to_string())?;
     let mut rb = client().request(m, url).header(header::USER_AGENT, UA);
@@ -1107,6 +1358,16 @@ fn build_http_request(
         rb = rb.body(b);
     }
     Ok(rb)
+}
+
+/// Decode a request body sent from JS as standard or URL-safe Base64 (padding optional).
+fn decode_body_b64(b: &str) -> Result<Vec<u8>, String> {
+    let trimmed = b.trim().trim_end_matches('=');
+    let normalized: String = trimmed.chars().map(|c| match c { '+' => '-', '/' => '_', c => c }).collect();
+    if normalized.len() > MAX_FETCH_BYTES {
+        return Err("Request body too large".into());
+    }
+    B64.decode(normalized.as_bytes()).map_err(|e| format!("Invalid base64 request body: {e}"))
 }
 
 fn encode_fetch_bytes(status: u16, url: String, bytes: &[u8]) -> Result<FetchBytesResult, String> {
@@ -1129,7 +1390,7 @@ pub async fn http_fetch(
     body: Option<String>,
 ) -> Result<FetchResult, String> {
     validate_http_url(&url)?;
-    let rb = build_http_request(&url, headers, method, body)?;
+    let rb = build_http_request(&url, headers, method, body.map(String::into_bytes))?;
     let mut res = rb.send().await.map_err(|e| e.to_string())?;
     let status = res.status().as_u16();
     let url = res.url().to_string();
@@ -1151,15 +1412,21 @@ pub async fn http_fetch(
 
 /// Fetch a remote resource as raw bytes (standard Base64 encoded, 20 MiB cap) so non-UTF-8
 /// payloads such as Windows-1252 or UTF-16 subtitles are never lossily decoded before JS sees them.
+/// `body_b64` (standard or URL-safe Base64) sends a binary request body; it wins over `body`.
 #[tauri::command]
 pub async fn http_fetch_bytes(
     url: String,
     headers: Option<HashMap<String, String>>,
     method: Option<String>,
     body: Option<String>,
+    body_b64: Option<String>,
 ) -> Result<FetchBytesResult, String> {
     let parsed = validate_http_url(&url)?;
-    let rb = build_http_request(parsed.as_str(), headers, method, body)?;
+    let raw_body = match body_b64 {
+        Some(b) => Some(decode_body_b64(&b)?),
+        None => body.map(String::into_bytes),
+    };
+    let rb = build_http_request(parsed.as_str(), headers, method, raw_body)?;
     let mut res = rb.send().await.map_err(|e| e.to_string())?;
     validate_http_url(res.url().as_str())?;
     if let Some(len) = res.content_length() {
@@ -1187,6 +1454,59 @@ pub async fn http_fetch_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssrf_guard_classifies_and_validates_targets() {
+        use std::net::IpAddr;
+        let c = |s: &str| classify_ip(s.parse::<IpAddr>().unwrap());
+        assert_eq!(c("8.8.8.8"), AddrClass::Public);
+        assert_eq!(c("127.0.0.1"), AddrClass::Loopback);
+        assert_eq!(c("::1"), AddrClass::Loopback);
+        assert_eq!(c("192.168.1.20"), AddrClass::Private);
+        assert_eq!(c("100.101.0.7"), AddrClass::Private);
+        assert_eq!(c("fd12::1"), AddrClass::Private);
+        assert_eq!(c("169.254.169.254"), AddrClass::Forbidden);
+        assert_eq!(c("fe80::1"), AddrClass::Forbidden);
+        assert_eq!(c("0.0.0.0"), AddrClass::Forbidden);
+        assert_eq!(c("::ffff:169.254.169.254"), AddrClass::Forbidden);
+
+        // Explicit local targets stay usable (self-hosted addons); forbidden ones never are.
+        assert!(validate_http_url("http://192.168.1.20:7000/manifest.json").is_ok());
+        assert!(validate_http_url("http://localhost:3000/manifest.json").is_ok());
+        assert!(validate_http_url("http://169.254.169.254/latest/meta-data").is_err());
+        assert!(validate_http_url("http://[fe80::1]/").is_err());
+        assert!(validate_http_url("http://tauri.localhost/").is_err());
+        assert!(validate_http_url("http://abxs.localhost/p?u=x").is_err());
+        assert!(validate_http_url("http://0x7f000001/").map(|u| literal_class(&u)).unwrap() == Some(AddrClass::Loopback));
+
+        // The stream proxy refuses loopback entirely, but still plays LAN media.
+        assert!(validate_proxy_target("http://127.0.0.1:8080/admin").is_err());
+        assert!(validate_proxy_target("http://localhost/x.m3u8").is_err());
+        assert!(validate_proxy_target("http://nas.local:8096/v.m3u8").is_ok());
+        assert!(validate_proxy_target("https://cdn.example.com/v.m3u8").is_ok());
+    }
+
+    #[test]
+    fn ssrf_guard_blocks_public_to_local_redirect_pivots() {
+        let u = |s: &str| url::Url::parse(s).unwrap();
+        assert!(redirect_allowed(&u("https://cdn.example.com/a"), &u("https://other.example.org/b")).is_ok());
+        assert!(redirect_allowed(&u("https://cdn.example.com/a"), &u("http://127.0.0.1:9000/")).is_err());
+        assert!(redirect_allowed(&u("https://cdn.example.com/a"), &u("http://192.168.0.1/")).is_err());
+        assert!(redirect_allowed(&u("https://cdn.example.com/a"), &u("http://router/")).is_err());
+        assert!(redirect_allowed(&u("https://cdn.example.com/a"), &u("http://169.254.169.254/")).is_err());
+        assert!(redirect_allowed(&u("https://cdn.example.com/a"), &u("file:///C:/Windows/win.ini")).is_err());
+        // A LAN addon redirecting within the LAN, or out to a public CDN, is fine.
+        assert!(redirect_allowed(&u("http://192.168.1.20:7000/s"), &u("http://192.168.1.20:7000/t")).is_ok());
+        assert!(redirect_allowed(&u("http://192.168.1.20:7000/s"), &u("https://cdn.example.com/v")).is_ok());
+    }
+
+    #[test]
+    fn decodes_binary_request_bodies_in_both_base64_alphabets() {
+        let bytes = vec![0x02u8, 0xfb, 0xff, 0x00, 0x3e, 0x80];
+        assert_eq!(decode_body_b64(&B64_STD.encode(&bytes)).unwrap(), bytes);
+        assert_eq!(decode_body_b64(&B64.encode(&bytes)).unwrap(), bytes);
+        assert!(decode_body_b64("not base64!").is_err());
+    }
 
     #[test]
     fn rewrites_relative_and_attribute_uris() {
@@ -1494,6 +1814,133 @@ mod tests {
         assert!(cached_playlist_at(&stale_url, now_ms).is_none());
         assert!(cached_playlist_at(nested_stale_url, now_ms).is_none());
         assert!(is_url_token_expired_at(&format!("https://cdn.example.com/exp/{stale_exp}/master.m3u8"), now_ms));
+    }
+
+    #[test]
+    fn looks_like_hls_and_dash_inspect_path_only() {
+        assert!(looks_like_hls_url("https://cdn.example/master.m3u8?token=abc"));
+        assert!(looks_like_hls_url("https://cdn.example/master.m3u8#t=10"));
+        assert!(looks_like_hls_url("https://cdn.example/master.m3u8/stream?x=1"));
+        assert!(!looks_like_hls_url("https://cdn.example/seg.ts?ref=master.m3u8"));
+        assert!(!looks_like_hls_url("https://cdn.example/seg.ts#master.m3u8"));
+        assert!(!looks_like_hls_url("https://cdn.example/master.m3u8.ts"));
+
+        assert!(looks_like_dash_url("https://cdn.example/manifest.mpd?token=1"));
+        assert!(looks_like_dash_url("https://cdn.example/manifest.mpd#t=0"));
+        assert!(!looks_like_dash_url("https://cdn.example/seg.m4s?src=manifest.mpd"));
+        assert!(!looks_like_dash_url("https://cdn.example/seg.m4s#manifest.mpd"));
+        assert!(!looks_like_dash_url("https://cdn.example/manifest.mpd.m4s"));
+    }
+
+    #[test]
+    fn rewrite_playlist_handles_bom_and_keyuri_boundary() {
+        let input = "\u{feff}#EXTM3U\n\
+            #EXT-X-KEY:METHOD=AES-128,KEYURI=\"https://cdn.example/raw.bin\",URI=\"key.bin\"\n\
+            #EXT-X-MAP:URI=\"init.mp4\"\n\
+            #EXTINF:6.0,\n\
+            seg0.ts?ref=master.m3u8\n";
+        let h = Hdrs {
+            referer: Some("https://embed.example/".to_string()),
+            ..Default::default()
+        };
+        let out = rewrite_playlist(input, "https://cdn.example/hls/master.m3u8", &h, "http://abxs.localhost");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "#EXTM3U");
+        assert!(lines[1].contains("KEYURI=\"https://cdn.example/raw.bin\""), "KEYURI must not be rewritten: {}", lines[1]);
+        assert!(lines[1].contains(",URI=\"http://abxs.localhost/p?u="), "URI attr must be rewritten: {}", lines[1]);
+        assert!(lines[2].starts_with("#EXT-X-MAP:URI=\"http://abxs.localhost/p?u="), "MAP URI must be rewritten: {}", lines[2]);
+        assert!(lines[4].starts_with("http://abxs.localhost/p?u="), "segment URI must be rewritten: {}", lines[4]);
+
+        // Rewriting an already-proxied playlist (e.g. if passed twice) must not double-wrap proxy URLs.
+        let again = rewrite_playlist(&out, "https://cdn.example/hls/master.m3u8", &h, "http://abxs.localhost");
+        let twice_wrapped = format!("{}p?u=", B64.encode("http://abxs.localhost/"));
+        assert!(!again.contains(&twice_wrapped));
+        assert_eq!(again, out);
+    }
+
+    #[test]
+    fn extensionless_bom_playlist_caches_and_query_m3u8_ts_is_uncorrupted() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        tauri::async_runtime::block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("local_addr");
+            let playlist_hits = Arc::new(AtomicUsize::new(0));
+            let hits_srv = playlist_hits.clone();
+            let raw_ts: Vec<u8> = vec![0x47, 0x40, 0x11, 0x10, 0xFF, 0xFE, 0x80, 0x00, 0x99, 0x01, 0x02];
+            let ts_srv = raw_ts.clone();
+
+            let srv = tokio::spawn(async move {
+                for _ in 0..2 {
+                    let (mut sock, _) = listener.accept().await.expect("accept");
+                    let hits_c = hits_srv.clone();
+                    let ts_c = ts_srv.clone();
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 2048];
+                        let n = sock.read(&mut buf).await.unwrap_or(0);
+                        let req_str = String::from_utf8_lossy(&buf[..n]);
+                        let path = req_str
+                            .lines()
+                            .next()
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .unwrap_or("");
+                        let (ctype, body): (&str, Vec<u8>) = if path.starts_with("/playlist/170060") {
+                            hits_c.fetch_add(1, Ordering::SeqCst);
+                            (
+                                "text/plain",
+                                b"\xEF\xBB\xBF#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\n720p/index.m3u8?tok=1\n".to_vec(),
+                            )
+                        } else if path.starts_with("/seg.ts?ref=master.m3u8") {
+                            ("video/mp2t", ts_c)
+                        } else {
+                            ("text/plain", b"not found".to_vec())
+                        };
+                        let hdr = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = sock.write_all(hdr.as_bytes()).await;
+                        let _ = sock.write_all(&body).await;
+                    });
+                }
+            });
+
+            let h = Hdrs::default();
+            let playlist_url = format!("http://{addr}/playlist/170060?type=video");
+            let ts_url = format!("http://{addr}/seg.ts?ref=master.m3u8");
+
+            let mk_req = |u: &str| {
+                let uri = format!(
+                    "http://abxs.localhost/p?u={}&h={}",
+                    B64.encode(u),
+                    B64.encode(serde_json::to_vec(&h).unwrap())
+                );
+                Request::builder().method("GET").uri(uri).body(Vec::new()).unwrap()
+            };
+
+            TEST_ALLOW_LOOPBACK.with(|c| c.set(true));
+            let r1 = handle(mk_req(&playlist_url)).await;
+            assert_eq!(r1.status(), StatusCode::OK);
+            assert_eq!(playlist_hits.load(Ordering::SeqCst), 1);
+            let b1 = String::from_utf8(r1.body().clone()).unwrap();
+            assert!(b1.starts_with("#EXTM3U\n"), "unexpected playlist body: {b1}");
+            assert_eq!(b1.matches("http://abxs.localhost/p?u=").count(), 1);
+
+            // Second request must be served from PLAYLISTS cache with zero extra upstream requests.
+            let r2 = handle(mk_req(&playlist_url)).await;
+            assert_eq!(r2.status(), StatusCode::OK);
+            assert_eq!(playlist_hits.load(Ordering::SeqCst), 1);
+            let b2 = String::from_utf8(r2.body().clone()).unwrap();
+            assert_eq!(b2, b1);
+
+            // Binary TS segment whose query string contains `.m3u8` must stay byte-identical.
+            let r3 = handle(mk_req(&ts_url)).await;
+            assert_eq!(r3.status(), StatusCode::OK);
+            assert_eq!(r3.body(), &raw_ts);
+
+            srv.await.unwrap();
+        });
     }
 }
 

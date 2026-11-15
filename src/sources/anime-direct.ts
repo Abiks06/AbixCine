@@ -48,6 +48,24 @@ function decodeConfig(blob: string): DecodedConfig | null {
 }
 
 const ANILIST = "https://graphql.anilist.co";
+function wantsAnimeMovie(req: PlaybackRequest): boolean {
+  return (
+    req.media.kind === "movie"
+    || (req.media as { format?: string }).format === "MOVIE"
+    || Boolean((req as { isAnimeMovie?: boolean }).isAnimeMovie)
+    || Boolean((req.media as { isAnimeMovie?: boolean }).isAnimeMovie)
+  );
+}
+
+function isAnimeTarget(req: PlaybackRequest): boolean {
+  return (
+    req.media.kind === "anime"
+    || req.media.key.startsWith("anilist:")
+    || Boolean((req as { isAnimeMovie?: boolean }).isAnimeMovie)
+    || Boolean((req.media as { isAnimeMovie?: boolean }).isAnimeMovie)
+  );
+}
+
 /**
  * MAL id for a request. Uses cached Fribb/Anibridge ID & cour mappings first, falling back
  * to AniList GraphQL title search only when no mapping hit is available.
@@ -55,8 +73,7 @@ const ANILIST = "https://graphql.anilist.co";
 export async function malIdFor(req: PlaybackRequest, signal?: AbortSignal): Promise<number | null> {
   if (req.media.malId) return req.media.malId;
   if (signal?.aborted) return null;
-  const kind = req.media.kind;
-  if (kind !== "anime" && !req.media.key.startsWith("anilist:")) return null;
+  if (!isAnimeTarget(req)) return null;
 
   const mapped = await resolveAnimeIds(req, signal);
   if (mapped.malId) return mapped.malId;
@@ -78,10 +95,16 @@ export async function malIdFor(req: PlaybackRequest, signal?: AbortSignal): Prom
       });
       if (!res.ok) throw new Error(`AniList ${res.status}`);
       const list: { idMal: number | null; format: string; seasonYear?: number }[] = (await res.json())?.data?.Page?.media ?? [];
-      const tv = list.filter((m) => m.idMal && m.format !== "MOVIE" && m.format !== "MUSIC");
+      const wantMovie = wantsAnimeMovie(req);
+      const filtered = list.filter((m) =>
+        Boolean(m.idMal)
+        && m.format !== "MUSIC"
+        && (wantMovie ? m.format === "MOVIE" || m.format === "OVA" || m.format === "SPECIAL" : m.format !== "MOVIE"),
+      );
+      const pool = filtered.length ? filtered : list.filter((m) => Boolean(m.idMal) && m.format !== "MUSIC");
       const mediaYear = req.media.year;
-      const byYear = season === 1 && mediaYear != null ? tv.find((m) => m.seasonYear && Math.abs(m.seasonYear - mediaYear) <= 1) : undefined;
-      const idMal = (byYear ?? tv[0])?.idMal ?? null;
+      const byYear = season === 1 && mediaYear != null ? pool.find((m) => m.seasonYear && Math.abs(m.seasonYear - mediaYear) <= 1) : undefined;
+      const idMal = (byYear ?? pool[0])?.idMal ?? null;
       if (!idMal) throw new Error("no MAL match");
       return idMal;
     });
@@ -98,8 +121,7 @@ export const animeDirectProvider: SourceProvider = {
   timeoutMs: 12_000,
   isEnabled: (s) => native && !s.disabledSources?.includes("hianime"),
   async find(req: PlaybackRequest, _s, signal): Promise<StreamCandidate[]> {
-    const isAnime = req.media.kind === "anime" || req.media.key.startsWith("anilist:");
-    if (!isAnime || signal.aborted) return [];
+    if (!isAnimeTarget(req) || signal.aborted) return [];
 
     let mal: number | null = req.media.malId ?? null;
     let ep = req.courEpisode;
@@ -118,7 +140,7 @@ export const animeDirectProvider: SourceProvider = {
     ep = ep ?? req.episode ?? 1;
     const audio = req.audio ?? "sub";
     const page = `${HOST}/stream/mal/${mal}/${ep}/${audio}`;
-    const res = await httpFetch(page, { Referer: "https://hianime.at/", Origin: "https://hianime.at", "User-Agent": DEFAULT_UA });
+    const res = await httpFetch(page, { Referer: `${HOST}/`, Origin: HOST, "User-Agent": DEFAULT_UA });
     if (res.status < 200 || res.status >= 300) return [];
     const blob = res.body.match(/window\.__P="([^"]*)"/)?.[1];
     if (!blob) return [];

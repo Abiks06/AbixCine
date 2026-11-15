@@ -11,6 +11,7 @@ import {
   isAbortError,
   isAnimeRequest,
   isDirectExtractorEnabled,
+  isMovieRequest,
   titleSimilarity,
   type RawSubtitleInput,
 } from "./common";
@@ -128,7 +129,7 @@ function pickLocale(locales: string[], audio: "sub" | "dub"): string | null {
 function pickBestKaaCard(cards: KaaCard[], req: PlaybackRequest, audio: "sub" | "dub"): { card: KaaCard; locale: string } | null {
   const targets = [req.media.title, req.media.originalTitle].filter((t): t is string => Boolean(t?.trim()));
   const year = req.media.year ?? 0;
-  const isMovie = req.media.kind === "movie";
+  const isMovie = isMovieRequest(req);
 
   let best: { card: KaaCard; locale: string; score: number } | null = null;
   for (const card of cards) {
@@ -142,6 +143,7 @@ function pickBestKaaCard(cards: KaaCard[], req: PlaybackRequest, audio: "sub" | 
       }
     }
 
+    if (card.eps === 0 && cards.some((c) => c.eps > 0)) sim -= 0.4;
     if (year > 0 && card.year > 0) {
       const diff = Math.abs(card.year - year);
       if (diff === 0) sim += 0.1;
@@ -284,8 +286,9 @@ export const kickassanimeProvider: SourceProvider = {
 
       return [];
     } catch (err) {
-      if (isAbortError(err)) return [];
-      return [];
+      if (isAbortError(err) || signal.aborted) return [];
+      // Unreachable or changed is an error, not "no results": the server's health has to see it.
+      throw err;
     }
   },
 };

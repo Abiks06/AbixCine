@@ -2,6 +2,7 @@ import { encodeKey } from "./catalog";
 import { getEntry } from "./progress";
 import { audioFor, type Audio } from "./settings";
 import type { Media } from "./types";
+import { isFilm } from "./types";
 
 /** One place that builds /watch links, so every Play button carries episode and sub/dub. */
 export function watchHref(key: string, s?: number, e?: number, a?: Audio) {
@@ -22,7 +23,7 @@ export function playTarget(
   const p = getEntry(canonical, [m.key]);
   const a = isAnime(m) ? p?.audio ?? audioFor(canonical, [m.key]) : undefined;
   const isTv = m.key.startsWith("tmdb:tv:") || m.kind === "tv";
-  const isAni = isAnime(m) && m.kind !== "movie";
+  const isAni = isAnime(m) && !isFilm(m);
   if (p) {
     return {
       s: p.season ?? (isTv ? 1 : undefined),

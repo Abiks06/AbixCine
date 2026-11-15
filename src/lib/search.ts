@@ -2,6 +2,7 @@ import { searchAnime } from "./anilist";
 import { normTitle } from "./format";
 import { searchTmdb } from "./tmdb";
 import type { Media } from "./types";
+import { isFilm } from "./types";
 
 /** "dune 2021" → { text: "dune", year: 2021 }. A number that can't be a release year ("Blade Runner 2049") stays in the text. */
 export function parseQuery(q: string): { text: string; year?: number } {
@@ -53,7 +54,7 @@ function relevance(m: Media, q: string, position: number) {
   let text = 0;
   for (const t of titles) for (const f of forms) text = Math.max(text, textScore(t, f));
   const wantsMovie = /\b(movie|film)\b/i.test(q);
-  const kind = m.kind === "movie" ? (wantsMovie ? 8 : 0) : wantsMovie ? 0 : 8;
+  const kind = isFilm(m) ? (wantsMovie ? 8 : 0) : wantsMovie ? 0 : 8;
   const quality = (m.rating ?? 6) * 1.2 + (m.poster ? 3 : -10);
   const when = year && m.year ? (m.year === year ? 30 : Math.abs(m.year - year) === 1 ? 8 : -6) : 0;
   return text + kind + quality + when - position * 0.8;
@@ -75,8 +76,26 @@ export function peekSearch(term: string): Media[] | undefined {
 async function fetchBoth(text: string, term: string): Promise<Media[]> {
   const [a, b] = await Promise.all([searchTmdb(text).catch(() => [] as Media[]), searchAnime(text).catch(() => [] as Media[])]);
   const aniTitles = new Set(b.flatMap((m) => [normTitle(m.title), m.originalTitle ? normTitle(m.originalTitle) : ""]).filter(Boolean));
-  // TMDB lists anime too; keep its entry only when AniList didn't return the same show.
-  const tmdb = a.filter((m) => !(m.kind === "anime" && (aniTitles.has(normTitle(m.title)) || aniTitles.has(normTitle(m.originalTitle ?? "")))));
+  // AniList films by title -> years, so a TMDB anime film (kind "movie") collapses into its AniList
+  // twin while a same-titled live-action film from another year survives.
+  const aniFilmYears = new Map<string, number[]>();
+  for (const m of b) {
+    if (!isFilm(m)) continue;
+    for (const t of [m.title, m.originalTitle]) {
+      if (!t) continue;
+      const k = normTitle(t);
+      aniFilmYears.set(k, [...(aniFilmYears.get(k) ?? []), m.year ?? 0]);
+    }
+  }
+  const sameAniFilm = (m: Media) =>
+    isFilm(m)
+    && [m.title, m.originalTitle].some((t) =>
+      !!t && (aniFilmYears.get(normTitle(t)) ?? []).some((y) => !y || !m.year || Math.abs(y - m.year) <= 1),
+    );
+  // TMDB lists anime too; keep its entry only when AniList didn't return the same show or film.
+  const tmdb = a.filter(
+    (m) => !((m.kind === "anime" && (aniTitles.has(normTitle(m.title)) || aniTitles.has(normTitle(m.originalTitle ?? "")))) || sameAniFilm(m)),
+  );
   const scored = [...tmdb.map((m, i) => ({ m, s: relevance(m, term, i) })), ...b.map((m, i) => ({ m, s: relevance(m, term, i) }))];
   return scored.sort((x, y) => y.s - x.s).map((x) => x.m);
 }

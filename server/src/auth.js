@@ -49,10 +49,15 @@ export async function issueTokens(user, device, familyId = crypto.randomUUID()) 
  */
 export async function rotateRefresh(token, device) {
   const h = sha256(token);
+  // Revoke and read the account in one statement: the revoke stays a single conditional UPDATE
+  // (two concurrent refreshes can't both win) and there's no window between it and the lookup.
   const { rows } = await q(
-    `UPDATE refresh_tokens SET revoked_at = now(), replaced_at = now()
-      WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now()
-      RETURNING user_id, family_id`,
+    `WITH revoked AS (
+       UPDATE refresh_tokens SET revoked_at = now(), replaced_at = now()
+        WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now()
+        RETURNING user_id, family_id
+     )
+     SELECT r.family_id, u.* FROM revoked r LEFT JOIN users u ON u.id = r.user_id`,
     [h],
   );
   if (!rows[0]) {
@@ -63,18 +68,41 @@ export async function rotateRefresh(token, device) {
     }
     return null;
   }
-  const { rows: u } = await q(`SELECT * FROM users WHERE id = $1`, [rows[0].user_id]);
-  if (!u[0]) return null;
-  return { user: publicUser(u[0]), ...(await issueTokens(u[0], device, rows[0].family_id ?? undefined)) };
+  const user = rows[0];
+  if (!user.id) return null; // account deleted since the token was issued
+  return { user: publicUser(user), ...(await issueTokens(user, device, user.family_id ?? undefined)) };
 }
 
 export async function revokeRefresh(token) {
   await q(`UPDATE refresh_tokens SET revoked_at = now() WHERE token_hash = $1 AND revoked_at IS NULL`, [sha256(token)]);
 }
 
+/**
+ * token_version per user, cached briefly so every API request isn't a second query. Changes made
+ * here (sign-out-everywhere, account deletion) drop the entry at once; another server instance
+ * sees them within VERSION_TTL_MS.
+ */
+const VERSION_TTL_MS = 15_000;
+const versionCache = new Map();
+
+export function forgetTokenVersion(userId) {
+  versionCache.delete(userId);
+}
+
+async function tokenVersion(userId) {
+  const hit = versionCache.get(userId);
+  if (hit && Date.now() - hit.at < VERSION_TTL_MS) return hit.version;
+  const { rows } = await q(`SELECT token_version FROM users WHERE id = $1`, [userId]);
+  const version = rows[0] ? rows[0].token_version : null;
+  if (versionCache.size > 5000) versionCache.clear();
+  versionCache.set(userId, { version, at: Date.now() });
+  return version;
+}
+
 /** Sign out everywhere: bump the token version (kills access tokens) and revoke every refresh token. */
 export async function revokeAll(userId) {
   await q(`UPDATE users SET token_version = token_version + 1 WHERE id = $1`, [userId]);
+  forgetTokenVersion(userId);
   await q(`UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL`, [userId]);
 }
 
@@ -92,11 +120,16 @@ export async function requireUser(req, reply) {
   } catch {
     return reply.code(401).send({ error: "token_expired" });
   }
-  const { rows } = await q(`SELECT token_version FROM users WHERE id = $1`, [payload.sub]);
-  if (!rows[0] || rows[0].token_version !== (payload.ver ?? 0)) return reply.code(401).send({ error: "unauthorized" });
+  const version = await tokenVersion(payload.sub);
+  if (version == null || version !== (payload.ver ?? 0)) return reply.code(401).send({ error: "unauthorized" });
   req.userId = payload.sub;
 }
 
 /** Housekeeping: expired and long-revoked refresh tokens are dead weight. */
 export const pruneTokens = () =>
-  q(`DELETE FROM refresh_tokens WHERE expires_at < now() OR revoked_at < now() - interval '7 days'`);
+  Promise.all([
+    q(`DELETE FROM refresh_tokens WHERE expires_at < now() OR revoked_at < now() - interval '7 days'`),
+    // Tombstones only need to outlive the longest a device plausibly stays offline.
+    q(`DELETE FROM progress WHERE deleted_at < now() - interval '90 days'`),
+    q(`DELETE FROM watchlist WHERE deleted_at < now() - interval '90 days'`),
+  ]);

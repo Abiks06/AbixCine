@@ -41,6 +41,8 @@ export interface DebridCachedFile {
 export interface DebridCacheStatus {
   infoHash: string;
   cached: boolean;
+  /** The provider couldn't say (Real-Debrid disabled its cache endpoint): try it on play. */
+  unknown?: boolean;
   files?: DebridCachedFile[];
 }
 
@@ -273,8 +275,37 @@ interface SelectableFile {
   index: number;
 }
 
-function selectBestFile<T extends SelectableFile>(files: T[], fileIdx?: number): T | undefined {
+/** Which file of a torrent the stream means. Stremio usually gives its position and its name. */
+export interface FileTarget {
+  fileIdx?: number;
+  filename?: string;
+  season?: number;
+  episode?: number;
+}
+
+const baseName = (path: string) => path.split(/[\\/]/).pop()?.trim().toLowerCase() ?? "";
+
+/** `S01E02`, `1x02`: true when the name is this episode (season packs list every episode). */
+function isEpisodeFile(filename: string, season: number, episode: number): boolean {
+  const m = filename.match(/\bs(\d{1,2})[ ._-]?e(\d{1,3})\b/i) ?? filename.match(/\b(\d{1,2})x(\d{2,3})\b/i);
+  return !!m && Number(m[1]) === season && Number(m[2]) === episode;
+}
+
+function selectBestFile<T extends SelectableFile>(files: T[], targetOrIdx?: FileTarget | number): T | undefined {
   if (!files.length) return undefined;
+  const target: FileTarget = typeof targetOrIdx === "number" ? { fileIdx: targetOrIdx } : (targetOrIdx ?? {});
+  const fileIdx = target.fileIdx;
+  // The exact name wins: positions shift when a provider lists a filtered subset (AllDebrid), and
+  // in a season pack a shifted position lands on the wrong episode rather than on a non-video.
+  const wantName = target.filename ? baseName(target.filename) : "";
+  if (wantName) {
+    const named = files.find((f) => baseName(f.filename) === wantName);
+    if (named) return named;
+  }
+  if (target.season != null && target.episode != null) {
+    const eps = files.filter((f) => VIDEO_EXT_RX.test(f.filename) && !SAMPLE_RX.test(f.filename) && isEpisodeFile(f.filename, target.season!, target.episode!));
+    if (eps.length) return eps.reduce((best, cur) => ((cur.sizeBytes ?? 0) > (best.sizeBytes ?? 0) ? cur : best), eps[0]);
+  }
   if (fileIdx != null && Number.isInteger(fileIdx) && fileIdx >= 0) {
     // `fileIdx` is the file's position in the torrent. Trust a match only when it lands on a
     // video: providers that list a filtered subset (AllDebrid's links) shift every position.
@@ -331,13 +362,26 @@ async function rdCheckCache(
   const chunkSize = 40;
   for (let i = 0; i < hashes.length; i += chunkSize) {
     const batch = hashes.slice(i, i + chunkSize);
-    const data = await requestJson<Record<string, RdInstantEntry | unknown[]>>(
-      "realdebrid",
-      `${RD_BASE}/torrents/instantAvailability/${batch.join("/")}`,
-      bearerHeaders(apiKey),
-      undefined,
-      signal,
-    );
+    let data: Record<string, RdInstantEntry | unknown[]>;
+    try {
+      data = await requestJson<Record<string, RdInstantEntry | unknown[]>>(
+        "realdebrid",
+        `${RD_BASE}/torrents/instantAvailability/${batch.join("/")}`,
+        bearerHeaders(apiKey),
+        undefined,
+        signal,
+      );
+    } catch (err) {
+      // Real-Debrid disabled this endpoint (it answers 403/404 now). That says nothing about the
+      // key (a bad key still fails with 401 on the real calls): report "unknown" so the stream
+      // is tried on play, where an uncached torrent is cleaned up again.
+      const status = (err as { status?: number } | null)?.status;
+      if (err instanceof DebridError && (status === 403 || status === 404)) {
+        for (const h of hashes) out[h] = { infoHash: h, cached: false, unknown: true };
+        return out;
+      }
+      throw err;
+    }
     for (const h of batch) {
       const entry = data[h];
       if (!entry || Array.isArray(entry) || !Array.isArray(entry.rd) || entry.rd.length === 0) continue;
@@ -381,16 +425,16 @@ async function withCleanup<T>(work: (track: (cleanup: () => Promise<unknown>) =>
 async function rdResolveStream(
   apiKey: string,
   magnetUri: string,
-  fileIdx?: number,
+  target: FileTarget = {},
   signal?: AbortSignal,
 ): Promise<ResolvedDebridStream> {
-  return withCleanup((track) => rdResolve(apiKey, magnetUri, fileIdx, signal, track));
+  return withCleanup((track) => rdResolve(apiKey, magnetUri, target, signal, track));
 }
 
 async function rdResolve(
   apiKey: string,
   magnetUri: string,
-  fileIdx: number | undefined,
+  target: FileTarget,
   signal: AbortSignal | undefined,
   track: (cleanup: () => Promise<unknown>) => void,
 ): Promise<ResolvedDebridStream> {
@@ -423,7 +467,7 @@ async function rdResolve(
       sizeBytes: f.bytes,
       index,
     }));
-    chosenFile = selectBestFile(files, fileIdx);
+    chosenFile = selectBestFile(files, target);
     const selectParam = chosenFile?.id != null ? String(chosenFile.id) : "all";
 
     const selectRes = await fetchDebrid(
@@ -470,7 +514,7 @@ async function rdResolve(
     .filter((f) => f.selected === 1);
   if (!chosenFile || !selectedFiles.some((f) => f.id === chosenFile!.id)) {
     const all: SelectableFile[] = (info.files ?? []).map((f, index) => ({ id: f.id, filename: f.path.replace(/^\/+/, ""), sizeBytes: f.bytes, index }));
-    const wanted = selectBestFile(all, fileIdx);
+    const wanted = selectBestFile(all, target);
     chosenFile = wanted && selectedFiles.some((f) => f.id === wanted.id) ? wanted : selectBestFile(selectedFiles);
   }
   let linkIndex = 0;
@@ -592,16 +636,16 @@ interface TorBoxTorrentItem {
 async function tbResolveStream(
   apiKey: string,
   magnetUri: string,
-  fileIdx?: number,
+  target: FileTarget = {},
   signal?: AbortSignal,
 ): Promise<ResolvedDebridStream> {
-  return withCleanup((track) => tbResolve(apiKey, magnetUri, fileIdx, signal, track));
+  return withCleanup((track) => tbResolve(apiKey, magnetUri, target, signal, track));
 }
 
 async function tbResolve(
   apiKey: string,
   magnetUri: string,
-  fileIdx: number | undefined,
+  target: FileTarget,
   signal: AbortSignal | undefined,
   track: (cleanup: () => Promise<unknown>) => void,
 ): Promise<ResolvedDebridStream> {
@@ -646,7 +690,7 @@ async function tbResolve(
     sizeBytes: f.size,
     index,
   }));
-  const chosen = selectBestFile(files, fileIdx);
+  const chosen = selectBestFile(files, target);
   if (!chosen || chosen.id == null) {
     throw new DebridError("UNCACHED", "torbox", "TorBox torrent contains no selectable files");
   }
@@ -764,16 +808,16 @@ interface AllDebridStatusMagnet {
 async function adResolveStream(
   apiKey: string,
   magnetUri: string,
-  fileIdx?: number,
+  target: FileTarget = {},
   signal?: AbortSignal,
 ): Promise<ResolvedDebridStream> {
-  return withCleanup((track) => adResolve(apiKey, magnetUri, fileIdx, signal, track));
+  return withCleanup((track) => adResolve(apiKey, magnetUri, target, signal, track));
 }
 
 async function adResolve(
   apiKey: string,
   magnetUri: string,
-  fileIdx: number | undefined,
+  target: FileTarget,
   signal: AbortSignal | undefined,
   track: (cleanup: () => Promise<unknown>) => void,
 ): Promise<ResolvedDebridStream> {
@@ -828,7 +872,7 @@ async function adResolve(
     sizeBytes: l.size,
     index,
   }));
-  const chosen = selectBestFile(selectable, fileIdx);
+  const chosen = selectBestFile(selectable, target);
   const targetLink = chosen ? rawLinks[chosen.index].link : rawLinks[0].link;
 
   const unlockEnv = await requestJson<
@@ -891,8 +935,10 @@ export async function resolveDebridStream(
   magnetOrHash: string,
   fileIdx?: number,
   signal?: AbortSignal,
+  hint?: Omit<FileTarget, "fileIdx">,
 ): Promise<ResolvedDebridStream> {
   throwIfAborted(signal);
+  const target: FileTarget = { fileIdx, ...hint };
   const key = assertApiKey(provider, apiKey);
   const parsed = toMagnetUri(magnetOrHash);
   if (!parsed) {
@@ -901,11 +947,11 @@ export async function resolveDebridStream(
 
   switch (provider) {
     case "realdebrid":
-      return rdResolveStream(key, parsed.magnetUri, fileIdx, signal);
+      return rdResolveStream(key, parsed.magnetUri, target, signal);
     case "torbox":
-      return tbResolveStream(key, parsed.magnetUri, fileIdx, signal);
+      return tbResolveStream(key, parsed.magnetUri, target, signal);
     case "alldebrid":
-      return adResolveStream(key, parsed.magnetUri, fileIdx, signal);
+      return adResolveStream(key, parsed.magnetUri, target, signal);
   }
 }
 

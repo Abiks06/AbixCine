@@ -1,9 +1,29 @@
-import { defineConfig } from "vite";
+import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
+
+/**
+ * JASSUB ships fallback `new URL("./wasm/jassub-worker.wasm", import.meta.url)` references to its
+ * legacy non-SIMD engine, which Vite always copies into the build (2 MB + 80 KB of glue). The app
+ * passes the modern build for both slots (SubtitleOverlay.tsx) and WebView2 always has WASM SIMD,
+ * so those fallbacks are dead: drop them so the files leave the installer too.
+ */
+function dropLegacyJassub(): Plugin {
+  return {
+    name: "abx-drop-legacy-jassub",
+    enforce: "pre",
+    transform(code, id) {
+      if (!/[\\/]jassub[\\/]dist[\\/]jassub\.js(?:\?.*)?$/.test(id)) return null;
+      const next = code
+        .replace(/new URL\(\s*['"]\.\/wasm\/jassub-worker\.wasm['"]\s*,\s*import\.meta\.url\s*\)\.href/g, '""')
+        .replace(/new URL\(\s*['"]\.\/wasm\/jassub-worker\.js['"]\s*,\s*import\.meta\.url\s*\)\.href/g, '""');
+      return next === code ? null : { code: next, map: null };
+    },
+  };
+}
 
 // Tauri expects a fixed port in dev and no screen clearing so Rust errors stay visible.
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), dropLegacyJassub()],
   clearScreen: false,
   // Never watch the Rust side: cargo locks files in target/ and the watcher would crash.
   server: { port: 1420, strictPort: true, watch: { ignored: ["**/src-tauri/**", "**/server/**"] } },

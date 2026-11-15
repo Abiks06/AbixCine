@@ -1,4 +1,5 @@
 import type { PlaybackRequest } from "../lib/types";
+import { isFilm } from "../lib/types";
 import { inferSubtitleMeta, type SourceProvider, type StreamCandidate, type SubtitleFormat, type SubtitleTrack } from "./types";
 
 /**
@@ -106,7 +107,7 @@ export const jellyfinProvider: SourceProvider = {
   isEnabled: (s) => s.jellyfin.enabled && !!s.jellyfin.url && !!s.jellyfin.apiKey,
   async find(req: PlaybackRequest, s, signal) {
     const { url, apiKey } = s.jellyfin;
-    const isMovie = req.media.kind === "movie";
+    const isMovie = isFilm(req.media);
     const found = await jf(url, apiKey, "/Items", {
       searchTerm: req.media.title,
       IncludeItemTypes: isMovie ? "Movie" : "Series",

@@ -1,6 +1,6 @@
 import { searchTmdb } from "../lib/tmdb";
 import type { Settings } from "../lib/settings";
-import type { PlaybackRequest } from "../lib/types";
+import { isFilm, type PlaybackRequest } from "../lib/types";
 import { DEFAULT_UA, normalizeHeaders, type StreamHeaders } from "./native";
 import type { SourceProvider, StreamCandidate, VideoSource } from "./types";
 
@@ -57,6 +57,46 @@ export const availableSources: VideoSource[] = [
     },
   },
   {
+    id: "vidrock-embed",
+    name: "VidRock Player",
+    isFrench: false,
+    headers: serverHeaders("https://vidrock.net"),
+    urls: {
+      movie: "https://vidrock.net/movie/{id}",
+      tv: "https://vidrock.net/tv/{id}/{season}/{episode}",
+    },
+  },
+  {
+    id: "zxcstream-embed",
+    name: "ZXCStream Player",
+    isFrench: false,
+    headers: serverHeaders("https://zxcstream.cc"),
+    urls: {
+      movie: "https://zxcstream.cc/player/movie/{id}",
+      tv: "https://zxcstream.cc/player/tv/{id}/{season}/{episode}",
+    },
+  },
+  {
+    id: "hexa",
+    name: "Hexa",
+    isFrench: false,
+    headers: serverHeaders("https://hexa.su"),
+    urls: {
+      movie: "https://hexa.su/watch/movie/{id}",
+      tv: "https://hexa.su/watch/tv/{id}/{season}/{episode}",
+    },
+  },
+  {
+    id: "vidmario",
+    name: "VidMario",
+    isFrench: false,
+    headers: serverHeaders("https://player.vidmario.net"),
+    urls: {
+      movie: "https://player.vidmario.net/embed/movie/{id}",
+      tv: "https://player.vidmario.net/embed/tv/{id}/{season}/{episode}",
+    },
+  },
+  {
     id: "vidsrcsu",
     name: "VidSrc.su",
     isFrench: false,
@@ -64,16 +104,6 @@ export const availableSources: VideoSource[] = [
     urls: {
       movie: "https://vidsrc.su/embed/movie/{id}",
       tv: "https://vidsrc.su/embed/tv/{id}/{season}/{episode}",
-    },
-  },
-  {
-    id: "vidrift",
-    name: "Vidrift",
-    isFrench: false,
-    headers: serverHeaders("https://embed.vidrift.net"),
-    urls: {
-      movie: "https://embed.vidrift.net/embed/movie/{id}",
-      tv: "https://embed.vidrift.net/embed/tv/{id}/{season}/{episode}",
     },
   },
   {
@@ -87,25 +117,14 @@ export const availableSources: VideoSource[] = [
     },
   },
   {
-    id: "smashystream",
-    name: "SmashyStream",
-    isFrench: false,
-    headers: serverHeaders("https://embed.smashystream.com"),
-    urls: {
-      movie: "https://embed.smashystream.com/playere.php?tmdb={id}",
-      tv: "https://embed.smashystream.com/playere.php?tmdb={id}&season={season}&episode={episode}",
-    },
-  },
-  {
     id: "vidsrccc",
     extra: true,
-    name: "VidSrc.cc",
+    name: "VidSrc",
     isFrench: false,
-    headers: serverHeaders("https://vidsrc.cc"),
+    headers: serverHeaders("https://vidsrcme.ru"),
     urls: {
-      movie: "https://vidsrc.cc/v2/embed/movie/{id}",
-      tv: "https://vidsrc.cc/v2/embed/tv/{id}/{season}/{episode}",
-      anime: "https://vidsrc.cc/v2/embed/anime/ani{anilist}/{episode}/{audio}",
+      movie: "https://vidsrcme.ru/embed/movie/{id}",
+      tv: "https://vidsrcme.ru/embed/tv/{id}/{season}/{episode}",
     },
   },
   {
@@ -142,17 +161,6 @@ export const availableSources: VideoSource[] = [
     },
   },
   {
-    id: "embedsu",
-    extra: true,
-    name: "Embed.su",
-    isFrench: false,
-    headers: serverHeaders("https://embed.su"),
-    urls: {
-      movie: "https://embed.su/embed/movie/{id}",
-      tv: "https://embed.su/embed/tv/{id}/{season}/{episode}",
-    },
-  },
-  {
     id: "vidsrcrip",
     extra: true,
     name: "VidSrc.rip",
@@ -161,17 +169,6 @@ export const availableSources: VideoSource[] = [
     urls: {
       movie: "https://vidsrc.rip/embed/movie/{id}",
       tv: "https://vidsrc.rip/embed/tv/{id}/{season}/{episode}",
-    },
-  },
-  {
-    id: "frembed",
-    extra: true,
-    name: "Frembed",
-    isFrench: true,
-    headers: serverHeaders("https://frembed.uno"),
-    urls: {
-      movie: "https://frembed.uno/embed/movie/{id}",
-      tv: "https://frembed.uno/embed/serie/{id}?sa={season}&epi={episode}",
     },
   },
 ];
@@ -293,7 +290,7 @@ export function resolveTmdbId(req: PlaybackRequest, signal?: AbortSignal): Promi
       const q = req.media.title || req.media.originalTitle;
       if (!q) return null;
 
-      const isMovie = req.media.kind === "movie";
+      const isMovie = isFilm(req.media) || Boolean((req as { isAnimeMovie?: boolean }).isAnimeMovie);
       let results = await searchTmdb(q);
       let match = pickBestTmdbMatch(results, req, isMovie);
 
@@ -379,7 +376,9 @@ export function createEmbedProvider(src: VideoSource, index: number): SourceProv
       };
       const anime = isAnimeReq(req);
       const audio = req.audio ?? "sub";
-      const anilist = req.media.key.match(/^anilist:(\d+)$/)?.[1];
+      const anilist =
+        req.media.key.match(/^anilist:(\d+)$/)?.[1] ??
+        (req.media.anilistId != null ? String(req.media.anilistId) : undefined);
 
       // Native anime endpoint: the right cour and episode numbering, and a real sub/dub switch.
       if (anime && anilist && src.urls.anime) {
@@ -403,7 +402,8 @@ export function createEmbedProvider(src: VideoSource, index: number): SourceProv
 
       const tmdbId = await resolveTmdbId(req, signal);
       if (!tmdbId || signal.aborted) return [];
-      const template = req.media.kind === "movie" ? src.urls?.movie : src.urls?.tv;
+      const isMovie = isFilm(req.media) || Boolean((req as { isAnimeMovie?: boolean }).isAnimeMovie);
+      const template = isMovie ? src.urls?.movie : src.urls?.tv;
       const url = buildEmbedUrl(template, tmdbId, req.season, req.episode);
       if (!url) return [];
       return [

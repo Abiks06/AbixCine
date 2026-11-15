@@ -16,7 +16,10 @@ export const MAX_PLUGIN_CANDIDATES = 25;
 const VALID_MEDIA_TYPES = new Set<MediaKind>(["movie", "tv", "anime"]);
 const VALID_PLUGIN_ID_RX = /^[a-z0-9][a-z0-9._-]{0,63}$/i;
 const VALID_HOST_PATTERN_RX = /^(?:\*\.)?[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/i;
-const SAFE_HTTP_METHODS = new Set(["GET", "POST", "HEAD", "PUT", "DELETE", "OPTIONS", "PATCH"]);
+/** Scrapers read pages and post search forms; nothing a plugin does needs to mutate remote state. */
+const SAFE_HTTP_METHODS = new Set(["GET", "POST", "HEAD"]);
+/** Headers that control the connection or routing rather than the request: never plugin-settable. */
+const FORBIDDEN_PLUGIN_HEADERS = /^(?:host|connection|content-length|transfer-encoding|te|trailer|upgrade|keep-alive|expect|proxy-.*|x-forwarded-.*|forwarded)$/i;
 
 export type PluginMediaType = MediaKind;
 
@@ -598,6 +601,27 @@ export function buildSandboxWorkerScript(pluginScript: string): string {
     }
   }
 
+  // In a real worker, fetch/importScripts/caches/indexedDB/postMessage live on the prototype chain
+  // (WorkerGlobalScope.prototype, DedicatedWorkerGlobalScope.prototype), and navigator.storage on
+  // WorkerNavigator.prototype. Shadowing them on the global alone left
+  // Object.getPrototypeOf(self).fetch(...) reaching the network around host.httpFetch, so strip
+  // them from every prototype too. EventTarget.prototype stays: AbortSignal listeners need it.
+  function __stripProtoChain(obj, names) {
+    let p = obj ? Object.getPrototypeOf(obj) : null;
+    while (p && p !== Object.prototype) {
+      for (const n of names) {
+        if (!Object.prototype.hasOwnProperty.call(p, n)) continue;
+        try { delete p[n]; } catch {}
+        if (Object.prototype.hasOwnProperty.call(p, n)) {
+          try { Object.defineProperty(p, n, { value: undefined, writable: false, configurable: false }); } catch {}
+        }
+      }
+      p = Object.getPrototypeOf(p);
+    }
+  }
+  __stripProtoChain(__global, ${blockedList}.concat(["postMessage", "onmessage", "onmessageerror", "close"]));
+  try { if (__global.navigator) __stripProtoChain(__global.navigator, ${navList}); } catch {}
+
   const __host = Object.freeze({
     httpFetch: function(url, opts) {
       return new Promise(function(resolve, reject) {
@@ -756,7 +780,7 @@ function sanitizePluginHeaders(raw?: Record<string, string>): Record<string, str
     if (typeof v !== "string") continue;
     const cleanKey = k.replace(/[\r\n:]/g, "").trim();
     const cleanVal = v.replace(/[\r\n]/g, "").trim();
-    if (!cleanKey || !cleanVal) continue;
+    if (!cleanKey || !cleanVal || FORBIDDEN_PLUGIN_HEADERS.test(cleanKey)) continue;
     out[cleanKey] = cleanVal;
   }
   return Object.keys(out).length > 0 ? out : undefined;

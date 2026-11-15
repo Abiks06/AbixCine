@@ -1337,12 +1337,30 @@ fn urlencoding_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Test-harness environment switches (`ABX_SNIFF_TEST`, `ABX_JS_TEST`, ...) only exist in debug
+/// builds: in a release build they are always unset, so nothing on the machine can drive the app.
+pub(crate) fn debug_env_var(name: &str) -> Option<std::ffi::OsString> {
+    if cfg!(debug_assertions) {
+        std::env::var_os(name)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn debug_env_string(name: &str) -> Result<String, std::env::VarError> {
+    if cfg!(debug_assertions) {
+        std::env::var(name)
+    } else {
+        Err(std::env::VarError::NotPresent)
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mut builder = tauri::Builder::default();
     // A second launch (e.g. from the Start menu while it's open) focuses the existing window.
     // The debug sniff harness runs alongside an installed copy, so it skips this.
-    if std::env::var_os("ABX_SNIFF_TEST").is_none() && std::env::var_os("ABX_JS_TEST").is_none() {
+    if debug_env_var("ABX_SNIFF_TEST").is_none() && debug_env_var("ABX_JS_TEST").is_none() {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.unminimize();
@@ -1355,7 +1373,18 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         // Direct streams play through this scheme (see stream.rs).
-        .register_asynchronous_uri_scheme_protocol("abxs", |_ctx, req, responder| {
+        .register_asynchronous_uri_scheme_protocol("abxs", |ctx, req, responder| {
+            // Only the app's own window may use the proxy. Hidden `sniff-*` windows run untrusted
+            // embed pages, which must not be able to fetch through it.
+            if ctx.webview_label() != "main" {
+                responder.respond(
+                    tauri::http::Response::builder()
+                        .status(tauri::http::StatusCode::FORBIDDEN)
+                        .body(Vec::new())
+                        .unwrap(),
+                );
+                return;
+            }
             tauri::async_runtime::spawn(async move { responder.respond(stream::handle(req).await) });
         })
         .setup(|app| {
@@ -1369,7 +1398,7 @@ pub fn run() {
             // Debug harness: ABX_JS_TEST="<js expression returning a promise of a string>" runs in the
             // main window once the app has loaded; the result is written to the URL hash and printed.
             #[cfg(debug_assertions)]
-            if let Ok(js) = std::env::var("ABX_JS_TEST") {
+            if let Ok(js) = debug_env_string("ABX_JS_TEST") {
                 let h = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_secs(6)).await;
@@ -1382,7 +1411,7 @@ pub fn run() {
                                 let _ = w.eval(&wrapped);
                             }
                             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                            if std::env::var_os("ABX_JS_VERBOSE").is_some() {
+                            if debug_env_var("ABX_JS_VERBOSE").is_some() {
                                 println!("JSURL {:?}", w.url().map(|u| u.to_string()));
                             }
                             if let Some(f) = w.url().ok().and_then(|u| u.fragment().map(|f| f.to_string())) {
@@ -1398,7 +1427,7 @@ pub fn run() {
             }
             // Debug harness: ABX_SNIFF_TEST="url|url" sniffs each URL, prints the result, exits.
             #[cfg(debug_assertions)]
-            if let Ok(list) = std::env::var("ABX_SNIFF_TEST") {
+            if let Ok(list) = debug_env_string("ABX_SNIFF_TEST") {
                 let h = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     // ABX_SNIFF_PARALLEL: run them all at once, like the app's race does.
@@ -1448,7 +1477,7 @@ pub fn run() {
                         }
                     }
                     // The webview itself must be able to read the proxy scheme (that's what hls.js does).
-                    if let (Some(w), Ok(u)) = (h.get_webview_window("main"), std::env::var("ABX_WEBVIEW_TEST")) {
+                    if let (Some(w), Ok(u)) = (h.get_webview_window("main"), debug_env_string("ABX_WEBVIEW_TEST")) {
                         if let Ok(Some(s)) = shield::sniff_media(h.clone(), u, Some(16_000), None).await {
                             let p = stream::proxy_path(&s.url, &s.headers);
                             let js = format!("fetch('http://abxs.localhost{p}').then(r=>r.text().then(t=>history.replaceState(null,'','#WV-'+r.status+'-'+t.length+'-'+encodeURIComponent(t.slice(0,7))))).catch(e=>history.replaceState(null,'','#WVERR-'+encodeURIComponent(String(e))))");

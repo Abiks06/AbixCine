@@ -11,7 +11,7 @@ import {
   recordPlayback,
   recordProbe,
 } from "./health";
-import { native } from "./native";
+import { isUrlTokenExpired, native } from "./native";
 import {
   candKey,
   isAbortedProbe,
@@ -100,7 +100,12 @@ export interface SessionDeps {
 /** Direct checks are plain HTTP: several at once is fine. */
 const DIRECT_POOL = 6;
 /** A provider (a Stremio addon, say) can return dozens of streams; check the best few, keep the rest on standby. */
-const AUTO_DIRECT_CHECKS = 12;
+const AUTO_DIRECT_CHECKS = 24;
+/**
+ * Automatic checks one provider gets while others still have candidates waiting, so one source
+ * returning a dozen dead links can't use up the whole budget before anyone else is tried.
+ */
+const AUTO_DIRECT_PER_PROVIDER = 3;
 /** Hidden-browser captures before a pick, and while only filling backups. */
 const CAPTURE_POOL = 3;
 const CAPTURE_POOL_BACKUP = 2;
@@ -127,8 +132,31 @@ const SOFT_CONFIRM_ERRORS = /^(?:timeout|AbortError)$/i;
 
 const isEmbed = (c: StreamCandidate) => c.kind === "embed";
 const isMagnet = (c: StreamCandidate) => /^magnet:/i.test(c.url);
+const isAbxsProxied = (url: string) => /^(?:https?:\/\/abxs\.localhost(?:[/:?]|$)|abxs:\/\/)/i.test(url);
 
-type Inflight = { ctl: AbortController; promise: Promise<StreamCandidate>; user: boolean; capture: boolean };
+const ANIME_ONLY_DIRECT_IDS = new Set(["hianime", "megaplay", "anizone", "kickassanime", "anikoto", "animeheaven"]);
+/** TMDB-keyed movie/TV extractors that only carry the original audio, so never an anime dub. */
+const NO_ANIME_DUB_DIRECT_IDS = new Set([
+  "vixsrc", "castle", "hexa-direct", "vidup", "cinejoy", "meowtv", "zxcstreams", "vidrock", "vidlink-direct",
+]);
+const ASIAN_DRAMA_DIRECT_IDS = new Set(["kisskh", "onetouchtv"]);
+const ASIAN_DRAMA_LANGS = new Set(["ko", "zh", "cn", "ja", "th", "tw", "tl", "id", "vi"]);
+
+type Inflight = {
+  ctl: AbortController;
+  promise: Promise<StreamCandidate>;
+  user: boolean;
+  capture: boolean;
+  /** Started by `verify()` (not by `pump()`): only then may its callers cancel it. */
+  ownedByVerify?: boolean;
+  /** `verify()` callers still waiting with a signal; cancelled only when the last one leaves. */
+  waiters?: number;
+  /** A `verify()` caller without a signal is waiting: never cancel on another caller's abort. */
+  pinned?: boolean;
+};
+
+/** Errors from a shared dependency (e.g. enc-dec.app) that say nothing about the provider itself. */
+const isDependencyOutage = (e: unknown) => (e as { dependencyOutage?: unknown } | null)?.dependencyOutage === true;
 
 export class SourceSession {
   readonly req: PlaybackRequest;
@@ -144,13 +172,18 @@ export class SourceSession {
   private directQueue: string[] = [];
   private captureQueue: string[] = [];
   private autoDirect = 0;
+  /** Providers looked up in warm (preview) mode, to be asked again for real when play is requested. */
+  private warmLookups = new Set<string>();
+  private autoByProvider = new Map<string, number>();
   private lookupsPending = 0;
-  private directLookupsPending = 0;
 
   private target = 1;
   private pickKey?: string;
   private pickMs?: number;
   private confirming?: string;
+  private confirmCtl?: AbortController;
+  private commitGen = 0;
+  private failoverToken = 0;
   private confirmed = new Set<string>();
   private recorded = new Set<string>();
   /** Keys the viewer chose by hand, so a successful play is remembered as their choice. */
@@ -253,6 +286,7 @@ export class SourceSession {
   private isBusy() {
     if (!this.started) return true;
     if (this.lookupsPending > 0 || this.inflight.size > 0 || this.confirming) return true;
+    if (this.backgroundStopped) return false;
     if (this.directQueue.length > 0 && this.autoDirect < AUTO_DIRECT_CHECKS && this.readyCount() < Math.max(this.target, 1)) return true;
     return this.captureQueue.length > 0 && this.readyCount() < this.target && !this.backupsHeld;
   }
@@ -271,6 +305,12 @@ export class SourceSession {
     this.backgroundStopped = false;
     if (this.started && !this.disposed) {
       this.target = Math.max(this.target, 1);
+      if (!this.captureOpen && !this.holdTimer) {
+        const direct = this.providers.filter((p) => p.category !== "embed");
+        const hold = this.holdMs(direct);
+        if (hold <= 0 || this.directSettled()) this.captureOpen = true;
+        else this.holdTimer = setTimeout(() => this.openCapture(), hold);
+      }
       this.pump();
     }
   }
@@ -304,6 +344,7 @@ export class SourceSession {
 
   dispose() {
     this.disposed = true;
+    this.cancelPendingCommit();
     this.root.abort();
     for (const t of [this.holdTimer, this.graceTimer, this.hedgeTimer, this.backupTimer, this.idleTimer]) clearTimeout(t);
     this.inflight.clear();
@@ -316,18 +357,21 @@ export class SourceSession {
   start(want = 1) {
     this.want(want);
     if (this.started || this.disposed) return this;
+    this.backgroundStopped = false;
     this.started = true;
     this.t0 = performance.now();
 
     const direct = this.providers.filter((p) => p.category !== "embed");
     this.lookupsPending = this.providers.length;
-    this.directLookupsPending = direct.length;
 
     const hold = this.holdMs(direct);
     if (hold <= 0) this.captureOpen = true;
     else this.holdTimer = setTimeout(() => this.openCapture(), hold);
 
-    for (const p of this.providers) void this.lookup(p);
+    // A preview (want 1, the Title page) must not touch the user's accounts: providers with side
+    // effects (Debrid magnets) are asked in warm mode until playback is requested.
+    const warm = want <= 1;
+    for (const p of this.providers) void this.lookup(p, warm && !!p.sideEffectsOnLookup?.(this.s));
     if (!this.providers.length) this.evaluate();
     this.changed();
     return this;
@@ -336,6 +380,7 @@ export class SourceSession {
   /** Raise the number of ready streams to aim for (never lowers it). */
   want(n: number) {
     this.resume();
+    if (n > 1 && this.started && this.warmLookups.size) this.activateWarmLookups();
     if (n > this.target) {
       this.target = n;
       if (this.started) {
@@ -363,19 +408,48 @@ export class SourceSession {
     this.backgroundStopped = true;
     this.target = this.readyCount();
     for (const t of [this.holdTimer, this.hedgeTimer, this.backupTimer]) clearTimeout(t);
+    this.holdTimer = undefined;
+    this.hedgeTimer = undefined;
+    this.backupTimer = undefined;
     this.backupsHeld = false;
     for (const f of this.inflight.values()) if (!f.user) f.ctl.abort();
     this.changed();
   }
 
+  private isApplicableDirect(p: SourceProvider): boolean {
+    if (p.category === "embed") return false;
+    const isAnime = this.req.media.kind === "anime" || this.req.media.key.startsWith("anilist:");
+    if (ANIME_ONLY_DIRECT_IDS.has(p.id)) return isAnime;
+    if (ASIAN_DRAMA_DIRECT_IDS.has(p.id)) {
+      if (isAnime) return false;
+      const lang =
+        "originalLanguage" in this.req.media && typeof this.req.media.originalLanguage === "string"
+          ? this.req.media.originalLanguage.toLowerCase().split(/[-_]/)[0]
+          : undefined;
+      return !!lang && ASIAN_DRAMA_LANGS.has(lang);
+    }
+    if (NO_ANIME_DUB_DIRECT_IDS.has(p.id) && isAnime && (this.req.audio ?? "sub") === "dub") return false;
+    return true;
+  }
+
+  private applicableDirectExhausted(direct: SourceProvider[]) {
+    const anySearching = direct.some((p) => this.lanes.get(p.id)?.status === "searching");
+    return !anySearching && this.running(false) === 0 && (!this.directQueue.length || this.autoDirect >= AUTO_DIRECT_CHECKS);
+  }
+
   /**
-   * How long embeds wait for direct sources. No direct providers: don't wait. Direct providers
-   * that rarely deliver this kind of title: barely wait. Otherwise give them a head start.
+   * How long embeds wait for direct sources. No applicable direct providers (or all exhausted
+   * with zero ready candidates / circuit-open): don't wait. Direct providers that rarely deliver
+   * this kind of title: barely wait. Otherwise give them a head start.
    */
   private holdMs(direct: SourceProvider[]) {
     if (!direct.length || !native) return 0;
+    const applicable = direct.filter((p) => this.isApplicableDirect(p));
+    if (!applicable.length) return 0;
+    if (this.readyCount() === 0 && this.applicableDirectExhausted(applicable)) return 0;
+    if (applicable.every((p) => isCircuitOpen(p.id))) return 0;
     const kind = this.req.media.kind;
-    const best = Math.max(...direct.map((p) => learnedRank(p.id, kind, 0)));
+    const best = Math.max(...applicable.map((p) => learnedRank(p.id, kind, 0)));
     // learnedRank(…, 0) is about -14 for a provider that keeps failing and +10 for a dependable one.
     return best < -6 ? 300 : CAPTURE_HOLD_MS;
   }
@@ -387,18 +461,35 @@ export class SourceSession {
     this.pump();
   }
 
-  private async lookup(p: SourceProvider) {
+  /** Playback was requested: ask the providers that only previewed again, for real. */
+  private activateWarmLookups() {
+    const ids = [...this.warmLookups];
+    this.warmLookups.clear();
+    for (const id of ids) {
+      const p = this.providers.find((x) => x.id === id);
+      if (!p || this.disposed) continue;
+      const lane = this.lanes.get(id);
+      if (lane) this.lanes.set(id, { ...lane, status: "searching" });
+      this.lookupsPending++;
+      void this.lookup(p, false);
+    }
+  }
+
+  private async lookup(p: SourceProvider, warm = false) {
+    if (warm) this.warmLookups.add(p.id);
     const { ctl, cleanup } = linkSignal(this.root.signal);
     const t0 = performance.now();
     let found: StreamCandidate[] = [];
     let failure: { status: "timeout" | "error"; error?: string } | undefined;
     try {
-      found = await withTimeout(p.find(this.req, this.s, ctl.signal), lookupTimeout(p.id, p.timeoutMs ?? PROVIDER_TIMEOUT), ctl);
-      recordLookup(p.id, performance.now() - t0);
+      found = await withTimeout(p.find(this.req, this.s, ctl.signal, { warm }), lookupTimeout(p.id, p.timeoutMs ?? PROVIDER_TIMEOUT), ctl);
+      // Learn the time a real search takes. A quick "not here" says nothing about it, and learning
+      // from those shrank the timeout until the searches that do find something were cut off.
+      if (found.length) recordLookup(p.id, performance.now() - t0);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : undefined;
       failure = { status: msg === "timeout" ? "timeout" : "error", error: msg };
-      if (!this.root.signal.aborted) recordLookupFailure(p.id, Math.round(performance.now() - t0));
+      if (!this.root.signal.aborted && !isDependencyOutage(e)) recordLookupFailure(p.id, Math.round(performance.now() - t0));
     } finally {
       cleanup();
     }
@@ -418,7 +509,6 @@ export class SourceSession {
     this.lanes.set(p.id, failure ? { ...lane, ...failure } : { ...lane, status: added ? "found" : "empty", count: added });
 
     this.lookupsPending--;
-    if (p.category !== "embed") this.directLookupsPending--;
     this.pump();
     this.evaluate();
     this.changed();
@@ -440,12 +530,12 @@ export class SourceSession {
     return learnedRank(c.providerId, this.req.media.kind, this.prio[c.providerId] ?? 0) + affinity;
   }
 
-  private takeBest(queue: string[]) {
+  private takeBest(queue: string[], eligible?: (c: StreamCandidate) => boolean) {
     let bi = 0;
     let best = -Infinity;
     for (let i = 0; i < queue.length; i++) {
       const c = this.cands.get(queue[i]);
-      const r = c ? this.rankOf(c) : -Infinity;
+      const r = c && (!eligible || eligible(c)) ? this.rankOf(c) : -Infinity;
       if (r > best) {
         best = r;
         bi = i;
@@ -467,7 +557,16 @@ export class SourceSession {
     // Direct streams: cheap, so check them as they arrive, best first.
     while (this.directQueue.length && this.running(false) < DIRECT_POOL && this.autoDirect < AUTO_DIRECT_CHECKS && (wantMore() || !this.pickKey)) {
       this.autoDirect++;
-      this.launch(this.takeBest(this.directQueue), false);
+      // Round-robin-ish: prefer providers still under their share; past that, the best candidate wins.
+      const underShare = (c: StreamCandidate) => (this.autoByProvider.get(c.providerId) ?? 0) < AUTO_DIRECT_PER_PROVIDER;
+      const fair = this.directQueue.some((k) => {
+        const c = this.cands.get(k);
+        return !!c && underShare(c);
+      });
+      const key = this.takeBest(this.directQueue, fair ? underShare : undefined);
+      const pid = this.cands.get(key)?.providerId;
+      if (pid) this.autoByProvider.set(pid, (this.autoByProvider.get(pid) ?? 0) + 1);
+      this.launch(key, false);
     }
 
     // Embeds: held until direct sources had their chance, or everything direct has answered.
@@ -500,7 +599,8 @@ export class SourceSession {
   }
 
   private directSettled() {
-    return this.directLookupsPending <= 0 && this.running(false) === 0 && (!this.directQueue.length || this.autoDirect >= AUTO_DIRECT_CHECKS);
+    const applicable = this.providers.filter((p) => this.isApplicableDirect(p));
+    return this.applicableDirectExhausted(applicable);
   }
 
   private armHedge() {
@@ -546,7 +646,7 @@ export class SourceSession {
         this.changed();
         return this.cands.get(key) ?? r;
       });
-    this.inflight.set(key, { ctl, promise, user, capture });
+    this.inflight.set(key, { ctl, promise, user, capture, ownedByVerify: user });
     this.changed();
     return promise;
   }
@@ -559,10 +659,20 @@ export class SourceSession {
   private learn(r: StreamCandidate) {
     if (!r.probe || r.providerId === "manual" || isAbortedProbe(r, this.root.signal)) return;
     recordWin(r.providerId, this.req.media.kind, r.probe.ok);
-    // One vote per provider per session, however many files it returned.
+    // One vote per provider per session, however many files it returned. A success counts at once;
+    // a failure only once none of the provider's other mirrors is still waiting or being checked,
+    // so mirror #1 dying 50 ms before mirror #2 plays doesn't mark the provider as broken.
     if (this.recorded.has(r.providerId)) return;
+    if (!r.probe.ok && this.hasPendingFor(r.providerId, candKey(r))) return;
     this.recorded.add(r.providerId);
     recordProbe(r);
+  }
+
+  private hasPendingFor(providerId: string, exceptKey: string) {
+    const pending = (k: string) => k !== exceptKey && this.cands.get(k)?.providerId === providerId;
+    if (this.directQueue.some(pending) || this.captureQueue.some(pending)) return true;
+    for (const k of this.inflight.keys()) if (pending(k)) return true;
+    return false;
   }
 
   private put(c: StreamCandidate) {
@@ -623,6 +733,7 @@ export class SourceSession {
   /** Stop waiting for anything better: play the best ready stream now. */
   pickNow() {
     clearTimeout(this.graceTimer);
+    this.graceTimer = undefined;
     this.firstReadyAt = -Infinity;
     this.commit();
   }
@@ -644,10 +755,22 @@ export class SourceSession {
     this.commit();
   }
 
+  private cancelPendingCommit() {
+    clearTimeout(this.graceTimer);
+    this.graceTimer = undefined;
+    this.commitGen++;
+    if (this.confirmCtl) {
+      this.confirmCtl.abort();
+      this.confirmCtl = undefined;
+    }
+    this.confirming = undefined;
+  }
+
   /** Does the would-be pick still need its first segment fetched for real? */
   private needsConfirm(c: StreamCandidate) {
     if (this.confirmed.has(candKey(c))) return false;
     if (c.providerId === "local" || c.providerId === "manual" || isEmbed(c) || isMagnet(c)) return false;
+    if (c.via === "sniffed" && isAbxsProxied(c.url) && !isUrlTokenExpired(c.url)) return false;
     return c.kind === "hls" || c.kind === "file";
   }
 
@@ -658,9 +781,13 @@ export class SourceSession {
     const key = candKey(best);
     if (!this.needsConfirm(best)) return this.setPick(key);
 
+    clearTimeout(this.graceTimer);
+    this.graceTimer = undefined;
+    const gen = ++this.commitGen;
     this.confirming = key;
-    this.changed();
     const { ctl, cleanup } = linkSignal(this.root.signal);
+    this.confirmCtl = ctl;
+    this.changed();
     const timer = setTimeout(() => ctl.abort(), CONFIRM_MS);
     this.deps
       .confirm(best, ctl.signal)
@@ -668,9 +795,11 @@ export class SourceSession {
       .then((res) => {
         clearTimeout(timer);
         cleanup();
-        if (this.disposed) return;
+        if (this.disposed || gen !== this.commitGen) return;
+        this.confirmCtl = undefined;
         this.confirming = undefined;
         this.confirmed.add(key);
+        if (this.pickKey) return;
         const cur = this.cands.get(key);
         if (!cur?.probe?.ok) return this.evaluate();
         // Too slow to say is not a no: the player's own watchdog is the last word.
@@ -689,12 +818,15 @@ export class SourceSession {
   }
 
   private setPick(key: string) {
+    if (this.disposed || this.pickKey === key) return;
     this.pickKey = key;
     this.pickMs ??= Math.round(performance.now() - this.t0);
     clearTimeout(this.graceTimer);
+    this.graceTimer = undefined;
     clearTimeout(this.hedgeTimer);
+    this.hedgeTimer = undefined;
     // Backups wait a moment so the stream that's about to start gets the bandwidth.
-    if (this.readyCount() < this.target && this.captureQueue.length) {
+    if (!this.backgroundStopped && this.readyCount() < this.target && this.captureQueue.length) {
       this.backupsHeld = true;
       this.captureOpen = true;
       clearTimeout(this.backupTimer);
@@ -772,25 +904,45 @@ export class SourceSession {
       f = this.inflight.get(key)!;
     }
     const mine = f;
-    if (!signal) return mine.promise;
+    if (!signal) {
+      mine.pinned = true;
+      return mine.promise;
+    }
+    mine.waiters = (mine.waiters ?? 0) + 1;
     return new Promise((resolve) => {
+      let left = false;
+      const leave = () => {
+        if (left) return;
+        left = true;
+        mine.waiters = Math.max(0, (mine.waiters ?? 1) - 1);
+      };
       const onAbort = () => {
-        mine.ctl.abort();
+        leave();
+        // Cancel only a check `verify()` started, and only once nobody else is waiting on it.
+        if (mine.ownedByVerify && !mine.pinned && mine.waiters === 0) mine.ctl.abort();
         resolve(null);
       };
       if (signal.aborted) return onAbort();
       signal.addEventListener("abort", onAbort, { once: true });
       void mine.promise.then((r) => {
         signal.removeEventListener("abort", onAbort);
+        leave();
         resolve(signal.aborted ? null : r);
       });
     });
   }
 
-  /** A sniffed stream's link expired mid-play: capture its page again. */
+  /**
+   * A sniffed stream's link expired mid-play: capture its page again. A direct extractor's
+   * `pageUrl` is an API or site address, not a player page, so it is never captured: the stream is
+   * reported expired and the player fails over to the next ready candidate.
+   */
   async refresh(key: string, signal?: AbortSignal): Promise<StreamCandidate | null> {
     const c = this.cands.get(key);
     if (!c?.pageUrl) return null;
+    if (!isEmbed(c) && c.via !== "sniffed") {
+      return { ...c, probe: { ok: false, latencyMs: c.probe?.latencyMs ?? 0, error: "expired stream" } };
+    }
     const { ctl, cleanup } = linkSignal(signal ?? this.root.signal);
     try {
       const r = await this.deps.capture(c, ctl.signal);
@@ -820,10 +972,14 @@ export class SourceSession {
       const latencyMs = c.probe?.ok && c.probe.latencyMs > 0 ? c.probe.latencyMs : (info.latencyMs ?? 0);
       const live = this.put({ ...c, quality, probe: { ok: true, latencyMs, quality } });
       this.confirmed.add(key);
-      this.pickKey ??= key;
+      if (!this.pickKey) {
+        this.cancelPendingCommit();
+        this.pickKey = key;
+      }
       recordPlayback(this.req, live, true, this.manual.has(key) ? { manual: true } : {});
       recordWin(live.providerId, this.req.media.kind, true);
     } else {
+      if (this.confirming === key) this.cancelPendingCommit();
       this.put({ ...c, probe: { ok: false, latencyMs: c.probe?.latencyMs ?? 0, error: info.error || "won't play" } });
       this.manual.delete(key);
       recordPlayback(this.req, c, false);
@@ -842,26 +998,44 @@ export class SourceSession {
    * plays in AbixCine's own player, checking waiting servers if none is ready. Null when out of options.
    */
   async failover(deadKey: string, signal?: AbortSignal): Promise<StreamCandidate | null> {
+    if (this.disposed || signal?.aborted) return null;
+    const token = ++this.failoverToken;
     const usable = () =>
       [...this.cands.values()]
         .filter((c) => candKey(c) !== deadKey && c.probe?.ok && !isEmbed(c))
         .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))[0];
+    const accept = (winner: StreamCandidate) => {
+      this.cancelPendingCommit();
+      const winKey = candKey(winner);
+      if (this.pickKey !== winKey) {
+        this.pickKey = undefined;
+        this.setPick(winKey);
+      }
+      return winner;
+    };
     const now = usable();
-    if (now) return now;
+    if (now) return accept(now);
     this.backgroundStopped = false;
     this.backupsHeld = false;
     clearTimeout(this.backupTimer);
+    this.backupTimer = undefined;
     this.captureOpen = true;
     this.hedged = false;
     this.autoDirect = Math.min(this.autoDirect, AUTO_DIRECT_CHECKS - DIRECT_POOL);
     this.target = Math.max(this.target, this.readyCount() + 1);
     this.pump();
     this.changed();
-    return this.until((s) => usable() ?? (s.busy ? undefined : null), signal).then((v) => v ?? null);
+    return this.until((s) => {
+      if (token !== this.failoverToken) return null;
+      const w = usable();
+      if (w) return accept(w);
+      return s.busy ? undefined : null;
+    }, signal).then((v) => v ?? null);
   }
 
   /** A stream link the viewer pasted. */
   addManual(url: string) {
+    this.cancelPendingCommit();
     const c = this.put({ ...manualCandidate(url), probe: { ok: true, latencyMs: 0 } });
     this.started = true;
     this.pickKey = candKey(c);
@@ -874,6 +1048,7 @@ export class SourceSession {
    * becomes a "web" stream.
    */
   useWebPlayers() {
+    this.cancelPendingCommit();
     let first: StreamCandidate | undefined;
     for (const c of [...this.cands.values()]) {
       // Only real player pages: a direct extractor's site address is not something to play in a frame.

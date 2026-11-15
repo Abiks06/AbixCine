@@ -16,12 +16,14 @@ vi.mock("../native", async (importOriginal) => {
 });
 
 import { unwrapProxyUrl } from "../native";
+import { castleProvider, clearCastleKeyCache, decryptCastlePayload } from "./castle";
 import {
   base64ToBytes,
   buildStreamHeaders,
   buildSubtitleTracks,
   fetchWithAbort,
   inferStreamKind,
+  md5Bytes,
   normalizeQuality,
   xsalsa20Poly1305Seal,
 } from "./common";
@@ -30,7 +32,7 @@ import { vaplayerProvider } from "./vaplayer";
 import { encryptVidLinkToken, vidlinkProvider } from "./vidlink";
 import { decryptVidrockUrl, vidrockProvider } from "./vidrock";
 import { buildVixMasterUrl, extractVixTokenData, parseVixMasterPlaylist, vixsrcProvider } from "./vixsrc";
-import { clearZxcBaseCache, generateZxcFrontendToken, zxcstreamsProvider } from "./zxcstreams";
+import { clearZxcBaseCache, decryptZxcLink, zxcstreamsProvider } from "./zxcstreams";
 
 function makeSettings(overrides: Partial<Settings> = {}): Settings {
   return {
@@ -90,6 +92,7 @@ function bytesToB64(bytes: Uint8Array): string {
 beforeEach(() => {
   mockHttpFetch.mockReset();
   clearZxcBaseCache();
+  clearCastleKeyCache();
 });
 
 afterEach(() => {
@@ -171,57 +174,90 @@ describe("extractors/common crypto & helpers", () => {
 });
 
 describe("zxcstreamsProvider", () => {
-  it("generates a 64-char SHA-512 frontend token slice", async () => {
-    const tok = await generateZxcFrontendToken("550", 1_700_000_000_000);
-    expect(tok.rt).toBe(1_700_000_000_000);
-    expect(tok.xt).toMatch(/^[0-9a-f]{64}$/);
+  it("decrypts OpenSSL Salted__ AES-256-CBC stream links", async () => {
+    const md5Hex = (s: string) =>
+      Array.from(md5Bytes(new TextEncoder().encode(s)))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+    expect(md5Hex("abc")).toBe("900150983cd24fb0d6963f7d28e17f72");
+
+    const pass = new TextEncoder().encode("7f4c9e2a81d63b05c4f7a9e8126d3b50e1a8c7f23d9465ab0c6e9f1d4a7b832c");
+    const salt = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+    const derived = new Uint8Array(48);
+    let filled = 0;
+    let prev: Uint8Array = new Uint8Array(0);
+    while (filled < 48) {
+      const buf = new Uint8Array(prev.length + pass.length + salt.length);
+      buf.set(prev, 0);
+      buf.set(pass, prev.length);
+      buf.set(salt, prev.length + pass.length);
+      prev = md5Bytes(buf);
+      const take = Math.min(prev.length, 48 - filled);
+      derived.set(prev.subarray(0, take), filled);
+      filled += take;
+    }
+
+    const key = await crypto.subtle.importKey("raw", derived.subarray(0, 32), { name: "AES-CBC" }, false, ["encrypt"]);
+    const cipherBuf = new Uint8Array(
+      await crypto.subtle.encrypt(
+        { name: "AES-CBC", iv: derived.subarray(32, 48) },
+        key,
+        new TextEncoder().encode("https://vidstuck.cc/master.m3u8"),
+      ),
+    );
+    const header = new TextEncoder().encode("Salted__");
+    const full = new Uint8Array(header.length + salt.length + cipherBuf.length);
+    full.set(header, 0);
+    full.set(salt, header.length);
+    full.set(cipherBuf, header.length + salt.length);
+
+    expect(await decryptZxcLink(bytesToB64(full))).toBe("https://vidstuck.cc/master.m3u8");
+    expect(await decryptZxcLink("https://cdn.example/direct.m3u8")).toBe("https://cdn.example/direct.m3u8");
+    expect(await decryptZxcLink("not-encrypted")).toBeNull();
   });
 
-  it("discovers base via portal redirect, fetches token, and extracts all 4 servers", async () => {
-    mockHttpFetch.mockImplementation(async (url: string) => {
-      if (url === "https://zxcstream.xyz") {
-        return { status: 200, url: "https://r7.zxcstream.xyz/", body: "" };
-      }
-      if (url === "https://zxcprime.xyz") {
-        return { status: 200, url: "https://zxcprime.xyz/", body: "" };
-      }
-      if (url === "https://r7.zxcstream.xyz/backend/token") {
+  it("requests per-server andromeda tokens, extracts all servers, and strips Referer for hakunaymatata", async () => {
+    mockHttpFetch.mockImplementation(async (url: string, _headers?: Record<string, string>, opts?: { body?: string }) => {
+      if (url === "https://zxcstream.cc/backend/andromeda") {
+        const body = JSON.parse(opts?.body ?? "{}");
+        const srv = body["6b491e258392e7561a9384c"];
         return {
           status: 200,
           url,
-          body: JSON.stringify({ ZDDVHJFGHYRHG: "srv-tok", rdghhdghhfssft: "1700000001" }),
+          body: JSON.stringify({ ts: 1700000001, token: `tok-${srv}` }),
         };
       }
-      if (url.includes("/backend_/servers/icarus?")) {
-        return {
-          status: 200,
-          url,
-          body: JSON.stringify({
-            success: true,
-            links: [{ link: "https://cdn.example/icarus/master.m3u8", type: "hls", resolution: 1080, size: 1_500_000_000 }],
-          }),
-        };
-      }
-      if (url.includes("/backend_/servers/berkas?")) {
+      if (url.includes("/backend_/sources/ursa?")) {
+        expect(url).toContain("tok-ursa");
         return {
           status: 200,
           url,
           body: JSON.stringify({
             success: true,
-            links: [{ link: "https://cdn.example/berkas/720.mp4", type: "mp4", resolution: "720p" }],
+            links: [{ link: "https://vidstuck.cc/ursa/master.m3u8", type: "hls", resolution: 1080, size: 1_500_000_000 }],
           }),
         };
       }
-      if (url.includes("/backend_/servers/orion?")) {
+      if (url.includes("/backend_/sources/alatreon?")) {
+        return {
+          status: 200,
+          url,
+          body: JSON.stringify({
+            success: true,
+            links: [{ link: "https://vidstuck.cc/alatreon/2160.m3u8", resolution: 2160 }],
+          }),
+        };
+      }
+      if (url.includes("/backend_/sources/valstrax?")) {
         return { status: 500, url, body: "err" };
       }
-      if (url.includes("/backend_/servers/athena?")) {
+      if (url.includes("/backend_/sources/orion?")) {
         return {
           status: 200,
           url,
           body: JSON.stringify({
             success: true,
-            links: [{ link: "https://cdn.example/athena/index.m3u8", resolution: 2160 }],
+            links: [{ link: "https://bcdnt.hakunaymatata.com/720.mp4", type: "mp4", resolution: "720p" }],
           }),
         };
       }
@@ -231,41 +267,37 @@ describe("zxcstreamsProvider", () => {
     const out = await zxcstreamsProvider.find(makeReq(), makeSettings(), new AbortController().signal);
     expect(out).toHaveLength(3);
     expect(out.map((c) => unwrapProxyUrl(c.url).url)).toEqual([
-      "https://cdn.example/athena/index.m3u8",
-      "https://cdn.example/icarus/master.m3u8",
-      "https://cdn.example/berkas/720.mp4",
+      "https://vidstuck.cc/alatreon/2160.m3u8",
+      "https://vidstuck.cc/ursa/master.m3u8",
+      "https://bcdnt.hakunaymatata.com/720.mp4",
     ]);
     expect(out[0].quality).toBe(2160);
-    expect(out[1].label).toContain("Icarus");
+    expect(out[1].label).toContain("Ursa");
     expect(out[1].label).toContain("1.50 GB");
+    expect(out[0].headers?.referer).toBe("https://zxcstream.cc/");
+    // hakunaymatata.com must NOT receive Referer or Origin and must use a non-browser UA
     expect(out[2].kind).toBe("file");
-    expect(out[0].headers?.referer).toBe("https://r7.zxcstream.xyz/player/movie/550");
+    expect(out[2].headers?.referer).toBeUndefined();
+    expect(out[2].headers?.origin).toBeUndefined();
+    expect(out[2].headers?.ua).toBe("Lavf/60.3.100");
+    expect(unwrapProxyUrl(out[2].url).headers.referer).toBeUndefined();
+    expect(unwrapProxyUrl(out[2].url).headers.ua).toBe("Lavf/60.3.100");
   });
 
-  it("retries discovery once when cached token fails and respects disabledSources", async () => {
+  it("falls back to secondary domain zxcstream.com when primary fails and respects disabledSources", async () => {
     expect(zxcstreamsProvider.isEnabled?.(makeSettings({ disabledSources: ["zxcstreams"] }))).toBe(false);
     expect(zxcstreamsProvider.isEnabled?.(makeSettings())).toBe(true);
 
-    let failFirstToken = true;
     mockHttpFetch.mockImplementation(async (url: string) => {
-      if (url === "https://zxcstream.xyz") return { status: 200, url: "https://zxcstream.xyz/", body: "" };
-      if (url === "https://zxcprime.xyz") return { status: 200, url: "https://zxcprime.xyz/", body: "" };
-      if (url.startsWith("https://r2.zxcstream.xyz/backend/token")) {
-        if (failFirstToken) {
-          failFirstToken = false;
-          return { status: 503, url, body: "" };
-        }
-        return {
-          status: 200,
-          url,
-          body: JSON.stringify({ ZDDVHJFGHYRHG: "tok2", rdghhdghhfssft: "1700000002" }),
-        };
+      if (url.startsWith("https://zxcstream.cc/")) return { status: 503, url, body: "" };
+      if (url === "https://zxcstream.com/backend/andromeda") {
+        return { status: 200, url, body: JSON.stringify({ ts: 1700000002, token: "tok2" }) };
       }
-      if (url.includes("/backend_/servers/icarus?")) {
+      if (url.startsWith("https://zxcstream.com/backend_/sources/ursa?")) {
         return {
           status: 200,
           url,
-          body: JSON.stringify({ success: true, links: [{ link: "https://cdn.example/r2.m3u8", resolution: 1080 }] }),
+          body: JSON.stringify({ success: true, links: [{ link: "https://vidstuck.cc/r2.m3u8", resolution: 1080 }] }),
         };
       }
       return { status: 404, url, body: "" };
@@ -273,7 +305,8 @@ describe("zxcstreamsProvider", () => {
 
     const out = await zxcstreamsProvider.find(makeReq(), makeSettings(), new AbortController().signal);
     expect(out).toHaveLength(1);
-    expect(unwrapProxyUrl(out[0].url).url).toBe("https://cdn.example/r2.m3u8");
+    expect(unwrapProxyUrl(out[0].url).url).toBe("https://vidstuck.cc/r2.m3u8");
+    expect(out[0].headers?.referer).toBe("https://zxcstream.com/");
   });
 });
 
@@ -420,15 +453,16 @@ describe("vixsrcProvider", () => {
 });
 
 describe("vidlinkProvider", () => {
-  it("encrypts deterministic XSalsa20-Poly1305 tokens with 24 zero-nonce prefix", () => {
+  it("encrypts XSalsa20-Poly1305 tokens with unique 24-byte random nonce prefixes", () => {
     const t1 = encryptVidLinkToken("550", 1_700_000_000_000);
     const t2 = encryptVidLinkToken("550", 1_700_000_000_000);
-    expect(t1).toBe(t2);
+    expect(t1).not.toBe(t2);
     expect(t1).toMatch(/^[A-Za-z0-9_-]+$/);
+    expect(t2).toMatch(/^[A-Za-z0-9_-]+$/);
     const raw = base64ToBytes(t1);
-    // 24-byte zero nonce + 16-byte MAC + (3 bytes "550" + 8 bytes uint64) = 51 bytes
+    // 24-byte random nonce + 16-byte MAC + (3 bytes "550" + 8 bytes uint64) = 51 bytes
     expect(raw.length).toBe(51);
-    expect(Array.from(raw.subarray(0, 24)).every((b) => b === 0)).toBe(true);
+    expect(Array.from(raw.subarray(0, 24)).some((b) => b !== 0)).toBe(true);
   });
 
   it("extracts qualities, fallback playlist, captions, and respects vidlink alias disable", async () => {
@@ -460,6 +494,206 @@ describe("vidlinkProvider", () => {
     expect(out[2].label).toContain("Auto");
     expect(out[0].subtitles).toHaveLength(1);
     expect(out[0].subtitles?.[0]?.lang).toBe("en");
+  });
+
+  it("falls back to enc-vidlink when local token returns empty and strips Referer/Chrome UA on hakunaymatata", async () => {
+    const requestedHeaders: Record<string, string>[] = [];
+    mockHttpFetch.mockImplementation(async (url: string, headers: Record<string, string> = {}) => {
+      requestedHeaders.push(headers);
+      if (url.startsWith("https://vidlink.pro/api/b/movie/enc-tok-550")) {
+        return {
+          status: 200,
+          url,
+          body: JSON.stringify({
+            stream: {
+              qualities: {
+                "720": { url: "https://bcdn.hakunaymatata.com/video/550.mp4", type: "mp4" },
+              },
+            },
+          }),
+        };
+      }
+      if (url.startsWith("https://vidlink.pro/api/b/movie/")) {
+        return { status: 200, url, body: "null" };
+      }
+      if (url === "https://enc-dec.app/api/enc-vidlink?text=550") {
+        return { status: 200, url, body: JSON.stringify({ status: 200, result: "enc-tok-550" }) };
+      }
+      return { status: 404, url, body: "" };
+    });
+
+    const out = await vidlinkProvider.find(makeReq(), makeSettings(), new AbortController().signal);
+    expect(out).toHaveLength(1);
+    expect(requestedHeaders[0]["X-Playback-Environment"]).toBe("standard");
+    expect(out[0].pageUrl).toBeUndefined();
+    expect(out[0].headers?.referer).toBeUndefined();
+    expect(out[0].headers?.origin).toBeUndefined();
+    expect(out[0].headers?.ua).toBe("Lavf/60.3.100");
+    expect(unwrapProxyUrl(out[0].url).headers).toEqual({ ua: "Lavf/60.3.100" });
+  });
+});
+
+describe("castleProvider", () => {
+  const secKeyB64 = bytesToB64(new TextEncoder().encode("fjATm*kgfJ"));
+
+  async function encryptCastle(payload: unknown): Promise<string> {
+    const rawKey = new Uint8Array([...b64ToBytes(secKeyB64), ...new TextEncoder().encode("T!BgJB")]).subarray(0, 16);
+    const cryptoKey = await crypto.subtle.importKey("raw", rawKey, "AES-CBC", false, ["encrypt"]);
+    const pt = new TextEncoder().encode(JSON.stringify({ code: 200, data: payload }));
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-CBC", iv: rawKey }, cryptoKey, pt));
+    return bytesToB64(ct);
+  }
+
+  it("decrypts raw base64 and JSON-wrapped Castle AES-128-CBC responses", async () => {
+    const rawCipher = await encryptCastle({ hello: "world" });
+    expect(await decryptCastlePayload(rawCipher, secKeyB64)).toEqual({ hello: "world" });
+    expect(await decryptCastlePayload(JSON.stringify({ code: 200, data: rawCipher }), secKeyB64)).toEqual({ hello: "world" });
+    expect(await decryptCastlePayload("{bad-json", secKeyB64)).toBeNull();
+  });
+
+  it("prioritizes OST/English tracks, switches TV seasons, and resolves Castle HLS streams", async () => {
+    const secResp = JSON.stringify({ code: 200, data: secKeyB64 });
+    const searchCipher = await encryptCastle({
+      rows: [{ id: "root-got", title: "Game of Thrones", publishTime: "2011-04-17" }],
+    });
+    const rootDetailCipher = await encryptCastle({
+      id: "root-got",
+      seasons: [
+        { number: 1, movieId: "got-s1" },
+        { number: 2, movieId: "got-s2" },
+      ],
+      episodes: [{ id: "wrong-ep", number: 1, tracks: [] }],
+    });
+    const s1DetailCipher = await encryptCastle({
+      id: "got-s1",
+      episodes: [
+        {
+          id: "ep1-id",
+          number: 1,
+          tracks: [
+            { languageId: 1018, abbreviate: "hi", languageName: "Hindi", isDefault: true },
+            { languageId: 1003, abbreviate: "en", languageName: "English", isDefault: false },
+          ],
+        },
+      ],
+    });
+    const videoCipher = await encryptCastle({
+      videoUrl: "https://img1.hscow.com/hls_mps/got_s1e1/720/index_287.m3u8",
+      videos: [
+        { resolution: 1, resolutionDescription: "SD 480P", premiumProPermission: false },
+        { resolution: 2, resolutionDescription: "HD 720P", premiumProPermission: false },
+        { resolution: 3, resolutionDescription: "FHD 1080P", premiumProPermission: true },
+      ],
+      subtitles: [
+        {
+          languageId: 1003,
+          abbreviate: "en",
+          title: "English",
+          url: "https://img1.fodcyy.com/subtitle/got/English_1.vtt",
+          isDefault: true,
+        },
+      ],
+    });
+
+    let postedLanguageId: string | undefined;
+    const postedResolutions: string[] = [];
+    mockHttpFetch.mockImplementation(async (url: string, _headers, init?: { method?: string; body?: string }) => {
+      if (url.includes("/getSecurityKey/")) return { status: 200, url, body: secResp };
+      if (url.includes("/searchByKeyword")) return { status: 200, url, body: searchCipher };
+      if (url.includes("movieId=root-got")) return { status: 200, url, body: rootDetailCipher };
+      if (url.includes("movieId=got-s1")) return { status: 200, url, body: s1DetailCipher };
+      if (init?.method === "POST" && url.includes("/getVideo2") && init.body) {
+        const parsed = JSON.parse(init.body) as {
+          languageId?: string;
+          movieId?: string;
+          episodeId?: string;
+          resolution?: string;
+        };
+        postedLanguageId = parsed.languageId;
+        if (parsed.resolution) postedResolutions.push(parsed.resolution);
+        expect(parsed.movieId).toBe("got-s1");
+        expect(parsed.episodeId).toBe("ep1-id");
+        return { status: 200, url, body: videoCipher };
+      }
+      return { status: 404, url, body: "" };
+    });
+
+    const tvReq = makeReq({
+      media: makeMedia({
+        key: "tmdb:tv:1399",
+        kind: "tv",
+        title: "Game of Thrones",
+        originalTitle: "Game of Thrones",
+        year: 2011,
+      }),
+      season: 1,
+      episode: 1,
+    });
+    const out = await castleProvider.find(tvReq, makeSettings(), new AbortController().signal);
+    expect(out).toHaveLength(1);
+    expect(postedLanguageId).toBe("1003");
+    expect(postedResolutions).toEqual(["2"]);
+    expect(out[0].quality).toBe(720);
+    expect(out[0].pageUrl).toBeUndefined();
+    expect(unwrapProxyUrl(out[0].url).url).toBe("https://img1.hscow.com/hls_mps/got_s1e1/720/index_287.m3u8");
+    expect(out[0].subtitles).toHaveLength(1);
+    expect(out[0].subtitles?.[0].lang).toBe("en");
+    expect(out[0].subtitles?.[0].label).toBe("English");
+    expect(unwrapProxyUrl(out[0].subtitles![0].url).url).toBe(
+      "https://img1.fodcyy.com/subtitle/got/English_1.vtt",
+    );
+  });
+
+  it("falls back from gated 720p to 480p and upgrades to 1080p when unlocked", async () => {
+    const secResp = JSON.stringify({ code: 200, data: secKeyB64 });
+    const searchCipher = await encryptCastle({
+      rows: [{ id: "m-550", title: "Fight Club", publishTime: "1999-10-15" }],
+    });
+    const detailCipher = await encryptCastle({
+      id: "m-550",
+      episodes: [{ id: "ep-550", number: 1, tracks: [{ languageId: 1003, abbreviate: "en", languageName: "English" }] }],
+    });
+
+    const deniedRes2 = await encryptCastle({ permissionDenied: true, expireTime: 1790000000 });
+    const allowedRes1 = await encryptCastle({
+      videoUrl: "https://img1.hscow.com/hls/fc/480/index.m3u8",
+      permissionDenied: false,
+    });
+    const unlockedRes2 = await encryptCastle({
+      videoUrl: "https://img1.hscow.com/hls/fc/720/index.m3u8",
+      permissionDenied: false,
+      videos: [
+        { resolution: 2, resolutionDescription: "HD 720P", premiumProPermission: false },
+        { resolution: 3, resolutionDescription: "FHD 1080P", premiumProPermission: false },
+      ],
+    });
+    const unlockedRes3 = await encryptCastle({
+      videoUrl: "https://img1.hscow.com/hls/fc/1080/index.m3u8",
+      permissionDenied: false,
+    });
+
+    let mode: "fallback" | "upgrade" = "fallback";
+    mockHttpFetch.mockImplementation(async (url: string, _headers, init?: { method?: string; body?: string }) => {
+      if (url.includes("/getSecurityKey/")) return { status: 200, url, body: secResp };
+      if (url.includes("/searchByKeyword")) return { status: 200, url, body: searchCipher };
+      if (url.includes("movieId=m-550")) return { status: 200, url, body: detailCipher };
+      if (init?.method === "POST" && url.includes("/getVideo2") && init.body) {
+        const parsed = JSON.parse(init.body) as { resolution?: string };
+        if (mode === "fallback") {
+          return { status: 200, url, body: parsed.resolution === "2" ? deniedRes2 : allowedRes1 };
+        }
+        return { status: 200, url, body: parsed.resolution === "3" ? unlockedRes3 : unlockedRes2 };
+      }
+      return { status: 404, url, body: "" };
+    });
+
+    const outFallback = await castleProvider.find(makeReq(), makeSettings(), new AbortController().signal);
+    expect(outFallback).toHaveLength(1);
+    expect(outFallback[0].quality).toBe(480);
+
+    mode = "upgrade";
+    const outUpgrade = await castleProvider.find(makeReq(), makeSettings(), new AbortController().signal);
+    expect(outUpgrade.map((c) => c.quality)).toEqual([1080, 720]);
   });
 });
 

@@ -1,7 +1,7 @@
 {
   "name": "abixcine",
   "private": true,
-  "version": "1.7.0",
+  "version": "1.8.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -17,7 +17,6 @@
     "@fontsource-variable/bricolage-grotesque": "^5.3.0",
     "@fontsource-variable/geist": "^5.2.8",
     "@fontsource-variable/jetbrains-mono": "^5.2.8",
-    "@fontsource-variable/sora": "^5.2.8",
     "@fontsource/instrument-serif": "^5.3.0",
     "@tauri-apps/api": "^2.1.1",
     "@tauri-apps/plugin-dialog": "^2.0.1",

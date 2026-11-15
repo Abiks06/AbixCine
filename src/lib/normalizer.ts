@@ -6,6 +6,7 @@ import {
 } from "./animeMapping";
 import { stripHtml } from "./format";
 import type { CanonicalSeason, Episode, Media, MediaDetail, PlaybackRequest, SeasonCour } from "./types";
+import { isFilm } from "./types";
 
 /** Raw AniList node shape used for franchise season/cour reconciliation. */
 export interface RawAnilistNode {
@@ -651,7 +652,7 @@ export function resolvePlaybackRequest(
 ): PlaybackRequest | null {
   if (!detail) return null;
 
-  if (detail.kind === "movie") {
+  if (isFilm(detail)) {
     return { media: detail, audio };
   }
 
@@ -784,7 +785,7 @@ export function resolveNextEpisode(
   currentEpisode?: number | null,
   audio?: "sub" | "dub",
 ): NextEpisodeTarget | null {
-  if (!detail || detail.kind === "movie" || currentEpisode == null) return null;
+  if (!detail || isFilm(detail) || currentEpisode == null) return null;
 
   const allSeasons = [...(detail.seasons ?? []), ...(detail.specials ?? [])].filter((s) => s.episodeCount > 0);
   if (allSeasons.length > 0 && currentSeason != null) {

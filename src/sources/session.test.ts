@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getSettings } from "../lib/settings";
 import type { PlaybackRequest } from "../lib/types";
-import { lastPick, resetHealth } from "./health";
+import { getHealth, lastPick, resetHealth } from "./health";
 import { candKey } from "./registry";
 import { acquireSession, invalidateSessions, SourceSession, type SessionDeps } from "./session";
 import type { SourceProvider, StreamCandidate } from "./types";
@@ -375,5 +375,97 @@ describe("source session: memory", () => {
     expect(acquireSession(request("tmdb:movie:78"))).not.toBe(a);
     invalidateSessions();
     expect(acquireSession(request("tmdb:movie:77"))).not.toBe(a);
+  });
+});
+
+describe("source session: lookup timing", () => {
+  it("learns lookup time only from searches that found something", async () => {
+    const quickNo = provider("quick-no", "external", []);
+    const slowYes = provider("slow-yes", "external", async () => {
+      await sleep(3000);
+      return [direct("slow-yes")];
+    });
+    const { session } = make([quickNo, slowYes]);
+    session.start(1);
+    await tick(4000);
+    expect(getHealth("quick-no").lookupMs).toBeUndefined();
+    expect(getHealth("slow-yes").lookupMs).toBeGreaterThanOrEqual(3000);
+  });
+
+  it("records an unreachable server as a failed lookup, not as an empty one", async () => {
+    const dead = provider("dead-srv", "external", async () => {
+      throw new Error("error sending request: dns error");
+    });
+    const { session } = make([dead, provider("live", "external", [direct("live")])]);
+    session.start(1);
+    await tick(100);
+    const lane = session.getSnapshot().lanes.find((l) => l.providerId === "dead-srv");
+    expect(lane?.status).toBe("error");
+    expect(getHealth("dead-srv").streak).toBeGreaterThan(0);
+  });
+});
+
+describe("source session: audit fixes", () => {
+  it("previews side-effect providers in warm mode and asks them again for real on play", async () => {
+    const seen: (boolean | undefined)[] = [];
+    const debridLike: SourceProvider = {
+      ...provider("stremio", "external", []),
+      sideEffectsOnLookup: () => true,
+      find: async (_req, _s, _signal, ctx) => {
+        seen.push(ctx?.warm);
+        return ctx?.warm ? [] : [direct("stremio")];
+      },
+    };
+    const plain: SourceProvider = { ...provider("vidrock", "external", [direct("vidrock")]) };
+    const plainSpy = vi.spyOn(plain, "find");
+    const { session } = make([debridLike, plain]);
+    session.start(1);
+    await tick(100);
+    expect(seen).toEqual([true]);
+    expect(plainSpy).toHaveBeenCalledTimes(1);
+    expect(plainSpy.mock.calls[0][3]).toEqual({ warm: false });
+
+    session.start(3); // Watch takes over the shared session
+    await tick(100);
+    expect(seen).toEqual([true, false]);
+    expect(plainSpy).toHaveBeenCalledTimes(1); // only the warm provider is asked again
+    expect([...session.getSnapshot().candidates].some((c) => c.providerId === "stremio")).toBe(true);
+  });
+
+  it("never captures a direct stream's API page on refresh: it reports it expired instead", async () => {
+    const withPage = { ...direct("vixsrc"), pageUrl: "https://vixsrc.example/api/movie/1" };
+    const capture = vi.fn();
+    const { session } = make([provider("vixsrc", "external", [withPage])], {}, { capture });
+    session.start(1);
+    await tick(100);
+    const r = await session.refresh(candKey(withPage));
+    expect(capture).not.toHaveBeenCalled();
+    expect(r?.probe?.ok).toBe(false);
+    expect(r?.probe?.error).toBe("expired stream");
+  });
+
+  it("keeps a shared-dependency outage out of the provider's circuit breaker", async () => {
+    const outage = Object.assign(new Error("enc-dec.app unavailable: HTTP 502"), { dependencyOutage: true });
+    const { session } = make([
+      provider("hexa-direct", "external", () => Promise.reject(outage)),
+      provider("broken", "external", () => Promise.reject(new Error("boom"))),
+    ]);
+    session.start(1);
+    await tick(100);
+    expect(getHealth("hexa-direct").streak ?? 0).toBe(0);
+    expect(getHealth("broken").streak).toBeGreaterThan(0);
+  });
+
+  it("gives every provider a turn before one provider's dead links use up the checks", async () => {
+    const many = Array.from({ length: 12 }, (_, i) => direct("addon", i + 1));
+    const { session, calls } = make(
+      [provider("addon", "external", many, 30), provider("vidrock", "external", [direct("vidrock")], 10)],
+      { addon: { ok: false, ms: 20 }, vidrock: { ms: 20 } },
+    );
+    session.start(1);
+    await tick(400);
+    // vidrock ranks lower but is checked within the first round, not after all 12 addon links.
+    expect(calls.indexOf("vidrock")).toBeLessThanOrEqual(6);
+    expect(session.getSnapshot().pick?.providerId).toBe("vidrock");
   });
 });

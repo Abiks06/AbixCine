@@ -36,14 +36,34 @@ const FALLBACK: Record<Exclude<EnhanceMode, "off">, EnhanceMode> = {
 
 export const webgpuAvailable = () => typeof navigator !== "undefined" && "gpu" in navigator;
 
+let webgl2Cached: boolean | null = null;
+
+/** Forget the WebGL2 probe result (unit tests swap the DOM between cases). */
+export function resetWebgl2Probe(): void {
+  webgl2Cached = null;
+}
+
+/**
+ * Probed once per session. The Picture sheet asks on every render (~4×/s); creating a context each
+ * time hit Chromium's 16-context cap and evicted the canvases actually in use.
+ */
 export const webgl2Available = () => {
+  if (webgl2Cached !== null) return webgl2Cached;
   if (typeof document === "undefined") return false;
   try {
     const c = document.createElement("canvas");
-    return !!c.getContext("webgl2");
+    const gl = c.getContext("webgl2");
+    webgl2Cached = !!gl;
+    try {
+      // Hand the probe's context back now rather than waiting for GC.
+      gl?.getExtension?.("WEBGL_lose_context")?.loseContext();
+    } catch {
+      /* releasing is best-effort; the answer stands */
+    }
   } catch {
-    return false;
+    webgl2Cached = false;
   }
+  return webgl2Cached;
 };
 
 export const upscalerAvailable = () => webgpuAvailable() || webgl2Available();
@@ -881,7 +901,10 @@ export async function startEnhancer(
             }
           }
           if (!running) return;
-          gpuEma = gpuEma ? gpuEma * 0.85 + ms * 0.15 : ms;
+          // With hardware timestamps, only stamped frames count: an unstamped frame's wall-clock
+          // time is mostly the GPU-process round trip (~12–25 ms vs ~2 ms of shader work) and
+          // tripped false downgrades. Without timestamp support the wall clock is all there is.
+          if (stamp || !timing) gpuEma = gpuEma ? gpuEma * 0.85 + ms * 0.15 : ms;
           govern();
         })
         .catch(() => {
@@ -968,7 +991,9 @@ export async function startEnhancer(
     lastMediaTime = meta.mediaTime;
     // Hidden window: nothing to show. Busy GPU: drop this frame rather than queue it.
     if (document.hidden) {
-      /* idle */
+      // Frames skipped while hidden aren't the GPU falling behind: don't count them.
+      winStartMedia = meta.mediaTime;
+      winFrames = winSkips = 0;
     } else if (inflight >= MAX_INFLIGHT) {
       skipped++;
       winSkips++;
@@ -994,6 +1019,15 @@ export async function startEnhancer(
     triggerFallback(msg ? `GPU error: ${msg}` : "GPU shader error — switched to native video");
   };
   device.addEventListener?.("uncapturederror", onUncapturedError);
+
+  // Coming back from a background tab: the measuring window spans time when nothing was drawn
+  // (the browser may not even have called us), so restart it with a short grace period.
+  const onVisibility = () => {
+    winStartMedia = video.currentTime;
+    winFrames = winSkips = 0;
+    graceUntil = performance.now() + 2500;
+  };
+  document.addEventListener?.("visibilitychange", onVisibility);
 
   // Paint the current frame right away (covers a paused video), then follow new frames.
   process();
@@ -1033,6 +1067,7 @@ export async function startEnhancer(
     video.removeEventListener("resize", onVideoResize);
     video.removeEventListener("seeked", onSeeked);
     device?.removeEventListener?.("uncapturederror", onUncapturedError);
+    document.removeEventListener?.("visibilitychange", onVisibility);
     ro.disconnect();
     clearTimeout(resizeTimer);
     releaseResources(pipes, input);

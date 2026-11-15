@@ -17,6 +17,7 @@ vi.mock("./native", async (importOriginal) => {
 
 import { unwrapProxyUrl } from "./native";
 import {
+  buildSandboxWorkerScript,
   clearPlugins,
   clearPluginScriptCache,
   createPluginProviders,
@@ -394,6 +395,44 @@ describe("SSRF & host-allowlist validation", () => {
 });
 
 describe("WebWorker sandbox execution & RPC bridge", () => {
+  it("strips network and RPC members from the worker global's prototype chain", () => {
+    const protoFetch = vi.fn();
+    const protoImport = vi.fn();
+    const posted: unknown[] = [];
+    // A real worker keeps these on WorkerGlobalScope.prototype / DedicatedWorkerGlobalScope.prototype.
+    const proto = {
+      fetch: protoFetch,
+      importScripts: protoImport,
+      caches: {},
+      indexedDB: {},
+      postMessage: (d: unknown) => posted.push(d),
+      close: () => {},
+    };
+    const g = Object.create(proto) as Record<string, unknown>;
+    g.addEventListener = () => {};
+    g.self = g;
+    g.globalThis = g;
+    const nav = Object.create({ storage: {}, locks: {}, sendBeacon: vi.fn() });
+    g.navigator = nav;
+    const plugin = `
+      const p = Object.getPrototypeOf(self);
+      self.__seen = {
+        fetch: typeof p.fetch,
+        importScripts: typeof p.importScripts,
+        postMessage: typeof p.postMessage,
+        caches: typeof p.caches,
+        storage: typeof Object.getPrototypeOf(self.navigator).storage,
+      };
+      module.exports = { find() { return []; } };
+    `;
+    const run = new Function("self", "globalThis", "navigator", buildSandboxWorkerScript(plugin));
+    run(g, g, nav);
+    expect(g.__seen).toEqual({ fetch: "undefined", importScripts: "undefined", postMessage: "undefined", caches: "undefined", storage: "undefined" });
+    expect(protoFetch).not.toHaveBeenCalled();
+    // The bootstrap kept its own bound postMessage and still reports ready.
+    expect(posted).toContainEqual({ type: "ready" });
+  });
+
   it("strips unsafe worker globals and routes network calls exclusively through host.httpFetch", async () => {
     const env = installVmWorkerEnv();
 

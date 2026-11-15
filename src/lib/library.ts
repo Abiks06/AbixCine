@@ -2,6 +2,7 @@ import { normTitle } from "./format";
 import { cached } from "./cache";
 import { searchAll } from "./search";
 import type { Media } from "./types";
+import { isFilm } from "./types";
 import { useEffect, useState } from "react";
 import { parseEpisode, scanErrors, scanLibrary, stripExt, type LibFile } from "../sources/local";
 import { useSettings } from "./settings";
@@ -86,7 +87,7 @@ export async function matchDrive(t: DriveTitle): Promise<Media | undefined> {
     const n = normTitle(t.title);
     const fit = (m: Media) =>
       (normTitle(m.title) === n || normTitle(m.originalTitle ?? "") === n) && (!t.year || !m.year || Math.abs(m.year - t.year) <= 1);
-    const kindOk = (m: Media) => (t.isShow ? m.kind !== "movie" : m.kind === "movie");
+    const kindOk = (m: Media) => (t.isShow ? !isFilm(m) : isFilm(m));
     // No results usually means offline: throw so the miss isn't cached for a week.
     if (!res.length) throw new Error("no results");
     // Only accept a near title (no "first result of any kind" guess, which matched Sample.mkv to random shows).

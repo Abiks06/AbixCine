@@ -3,6 +3,26 @@ import { memo, useEffect, useRef, useState, type CSSProperties, type RefObject }
 import type { CueAlign, CueSpan, SubPref, SubtitleCue } from "../lib/subtitles";
 import type { SubtitleFormat } from "../sources/types";
 
+/** JASSUB draws on its own canvas over the video. */
+function setCanvasVisible(inst: JASSUB, visible: boolean) {
+  const canvas = (inst as unknown as { _canvas?: HTMLCanvasElement })._canvas;
+  if (canvas) canvas.style.visibility = visible ? "" : "hidden";
+}
+
+/**
+ * JASSUB renders from video frame callbacks, and a paused video sends none: until one frame time is
+ * known, resize()/offset changes repaint nothing. Seed it with the current frame.
+ */
+function repaintIfPaused(inst: JASSUB, video: HTMLVideoElement) {
+  if (!video.paused || !video.videoWidth) return;
+  void inst
+    .manualRender(
+      { mediaTime: video.currentTime, expectedDisplayTime: performance.now(), width: video.videoWidth, height: video.videoHeight },
+      true,
+    )
+    .catch(() => {});
+}
+
 export interface SubtitleOverlayProps {
   cues: readonly SubtitleCue[];
   secondaryCues?: readonly SubtitleCue[];
@@ -88,12 +108,21 @@ export const SubtitleOverlay = memo(function SubtitleOverlay({
   offsetSec = 0,
   subEnabled = true,
 }: SubtitleOverlayProps) {
-  const isAssTrack = !preview && subEnabled && (assFormat === "ass" || assFormat === "ssa") && Boolean(assRaw);
-  const jassubKey = isAssTrack && assRaw ? `${assFormat}:${assRaw.length}:${assRaw.slice(0, 64)}` : "";
+  const assTrack = !preview && (assFormat === "ass" || assFormat === "ssa") && Boolean(assRaw);
+  const jassubKey = assTrack && assRaw ? `${assFormat}:${assRaw.length}:${assRaw.slice(0, 64)}` : "";
+  // The renderer (a 2.2 MB WASM worker) starts the first time subtitles are on for this track and
+  // then stays: toggling subtitles (C) only hides its canvas instead of tearing the worker down.
+  const [armedKey, setArmedKey] = useState("");
+  useEffect(() => {
+    if (subEnabled && jassubKey) setArmedKey(jassubKey);
+  }, [subEnabled, jassubKey]);
+  const isAssTrack = assTrack && armedKey === jassubKey;
 
   const jassubRef = useRef<JASSUB | null>(null);
   const offsetRef = useRef(offsetSec);
   offsetRef.current = offsetSec;
+  const subEnabledRef = useRef(subEnabled);
+  subEnabledRef.current = subEnabled;
 
   const [jassubState, setJassubState] = useState<{ key: string; failed: boolean }>({ key: "", failed: false });
   const jassubFailed = jassubState.key === jassubKey && jassubState.failed;
@@ -113,23 +142,24 @@ export const SubtitleOverlay = memo(function SubtitleOverlay({
 
     (async () => {
       try {
+        // WebView2 is evergreen Chromium, which always has WASM SIMD, so JASSUB would never pick its
+        // legacy non-SIMD engine. Pointing both slots at the modern build keeps the 2 MB legacy
+        // .wasm (and its 80 KB glue) out of the bundle entirely.
         const [
           { default: JassubCtor },
           { default: workerUrl },
-          { default: wasmUrl },
           { default: modernWasmUrl },
-          { default: wasmWorkerUrl },
           { default: modernWasmWorkerUrl },
           { default: defaultFontUrl },
         ] = await Promise.all([
           import("jassub"),
           import("jassub/dist/worker/worker.js?worker&url"),
-          import("jassub/dist/wasm/jassub-worker.wasm?url"),
           import("jassub/dist/wasm/jassub-worker-modern.wasm?url"),
-          import("jassub/dist/wasm/jassub-worker.js?url"),
           import("jassub/dist/wasm/jassub-worker-modern.js?url"),
           import("jassub/dist/default.woff2?url"),
         ]);
+        const wasmUrl = modernWasmUrl;
+        const wasmWorkerUrl = modernWasmWorkerUrl;
 
         if (cancelled || !videoEl.isConnected) return;
 
@@ -153,7 +183,9 @@ export const SubtitleOverlay = memo(function SubtitleOverlay({
           void instance.destroy().catch(() => {});
           return;
         }
+        setCanvasVisible(instance, subEnabledRef.current);
         void instance.resize(true).catch(() => {});
+        repaintIfPaused(instance, videoEl);
       } catch {
         if (instance) {
           if (jassubRef.current === instance) jassubRef.current = null;
@@ -177,8 +209,23 @@ export const SubtitleOverlay = memo(function SubtitleOverlay({
     const inst = jassubRef.current;
     if (!inst) return;
     inst.timeOffset = Number.isFinite(offsetSec) ? -offsetSec : 0;
-    void inst.ready.then(() => inst.resize(true)).catch(() => {});
-  }, [offsetSec]);
+    void inst.ready
+      .then(() => {
+        void inst.resize(true).catch(() => {});
+        const v = videoRef?.current;
+        if (v) repaintIfPaused(inst, v);
+      })
+      .catch(() => {});
+  }, [offsetSec, videoRef]);
+
+  // C toggles visibility only; turning subtitles back on while paused repaints the current line.
+  useEffect(() => {
+    const inst = jassubRef.current;
+    if (!inst) return;
+    setCanvasVisible(inst, subEnabled);
+    const v = videoRef?.current;
+    if (subEnabled && v) repaintIfPaused(inst, v);
+  }, [subEnabled, usingJassub, videoRef]);
 
   const primaryCues = usingJassub ? [] : cues;
   const secList = secondaryCues ?? [];

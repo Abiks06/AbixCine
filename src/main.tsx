@@ -9,6 +9,7 @@ import App from "./App";
 import "./styles/base.css";
 import "./styles/browse.css";
 import "./styles/player.css";
+import "./styles/frost.css";
 import { installPointerLight } from "./lib/pointerLight";
 
 installPointerLight();

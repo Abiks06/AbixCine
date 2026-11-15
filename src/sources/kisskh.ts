@@ -1,8 +1,12 @@
 import { cached } from "../lib/cache";
 import { normTitle } from "../lib/format";
+import type { Settings } from "../lib/settings";
+import { langBase } from "../lib/subtitles";
 import type { MediaDetail, PlaybackRequest } from "../lib/types";
+import { isFilm } from "../lib/types";
 import { DEFAULT_UA, httpFetch, native, normalizeHeaders, proxyUrl, sniff, type StreamHeaders } from "./native";
 import { inferSubtitleMeta, isThumbnailSubtitleUrl, type SourceProvider, type StreamCandidate, type SubtitleFormat, type SubtitleTrack } from "./types";
+import { encDec } from "./extractors/encdec";
 
 /**
  * KissKH: Korean, Chinese, Japanese, Thai and Taiwanese dramas and films with subtitles
@@ -16,7 +20,9 @@ const HOST = "https://kisskh.co";
 const ASIAN = new Set(["ko", "zh", "cn", "ja", "th", "tw", "tl", "id", "vi"]);
 const KISSKH_SUB_KEY = "8056483646328763";
 const KISSKH_SUB_IV = "6852612370185273";
-const SUB_FETCH_TIMEOUT_MS = 6_000;
+const SUB_FETCH_TIMEOUT_MS = 2_500;
+const DIRECT_FETCH_TIMEOUT_MS = 4_500;
+const MAX_DECRYPT_SUBS = 3;
 
 interface Hit { id: number; title: string; episodesCount: number }
 interface Drama { id: number; title: string; episodes: { id: number; number: number }[] }
@@ -167,24 +173,33 @@ function toSubtitleDataUrl(text: string, format: SubtitleFormat): string {
 
 function isEncryptedSubCandidateUrl(url: string): boolean {
   const clean = url.split(/[?#]/)[0].toLowerCase();
-  return clean.endsWith(".txt") || clean.endsWith(".txt1") || clean.endsWith(".txt2");
+  return (
+    clean.endsWith(".txt")
+    || clean.endsWith(".txt1")
+    || clean.endsWith(".txt2")
+    || clean.endsWith(".srt1")
+    || clean.endsWith(".srt2")
+  );
 }
 
 async function fetchTextWithSignal(
   url: string,
   headers: Record<string, string>,
   signal?: AbortSignal,
+  timeoutMs = SUB_FETCH_TIMEOUT_MS,
 ): Promise<string | null> {
   if (signal?.aborted) return null;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
   try {
     const work = httpFetch(url, headers);
     const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error("timeout")), SUB_FETCH_TIMEOUT_MS);
+      timer = setTimeout(() => reject(new Error("timeout")), timeoutMs);
     });
     const abort = signal
       ? new Promise<never>((_, reject) => {
-          signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+          onAbort = () => reject(new Error("aborted"));
+          signal.addEventListener("abort", onAbort, { once: true });
         })
       : null;
     const res = await Promise.race(abort ? [work, timeout, abort] : [work, timeout]);
@@ -194,16 +209,60 @@ async function fetchTextWithSignal(
     return null;
   } finally {
     if (timer !== undefined) clearTimeout(timer);
+    if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+  }
+}
+
+async function fetchKisskhKkey(epId: number, kind: "vid" | "sub", signal?: AbortSignal): Promise<string | null> {
+  try {
+    const kkey = await encDec<string>(
+      "enc-kisskh",
+      { query: { text: String(epId), type: kind } },
+      signal,
+      DIRECT_FETCH_TIMEOUT_MS,
+    );
+    return typeof kkey === "string" && kkey.trim() ? kkey.trim() : null;
+  } catch {
+    // No kkey (service down or aborted): the caller falls back to capturing the episode page.
+    return null;
+  }
+}
+
+async function fetchDirectEpisodeVideo(epId: number, page: string, signal?: AbortSignal): Promise<string | null> {
+  const kkey = await fetchKisskhKkey(epId, "vid", signal);
+  if (!kkey || signal?.aborted) return null;
+  const body = await fetchTextWithSignal(
+    `${HOST}/api/DramaList/Episode/${epId}.png?err=false&ts=&time=&kkey=${encodeURIComponent(kkey)}`,
+    { Referer: page, Origin: HOST, Accept: "application/json", "User-Agent": DEFAULT_UA },
+    signal,
+    DIRECT_FETCH_TIMEOUT_MS,
+  );
+  if (!body) return null;
+  try {
+    const parsed = JSON.parse(body) as { Video?: string; video?: string };
+    const videoUrl = (parsed?.Video ?? parsed?.video ?? "").trim();
+    return /^https?:\/\//i.test(videoUrl) ? videoUrl : null;
+  } catch {
+    return null;
   }
 }
 
 async function fetchApiSubtitles(epId: number, page: string, signal?: AbortSignal): Promise<KisskhSubItem[]> {
   if (signal?.aborted) return [];
-  const body = await fetchTextWithSignal(
-    `${HOST}/api/Sub/${epId}`,
+  const kkey = await fetchKisskhKkey(epId, "sub", signal);
+  const query = kkey ? `?kkey=${encodeURIComponent(kkey)}` : "";
+  let body = await fetchTextWithSignal(
+    `${HOST}/api/Sub/${epId}${query}`,
     { Referer: page, Origin: HOST, "User-Agent": DEFAULT_UA },
     signal,
   );
+  if (!body && kkey) {
+    body = await fetchTextWithSignal(
+      `${HOST}/api/Sub/${epId}`,
+      { Referer: page, Origin: HOST, "User-Agent": DEFAULT_UA },
+      signal,
+    );
+  }
   if (!body) return [];
   try {
     const parsed = JSON.parse(body);
@@ -213,15 +272,30 @@ async function fetchApiSubtitles(epId: number, page: string, signal?: AbortSigna
   }
 }
 
+function scoreSubPriority(
+  lang: string,
+  isDefault: boolean,
+  prefBases: string[],
+): number {
+  const base = langBase(lang);
+  if (prefBases[0] && base === prefBases[0]) return 4;
+  if (prefBases.includes(base)) return 3;
+  if (base === "en") return 2;
+  if (isDefault) return 1;
+  return 0;
+}
+
 /**
  * Resolve KissKH subtitles from sniffed URLs + optional `/api/Sub/{epId}` metadata,
- * decrypting `.txt` / `.txt1` (or encrypted `.srt`/`.vtt`) payloads into playable `data:` URLs.
+ * prioritizing user language / English and capping parallel decryption so stream candidates
+ * return promptly without blocking on 10+ secondary language tracks.
  */
 export async function resolveKisskhSubtitles(
   items: { url: string; hintLang?: string; hintLabel?: string; isDefault?: boolean }[],
   headers: StreamHeaders,
   page: string,
   signal?: AbortSignal,
+  preferredLangs: string[] = [],
 ): Promise<SubtitleTrack[]> {
   const seen = new Set<string>();
   const unique: typeof items = [];
@@ -237,25 +311,45 @@ export async function resolveKisskhSubtitles(
     ...(headers.origin ? { Origin: headers.origin } : { Origin: HOST }),
     "User-Agent": headers.ua ?? DEFAULT_UA,
   };
+  const prefBases = preferredLangs
+    .map((l) => langBase(l))
+    .filter((l) => l && l !== "und");
 
+  const annotated = unique.map((item, idx) => {
+    const meta = inferSubtitleMeta(item.url, item.hintLang, item.hintLabel);
+    const isDefault = Boolean(item.isDefault || meta.isDefault);
+    const priority = scoreSubPriority(meta.lang, isDefault, prefBases);
+    return { item, meta, isDefault, priority, idx };
+  });
+
+  // Decrypt only the top MAX_DECRYPT_SUBS prioritized tracks in parallel; keep the rest proxied.
+  const decryptSet = new Set<number>(
+    [...annotated]
+      .sort((a, b) => (b.priority - a.priority) || (a.idx - b.idx))
+      .slice(0, MAX_DECRYPT_SUBS)
+      .map((entry) => entry.idx),
+  );
+
+  const ordered = [...annotated].sort((a, b) => (b.priority - a.priority) || (a.idx - b.idx));
   const tracks = await Promise.all(
-    unique.map(async (item): Promise<SubtitleTrack> => {
-      const meta = inferSubtitleMeta(item.url, item.hintLang, item.hintLabel);
-      const body = await fetchTextWithSignal(item.url, fetchHeaders, signal);
-      if (body) {
-        const { text, decrypted } = await decryptKisskhSubtitle(body);
-        if (decrypted || (isEncryptedSubCandidateUrl(item.url) && text.includes("-->"))) {
-          const format = detectDecryptedFormat(text);
-          return {
-            lang: meta.lang,
-            label: meta.label,
-            url: toSubtitleDataUrl(text, format),
-            format,
-            isDefault: Boolean(item.isDefault || meta.isDefault),
-            isForced: meta.isForced,
-            isHearingImpaired: meta.isHearingImpaired,
-            source: "stream",
-          };
+    ordered.map(async ({ item, meta, isDefault, idx }): Promise<SubtitleTrack> => {
+      if (decryptSet.has(idx)) {
+        const body = await fetchTextWithSignal(item.url, fetchHeaders, signal);
+        if (body) {
+          const { text, decrypted } = await decryptKisskhSubtitle(body);
+          if (decrypted || (isEncryptedSubCandidateUrl(item.url) && text.includes("-->"))) {
+            const format = detectDecryptedFormat(text);
+            return {
+              lang: meta.lang,
+              label: meta.label,
+              url: toSubtitleDataUrl(text, format),
+              format,
+              isDefault,
+              isForced: meta.isForced,
+              isHearingImpaired: meta.isHearingImpaired,
+              source: "stream",
+            };
+          }
         }
       }
       return {
@@ -263,7 +357,7 @@ export async function resolveKisskhSubtitles(
         label: meta.label,
         url: proxyUrl(item.url, headers, page),
         ...(meta.format ? { format: meta.format } : {}),
-        isDefault: Boolean(item.isDefault || meta.isDefault),
+        isDefault,
         isForced: meta.isForced,
         isHearingImpaired: meta.isHearingImpaired,
         source: "stream",
@@ -323,7 +417,7 @@ export const kisskhProvider: SourceProvider = {
   priority: 18,
   timeoutMs: 26_000,
   isEnabled: (s) => native && !s.disabledSources?.includes("kisskh"),
-  async find(req: PlaybackRequest, _s, signal): Promise<StreamCandidate[]> {
+  async find(req: PlaybackRequest, s: Settings, signal): Promise<StreamCandidate[]> {
     // "zh-CN", "ZH" and "zh" are all Chinese.
     const lang = (req.media as MediaDetail).originalLanguage?.toLowerCase().split(/[-_]/)[0];
     if (!lang || !ASIAN.has(lang) || req.media.kind === "anime" || signal.aborted) return [];
@@ -344,15 +438,51 @@ export const kisskhProvider: SourceProvider = {
       (season > 1 ? undefined : hits.find((h) => normTitle(h.title).startsWith(want)));
     if (!hit) return [];
     const d = await drama(hit.id);
-    const epNo = req.media.kind === "movie" ? 1 : req.episode ?? 1;
+    const epNo = isFilm(req.media) ? 1 : req.episode ?? 1;
     // Exact first. Rounding is only for "12.0"-style numbers; it used to turn a 0.5 preview into episode 1.
     const ep = d?.episodes.find((e) => e.number === epNo) ?? d?.episodes.find((e) => e.number >= 1 && Math.round(e.number) === epNo);
     if (!d || !ep || signal.aborted) return [];
     const page = `${HOST}/Drama/${slug(d.title)}/Episode-${epNo}?id=${d.id}&ep=${ep.id}&page=0&pageSize=100`;
     const t0 = performance.now();
+    const apiSubsPromise = fetchApiSubtitles(ep.id, page, signal);
+    const directVideoUrl = await fetchDirectEpisodeVideo(ep.id, page, signal);
+    if (signal.aborted) return [];
+    const prefLangs = [s.subtitlePref?.lang, s.subtitlePref?.secondaryLang].filter(
+      (v): v is string => Boolean(v?.trim()),
+    );
+
+    if (directVideoUrl) {
+      const apiSubs = await apiSubsPromise;
+      if (signal.aborted) return [];
+      const headers = normalizeHeaders({ referer: page, origin: HOST, ua: DEFAULT_UA }, page);
+      const subItems = apiSubs
+        .filter((sub) => typeof sub?.src === "string" && sub.src.trim())
+        .map((sub) => ({
+          url: sub.src!.trim(),
+          hintLang: sub.land?.trim() || undefined,
+          hintLabel: sub.label?.trim() || undefined,
+          isDefault: Boolean(sub.default),
+        }));
+      const subtitles = await resolveKisskhSubtitles(subItems, headers, page, signal, prefLangs);
+      if (signal.aborted) return [];
+      return [
+        {
+          providerId: "kisskh",
+          providerName: "KissKH",
+          label: `${d.title}${isFilm(req.media) ? "" : ` · Episode ${epNo}`}`,
+          url: proxyUrl(directVideoUrl, headers, page),
+          kind: /\.mp4(?:[?#]|$)/i.test(directVideoUrl) ? "file" : "hls",
+          via: "direct",
+          headers,
+          subtitles,
+          lookupMs: Math.round(performance.now() - t0),
+        },
+      ];
+    }
+
     const [got, apiSubs] = await Promise.all([
       sniff(page, 16_000, signal),
-      fetchApiSubtitles(ep.id, page, signal),
+      apiSubsPromise,
     ]);
     if (!got || got.verified === false || signal.aborted) return [];
     const headers = normalizeHeaders(got.headers, page);
@@ -367,13 +497,13 @@ export const kisskhProvider: SourceProvider = {
         })),
       ...got.subtitles.map((url) => ({ url })),
     ];
-    const subtitles = await resolveKisskhSubtitles(subItems, headers, page, signal);
+    const subtitles = await resolveKisskhSubtitles(subItems, headers, page, signal, prefLangs);
     if (signal.aborted) return [];
     return [
       {
         providerId: "kisskh",
         providerName: "KissKH",
-        label: `${d.title}${req.media.kind === "movie" ? "" : ` · Episode ${epNo}`}`,
+        label: `${d.title}${isFilm(req.media) ? "" : ` · Episode ${epNo}`}`,
         url: proxyUrl(got.url, headers, page),
         kind: got.kind === "mp4" ? "file" : got.kind === "dash" ? "dash" : "hls",
         via: "sniffed",

@@ -175,15 +175,23 @@ export function httpFetch(url: string, headers?: Record<string, string>, init?: 
 export async function httpFetchBytes(
   url: string,
   headers?: Record<string, string>,
-  opts?: { signal?: AbortSignal },
+  opts?: { signal?: AbortSignal; method?: string; bodyBytes?: Uint8Array },
 ): Promise<FetchBytesResult> {
   const signal = opts?.signal;
   if (signal?.aborted) throw abortReason(signal);
+  const method = opts?.method;
+  const bodyBytes = opts?.bodyBytes;
   if (!isTauri()) {
-    const r = await fetch(url, { headers, signal });
+    const body = bodyBytes ? (() => { const copy = new Uint8Array(bodyBytes.byteLength); copy.set(bodyBytes); return copy.buffer; })() : undefined;
+    const r = await fetch(url, { headers, signal, method, body });
     return { status: r.status, url: r.url || url, bytes: await r.arrayBuffer() };
   }
-  const call = invoke<{ status: number; url: string; bodyB64: string }>("http_fetch_bytes", { url, headers });
+  const call = invoke<{ status: number; url: string; bodyB64: string }>("http_fetch_bytes", {
+    url,
+    headers,
+    ...(method ? { method } : {}),
+    ...(bodyBytes ? { bodyB64: btoa(binary(bodyBytes)) } : {}),
+  });
   const res = signal
     ? await new Promise<{ status: number; url: string; bodyB64: string }>((resolve, reject) => {
         const onAbort = () => reject(abortReason(signal));

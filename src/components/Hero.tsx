@@ -8,6 +8,7 @@ import { playHref } from "../lib/play";
 import { setStageLight } from "../lib/light";
 import { useSettings } from "../lib/settings";
 import type { Media } from "../lib/types";
+import { isFilm } from "../lib/types";
 import { Art } from "./Art";
 import { kindLabel, seedState } from "./Card";
 import { Icon } from "./Icon";
@@ -17,7 +18,7 @@ const SLIDE_MS = 9000;
 const pad2 = (n: number) => String(n).padStart(2, "0");
 
 const length = (m: Featured) =>
-  m.kind === "movie"
+  isFilm(m)
     ? fmtRuntime(m.runtime)
     : m.seasons?.length
       ? `${m.seasons.length} season${m.seasons.length > 1 ? "s" : ""}`

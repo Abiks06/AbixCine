@@ -171,15 +171,32 @@ fn shield_resources() -> Vec<Resource> {
   if (window.__abxNoWoiF) return;
   window.__abxNoWoiF = true;
   const origOpen = window.open;
+  // A blocked popup returns a harmless fake window, not null: players that check
+  // `window.open(...) === null` to detect a popup blocker refuse to start otherwise
+  // (the same stub build_player_hook_script installs; this scriptlet must not undo it).
+  const fakeWin = function() {
+    const w = {
+      closed: false,
+      opener: window,
+      name: '',
+      focus() {},
+      blur() {},
+      postMessage() {},
+      location: { href: 'about:blank', replace() {}, assign() {} },
+      document: { open() { return this; }, write() {}, writeln() {}, close() {} },
+    };
+    w.close = function() { w.closed = true; };
+    return w;
+  };
   window.open = function(url) {
     try {
-      if (!url || typeof url !== 'string') return null;
+      if (!url || typeof url !== 'string') return fakeWin();
       const s = url.trim().toLowerCase();
       if (s === '' || s === 'about:blank' || s.startsWith('http://') || s.startsWith('https://')) {
-        return null;
+        return fakeWin();
       }
     } catch {}
-    return origOpen ? origOpen.apply(this, arguments) : null;
+    return origOpen ? origOpen.apply(this, arguments) : fakeWin();
   };
 }"#;
     let set_const_js = r#"function abxSetConstant(prop, val) {
@@ -282,7 +299,7 @@ fn maybe_refresh_filter_cache(app: &AppHandle) {
     };
     let path = dir.join(SHIELD_CACHE_FILE);
     let allow_remote = std::env::var_os("ABX_NO_FILTER_UPDATE").is_none()
-        && std::env::var_os("ABX_SNIFF_TEST").is_none();
+        && crate::debug_env_var("ABX_SNIFF_TEST").is_none();
 
     tauri::async_runtime::spawn(async move {
         let mut needs_refresh = allow_remote;
@@ -401,6 +418,28 @@ pub(crate) fn is_app_navigation(uri: &str) -> bool {
             Some("tauri.localhost") => true,
             Some("localhost") | Some("127.0.0.1") => cfg!(debug_assertions),
             _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Where a hidden sniffer window, or any child frame, may navigate: the open web only. Never the
+/// app's own WebView hosts (`tauri.`/`abxs.`/`asset.localhost`), loopback, `file:` or OS URI
+/// schemes (`ms-settings:`, custom protocol handlers).
+pub(crate) fn is_untrusted_navigation_allowed(uri: &str) -> bool {
+    let Ok(u) = url::Url::parse(uri) else { return false };
+    match u.scheme() {
+        "about" => matches!(u.as_str(), "about:blank" | "about:srcdoc"),
+        // In-frame content documents, not a way out of the sandbox.
+        "data" | "blob" | "javascript" => true,
+        "http" | "https" => match u.host() {
+            Some(url::Host::Domain(d)) => {
+                let d = d.trim_end_matches('.').to_ascii_lowercase();
+                d != "localhost" && !d.ends_with(".localhost")
+            }
+            Some(url::Host::Ipv4(ip)) => !ip.is_loopback() && !ip.is_unspecified() && !ip.is_link_local(),
+            Some(url::Host::Ipv6(ip)) => !ip.is_loopback() && !ip.is_unspecified(),
+            None => false,
         },
         _ => false,
     }
@@ -545,6 +584,352 @@ pub fn is_sniffed_subtitle(uri: &str, ctype: &str) -> bool {
     has_sub_ext || has_sub_mime
 }
 
+const DEFAULT_EMBED_REFERER: &str = "https://www.themoviedb.org/";
+
+pub(crate) fn normalize_referer_url(referer: Option<&str>) -> String {
+    let raw = referer.unwrap_or(DEFAULT_EMBED_REFERER).trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("about:blank") {
+        return DEFAULT_EMBED_REFERER.to_string();
+    }
+    if let Ok(u) = url::Url::parse(raw) {
+        if matches!(u.scheme(), "http" | "https") && u.host_str().is_some() {
+            return u.to_string();
+        }
+    }
+    DEFAULT_EMBED_REFERER.to_string()
+}
+
+/// Document-start script injected into every frame of a sniff window so embeds running
+/// top-level still observe iframe ancestry, an embedder referrer, and a working `window.open`
+/// probe stub without modifying genuine nested sub-iframes.
+pub(crate) fn build_player_hook_script(referer_hint: Option<&str>) -> String {
+    let ref_url = normalize_referer_url(referer_hint);
+    let ref_origin = url::Url::parse(&ref_url)
+        .ok()
+        .and_then(|u| {
+            u.host_str().map(|h| match u.port() {
+                Some(p) => format!("{}://{}:{}", u.scheme(), h, p),
+                None => format!("{}://{}", u.scheme(), h),
+            })
+        })
+        .unwrap_or_else(|| "https://www.themoviedb.org".to_string());
+    let ref_json = serde_json::to_string(&ref_url).unwrap_or_else(|_| "\"https://www.themoviedb.org/\"".to_string());
+    let orig_json = serde_json::to_string(&ref_origin).unwrap_or_else(|_| "\"https://www.themoviedb.org\"".to_string());
+    format!(
+        r#"(() => {{
+  try {{
+    const refUrl = {ref_json};
+    const refOrigin = {orig_json};
+    const safeWinOpen = () => {{
+      const w = {{
+        closed: false,
+        opener: window,
+        name: '',
+        focus() {{}},
+        blur() {{}},
+        postMessage() {{}},
+        location: {{ href: 'about:blank', replace() {{}}, assign() {{}} }},
+        document: {{ open() {{ return this; }}, write() {{}}, writeln() {{}}, close() {{}} }},
+      }};
+      w.close = () => {{ w.closed = true; }};
+      return w;
+    }};
+    try {{ window.open = safeWinOpen; }} catch {{}}
+    if (window.self !== window.top) return;
+    const fakeParent = {{
+      closed: false,
+      location: {{ href: refUrl, origin: refOrigin, ancestorOrigins: [] }},
+      document: {{ referrer: '' }},
+      postMessage() {{}},
+    }};
+    fakeParent.self = fakeParent;
+    fakeParent.top = fakeParent;
+    fakeParent.parent = fakeParent;
+    const fakeFrame = {{
+      tagName: 'IFRAME',
+      nodeName: 'IFRAME',
+      contentWindow: window,
+      hasAttribute: () => false,
+      getAttribute: (n) => n === 'src' ? location.href : (n === 'referrerpolicy' ? 'origin' : null),
+    }};
+    try {{ Object.defineProperty(window, 'top', {{ get: () => fakeParent, configurable: true }}); }} catch {{}}
+    try {{ Object.defineProperty(window, 'parent', {{ get: () => fakeParent, configurable: true }}); }} catch {{}}
+    try {{ Object.defineProperty(window, 'frameElement', {{ get: () => fakeFrame, configurable: true }}); }} catch {{}}
+    try {{
+      const refDesc = Object.getOwnPropertyDescriptor(Document.prototype, 'referrer');
+      Object.defineProperty(Document.prototype, 'referrer', {{
+        get: function () {{
+          try {{
+            const v = refDesc && refDesc.get ? refDesc.get.call(this) : '';
+            return v || refUrl;
+          }} catch {{
+            return refUrl;
+          }}
+        }},
+        configurable: true,
+      }});
+    }} catch {{}}
+    try {{
+      const locDesc = Object.getOwnPropertyDescriptor(Location.prototype, 'ancestorOrigins');
+      const fakeAnc = Object.assign([refOrigin], {{
+        item: (i) => (i === 0 ? refOrigin : null),
+        contains: (s) => s === refOrigin,
+      }});
+      Object.defineProperty(Location.prototype, 'ancestorOrigins', {{
+        get: function () {{
+          try {{
+            const v = locDesc && locDesc.get ? locDesc.get.call(this) : null;
+            return v && v.length > 0 ? v : fakeAnc;
+          }} catch {{
+            return fakeAnc;
+          }}
+        }},
+        configurable: true,
+      }});
+    }} catch {{}}
+  }} catch {{}}
+}})();"#,
+    )
+}
+
+pub(crate) fn is_opaque_header_value(val: Option<&str>) -> bool {
+    val.map(str::trim).is_none_or(|v| {
+        v.is_empty() || v.eq_ignore_ascii_case("null") || v.eq_ignore_ascii_case("about:blank")
+    })
+}
+
+fn clean_header_value(val: Option<String>) -> Option<String> {
+    val.and_then(|v| {
+        let t = v.trim();
+        if t.is_empty() || t.eq_ignore_ascii_case("null") || t.eq_ignore_ascii_case("about:blank") {
+            None
+        } else {
+            Some(t.to_string())
+        }
+    })
+}
+
+pub(crate) fn merge_captured_headers(resp: Hdrs, req: Option<&Hdrs>) -> Hdrs {
+    let pick = |primary: Option<String>, fallback: Option<&String>| -> Option<String> {
+        clean_header_value(primary).or_else(|| fallback.and_then(|s| clean_header_value(Some(s.clone()))))
+    };
+    Hdrs {
+        referer: pick(resp.referer, req.and_then(|r| r.referer.as_ref())),
+        origin: pick(resp.origin, req.and_then(|r| r.origin.as_ref())),
+        ua: pick(resp.ua, req.and_then(|r| r.ua.as_ref())),
+    }
+}
+
+fn path_ext_lower(path_only: &str) -> &str {
+    let last_seg = path_only.rsplit('/').next().unwrap_or(path_only);
+    match last_seg.rsplit_once('.') {
+        Some((_, ext)) => ext,
+        None => "",
+    }
+}
+
+fn is_non_manifest_asset_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "ts" | "m4s"
+            | "mp4"
+            | "m4v"
+            | "m4a"
+            | "aac"
+            | "mp3"
+            | "webm"
+            | "mkv"
+            | "avi"
+            | "mov"
+            | "vtt"
+            | "srt"
+            | "ass"
+            | "ssa"
+            | "js"
+            | "mjs"
+            | "css"
+            | "json"
+            | "html"
+            | "htm"
+            | "woff"
+            | "woff2"
+            | "ttf"
+            | "otf"
+            | "svg"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "webp"
+            | "ico"
+            | "map"
+            | "wasm"
+    )
+}
+
+pub(crate) fn classify_manifest_request_uri(uri: &str) -> Option<&'static str> {
+    if is_exempt_url(uri)
+        || host_of(uri).is_none_or(|h| is_blocked_host(&h))
+        || is_blocked_url(uri)
+        || is_preview_or_ad_url(uri)
+        || is_thumbnail_subtitle_url(uri)
+    {
+        return None;
+    }
+    let path_only = uri.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase();
+    let ext = path_ext_lower(&path_only);
+    if is_non_manifest_asset_ext(ext) {
+        return None;
+    }
+    if path_only.ends_with(".m3u8") || path_only.contains(".m3u8/") {
+        return Some("hls");
+    }
+    if path_only.ends_with(".mpd") || path_only.contains(".mpd/") {
+        return Some("dash");
+    }
+    let file = path_only.rsplit('/').next().unwrap_or("");
+    if matches!(file, "master.txt" | "playlist.txt" | "index.txt")
+        || (ext.is_empty() && (path_only.contains("/playlist/") || path_only.ends_with("/playlist")))
+    {
+        return Some("hls");
+    }
+    None
+}
+
+/// `init.mp4`, `seg-12-v1.mp4`, `frag_3.mp4`, `chunk-0001.mp4`, `part2.mp4`, `000123.mp4`: pieces of
+/// an adaptive stream rather than a standalone file.
+pub(crate) fn is_stream_fragment_name(file: &str) -> bool {
+    let stem = file.rsplit_once('.').map(|(s, _)| s).unwrap_or(file);
+    if !stem.is_empty() && stem.bytes().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    ["init", "seg", "segment", "frag", "fragment", "chunk", "part"].iter().any(|p| {
+        stem.strip_prefix(p)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(|c: char| c.is_ascii_digit() || c == '-' || c == '_' || c == '.'))
+    })
+}
+
+pub(crate) fn classify_response_media(uri: &str, ctype: &str) -> Option<&'static str> {
+    let ctype_lower = ctype.to_ascii_lowercase();
+    if ctype_lower.contains("text/html")
+        || ctype_lower.contains("xhtml")
+        || ctype_lower.contains("javascript")
+        || ctype_lower.contains("text/css")
+        || ctype_lower.contains("application/json")
+        || ctype_lower.starts_with("image/")
+        || ctype_lower.starts_with("font/")
+        || is_sniffed_subtitle(uri, ctype)
+    {
+        return None;
+    }
+    let path_only = uri.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase();
+    if ctype_lower.contains("mpegurl") || ctype_lower.contains("x-mpegurl") {
+        return Some("hls");
+    }
+    if ctype_lower.contains("dash+xml") {
+        return Some("dash");
+    }
+    let is_progressive = ctype_lower.starts_with("video/mp4")
+        || ctype_lower.starts_with("video/webm")
+        || path_only.ends_with(".mp4")
+        || path_only.ends_with(".webm");
+    if is_progressive {
+        // fMP4 init/fragment files of an HLS/DASH stream are not a film: counting them armed the
+        // early exit before the manifest itself was captured.
+        let file = path_only.rsplit('/').next().unwrap_or("");
+        return if is_stream_fragment_name(file) { None } else { Some("mp4") };
+    }
+    if path_only.ends_with(".m3u8") || path_only.contains(".m3u8/") {
+        return Some("hls");
+    }
+    if path_only.ends_with(".mpd") || path_only.contains(".mpd/") {
+        return Some("dash");
+    }
+    let ext = path_ext_lower(&path_only);
+    if !is_non_manifest_asset_ext(ext)
+        && (ctype_lower.is_empty()
+            || ctype_lower.starts_with("text/plain")
+            || ctype_lower.contains("octet-stream"))
+    {
+        let file = path_only.rsplit('/').next().unwrap_or("");
+        if matches!(file, "master.txt" | "playlist.txt" | "index.txt")
+            || (ext.is_empty() && (path_only.contains("/playlist/") || path_only.ends_with("/playlist")))
+            || ext == "txt" && (file.contains("master") || file.contains("playlist") || file.contains("index"))
+        {
+            return Some("hls");
+        }
+    }
+    None
+}
+
+pub(crate) fn has_primary_media_candidate(candidates: &[Sniffed]) -> bool {
+    candidates.iter().any(|c| !is_preview_or_ad_url(&c.url))
+}
+
+#[derive(Default)]
+pub struct SniffCapture {
+    pub(crate) headers_by_uri: std::collections::HashMap<String, Hdrs>,
+    /// Insertion order of `headers_by_uri`, so a busy page evicts its oldest entries instead of
+    /// wiping the map (which dropped the headers of a manifest whose response was about to arrive).
+    header_order: std::collections::VecDeque<String>,
+    pub(crate) pending_manifests: std::collections::HashMap<String, (&'static str, Hdrs)>,
+}
+
+const MAX_CAPTURED_HEADERS: usize = 512;
+
+impl SniffCapture {
+    #[allow(dead_code)]
+    pub(crate) fn record_request(&mut self, uri: &str, hdrs: Hdrs, is_subrequest: bool, capture_hdrs: bool) {
+        if capture_hdrs {
+            if !self.headers_by_uri.contains_key(uri) {
+                while self.headers_by_uri.len() >= MAX_CAPTURED_HEADERS {
+                    match self.header_order.pop_front() {
+                        Some(old) => {
+                            self.headers_by_uri.remove(&old);
+                        }
+                        None => {
+                            self.headers_by_uri.clear();
+                            break;
+                        }
+                    }
+                }
+                self.header_order.push_back(uri.to_string());
+            }
+            self.headers_by_uri.insert(uri.to_string(), hdrs.clone());
+        }
+        if is_subrequest {
+            if let Some(kind) = classify_manifest_request_uri(uri) {
+                if self.pending_manifests.len() < 64 || self.pending_manifests.contains_key(uri) {
+                    self.pending_manifests.insert(uri.to_string(), (kind, hdrs));
+                }
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn headers_for(&self, uri: &str) -> Option<&Hdrs> {
+        self.headers_by_uri.get(uri)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn clear_pending(&mut self, uri: &str) {
+        self.pending_manifests.remove(uri);
+    }
+
+    pub(crate) fn take_pending(&mut self) -> Vec<(String, &'static str, Hdrs)> {
+        self.pending_manifests
+            .drain()
+            .map(|(url, (kind, hdrs))| (url, kind, hdrs))
+            .collect()
+    }
+}
+
+pub struct SniffInstallOptions {
+    pub tx: UnboundedSender<Found>,
+    pub referer_hint: Option<String>,
+    pub capture: Arc<std::sync::Mutex<SniffCapture>>,
+}
+
 #[cfg(windows)]
 mod win {
     use super::*;
@@ -625,6 +1010,12 @@ mod win {
                         let mut uri = PWSTR::null();
                         if args.Uri(&mut uri).is_ok() {
                             let u = take_pwstr(uri);
+                            // Child frames (in the app window and in sniffers) stay on the open web.
+                            if !is_untrusted_navigation_allowed(&u) {
+                                BLOCKED.fetch_add(1, Ordering::Relaxed);
+                                let _ = args.SetCancel(true);
+                                return Ok(());
+                            }
                             if let Ok(mut g) = url_ref.lock() {
                                 *g = u;
                             }
@@ -688,11 +1079,53 @@ mod win {
         }
     }
 
+    /// Navigate to `url` with an explicit initial `Referer` request header when WebView2
+    /// supports `ICoreWebView2Environment9` + `ICoreWebView2_10`.
+    pub fn navigate_with_referer(pw: &tauri::webview::PlatformWebview, url: &str, referer: &str) -> bool {
+        let ref_val = normalize_referer_url(Some(referer));
+        unsafe {
+            let Ok(core) = pw.controller().CoreWebView2() else { return false };
+            let env = pw.environment();
+            let Ok(env9) = env.cast::<ICoreWebView2Environment9>() else { return false };
+            let Ok(core10) = core.cast::<ICoreWebView2_10>() else { return false };
+            let headers = HSTRING::from(format!("Referer: {ref_val}\r\n"));
+            let Ok(req) = env9.CreateWebResourceRequest(
+                &HSTRING::from(url),
+                &HSTRING::from("GET"),
+                None,
+                &headers,
+            ) else {
+                return false;
+            };
+            core10.NavigateWithWebResourceRequest(&req).is_ok()
+        }
+    }
+
     /// Install the shield (always) and the sniffer (when `sniff` is given) on one webview.
     pub fn install(pw: &tauri::webview::PlatformWebview, main: bool, sniff: Option<UnboundedSender<Found>>) {
+        let opts = sniff.map(|tx| SniffInstallOptions {
+            tx,
+            referer_hint: None,
+            capture: Arc::new(std::sync::Mutex::new(SniffCapture::default())),
+        });
+        install_with_options(pw, main, opts);
+    }
+
+    /// Install the shield (always) and the sniffer with optional referer hint and capture store.
+    pub fn install_with_options(
+        pw: &tauri::webview::PlatformWebview,
+        main: bool,
+        sniff: Option<SniffInstallOptions>,
+    ) {
         unsafe {
             let Ok(core) = pw.controller().CoreWebView2() else { return };
             let env = pw.environment();
+
+            let referer_hint = sniff
+                .as_ref()
+                .and_then(|s| s.referer_hint.as_deref())
+                .map(|r| normalize_referer_url(Some(r)));
+            let req_capture = sniff.as_ref().map(|s| Arc::clone(&s.capture));
 
             // Single wildcard filter routes requests to the `adblock::Engine`, while
             // `is_exempt_url` fast-paths localhost/abxs/asset/tauri requests immediately.
@@ -723,6 +1156,16 @@ mod win {
                     }
                     let mut ctx = COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL;
                     let _ = args.ResourceContext(&mut ctx);
+                    if ctx == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT {
+                        if let Some(ref ref_val) = referer_hint {
+                            let existing_ref = req_header(&req, "Referer");
+                            if is_opaque_header_value(existing_ref.as_deref()) {
+                                if let Ok(hdrs) = req.Headers() {
+                                    let _ = hdrs.SetHeader(&HSTRING::from("Referer"), &HSTRING::from(ref_val.as_str()));
+                                }
+                            }
+                        }
+                    }
                     let req_type = map_resource_context(ctx);
                     let source_url = req_header(&req, "Referer")
                         .or_else(|| req_header(&req, "Origin"))
@@ -733,6 +1176,28 @@ mod win {
                         BLOCKED.fetch_add(1, Ordering::Relaxed);
                         let resp = env2.CreateWebResourceResponse(None, 403, &HSTRING::from("Blocked"), &HSTRING::new())?;
                         args.SetResponse(&resp)?;
+                        return Ok(());
+                    }
+                    if let Some(ref cap) = req_capture {
+                        if !method.eq_ignore_ascii_case("OPTIONS")
+                            && !is_blocked_url(&uri)
+                            && host_of(&uri).is_some_and(|h| !is_blocked_host(&h))
+                        {
+                            let is_subrequest = ctx != COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT;
+                            let capture_hdrs = !matches!(
+                                ctx,
+                                COREWEBVIEW2_WEB_RESOURCE_CONTEXT_STYLESHEET
+                                    | COREWEBVIEW2_WEB_RESOURCE_CONTEXT_FONT
+                            );
+                            let hdrs = Hdrs {
+                                referer: clean_header_value(req_header(&req, "Referer")),
+                                origin: clean_header_value(req_header(&req, "Origin")),
+                                ua: clean_header_value(req_header(&req, "User-Agent")),
+                            };
+                            if let Ok(mut g) = cap.lock() {
+                                g.record_request(&uri, hdrs, is_subrequest, capture_hdrs);
+                            }
+                        }
                     }
                     Ok(())
                 })),
@@ -799,7 +1264,8 @@ mod win {
                             let mut src = PWSTR::null();
                             let _ = frame.Source(&mut src);
                             let src = take_pwstr(src);
-                            from_app = main && host_of(&src).is_some_and(|h| h == "localhost" || h.ends_with(".localhost"));
+                            // Only the app's own page (tauri.localhost), not abxs./asset.localhost.
+                            from_app = main && is_app_navigation(&src);
                         }
                     }
                     if from_app {
@@ -818,24 +1284,23 @@ mod win {
                 &mut token,
             );
 
-            // A frame must never be able to take over the app window.
-            if main {
-                let _ = core.add_NavigationStarting(
-                    &NavigationStartingEventHandler::create(Box::new(move |_, args| {
-                        let Some(args) = args else { return Ok(()) };
-                        let mut uri = PWSTR::null();
-                        args.Uri(&mut uri)?;
-                        let uri = take_pwstr(uri);
-                        let ours = is_app_navigation(&uri);
-                        if !ours {
-                            BLOCKED.fetch_add(1, Ordering::Relaxed);
-                            args.SetCancel(true)?;
-                        }
-                        Ok(())
-                    })),
-                    &mut token,
-                );
-            }
+            // A frame must never be able to take over the app window, and a sniffer window (which
+            // runs an untrusted embed) must never navigate into the app or off the open web.
+            let _ = core.add_NavigationStarting(
+                &NavigationStartingEventHandler::create(Box::new(move |_, args| {
+                    let Some(args) = args else { return Ok(()) };
+                    let mut uri = PWSTR::null();
+                    args.Uri(&mut uri)?;
+                    let uri = take_pwstr(uri);
+                    let allowed = if main { is_app_navigation(&uri) } else { is_untrusted_navigation_allowed(&uri) };
+                    if !allowed {
+                        BLOCKED.fetch_add(1, Ordering::Relaxed);
+                        args.SetCancel(true)?;
+                    }
+                    Ok(())
+                })),
+                &mut token,
+            );
 
             // No drive-by downloads.
             if let Ok(c4) = core.cast::<ICoreWebView2_4>() {
@@ -851,7 +1316,7 @@ mod win {
                 );
             }
 
-            let Some(tx) = sniff else { return };
+            let Some(SniffInstallOptions { tx, capture, .. }) = sniff else { return };
             #[cfg(debug_assertions)]
             if std::env::var_os("ABX_SNIFF_DEBUG").is_some() {
                 let _ = core.add_NavigationStarting(
@@ -887,6 +1352,9 @@ mod win {
                 &WebResourceResponseReceivedEventHandler::create(Box::new(move |_, args| {
                     let Some(args) = args else { return Ok(()) };
                     let req = args.Request()?;
+                    if method_of_request(&req).eq_ignore_ascii_case("OPTIONS") {
+                        return Ok(());
+                    }
                     let uri = uri_of_request(&req);
                     if host_of(&uri).is_none_or(|h| is_blocked_host(&h)) || is_blocked_url(&uri) {
                         return Ok(());
@@ -900,6 +1368,12 @@ mod win {
                         })
                         .unwrap_or(200);
                     if status >= 400 {
+                        if let Ok(mut g) = capture.lock() {
+                            g.clear_pending(&uri);
+                        }
+                        return Ok(());
+                    }
+                    if !(200..300).contains(&status) {
                         return Ok(());
                     }
                     let ctype = args
@@ -912,29 +1386,31 @@ mod win {
                         })
                         .unwrap_or_default()
                         .to_ascii_lowercase();
-                    let path = uri.split('?').next().unwrap_or("").to_ascii_lowercase();
                     #[cfg(debug_assertions)]
                     if std::env::var_os("ABX_SNIFF_DEBUG").is_some() {
                         let preview: String = uri.chars().take(160).collect();
                         println!("  RESP {status} [{ctype}] {preview}");
                     }
-                    let kind = if ctype.contains("mpegurl") || path.ends_with(".m3u8") || uri.to_ascii_lowercase().contains(".m3u8") {
-                        Some("hls")
-                    } else if ctype.contains("dash+xml") || path.ends_with(".mpd") {
-                        Some("dash")
-                    } else if ctype.starts_with("video/mp4") || path.ends_with(".mp4") {
-                        Some("mp4")
-                    } else {
-                        None
-                    };
+                    let kind = classify_response_media(&uri, &ctype);
+                    let is_sub = kind.is_none() && is_sniffed_subtitle(&uri, &ctype);
+                    let recorded_hdrs = capture
+                        .lock()
+                        .ok()
+                        .and_then(|mut g| {
+                            if kind.is_some() || is_sub {
+                                g.clear_pending(&uri);
+                            }
+                            g.headers_for(&uri).cloned()
+                        });
                     if let Some(kind) = kind {
-                        let headers = Hdrs {
+                        let resp_hdrs = Hdrs {
                             referer: req_header(&req, "Referer"),
                             origin: req_header(&req, "Origin"),
                             ua: req_header(&req, "User-Agent"),
                         };
+                        let headers = merge_captured_headers(resp_hdrs, recorded_hdrs.as_ref());
                         let _ = tx.send(Found::Media(Sniffed { url: uri, kind, headers, subtitles: vec![], verified: None, quality: None }));
-                    } else if is_sniffed_subtitle(&uri, &ctype) {
+                    } else if is_sub {
                         let _ = tx.send(Found::Subtitle(uri));
                     }
                     Ok(())
@@ -946,7 +1422,7 @@ mod win {
 }
 
 #[cfg(windows)]
-pub use win::{cdp, install};
+pub use win::{cdp, install, install_with_options, navigate_with_referer};
 
 #[cfg(not(windows))]
 pub fn cdp(_pw: &tauri::webview::PlatformWebview, _method: &str, _params: &str) {}
@@ -954,12 +1430,19 @@ pub fn cdp(_pw: &tauri::webview::PlatformWebview, _method: &str, _params: &str) 
 #[cfg(not(windows))]
 pub fn install(_pw: &tauri::webview::PlatformWebview, _main: bool, _sniff: Option<UnboundedSender<Found>>) {}
 
-/// Runs in every frame of a sniff window: mute everything, stop window.open, and keep nudging
+#[cfg(not(windows))]
+pub fn install_with_options(_pw: &tauri::webview::PlatformWebview, _main: bool, _sniff: Option<SniffInstallOptions>) {}
+
+#[cfg(not(windows))]
+pub fn navigate_with_referer(_pw: &tauri::webview::PlatformWebview, _url: &str, _referer: &str) -> bool {
+    false
+}
+
+/// Runs in every frame of a sniff window: mute everything and keep nudging
 /// the player to start (most embeds request their playlist only once playback begins).
 const NUDGE_JS: &str = r#"
 (() => {
   try {
-    window.open = () => null;
     // The check window is hidden: tell players they're on screen so they load like normal.
     try {
       Object.defineProperty(Document.prototype, 'hidden', { get: () => false, configurable: true });
@@ -972,14 +1455,28 @@ const NUDGE_JS: &str = r#"
         unobserve() {} disconnect() {} takeRecords() { return []; }
       };
     } catch {}
-    const sels = ['.vjs-big-play-button','.jw-display-icon-display','.plyr__control--overlaid','.play-button','#play-button',
-      '.playbtn','#btn-play','.btn-play','[aria-label="Play"]','button[title="Play"]','.art-control-play','.fp-play','.vds-play-button'];
+    const sels = [
+      '.vjs-big-play-button', '.jw-icon-display', '.jw-display-icon-display',
+      '.plyr__control--overlaid', '.art-state', '.art-control-play', '.fp-play',
+      '.vds-play-button', '.play-button', '#play-button', '.playbtn', '#btn-play',
+      '.btn-play', '[aria-label*="Play" i]', 'button[title*="Play" i]',
+      '[class*="play-btn" i]', '#player', 'video'
+    ];
+    const isVis = (el) => el && (el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0);
     let n = 0;
     const tick = () => {
       if (++n > 40) return;
       document.querySelectorAll('video,audio').forEach(v => { try { v.muted = true; const p = v.play(); p && p.catch(() => {}); } catch {} });
-      for (const s of sels) { const el = document.querySelector(s); if (el) { try { el.click(); } catch {} break; } }
-      if (n % 3 === 0) {
+      const activeVideo = document.querySelector('video');
+      const isPlaying = !!(activeVideo && !activeVideo.paused && activeVideo.currentTime > 0);
+      for (const s of sels) {
+        if ((s === '#player' || s === 'video') && isPlaying) continue;
+        const el = document.querySelector(s);
+        if (!el || !isVis(el)) continue;
+        try { el.click(); } catch {}
+        break;
+      }
+      if (n % 3 === 0 && !isPlaying) {
         const el = document.elementFromPoint(innerWidth / 2, innerHeight / 2);
         if (el && el.tagName !== 'IFRAME') try { el.click(); } catch {}
       }
@@ -999,6 +1496,20 @@ fn sem() -> &'static tokio::sync::Semaphore {
 struct SniffCancelEntry {
     label: Option<String>,
     tx: tokio::sync::watch::Sender<bool>,
+    /// When it was recorded: a cancel that arrived before (or after) its sniff is only a
+    /// tombstone for a short while, so unknown IDs can't pile up for the whole session.
+    at: std::time::Instant,
+}
+
+const CANCEL_TOMBSTONE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Aborts the spawned task when dropped, so every exit path (not just the happy one) stops it.
+struct AbortOnDrop<T>(tauri::async_runtime::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 fn cancel_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, SniffCancelEntry>> {
@@ -1019,8 +1530,9 @@ pub fn cancel_sniff(app: AppHandle, cancel_id: String) {
             }
         }
     } else if let Ok(mut m) = cancel_map().lock() {
+        m.retain(|_, e| e.label.is_some() || e.at.elapsed() < CANCEL_TOMBSTONE_TTL);
         let (tx, _rx) = tokio::sync::watch::channel(true);
-        m.insert(cancel_id, SniffCancelEntry { label: None, tx });
+        m.insert(cancel_id, SniffCancelEntry { label: None, tx, at: std::time::Instant::now() });
     }
 }
 
@@ -1072,7 +1584,7 @@ pub async fn sniff_media(
             if let Some(existing) = m.remove(cid) {
                 *existing.tx.borrow()
             } else {
-                m.insert(cid.clone(), SniffCancelEntry { label: Some(label.clone()), tx });
+                m.insert(cid.clone(), SniffCancelEntry { label: Some(label.clone()), tx, at: std::time::Instant::now() });
                 false
             }
         } else {
@@ -1159,6 +1671,7 @@ async fn sniff_inner(app: AppHandle, target: url::Url, timeout_ms: Option<u64>, 
     dbg("permit");
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Found>();
 
+    let hook_js = build_player_hook_script(Some(DEFAULT_EMBED_REFERER));
     let win = WebviewWindowBuilder::new(&app, &label, WebviewUrl::External("about:blank".parse().unwrap()))
         .title("AbixCine resolver")
         .inner_size(960.0, 540.0)
@@ -1169,12 +1682,15 @@ async fn sniff_inner(app: AppHandle, target: url::Url, timeout_ms: Option<u64>, 
         // Never shown: no taskbar entry, no Alt-Tab, no flash. The webview inside is still
         // marked visible (below), so pages don't throttle their players.
         .visible(false)
+        .initialization_script_for_all_frames(hook_js)
         .initialization_script_for_all_frames(NUDGE_JS)
         // Must match the main window's arguments: WebView2 shares one browser per data folder.
         .additional_browser_args(BROWSER_ARGS)
         .build()
         .map_err(|e| e.to_string())?;
 
+    let capture = Arc::new(std::sync::Mutex::new(SniffCapture::default()));
+    let cap_install = Arc::clone(&capture);
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
     let tx2 = tx.clone();
     win.with_webview(move |pw| {
@@ -1182,7 +1698,15 @@ async fn sniff_inner(app: AppHandle, target: url::Url, timeout_ms: Option<u64>, 
         unsafe {
             let _ = pw.controller().SetIsVisible(true);
         }
-        install(&pw, false, Some(tx2));
+        install_with_options(
+            &pw,
+            false,
+            Some(SniffInstallOptions {
+                tx: tx2,
+                referer_hint: Some(DEFAULT_EMBED_REFERER.to_string()),
+                capture: cap_install,
+            }),
+        );
         let _ = ready_tx.send(());
     })
     .map_err(|e| e.to_string())?;
@@ -1190,13 +1714,21 @@ async fn sniff_inner(app: AppHandle, target: url::Url, timeout_ms: Option<u64>, 
     let _ = ready_rx.await;
     dbg("shield ready");
     drop(tx);
-    let _ = win.navigate(target.clone());
+    let nav_url = target.to_string();
+    let nav_ok = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let nav_ok2 = Arc::clone(&nav_ok);
+    let _ = win.with_webview(move |pw| {
+        nav_ok2.store(navigate_with_referer(&pw, &nav_url, DEFAULT_EMBED_REFERER), Ordering::Relaxed);
+    });
+    if !nav_ok.load(Ordering::Relaxed) {
+        let _ = win.navigate(target.clone());
+    }
 
     // Many players only fetch their stream after a real click on "play". Script clicks don't
     // count as a user gesture and can't reach cross-origin or script-written frames, so send
     // trusted mouse input through the DevTools protocol instead, at the centre of the player,
     // a few times while the page settles. Focus is emulated so "is the tab active?" checks pass.
-    {
+    let clicker = AbortOnDrop({
         let w = win.clone();
         tauri::async_runtime::spawn(async move {
             let _ = w.with_webview(|pw| cdp(&pw, "Emulation.setFocusEmulationEnabled", r#"{"enabled":true}"#));
@@ -1214,41 +1746,53 @@ async fn sniff_inner(app: AppHandle, target: url::Url, timeout_ms: Option<u64>, 
                     break; // window already closed: the stream was found
                 }
             }
-        });
-    }
+        })
+    });
 
     let page_origin = target.host_str().map(|h| match target.port() {
         Some(p) => format!("{}://{}:{}", target.scheme(), h, p),
         None => format!("{}://{}", target.scheme(), h),
     });
+    let fill_default_headers = |headers: &mut Hdrs| {
+        if headers.referer.as_deref().unwrap_or("").is_empty() {
+            if let Some(ref orig) = page_origin {
+                headers.referer = Some(format!("{orig}/"));
+            }
+        }
+        if headers.origin.as_deref().unwrap_or("").is_empty() {
+            headers.origin = headers
+                .referer
+                .as_deref()
+                .and_then(|r| url::Url::parse(r).ok())
+                .and_then(|u| {
+                    u.host_str().map(|h| match u.port() {
+                        Some(p) => format!("{}://{}:{}", u.scheme(), h, p),
+                        None => format!("{}://{}", u.scheme(), h),
+                    })
+                })
+                .or_else(|| page_origin.clone());
+        }
+    };
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.unwrap_or(14_000));
     let mut candidates: Vec<Sniffed> = Vec::new();
     let mut subs: Vec<String> = Vec::new();
+    let mut first_hit_at: Option<tokio::time::Instant> = None;
     loop {
-        // Once a stream is found, linger briefly for a master playlist or subtitle tracks.
-        let until = match candidates.first() {
-            Some(_) => (tokio::time::Instant::now() + std::time::Duration::from_millis(900)).min(deadline),
+        if first_hit_at.is_none() && has_primary_media_candidate(&candidates) {
+            first_hit_at = Some(tokio::time::Instant::now());
+        }
+        // Only start the 900ms linger countdown once a non-ad/non-preview candidate is seen.
+        let until = match first_hit_at {
+            Some(t) => (t + std::time::Duration::from_millis(900)).min(deadline),
             None => deadline,
         };
+        if tokio::time::Instant::now() >= until {
+            dbg("wait over");
+            break;
+        }
         match tokio::time::timeout_at(until, rx.recv()).await {
             Ok(Some(Found::Media(mut m))) => {
-                if m.headers.referer.as_deref().unwrap_or("").is_empty() {
-                    if let Some(ref orig) = page_origin {
-                        m.headers.referer = Some(format!("{orig}/"));
-                    }
-                }
-                if m.headers.origin.as_deref().unwrap_or("").is_empty() {
-                    m.headers.origin = m
-                        .headers
-                        .referer
-                        .as_deref()
-                        .and_then(|r| url::Url::parse(r).ok())
-                        .and_then(|u| u.host_str().map(|h| match u.port() {
-                            Some(p) => format!("{}://{}:{}", u.scheme(), h, p),
-                            None => format!("{}://{}", u.scheme(), h),
-                        }))
-                        .or_else(|| page_origin.clone());
-                }
+                fill_default_headers(&mut m.headers);
                 if !candidates.iter().any(|c| c.url == m.url) {
                     candidates.push(m);
                 }
@@ -1261,6 +1805,24 @@ async fn sniff_inner(app: AppHandle, target: url::Url, timeout_ms: Option<u64>, 
             Ok(None) | Err(_) => {
                 dbg("wait over");
                 break;
+            }
+        }
+    }
+    drop(clicker);
+    if candidates.is_empty() {
+        if let Ok(mut g) = capture.lock() {
+            for (url, kind, mut headers) in g.take_pending().into_iter().take(6) {
+                fill_default_headers(&mut headers);
+                if !candidates.iter().any(|c| c.url == url) {
+                    candidates.push(Sniffed {
+                        url,
+                        kind,
+                        headers,
+                        subtitles: vec![],
+                        verified: None,
+                        quality: None,
+                    });
+                }
             }
         }
     }
@@ -1725,6 +2287,113 @@ mod tests {
             "xmlhttprequest",
             "get",
         ));
+    }
+
+    #[test]
+    fn primary_media_candidate_check_ignores_ads_and_previews() {
+        let ad = Sniffed {
+            url: "https://cdn.example.com/preroll/promo/master.m3u8".into(),
+            kind: "hls",
+            headers: Hdrs::default(),
+            subtitles: vec![],
+            verified: None,
+            quality: None,
+        };
+        let preview = Sniffed {
+            url: "https://preview.example.com/clip.mp4".into(),
+            kind: "mp4",
+            headers: Hdrs::default(),
+            subtitles: vec![],
+            verified: None,
+            quality: None,
+        };
+        let feature = Sniffed {
+            url: "https://cdn.example.com/stream/170060/master.m3u8".into(),
+            kind: "hls",
+            headers: Hdrs::default(),
+            subtitles: vec![],
+            verified: None,
+            quality: None,
+        };
+        assert!(!has_primary_media_candidate(&[]));
+        assert!(!has_primary_media_candidate(&[ad.clone(), preview.clone()]));
+        assert!(has_primary_media_candidate(&[ad, preview, feature]));
+    }
+
+    #[test]
+    fn manifest_request_and_response_classification_cover_txt_and_extensionless_playlists() {
+        assert_eq!(classify_manifest_request_uri("https://cdn.example/hls/master.m3u8?tok=1"), Some("hls"));
+        assert_eq!(classify_manifest_request_uri("https://cdn.example/hls/master.txt?tok=1"), Some("hls"));
+        assert_eq!(classify_manifest_request_uri("https://vixsrc.to/playlist/170060?type=video"), Some("hls"));
+        assert_eq!(classify_manifest_request_uri("https://cdn.example/dash/manifest.mpd?id=1"), Some("dash"));
+        assert_eq!(classify_manifest_request_uri("https://cdn.example/seg.ts?ref=master.m3u8"), None);
+        assert_eq!(classify_manifest_request_uri("https://cdn.example/ads/preroll/master.m3u8"), None);
+
+        assert_eq!(
+            classify_response_media("https://vixsrc.to/playlist/170060?type=video", "application/vnd.apple.mpegurl"),
+            Some("hls")
+        );
+        assert_eq!(
+            classify_response_media("https://cdn.example/stream/master.txt?k=1", "application/x-mpegurl"),
+            Some("hls")
+        );
+        assert_eq!(
+            classify_response_media("https://cdn.example/stream/master.txt?k=1", "text/plain; charset=utf-8"),
+            Some("hls")
+        );
+        assert_eq!(
+            classify_response_media("https://vixsrc.to/playlist/170060?type=video", "text/html; charset=utf-8"),
+            None
+        );
+        assert_eq!(
+            classify_response_media("https://cdn.example/seg.ts?ref=master.m3u8", "video/mp2t"),
+            None
+        );
+    }
+
+    #[test]
+    fn merge_captured_headers_replaces_opaque_response_headers() {
+        let resp = Hdrs {
+            referer: Some("about:blank".into()),
+            origin: Some("null".into()),
+            ua: None,
+        };
+        let req = Hdrs {
+            referer: Some("https://embed.vidrift.net/embed/movie/123".into()),
+            origin: Some("https://embed.vidrift.net".into()),
+            ua: Some("Mozilla/5.0".into()),
+        };
+        let merged = merge_captured_headers(resp, Some(&req));
+        assert_eq!(merged.referer.as_deref(), Some("https://embed.vidrift.net/embed/movie/123"));
+        assert_eq!(merged.origin.as_deref(), Some("https://embed.vidrift.net"));
+        assert_eq!(merged.ua.as_deref(), Some("Mozilla/5.0"));
+    }
+
+    #[test]
+    fn player_hook_and_nudge_scripts_include_iframe_spoof_and_selectors() {
+        let hook = build_player_hook_script(None);
+        assert!(hook.contains("window.self !== window.top"));
+        assert!(hook.contains("https://www.themoviedb.org/"));
+        assert!(hook.contains("'top'"));
+        assert!(hook.contains("'parent'"));
+        assert!(hook.contains("'frameElement'"));
+        assert!(hook.contains("'referrer'"));
+        assert!(hook.contains("'ancestorOrigins'"));
+        assert!(hook.contains("closed: false"));
+
+        for sel in [
+            ".jw-icon-display",
+            ".vjs-big-play-button",
+            ".plyr__control--overlaid",
+            ".art-state",
+            "[aria-label*=\"Play\" i]",
+            "[class*=\"play-btn\" i]",
+            "#player",
+            "'video'",
+        ] {
+            assert!(NUDGE_JS.contains(sel), "NUDGE_JS missing selector {sel}");
+        }
+        assert!(!NUDGE_JS.contains("window.open = () => null"));
     }
 }
 

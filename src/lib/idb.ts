@@ -10,9 +10,13 @@ const DB_NAME = "abx-catalog-v1";
 const STORE = "kv";
 
 let opening: Promise<IDBDatabase | null> | null = null;
+/** A failed open is retried, but not on every call: a locked profile would be asked constantly. */
+let failedAt = 0;
+const RETRY_AFTER_MS = 5_000;
 
 function open(): Promise<IDBDatabase | null> {
   if (typeof indexedDB === "undefined") return Promise.resolve(null);
+  if (!opening && failedAt && Date.now() - failedAt < RETRY_AFTER_MS) return Promise.resolve(null);
   opening ??= new Promise<IDBDatabase | null>((resolve) => {
     try {
       const req = indexedDB.open(DB_NAME, 1);
@@ -33,6 +37,16 @@ function open(): Promise<IDBDatabase | null> {
     } catch {
       resolve(null);
     }
+  }).then((db) => {
+    // A transient failure (blocked by another tab mid-upgrade, a busy disk) used to disable
+    // IndexedDB for the rest of the session: forget it so a later call opens again.
+    if (!db) {
+      opening = null;
+      failedAt = Date.now();
+    } else {
+      failedAt = 0;
+    }
+    return db;
   });
   return opening;
 }

@@ -14,6 +14,7 @@ import {
 } from "./normalizer";
 import { tmdbDetail, tmdbSeason } from "./tmdb";
 import type { CanonicalSeason, Episode, MediaDetail } from "./types";
+import { isFilm } from "./types";
 
 export {
   clampEpisode,
@@ -106,7 +107,7 @@ export async function getSeasonEpisodes(
   requestedSeason?: number | null,
 ): Promise<Episode[]> {
   const detail = typeof detailOrKey === "string" ? await getDetail(detailOrKey).catch(() => null) : detailOrKey;
-  if (!detail || detail.kind === "movie") return [];
+  if (!detail || isFilm(detail)) return [];
 
   // Determine the target canonical season. If a specific season number was requested, check if it exists
   // in playable `seasons` or `specials`; otherwise fall back via `clampSeason`.

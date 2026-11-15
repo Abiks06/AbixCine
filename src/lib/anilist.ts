@@ -1,3 +1,4 @@
+import { whenAnimeMappingsHydrated } from "./animeMapping";
 import { cached, peekCache, seedCache } from "./cache";
 import { stripHtml } from "./format";
 import {
@@ -293,6 +294,7 @@ export async function animeFranchiseNodes(key: string): Promise<RawAnilistNode[]
  */
 export async function reconcileAnilistFranchise(key: string): Promise<ReconciledSeasons> {
   const nodes = await animeFranchiseNodes(key);
+  await whenAnimeMappingsHydrated();
   return reconcileAnimeSeasons(nodes, key);
 }
 

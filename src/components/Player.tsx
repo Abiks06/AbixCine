@@ -511,6 +511,15 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
   const activeCurUrl = cur?.url ?? "";
   const activeCurUrlRef = useRef(activeCurUrl);
   activeCurUrlRef.current = activeCurUrl;
+  // Which stream this is, independent of its URL: a refreshed CDN token on the same server keeps
+  // its identity, so the viewer's subtitle, audio and pause choices must survive it.
+  const streamIdentity = cur ? `${activeKey}::${cur.localPath ?? ""}` : "";
+  const streamIdentityRef = useRef(streamIdentity);
+  streamIdentityRef.current = streamIdentity;
+  const subsIdentityRef = useRef("");
+  const attachIdentityRef = useRef("");
+  /** Set when a refresh replaced the URL of a paused stream, so the new one doesn't autoplay. */
+  const keepPausedRef = useRef(false);
 
   const [hlsReady, setHlsReady] = useState(false);
   const [hlsSubsState, setHlsSubsState] = useState<{ url: string; tracks: UnifiedSubTrack[] }>({ url: "", tracks: [] });
@@ -806,19 +815,30 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     trackCtlsRef.current.forEach((ctl) => ctl.abort());
     trackCtlsRef.current.clear();
 
+    // Same stream with a fresh URL (token refresh): keep what the viewer chose, the online
+    // subtitles they loaded and the cues already parsed. Only a different stream starts over.
+    const sameStream = !!streamIdentityRef.current && subsIdentityRef.current === streamIdentityRef.current;
+    subsIdentityRef.current = streamIdentityRef.current;
+
     setHlsReady(false);
     setHlsSubsState({ url: activeCurUrl, tracks: [] });
     setNativeSubsState({ url: activeCurUrl, tracks: [] });
-    setOnlineSubsState({ url: activeCurUrl, tracks: [] });
-    setTrackDataState({ url: activeCurUrl, data: {} });
+    if (sameStream) {
+      setOnlineSubsState((prev) => ({ url: activeCurUrl, tracks: prev.tracks }));
+      setTrackDataState((prev) => ({ url: activeCurUrl, data: prev.data }));
+    } else {
+      setOnlineSubsState({ url: activeCurUrl, tracks: [] });
+      setTrackDataState({ url: activeCurUrl, data: {} });
+    }
     setOnlineResults([]);
     setOnlineLoading(false);
     setOnlineSearched(false);
     setOnlineError(null);
     setLoadingOnlineId(null);
-    setLoadedOnlineMap(new Map());
     setSavingTrackId(null);
     setSavedTrackIds(new Set());
+    if (sameStream) return;
+    setLoadedOnlineMap(new Map());
     manualSub.current = false;
     manualSecondary.current = false;
     lastActiveSubRef.current = null;
@@ -1626,8 +1646,14 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     setPreparingTorrent(false);
     stopActiveTorrent();
     setAudioTracks([]);
-    setSelectedAudioTrack(-1);
-    manualAudio.current = false;
+    // A token refresh of the same stream keeps the viewer's audio pick (re-applied once tracks list).
+    const sameStream = !!streamIdentityRef.current && attachIdentityRef.current === streamIdentityRef.current;
+    attachIdentityRef.current = streamIdentityRef.current;
+    if (!sameStream) {
+      setSelectedAudioTrack(-1);
+      manualAudio.current = false;
+      keepPausedRef.current = false;
+    }
     setLevels([]);
     setLevel(-1);
     setActiveLevel(-1);
@@ -1656,6 +1682,11 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     const seekAndPlay = () => {
       if (resumeAt.current > 0 && resumeAt.current < (v.duration || Infinity) - 5) v.currentTime = resumeAt.current;
       pickAudioTrack();
+      // A refreshed link for a paused video stays paused at the same spot.
+      if (keepPausedRef.current) {
+        keepPausedRef.current = false;
+        return;
+      }
       v.play().catch(() => {});
     };
     let cancelled = false;
@@ -1668,6 +1699,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
       const targetId = candKey(target);
       lastRefreshedAtRef.current.set(targetId, Date.now());
       if (v.currentTime > 1) resumeAt.current = v.currentTime;
+      keepPausedRef.current = v.paused && v.currentTime > 1;
       saveNowRef.current();
       clearStall();
       setWaiting(true);
@@ -1725,6 +1757,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
       hlsRef.current = hls;
       hls.subtitleDisplay = false;
       let recoveries = 0;
+      let lastRecoveryAt = 0;
       let midStreamRefreshing = false;
       let lastNetErrCode: number | undefined;
       hls.on(H.Events.MANIFEST_PARSED, (_, d) => {
@@ -1736,6 +1769,9 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
       });
       hls.on(H.Events.FRAG_LOADED, () => {
         lastNetErrCode = undefined;
+        // Repairs are for a burst of trouble: after 15 s of healthy playback the budget is restored,
+        // so three isolated hiccups across a long film don't add up to a failover.
+        if (recoveries && performance.now() - lastRecoveryAt > 15_000) recoveries = 0;
       });
       hls.on(H.Events.LEVEL_SWITCHED, (_, d) => {
         setActiveLevel(d.level);
@@ -1780,6 +1816,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
 
         // Media errors get two local repair attempts (the second also swaps the audio codec), then the next source.
         if (d.type === H.ErrorTypes.MEDIA_ERROR && recoveries < 2) {
+          lastRecoveryAt = performance.now();
           if (recoveries++ === 1) hls.swapAudioCodec();
           hls.recoverMediaError();
           return;
@@ -2440,8 +2477,9 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     ) return;
     // Ctrl+K and friends belong to the app, not the player (Ctrl+K used to pause as well).
     if (e.ctrlKey || e.metaKey || e.altKey) return;
-    // A modal on top (the command palette) owns the keyboard until it closes.
-    if (document.querySelector('[aria-modal="true"]')) return;
+    // A modal on top (the command palette) owns the keyboard until it closes. The player's own
+    // shortcuts card is handled just below (Escape / ? close it).
+    if (document.querySelector('[aria-modal="true"]:not(.pkeys)')) return;
     // Letters work with Caps Lock on.
     const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
     // The shortcuts card is modal too: Escape or ? closes it, and nothing else leaks through to
@@ -2661,6 +2699,12 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
   const inIntro = !!sk?.intro && time >= sk.intro[0] && time < sk.intro[1] - 1.5;
   const inOutro = !!sk?.outro && outroEnd != null && time >= sk.outro[0] && time < outroEnd - 1.5;
   const isPrimAss = Boolean(primTrack && (primTrack.format === "ass" || primTrack.format === "ssa") && primTrack.raw);
+  // Subtitles toggled off with C: keep handing the overlay the ASS track it was rendering (marked
+  // disabled), so it hides the renderer instead of destroying and later reloading its WASM worker.
+  const parkedAss = !primTrack && lastActiveSubRef.current?.prim
+    ? subTracks.find((t) => t.id === lastActiveSubRef.current?.prim && (t.format === "ass" || t.format === "ssa") && t.raw)
+    : undefined;
+  const overlayAss = isPrimAss ? primTrack : parkedAss;
   const enhMode = ENHANCE_MODES.find((m) => m.id === enhance) ?? ENHANCE_MODES[0];
   const openSheet = (s: Sheet) => setSheet((x) => (x === s ? null : s));
 
@@ -2794,8 +2838,8 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
               subPref={pref}
               controlsVisible={!(hide || embedHide)}
               videoRef={video}
-              assRaw={isPrimAss ? primTrack?.raw : undefined}
-              assFormat={isPrimAss ? primTrack?.format : undefined}
+              assRaw={overlayAss?.raw}
+              assFormat={overlayAss?.format}
               offsetSec={offset}
               subEnabled={Boolean(primTrack)}
             />
@@ -3186,7 +3230,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
 
       {keysOpen && (
         <div className="pkeys-scrim" onClick={() => setKeysOpen(false)}>
-          <div className="pkeys" role="dialog" aria-label="Keyboard shortcuts" onClick={(e) => e.stopPropagation()}>
+          <div className="pkeys" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts" onClick={(e) => e.stopPropagation()}>
             <div className="pkeys-h">Keyboard shortcuts <button className="pbtn icon" onClick={() => setKeysOpen(false)} aria-label="Close"><Icon name="x" size={16} /></button></div>
             <dl>
               {SHORTCUTS.map(([k, what]) => (

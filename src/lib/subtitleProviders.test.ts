@@ -395,13 +395,13 @@ describe("searchOnlineSubtitles", () => {
     expect(results[0].format).toBe("vtt");
   });
 
-  it("never throws on malformed JSON or total failure and does not cache failed searches", async () => {
+  it("reports a total outage as an error (not 'no matches') and does not cache failed searches", async () => {
     mockHttpFetch.mockRejectedValueOnce(new Error("network down"));
     mockHttpFetch.mockRejectedValueOnce(new Error("wyzie fallback down"));
     mockHttpFetch.mockResolvedValueOnce({ status: 200, url: "x", body: "{broken json" });
 
-    const first = await searchOnlineSubtitles({ tmdbId: 550, imdbId: "tt0137523" });
-    expect(first).toEqual([]);
+    // Every provider that was asked failed: the sheet shows an error rather than "none found".
+    await expect(searchOnlineSubtitles({ tmdbId: 550, imdbId: "tt0137523" })).rejects.toThrow(/unreachable/);
 
     mockHttpFetch.mockResolvedValue({
       status: 200,

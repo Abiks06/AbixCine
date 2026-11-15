@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from "react";
 import { push, registerSync, fetchSync } from "./account";
+import { clearSubTrackMemory } from "./subtitles";
 
 export type Audio = "sub" | "dub";
 
@@ -243,7 +244,11 @@ registerSync({
       .catch(() => {}),
   // Per-show sub/dub choices belong to the account that made them. Device settings (quality,
   // motion, folders, servers) stay, so signing out doesn't reconfigure the PC.
-  clear: () => apply({ audioByTitle: {} }),
+  clear: () => {
+    apply({ audioByTitle: {} });
+    // Per-title subtitle picks (up to 120 titles) are the same kind of account data.
+    clearSubTrackMemory();
+  },
 });
 
 export function useSettings(): Settings {

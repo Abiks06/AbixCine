@@ -48,6 +48,25 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
   const box = useRef<HTMLDivElement>(null);
   const returnTo = useRef<HTMLElement | null>(null);
   const history = useSearchHistory();
+  const qRef = useRef(q);
+  qRef.current = q;
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
+  // Escape belongs to the palette while it is open, wherever focus is: a click on its blank space
+  // drops focus to <body>, and the key then reached Watch (abandoning the source race) or the player.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      if (qRef.current) setQ("");
+      else onCloseRef.current();
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [open]);
 
   useEffect(() => {
     if (open) {
@@ -203,7 +222,16 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
 
   return (
     <div className={`palette-scrim ${open ? "" : "closing"}`} onMouseDown={onClose}>
-      <div className="palette" ref={box} onMouseDown={(e) => e.stopPropagation()} onKeyDown={onKeyDown} role="dialog" aria-modal="true" aria-label="Search and commands">
+      <div
+        className="palette"
+        ref={box}
+        onMouseDown={(e) => e.stopPropagation()}
+        onKeyDown={onKeyDown}
+        role="dialog"
+        // Only while open: during the close animation it must not block the player's hotkeys.
+        aria-modal={open ? "true" : undefined}
+        aria-label="Search and commands"
+      >
         <div className="pal-input">
           {busy ? <span className="mini-spin" /> : <Icon name="search" size={21} />}
           <input
@@ -253,7 +281,7 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
             {searching && Array.from({ length: 3 }, (_, i) => <div key={i} className="pal-item pal-skel"><span className="pal-thumb" /><span className="sk-line" /></div>)}
             {items.length === 0 && !busy && <div className="pal-empty">Nothing matches “{q}”. Check the spelling, or try the original title.</div>}
           </div>
-          <aside className="pal-preview" aria-hidden>
+          <aside className="pal-preview" aria-label="Preview">
             {cur?.media ? <Preview key={cur.media.key} m={cur.media} /> : (
               <div className="pp-idle">
                 <span className="pp-glyph"><Icon name={cur?.icon ?? "search"} size={30} /></span>

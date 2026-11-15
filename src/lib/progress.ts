@@ -2,6 +2,7 @@ import { useMemo, useSyncExternalStore } from "react";
 import { fetchSync, push, registerSync } from "./account";
 import type { Audio } from "./settings";
 import type { Media } from "./types";
+import { isFilm } from "./types";
 
 export interface ProgressEntry {
   media: Media;
@@ -80,7 +81,7 @@ export function saveProgress(
   const canonicalKey = e.media.canonicalKey ?? e.media.key;
   const done = isDone(e.position, e.duration);
   const isSeries = canonicalKey.startsWith("tmdb:tv:") || e.media.kind === "tv";
-  const isEpisodicAnime = (canonicalKey.startsWith("anilist:") || e.media.kind === "anime") && e.media.kind !== "movie";
+  const isEpisodicAnime = (canonicalKey.startsWith("anilist:") || e.media.kind === "anime") && !isFilm(e.media);
   const base = {
     ...e,
     ...(isSeries && e.season == null ? { season: 1 } : {}),
@@ -211,6 +212,12 @@ registerSync({
           const mine = next[r.media.key];
           if (!mine || mine.updatedAt < r.updatedAt) next[r.media.key] = r;
           else if (mine.updatedAt > r.updatedAt) push(`/progress/${encodeURIComponent(r.media.key)}`, "PUT", mine);
+        }
+        // Removed on another device: drop our copy unless we watched it again since.
+        for (const t of (Array.isArray(s.progressDeleted) ? s.progressDeleted : []) as { key?: unknown; deletedAt?: unknown }[]) {
+          if (typeof t?.key !== "string" || typeof t?.deletedAt !== "number") continue;
+          const mine = next[t.key];
+          if (mine && mine.updatedAt <= t.deletedAt) delete next[t.key];
         }
         store = next;
         save();

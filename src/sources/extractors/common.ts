@@ -1,9 +1,9 @@
 import { hasTmdb, tmdbDetail } from "../../lib/tmdb";
 import { langBase } from "../../lib/subtitles";
 import type { Settings } from "../../lib/settings";
-import type { MediaDetail, PlaybackRequest } from "../../lib/types";
+import { isFilm, type MediaDetail, type PlaybackRequest } from "../../lib/types";
 import { resolveTmdbId } from "../embeds";
-import { DEFAULT_UA, httpFetch, native, normalizeHeaders, proxyUrl, type FetchResult, type StreamHeaders } from "../native";
+import { DEFAULT_UA, httpFetch, httpFetchBytes, native, normalizeHeaders, proxyUrl, type FetchResult, type StreamHeaders } from "../native";
 import { inferSubtitleMeta, isThumbnailSubtitleUrl, type StreamKind, type SubtitleTrack } from "../types";
 
 export const DEFAULT_TIMEOUT_MS = 10_000;
@@ -126,6 +126,56 @@ export async function fetchJsonWithAbort<T = unknown>(
 }
 
 /**
+ * `httpFetchBytes` with a timeout and abort propagation, for binary request/response protocols.
+ * Rejects with AbortError on abort and with a timeout error after `timeoutMs`.
+ */
+export async function fetchBytesWithAbort(
+  url: string,
+  headers: Record<string, string> | undefined,
+  init: { method?: string; bodyBytes?: Uint8Array } | undefined,
+  signal: AbortSignal,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+): Promise<{ status: number; url: string; bytes: Uint8Array }> {
+  if (signal.aborted) throw abortError(signal);
+  const ctl = new AbortController();
+  const onAbort = () => ctl.abort(abortError(signal));
+  signal.addEventListener("abort", onAbort, { once: true });
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    ctl.abort(new Error(`Request timed out after ${timeoutMs}ms: ${url}`));
+  }, timeoutMs);
+  try {
+    const res = await httpFetchBytes(url, headers, { signal: ctl.signal, ...init });
+    return { status: res.status, url: res.url, bytes: new Uint8Array(res.bytes) };
+  } catch (err) {
+    if (signal.aborted) throw abortError(signal);
+    if (timedOut) throw new Error(`Request timed out after ${timeoutMs}ms: ${url}`);
+    throw err;
+  } finally {
+    clearTimeout(timer);
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
+/** Random lowercase hex string of `byteLength` bytes. */
+export function randomHex(byteLength: number): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(byteLength));
+  let hex = "";
+  for (let i = 0; i < bytes.length; i++) hex += bytes[i].toString(16).padStart(2, "0");
+  return hex;
+}
+
+/** True when the request targets a film (including anime movies via `format` or `isAnimeMovie`). */
+export function isMovieRequest(req: PlaybackRequest): boolean {
+  return (
+    isFilm(req.media)
+    || Boolean((req as { isAnimeMovie?: boolean }).isAnimeMovie)
+    || Boolean((req.media as { isAnimeMovie?: boolean }).isAnimeMovie)
+  );
+}
+
+/**
  * Resolve TMDB ID, IMDb ID, title, year, and release date for a playback request
  * without triggering unnecessary network requests when the caller already supplied them.
  */
@@ -139,7 +189,7 @@ export async function resolveMediaIds(req: PlaybackRequest, signal?: AbortSignal
   let releaseDate = detail.releaseDate?.slice(0, 10) || "";
 
   if (!signal?.aborted && (!imdbId || !releaseDate) && tmdbId && hasTmdb()) {
-    const kind = req.media.kind === "movie" ? "movie" : "tv";
+    const kind = isMovieRequest(req) ? "movie" : "tv";
     try {
       const fetched = await tmdbDetail(`tmdb:${kind}:${tmdbId}`);
       if (!signal?.aborted) {
@@ -244,28 +294,81 @@ export function buildStreamHeaders(referer: string, origin?: string, ua = DEFAUL
   return normalizeHeaders({ referer, origin: origin ?? new URL(referer).origin, ua }, referer);
 }
 
+export const NON_BROWSER_STREAM_UA = "Lavf/60.3.100";
+
+export function isNoRefererMediaHost(streamUrl: string): boolean {
+  try {
+    const host = new URL(streamUrl).hostname.toLowerCase();
+    return host === "hakunaymatata.com" || host.endsWith(".hakunaymatata.com");
+  } catch {
+    return false;
+  }
+}
+
+export function resolveExtractorStreamHeaders(
+  streamUrl: string,
+  defaultReferer: string,
+  defaultOrigin?: string,
+  explicitHeaders?: Record<string, string | undefined>,
+): { headers: StreamHeaders; fallbackReferer?: string } {
+  if (isNoRefererMediaHost(streamUrl)) {
+    return { headers: { ua: NON_BROWSER_STREAM_UA } };
+  }
+  if (explicitHeaders) {
+    const referer = explicitHeaders.Referer ?? explicitHeaders.referer ?? defaultReferer;
+    const origin = explicitHeaders.Origin ?? explicitHeaders.origin ?? defaultOrigin;
+    const ua = explicitHeaders["User-Agent"] ?? explicitHeaders.ua ?? DEFAULT_UA;
+    const picked = normalizeHeaders({ referer, origin, ua }, referer);
+    return { headers: picked, fallbackReferer: picked.referer ?? defaultReferer };
+  }
+  return {
+    headers: buildStreamHeaders(defaultReferer, defaultOrigin),
+    fallbackReferer: defaultReferer,
+  };
+}
+
+const HTML_ENTITIES: Record<string, string> = {
+  amp: "&",
+  lt: "<",
+  gt: ">",
+  quot: '"',
+  apos: "'",
+  nbsp: " ",
+};
+
+/** Single-pass HTML entity decoder so sequences like `&amp;quot;` are never double-decoded. */
 export function decodeHtmlEntities(s: string): string {
   return (s || "")
-    .replace(/&amp;/gi, "&")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&quot;/gi, '"')
-    .replace(/&apos;|&#0?39;/gi, "'")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&#(?:x([0-9a-f]+)|(\d+));/gi, (m, hex, dec) => {
-      const code = hex ? parseInt(hex, 16) : parseInt(dec, 10);
+    .replace(/&(amp|lt|gt|quot|apos|nbsp);|&#(?:x([0-9a-f]+)|(\d+));/gi, (m, named: string | undefined, hex: string | undefined, dec: string | undefined) => {
+      if (named) return HTML_ENTITIES[named.toLowerCase()] ?? m;
+      const code = hex ? parseInt(hex, 16) : parseInt(dec!, 10);
       return Number.isFinite(code) && code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : m;
     })
     .trim();
 }
 
+/**
+ * Unescape a JS single-quoted string literal so it remains valid JSON for `JSON.parse`:
+ * decodes `\\`, `\'`, `\/`, and non-control `\uXXXX`/`\xXX` while keeping JSON string escapes
+ * (`\"`, `\n`, `\r`, `\t`, `\b`, `\f`) intact.
+ */
 export function unescapeJsString(escaped: string): string {
   return escaped.replace(/\\(u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|.)/g, (_m, esc: string) => {
-    if (esc.startsWith("u") && esc.length === 5) return String.fromCharCode(parseInt(esc.slice(1), 16));
-    if (esc.startsWith("x") && esc.length === 3) return String.fromCharCode(parseInt(esc.slice(1), 16));
-    if (esc === "n") return "\n";
-    if (esc === "r") return "\r";
-    if (esc === "t") return "\t";
+    if (esc.startsWith("u") && esc.length === 5) {
+      const code = parseInt(esc.slice(1), 16);
+      return code >= 0x20 ? String.fromCharCode(code) : `\\${esc}`;
+    }
+    if (esc.startsWith("x") && esc.length === 3) {
+      const code = parseInt(esc.slice(1), 16);
+      if (code >= 0x20 && code !== 0x22 && code !== 0x5c) return String.fromCharCode(code);
+      if (code === 0x22) return '"';
+      if (code === 0x5c) return "\\";
+      return `\\u${code.toString(16).padStart(4, "0")}`;
+    }
+    if (esc === "n" || esc === "r" || esc === "t" || esc === "b" || esc === "f" || esc === '"') {
+      return `\\${esc}`;
+    }
+    if (esc === "'" || esc === "/" || esc === "\\") return esc;
     return esc;
   });
 }
@@ -365,7 +468,7 @@ export async function aes256GcmDecrypt(
   }
 }
 
-export async function aes256CbcDecrypt(
+export async function aesCbcDecrypt(
   keyBytes: Uint8Array,
   ivBytes: Uint8Array,
   ciphertext: Uint8Array,
@@ -389,6 +492,8 @@ export async function aes256CbcDecrypt(
     return null;
   }
 }
+
+export const aes256CbcDecrypt = aesCbcDecrypt;
 
 /* ------------------------------------------------------------------ */
 /* Pure TypeScript XSalsa20-Poly1305 (NaCl SecretBox)                  */
@@ -575,4 +680,111 @@ export function xsalsa20Poly1305Seal(key32: Uint8Array, nonce24: Uint8Array, mes
   const tag = poly1305Mac(polyKey, ciphertext);
   out.set(tag, 0);
   return out;
+}
+
+/* ------------------------------------------------------------------ */
+/* Pure TypeScript MD5 & OpenSSL EVP_BytesToKey AES-256-CBC Decrypt    */
+/* ------------------------------------------------------------------ */
+
+const MD5_S = [
+  7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+  5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+  4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+  6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+] as const;
+
+const MD5_K = Uint32Array.from({ length: 64 }, (_, i) => Math.floor(Math.abs(Math.sin(i + 1)) * 0x1_0000_0000) >>> 0);
+
+/** Compute a 16-byte RFC 1321 MD5 digest (needed in browser/WebView where SubtleCrypto omits MD5). */
+export function md5Bytes(input: Uint8Array): Uint8Array {
+  const bitLen = input.length * 8;
+  const padLen = ((56 - ((input.length + 1) % 64)) + 64) % 64;
+  const padded = new Uint8Array(input.length + 1 + padLen + 8);
+  padded.set(input, 0);
+  padded[input.length] = 0x80;
+  writeU32LE(padded, padded.length - 8, bitLen >>> 0);
+  writeU32LE(padded, padded.length - 4, Math.floor(bitLen / 0x1_0000_0000) >>> 0);
+
+  let a0 = 0x67452301;
+  let b0 = 0xefcdab89;
+  let c0 = 0x98badcfe;
+  let d0 = 0x10325476;
+  const M = new Uint32Array(16);
+
+  for (let off = 0; off < padded.length; off += 64) {
+    for (let j = 0; j < 16; j++) M[j] = readU32LE(padded, off + j * 4);
+    let A = a0;
+    let B = b0;
+    let C = c0;
+    let D = d0;
+    for (let i = 0; i < 64; i++) {
+      let F: number;
+      let g: number;
+      if (i < 16) {
+        F = (B & C) | (~B & D);
+        g = i;
+      } else if (i < 32) {
+        F = (D & B) | (~D & C);
+        g = (5 * i + 1) % 16;
+      } else if (i < 48) {
+        F = B ^ C ^ D;
+        g = (3 * i + 5) % 16;
+      } else {
+        F = C ^ (B | ~D);
+        g = (7 * i) % 16;
+      }
+      const sum = (A + F + MD5_K[i] + M[g]) >>> 0;
+      A = D;
+      D = C;
+      C = B;
+      B = (B + rotl32(sum, MD5_S[i])) >>> 0;
+    }
+    a0 = (a0 + A) >>> 0;
+    b0 = (b0 + B) >>> 0;
+    c0 = (c0 + C) >>> 0;
+    d0 = (d0 + D) >>> 0;
+  }
+
+  const out = new Uint8Array(16);
+  writeU32LE(out, 0, a0);
+  writeU32LE(out, 4, b0);
+  writeU32LE(out, 8, c0);
+  writeU32LE(out, 12, d0);
+  return out;
+}
+
+/**
+ * Decrypt an OpenSSL CryptoJS-formatted AES-256-CBC string (`Salted__` + 8-byte salt + ciphertext)
+ * using MD5 `EVP_BytesToKey` key/IV derivation.
+ */
+export async function openSslAes256CbcDecrypt(b64: string, passphrase: string): Promise<string | null> {
+  try {
+    const raw = base64ToBytes(b64);
+    if (raw.length <= 16) return null;
+    const header = String.fromCharCode(...raw.subarray(0, 8));
+    if (header !== "Salted__") return null;
+
+    const salt = raw.subarray(8, 16);
+    const ciphertext = raw.subarray(16);
+    const passBytes = new TextEncoder().encode(passphrase);
+
+    // Derive 32-byte key + 16-byte IV (48 bytes total) via OpenSSL MD5 EVP_BytesToKey.
+    const derived = new Uint8Array(48);
+    let filled = 0;
+    let prev: Uint8Array = new Uint8Array(0);
+    while (filled < 48) {
+      const chunkInput = new Uint8Array(prev.length + passBytes.length + salt.length);
+      chunkInput.set(prev, 0);
+      chunkInput.set(passBytes, prev.length);
+      chunkInput.set(salt, prev.length + passBytes.length);
+      prev = md5Bytes(chunkInput);
+      const take = Math.min(prev.length, 48 - filled);
+      derived.set(prev.subarray(0, take), filled);
+      filled += take;
+    }
+
+    return await aes256CbcDecrypt(derived.subarray(0, 32), derived.subarray(32, 48), ciphertext);
+  } catch {
+    return null;
+  }
 }

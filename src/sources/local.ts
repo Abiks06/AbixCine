@@ -1,6 +1,7 @@
 import { invoke, convertFileSrc, isTauri } from "@tauri-apps/api/core";
 import { normTitle } from "../lib/format";
 import type { PlaybackRequest } from "../lib/types";
+import { isFilm } from "../lib/types";
 import {
   codecToSubtitleFormat,
   inferSubtitleMeta,
@@ -205,7 +206,8 @@ export const localProvider: SourceProvider = {
       const hay = relativeToLibrary(f.path, s.libraryPaths).split(/[\\/]/).slice(-3).join(" ");
       if (!titleMatches(hay, req)) continue;
       const ep = parseEpisode(f.name, f.path);
-      if (req.episode != null) {
+      // An anime film (kind "anime", format "MOVIE") is a film even if a stale link passed ?e=1.
+      if (req.episode != null && !isFilm(req.media)) {
         if (!episodeMatches(ep, req)) continue;
       } else {
         // A film request never plays an episode file, nor a same-named film from another year (Dune 1984 vs 2021).

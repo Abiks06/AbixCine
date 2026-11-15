@@ -110,7 +110,7 @@ export function Title() {
 
   // Active canonical season, strictly clamped to playable seasons / specials.
   const activeSeasonObj: CanonicalSeason | undefined = useMemo(() => {
-    if (!d || d.kind === "movie") return undefined;
+    if (!d || isFilm(d)) return undefined;
     const preferred = pickedSeason ?? routeParams.season ?? matchedProgress?.season ?? d.initialSeason;
     return clampSeason(d, preferred);
   }, [d, pickedSeason, routeParams.season, matchedProgress?.season]);
@@ -118,7 +118,7 @@ export function Title() {
   const season = activeSeasonObj?.number ?? 1;
 
   const eps = useAsync(
-    () => (detail && detail.kind !== "movie" ? getSeasonEpisodes(detail, activeSeasonObj?.number) : Promise.resolve([] as Episode[])),
+    () => (detail && !isFilm(detail) ? getSeasonEpisodes(detail, activeSeasonObj?.number) : Promise.resolve([] as Episode[])),
     [detail?.key, activeSeasonObj?.number],
   );
 
@@ -152,7 +152,7 @@ export function Title() {
 
   // What pressing Play would start: clamped resume point, else the first episode of the active season, else the film.
   const startS = useMemo(() => {
-    if (!d || d.kind === "movie") return undefined;
+    if (!d || isFilm(d)) return undefined;
     if (matchedProgress?.season != null) {
       return clampSeason(d, matchedProgress.season)?.number ?? activeSeasonObj?.number;
     }
@@ -160,7 +160,7 @@ export function Title() {
   }, [d, matchedProgress?.season, activeSeasonObj?.number]);
 
   const startE = useMemo(() => {
-    if (!d || d.kind === "movie") return undefined;
+    if (!d || isFilm(d)) return undefined;
     const targetS = startS != null ? clampSeason(d, startS) : activeSeasonObj;
     return clampEpisode(targetS, matchedProgress?.episode ?? routeParams.episode ?? 1, d.episodeCount);
   }, [d, startS, activeSeasonObj, matchedProgress?.episode, routeParams.episode]);
@@ -497,11 +497,11 @@ function Details({ d, anime }: { d: MediaDetail; anime: boolean }) {
   const multiple = d.budget && d.revenue ? d.revenue / d.budget : 0;
   const ended = !!d.status && !/return|airing|production|releasing|planned/i.test(d.status);
   const rows: [string, string | undefined | null][] = [
-    [d.kind === "movie" ? "Released" : "First aired", fmtDate(d.releaseDate)],
-    ["Last aired", d.kind !== "movie" && ended ? fmtDate(d.endDate) : ""],
+    [isFilm(d) ? "Released" : "First aired", fmtDate(d.releaseDate)],
+    ["Last aired", !isFilm(d) && ended ? fmtDate(d.endDate) : ""],
     ["Season", d.seasonLabel],
     ["Format", d.format],
-    ["Runtime", d.runtime ? (d.kind === "movie" ? fmtRuntime(d.runtime) : `${d.runtime} min per episode`) : ""],
+    ["Runtime", d.runtime ? (isFilm(d) ? fmtRuntime(d.runtime) : `${d.runtime} min per episode`) : ""],
     ["Episodes", d.totalEpisodes ? String(d.totalEpisodes) : d.episodeCount ? String(d.episodeCount) : ""],
     ["Last episode", ep(d.lastEpisode)],
     [
@@ -512,7 +512,7 @@ function Details({ d, anime }: { d: MediaDetail; anime: boolean }) {
     ["Status", d.status ? nice(d.status) : ""],
     ["Budget", fmtMoney(d.budget)],
     ["Box office", d.revenue ? `${fmtMoney(d.revenue)}${multiple ? ` · ${multiple.toFixed(1)}× budget` : ""}` : ""],
-    [d.kind === "movie" || anime ? "Director" : "Created by", people(d.kind === "movie" || anime ? /^(Chief )?Director$/ : /^Creator$/)],
+    [isFilm(d) || anime ? "Director" : "Created by", people(isFilm(d) || anime ? /^(Chief )?Director$/ : /^Creator$/)],
     ["Written by", people(/Screenplay|Writer|Story|Novel|Series Composition|Script|Original Creator/)],
     ["Music", people(/Music|Composer/)],
     ["Source material", d.source],

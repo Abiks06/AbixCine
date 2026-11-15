@@ -65,9 +65,11 @@
   --r-xl: 30px;
   /* materials */
   --glass: color-mix(in oklab, var(--s1) 74%, transparent);
-  --glass-blur: blur(26px) saturate(1.6);
-  --plate: linear-gradient(180deg, rgb(255 255 255 / 0.045), rgb(255 255 255 / 0.015));
-  --rim: inset 0 1px 0 rgb(255 255 255 / 0.09), inset 0 0 0 1px rgb(255 255 255 / 0.06);
+  /* frosted: a little more blur and lift, so translucent fills read as ground glass (frost.css) */
+  --glass-blur: blur(28px) saturate(1.7) brightness(1.06);
+  --plate: linear-gradient(180deg, rgb(255 255 255 / 0.055), rgb(255 255 255 / 0.018));
+  /* lit top edge, hairline, and a faint shadowed underside: the edge of a pane of frosted glass */
+  --rim: inset 0 1px 0 rgb(255 255 255 / 0.15), inset 0 0 0 1px rgb(255 255 255 / 0.075), inset 0 -1px 0 rgb(0 0 0 / 0.2);
   --float: 0 30px 80px -30px rgb(0 0 0 / 0.85), 0 2px 10px rgb(0 0 0 / 0.3);
 }
 
@@ -138,7 +140,9 @@ kbd { font: 500 10.5px/1.5 var(--f-mono); color: var(--fg2); padding: 1px 6px; b
 @keyframes launchOut { to { opacity: 0; visibility: hidden; } }
 
 /* ---------- top bar: brand · dock · tools · window ---------- */
-.top { position: absolute; inset: 0 0 auto 0; height: var(--top); z-index: 40; display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center; gap: 12px; padding-left: 22px; }
+/* Each side claims at least its own width: the dock is centred while there's room and steps aside
+   (never over the search button) when there isn't. */
+.top { position: absolute; inset: 0 0 auto 0; height: var(--top); z-index: 40; display: grid; grid-template-columns: minmax(max-content, 1fr) auto minmax(max-content, 1fr); align-items: center; gap: 12px; padding-left: 22px; }
 /* tier 1: a gradient that arrives once the page slides underneath */
 .top::before { content: ""; position: absolute; inset: 0 0 -22px; z-index: -1; pointer-events: none; opacity: 0; transition: opacity var(--base) var(--ease);
   background: linear-gradient(180deg, rgb(7 7 10 / 0.97) 0%, rgb(7 7 10 / 0.93) 62%, rgb(7 7 10 / 0.6) 82%, transparent); }
@@ -364,9 +368,13 @@ button.chip:hover:not(.on):not(:disabled) { color: var(--fg); background: rgb(25
 :root.reduce-motion *, :root.reduce-motion *::before, :root.reduce-motion *::after { animation-duration: 1ms !important; animation-iteration-count: 1 !important; animation-delay: 0ms !important; transition-duration: 1ms !important; scroll-behavior: auto !important; }
 :root.reduce-motion .spin, :root.reduce-motion .mini-spin, :root.reduce-motion .pload-ring, :root.reduce-motion .smart-refresh.spinning svg { animation: spin 1.6s linear infinite !important; }
 :root.reduce-motion::view-transition-group(*), :root.reduce-motion::view-transition-old(*), :root.reduce-motion::view-transition-new(*) { animation: none !important; }
-:root.reduce-motion .dock, :root.reduce-motion .menu, :root.reduce-motion .toast, :root.reduce-motion .palette, :root.reduce-motion .psheet, :root.reduce-motion .hud { backdrop-filter: none; background: #0d0d13f2; }
+:root.reduce-motion .dock, :root.reduce-motion .menu, :root.reduce-motion .toast, :root.reduce-motion .palette, :root.reduce-motion .psheet { backdrop-filter: none; background: #0d0d13f2; }
+/* Player HUD and launch-card glass: drop only the blur, these panels keep their own (mostly opaque) fills. */
+:root.reduce-motion .ptop-actions, :root.reduce-motion .pbot, :root.reduce-motion .cc-btn, :root.reduce-motion .smart, :root.reduce-motion .race-grid-wrap, :root.reduce-motion .auth-card { backdrop-filter: none !important; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 1ms !important; animation-iteration-count: 1 !important; animation-delay: 0ms !important; transition-duration: 1ms !important; scroll-behavior: auto !important; }
   .spin, .mini-spin, .pload-ring, .smart-refresh.spinning svg { animation: spin 1.6s linear infinite !important; }
   ::view-transition-group(*), ::view-transition-old(*), ::view-transition-new(*) { animation: none !important; }
+  .dock, .menu, .toast, .palette, .psheet { backdrop-filter: none; background: #0d0d13f2; }
+  .ptop-actions, .pbot, .cc-btn, .smart, .race-grid-wrap, .auth-card { backdrop-filter: none !important; }
 }

@@ -1,3 +1,4 @@
+import { whenAnimeMappingsHydrated } from "./animeMapping";
 import { cached } from "./cache";
 import { api, getAuth } from "./account";
 import { normalizeEpisodes, normalizeTmdbSeasons, type RawTmdbSeason } from "./normalizer";
@@ -253,6 +254,9 @@ export async function tmdbDetail(key: string): Promise<MediaDetail> {
         ? { season: e.season_number, episode: e.episode_number, name: e.name ?? "", airDate: e.air_date }
         : undefined;
     const related = list(r.recommendations?.results ?? [], kind);
+    // Splitting seasons into cours reads the anime index: wait for it (briefly) so an early visit
+    // doesn't cache an unsplit season for three hours.
+    if (kind === "tv") await whenAnimeMappingsHydrated();
     const normalizedSeasons = kind === "tv" ? normalizeTmdbSeasons(r.seasons, base.key, Number(id)) : undefined;
 
     return {

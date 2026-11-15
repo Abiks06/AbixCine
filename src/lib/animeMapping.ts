@@ -462,16 +462,26 @@ function hydrateFromIdb(): Promise<void> {
     // One-time move of an old localStorage copy into IndexedDB.
     if (legacyF) writeStorageJson(STORAGE_FRIBB_KEY, legacyF);
     if (legacyA) writeStorageJson(STORAGE_ANIBRIDGE_KEY, legacyA);
-  })().catch(() => {});
+  })().catch(() => {
+    // A failed read is retried by the next caller instead of being remembered as "done".
+    hydrating = null;
+  });
   return hydrating;
 }
 
-// Warm the index as soon as the module loads, off the critical path.
-if (idbStore && typeof window !== "undefined") {
-  const start = () => void hydrateFromIdb();
-  if ("requestIdleCallback" in window) window.requestIdleCallback(start, { timeout: 3000 });
-  else setTimeout(start, 500);
+/**
+ * Resolves once the persisted index is in memory (or after `capMs`, so a slow disk never holds up
+ * a page). Title details await this before splitting seasons into cours: reading the index while
+ * it was still empty cached an unsplit multi-cour season for hours.
+ */
+export function whenAnimeMappingsHydrated(capMs = 800): Promise<void> {
+  const ready = hydrateFromIdb();
+  return Promise.race([ready, new Promise<void>((r) => setTimeout(r, capMs))]);
 }
+
+// Start reading the index as soon as the module loads: it is a single IndexedDB read, and the
+// first title page usually needs it within the first second.
+if (idbStore && typeof window !== "undefined") void hydrateFromIdb();
 
 function hydrateIndexFromStorage(ttlMs = DEFAULT_TTL_MS): {
   index: MappingIndex;
@@ -597,13 +607,15 @@ export async function loadAnimeMappings(signal?: AbortSignal, ttlMs = DEFAULT_TT
 
   if (!inflightLoad) {
     const epoch = loadEpoch;
-    inflightLoad = (async () => {
+    const load: Promise<MappingIndex> = (async () => {
       const idx = memIndex ?? state.index;
       const tasks: Promise<void>[] = [];
 
       if (needFribb) {
         tasks.push(
           fetchJsonWithTimeout<RawFribbEntry[]>(FRIBB_MINI_URL).then((raw) => {
+            // Cleared while downloading: this result belongs to an index nobody uses any more.
+            if (epoch !== loadEpoch) return;
             if (Array.isArray(raw)) {
               const rows = compactFribbEntries(raw);
               const at = Date.now();
@@ -620,6 +632,7 @@ export async function loadAnimeMappings(signal?: AbortSignal, ttlMs = DEFAULT_TT
       if (needAnibridge) {
         tasks.push(
           fetchJsonWithTimeout<RawAnibridgeMappings>(ANIBRIDGE_MAPPINGS_URL).then((raw) => {
+            if (epoch !== loadEpoch) return;
             if (raw && typeof raw === "object") {
               const data = compactAnibridgeMappings(raw);
               const at = Date.now();
@@ -638,8 +651,10 @@ export async function loadAnimeMappings(signal?: AbortSignal, ttlMs = DEFAULT_TT
       if (epoch === loadEpoch) memIndex = idx;
       return idx;
     })().finally(() => {
-      inflightLoad = null;
+      // Only clear our own slot: a clear mid-download may already have started a newer load.
+      if (inflightLoad === load) inflightLoad = null;
     });
+    inflightLoad = load;
   }
 
   const res = await raceWithAbort(inflightLoad, signal);
@@ -904,11 +919,12 @@ function resolveWithIndex(idx: MappingIndex, input: AnimeMappingInput): Resolved
         [];
 
       if (fribbSeasonList.length > 0) {
-        let best = fribbSeasonList[0];
-        for (const rec of fribbSeasonList) {
-          if (ep > rec.tmdbOffset && rec.tmdbOffset >= best.tmdbOffset) {
-            best = rec;
-          }
+        // The cour this episode falls in: the largest offset below it. Starting from the list's
+        // first row picked Cour 2's ids for an early episode whenever Cour 2 happened to come first.
+        const byOffset = [...fribbSeasonList].sort((a, b) => a.tmdbOffset - b.tmdbOffset);
+        let best = byOffset[0];
+        for (const rec of byOffset) {
+          if (ep > rec.tmdbOffset) best = rec;
         }
         if (!out.anilistId && best.anilistId) {
           out.anilistId = best.anilistId;
@@ -1211,8 +1227,15 @@ export function getTmdbSeasonMappingSync(
     [];
   if (fribbList.length === 0) return undefined;
 
-  // Deduplicate by offset, keeping entries within [0, episodeCount)
-  const valid = fribbList.filter((r) => r.tmdbOffset < episodeCount);
+  // One row per offset (preferring one with an AniList id), in order, within [0, episodeCount).
+  // Duplicate offsets used to produce an empty range and drop Cour 1.
+  const byOffset = new Map<number, (typeof fribbList)[number]>();
+  for (const r of fribbList) {
+    if (!(r.tmdbOffset >= 0 && r.tmdbOffset < episodeCount)) continue;
+    const prev = byOffset.get(r.tmdbOffset);
+    if (!prev || (!prev.anilistId && r.anilistId)) byOffset.set(r.tmdbOffset, r);
+  }
+  const valid = [...byOffset.values()].sort((a, b) => a.tmdbOffset - b.tmdbOffset);
   if (valid.length === 0) return undefined;
 
   if (valid.length === 1) {

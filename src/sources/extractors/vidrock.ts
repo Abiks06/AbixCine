@@ -12,15 +12,16 @@ import {
   isAbortError,
   isAnimeRequest,
   isDirectExtractorEnabled,
+  isMovieRequest,
   normalizeQuality,
   resolveMediaIds,
 } from "./common";
 
-const VIDROCK_API = "https://vidrock.ru";
+const VIDROCK_API = "https://vidrock.net";
 const VIDROCK_KEY_HEX = "7f3e9c2a8b5d1f4e6a9c3b7d2e5f8a1c4b6d9e2f5a8c1b4d7e9f2a5c8b1d4e7f";
 const VIDROCK_KEY = hexToBytes(VIDROCK_KEY_HEX);
 
-type VidrockServerValue = string | { url?: string; quality?: string | number; type?: string };
+type VidrockServerValue = string | { url?: string; quality?: string | number; type?: string; language?: string };
 
 /**
  * Decrypt a Vidrock encrypted server URL payload:
@@ -42,7 +43,7 @@ export async function decryptVidrockUrl(payload: string): Promise<string | null>
 }
 
 /**
- * Direct Vidrock extractor (`vidrock.ru/api/...`) with local WebCrypto AES-256-GCM decryption.
+ * Direct Vidrock extractor (`vidrock.net/api/...`) with local WebCrypto AES-256-GCM decryption.
  */
 export const vidrockProvider: SourceProvider = {
   id: "vidrock",
@@ -61,12 +62,13 @@ export const vidrockProvider: SourceProvider = {
       const meta = await resolveMediaIds(req, signal);
       if (signal.aborted || !meta.tmdbId) return [];
 
-      const isMovie = req.media.kind === "movie";
+      const isMovie = isMovieRequest(req);
       const season = req.season ?? 1;
       const episode = req.episode ?? 1;
+      // Avoid trailing slashes: vidrock.net redirects trailing-slash API URLs to HTML.
       const endpoint = isMovie
-        ? `${VIDROCK_API}/api/movie/${meta.tmdbId}/`
-        : `${VIDROCK_API}/api/tv/${meta.tmdbId}_${season}_${episode}/`;
+        ? `${VIDROCK_API}/api/movie/${meta.tmdbId}`
+        : `${VIDROCK_API}/api/tv/${meta.tmdbId}/${season}/${episode}`;
 
       const res = await fetchJsonWithAbort<Record<string, VidrockServerValue>>(
         endpoint,
@@ -100,7 +102,6 @@ export const vidrockProvider: SourceProvider = {
             url: proxyUrl(url, streamHeaders, VIDROCK_API),
             kind,
             via: "direct" as const,
-            pageUrl: `${VIDROCK_API}/`,
             headers: streamHeaders,
             ...(quality ? { quality } : {}),
             ...(anime ? { audio: "sub" as const } : {}),
@@ -118,8 +119,9 @@ export const vidrockProvider: SourceProvider = {
       }
       return out.sort((a, b) => (b.quality ?? 0) - (a.quality ?? 0));
     } catch (err) {
-      if (isAbortError(err)) return [];
-      return [];
+      if (isAbortError(err) || signal.aborted) return [];
+      // Unreachable or changed is an error, not "no results": the server's health has to see it.
+      throw err;
     }
   },
 };

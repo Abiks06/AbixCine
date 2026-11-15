@@ -11,6 +11,7 @@ import {
   isAnimeRequest,
   isDirectExtractorEnabled,
   resolveMediaIds,
+  isMovieRequest,
 } from "./common";
 
 const VAPLAYER_API = "https://streamdata.vaplayer.ru/api.php";
@@ -54,7 +55,7 @@ export const vaplayerProvider: SourceProvider = {
       const meta = await resolveMediaIds(req, signal);
       if (signal.aborted || !meta.imdbId || !/^tt\d+$/i.test(meta.imdbId)) return [];
 
-      const isTv = req.media.kind !== "movie";
+      const isTv = !isMovieRequest(req);
       const season = req.season ?? 1;
       const episode = req.episode ?? 1;
       const params = new URLSearchParams({
@@ -122,8 +123,9 @@ export const vaplayerProvider: SourceProvider = {
       }
       return out;
     } catch (err) {
-      if (isAbortError(err)) return [];
-      return [];
+      if (isAbortError(err) || signal.aborted) return [];
+      // Unreachable or changed is an error, not "no results": the server's health has to see it.
+      throw err;
     }
   },
 };

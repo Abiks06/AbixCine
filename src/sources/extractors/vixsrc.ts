@@ -10,6 +10,7 @@ import {
   isAbortError,
   isAnimeRequest,
   isDirectExtractorEnabled,
+  isMovieRequest,
   resolveMediaIds,
   type RawSubtitleInput,
 } from "./common";
@@ -29,8 +30,7 @@ export interface VixTokenData {
 
 /** Normalize `/playlist/12345` -> `/playlist/12345.m3u8` and assemble signed master URL. */
 export function buildVixMasterUrl(data: VixTokenData): string {
-  let raw = data.playlist.trim();
-  let hadB = false;
+  const raw = data.playlist.trim();
   try {
     const u = new URL(raw);
     if (u.pathname.includes("/playlist/")) {
@@ -44,15 +44,15 @@ export function buildVixMasterUrl(data: VixTokenData): string {
         }
       }
     }
-    hadB = u.searchParams.get("b") === "1";
-    u.search = "";
-    if (hadB) u.searchParams.set("b", "1");
+    u.searchParams.delete("token");
+    u.searchParams.delete("expires");
+    u.searchParams.delete("h");
     u.searchParams.set("token", data.token);
     u.searchParams.set("expires", data.expires);
     if (data.canPlayFhd) u.searchParams.set("h", "1");
     return u.toString();
   } catch {
-    hadB = /([?&])b=1(?!\d)/.test(raw);
+    const hadB = /([?&])b=1(?!\d)/.test(raw);
     const sep = raw.includes("?") ? "&" : "?";
     const params = [
       ...(hadB ? ["b=1"] : []),
@@ -68,7 +68,8 @@ export function buildVixMasterUrl(data: VixTokenData): string {
 export function extractVixTokenData(html: string, now = Date.now()): VixTokenData | null {
   const token = html.match(/['"]?token['"]?\s*:\s*['"]([^'"]+)['"]/)?.[1];
   const expires = html.match(/['"]?expires['"]?\s*:\s*['"](\d+)['"]/)?.[1];
-  const playlist = html.match(/url\s*:\s*['"](https?:\/\/[^'"]+)['"]/)?.[1];
+  const blockPlaylist = html.match(/masterPlaylist\s*[\s\S]{0,400}?url\s*:\s*['"](https?:\/\/[^'"]+)['"]/)?.[1];
+  const playlist = blockPlaylist ?? html.match(/url\s*:\s*['"](https?:\/\/[^'"]+)['"]/)?.[1];
   if (!token || !expires || !playlist) return null;
 
   const expiresMs = parseInt(expires, 10) * 1000;
@@ -107,6 +108,8 @@ export function parseVixMasterPlaylist(
       } catch {
         /* keep raw URI */
       }
+      // hls.js handles HLS subtitle playlists (`*.m3u8` / `?type=subtitle`) natively; `<track>` fails on playlists.
+      if (/\.m3u8(?:[?#]|$)/i.test(resolved) || /[?&]type=subtitles?\b/i.test(resolved)) continue;
       const lang = line.match(/LANGUAGE="([^"]+)"/)?.[1];
       const label = line.match(/NAME="([^"]+)"/)?.[1];
       const isDefault = /DEFAULT=YES/i.test(line);
@@ -139,7 +142,7 @@ export const vixsrcProvider: SourceProvider = {
       const meta = await resolveMediaIds(req, signal);
       if (signal.aborted || !meta.tmdbId) return [];
 
-      const isMovie = req.media.kind === "movie";
+      const isMovie = isMovieRequest(req);
       const season = req.season ?? 1;
       const episode = req.episode ?? 1;
       const apiUrl = isMovie
@@ -180,14 +183,14 @@ export const vixsrcProvider: SourceProvider = {
       if (!tokenData) return [];
 
       const masterUrl = buildVixMasterUrl(tokenData);
-      const streamHeaders = buildStreamHeaders(apiUrl, BASE_URL);
+      const streamHeaders = buildStreamHeaders(embedUrl, BASE_URL);
 
       const playlistRes = await fetchWithAbort(
         masterUrl,
         {
           "User-Agent": DEFAULT_UA,
           Accept: "application/vnd.apple.mpegurl, */*",
-          Referer: apiUrl,
+          Referer: embedUrl,
           Origin: BASE_URL,
         },
         undefined,
@@ -200,7 +203,7 @@ export const vixsrcProvider: SourceProvider = {
       const parsed = parseVixMasterPlaylist(playlistRes.body, masterUrl);
       if (!parsed.quality && !/#EXT-X-STREAM-INF|#EXTINF/i.test(playlistRes.body)) return [];
 
-      const subtitles = buildSubtitleTracks(parsed.subtitles, streamHeaders, apiUrl);
+      const subtitles = buildSubtitleTracks(parsed.subtitles, streamHeaders, embedUrl);
       const langTag = parsed.audioLangs.length > 0 ? ` · ${parsed.audioLangs.join("/").toUpperCase()}` : "";
 
       return [
@@ -208,7 +211,7 @@ export const vixsrcProvider: SourceProvider = {
           providerId: "vixsrc",
           providerName: "VixSrc",
           label: `VixSrc${parsed.quality ? ` · ${parsed.quality}p` : ""}${langTag}`,
-          url: proxyUrl(masterUrl, streamHeaders, apiUrl),
+          url: proxyUrl(masterUrl, streamHeaders, embedUrl),
           kind: "hls",
           via: "direct",
           pageUrl: embedUrl,
@@ -219,8 +222,9 @@ export const vixsrcProvider: SourceProvider = {
         },
       ];
     } catch (err) {
-      if (isAbortError(err)) return [];
-      return [];
+      if (isAbortError(err) || signal.aborted) return [];
+      // Unreachable or changed is an error, not "no results": the server's health has to see it.
+      throw err;
     }
   },
 };

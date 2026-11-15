@@ -45,6 +45,9 @@ import {
   addStremioAddon,
   fetchStremioManifest,
   getStremioConfig,
+  installPublicHttpStremioPresets,
+  normalizeManifestUrl,
+  PUBLIC_HTTP_STREMIO_PRESETS,
   removeStremioAddon,
   toggleStremioAddon,
   updateStremioConfig,
@@ -136,14 +139,15 @@ export function Settings() {
   const [name, setName] = useState(user?.name ?? "");
   const [profileMsg, setProfileMsg] = useState<string | null>(null);
   const [showExternal, setShowExternal] = useState(s.jellyfin.enabled);
-  const [healthTick, setHealthTick] = useState(0);
+  // Ticks while a circuit is open so the cooldown countdowns re-render.
+  const [, setHealthTick] = useState(0);
   const enabledProviders = PROVIDERS.filter((p) => p.isEnabled(s));
   const hasOpenCircuit = enabledProviders.some((p) => isCircuitOpen(p.id));
   useEffect(() => {
     if (!hasOpenCircuit) return;
     const t = window.setInterval(() => setHealthTick((n) => n + 1), 15_000);
     return () => window.clearInterval(t);
-  }, [hasOpenCircuit, healthTick]);
+  }, [hasOpenCircuit]);
   const formatCooldown = (ms: number) => (ms >= 60_000 ? `${Math.ceil(ms / 60_000)}m` : `${Math.max(1, Math.ceil(ms / 1000))}s`);
   const [subPref, setSubPref] = useState<SubPref>(() =>
     normalizeSubPref({ ...loadSubPref(), ...(s.subtitlePref ?? {}) }),
@@ -237,6 +241,47 @@ export function Settings() {
     } catch (err) {
       if (!mountedRef.current || ctl.signal.aborted) return;
       setStremioMsg(err instanceof Error ? err.message : "Could not add Stremio addon");
+    } finally {
+      if (mountedRef.current) setStremioBusy(false);
+    }
+  };
+
+  // Compare normalized URLs: an addon added by hand as ".../manifest.json/" or without the
+  // manifest suffix is the same addon as its preset.
+  const manifestKey = (url: string) => {
+    try {
+      return normalizeManifestUrl(url).manifestUrl;
+    } catch {
+      return url;
+    }
+  };
+  const installedManifestUrls = new Set(stremioAddons.map((a) => manifestKey(a.manifestUrl)));
+  const missingPresets = PUBLIC_HTTP_STREMIO_PRESETS.filter((p) => !installedManifestUrls.has(manifestKey(p.manifestUrl)));
+
+  const handleInstallStremioPresets = async () => {
+    if (stremioBusy || missingPresets.length === 0) return;
+    stremioCtlRef.current?.abort();
+    const ctl = new AbortController();
+    stremioCtlRef.current = ctl;
+    setStremioBusy(true);
+    setStremioMsg(`Loading ${missingPresets.length} public HTTP addon${missingPresets.length === 1 ? "" : "s"}...`);
+    try {
+      const { installed, failed } = await installPublicHttpStremioPresets(missingPresets, ctl.signal);
+      if (installed.length) invalidateSessions();
+      if (!mountedRef.current || ctl.signal.aborted) return;
+      refreshStremioState();
+      const names = installed.map((a) => a.name).join(", ");
+      const failedNames = failed
+        .map((url) => PUBLIC_HTTP_STREMIO_PRESETS.find((p) => p.manifestUrl === url)?.name ?? url)
+        .join(", ");
+      setStremioMsg(
+        installed.length
+          ? `Added ${names}${failed.length ? ` · unreachable right now: ${failedNames}` : ""}`
+          : `None of the public addons are reachable right now (${failedNames}). Try again later.`,
+      );
+    } catch (err) {
+      if (!mountedRef.current || ctl.signal.aborted) return;
+      setStremioMsg(err instanceof Error ? err.message : "Could not load public addons");
     } finally {
       if (mountedRef.current) setStremioBusy(false);
     }
@@ -737,6 +782,24 @@ export function Settings() {
               <Icon name="plus" size={14} /> {stremioBusy ? "Adding..." : "Add addon"}
             </button>
           </form>
+          {missingPresets.length > 0 && (
+            <div className="setting-line" style={{ marginTop: 10 }}>
+              <div>
+                <strong>Public HTTP stream addons</strong>
+                <span className="muted">
+                  {missingPresets.map((p) => p.name).join(", ")} · direct streams, no Debrid key needed
+                </span>
+              </div>
+              <button
+                type="button"
+                className="btn btn-glass sm"
+                onClick={() => void handleInstallStremioPresets()}
+                disabled={stremioBusy}
+              >
+                <Icon name="plus" size={14} /> {stremioBusy ? "Loading..." : `Load ${missingPresets.length === PUBLIC_HTTP_STREMIO_PRESETS.length ? "all" : missingPresets.length}`}
+              </button>
+            </div>
+          )}
           {stremioMsg && <p className="muted" style={{ marginTop: 8 }}>{stremioMsg}</p>}
 
           {stremioAddons.length > 0 && (

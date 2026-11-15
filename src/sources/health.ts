@@ -1,6 +1,24 @@
 import type { PlaybackRequest } from "../lib/types";
-import { isUrlTokenExpired } from "./native";
+import { isUrlTokenExpired, unwrapProxyUrl } from "./native";
 import type { StreamCandidate } from "./types";
+
+/** Query parameters that are credentials, not stream identity: never persisted to localStorage. */
+const SECRET_PARAM = /^(?:api_?key|apikey|x-emby-token|x-mediabrowser-token|access_token)$/i;
+const HAS_SECRET_PARAM = /[?&](?:api_?key|apikey|x-emby-token|x-mediabrowser-token|access_token)=/i;
+
+/** Strip credential query params (e.g. Jellyfin's `api_key`) so they never land in stored health data. */
+export function redactUrlSecrets(url: string): string {
+  if (!HAS_SECRET_PARAM.test(url)) return url;
+  try {
+    const u = new URL(url);
+    for (const k of [...u.searchParams.keys()]) if (SECRET_PARAM.test(k)) u.searchParams.delete(k);
+    return u.toString();
+  } catch {
+    return url;
+  }
+}
+
+const normalizeMediaUrl = (url: string) => redactUrlSecrets(unwrapProxyUrl(url)?.url ?? url);
 
 /**
  * What AbixCine remembers about sources between sessions, so the picker gets smarter:
@@ -74,6 +92,29 @@ function write(k: string, v: unknown) {
 let health: Record<string, ProviderHealth> = read(HKEY, {});
 let picks: Record<string, TitlePick> = read(PKEY, {});
 let badUrls: Record<string, number> = read(BKEY, {});
+
+// One-time scrub of credentials persisted by builds that stored raw Jellyfin URLs.
+(() => {
+  let dirty = false;
+  const cleanPicks: Record<string, TitlePick> = {};
+  for (const [k, p] of Object.entries(picks)) {
+    const url = p?.url ? redactUrlSecrets(p.url) : p?.url;
+    if (url !== p?.url) dirty = true;
+    cleanPicks[k] = url === p?.url ? p : { ...p, url };
+  }
+  const cleanBad: Record<string, number> = {};
+  for (const [u, at] of Object.entries(badUrls)) {
+    const r = redactUrlSecrets(u);
+    if (r !== u) dirty = true;
+    cleanBad[r] = Math.max(cleanBad[r] ?? 0, at);
+  }
+  if (dirty) {
+    picks = cleanPicks;
+    badUrls = cleanBad;
+    write(PKEY, picks);
+    write(BKEY, badUrls);
+  }
+})();
 
 export const getHealth = (providerId: string): ProviderHealth => {
   const raw = health[providerId];
@@ -151,8 +192,9 @@ export function recordProbe(c: StreamCandidate) {
   if (!ok) {
     let changed = false;
     const next = { ...picks };
+    const normUrl = normalizeMediaUrl(c.url);
     for (const [k, pick] of Object.entries(next)) {
-      if (pick.url === c.url || (pick.providerId === c.providerId && isCircuitOpen(c.providerId))) {
+      if (normalizeMediaUrl(pick.url) === normUrl || (pick.providerId === c.providerId && isCircuitOpen(c.providerId))) {
         delete next[k];
         changed = true;
       }
@@ -177,7 +219,8 @@ export function recordLookup(providerId: string, ms: number) {
 
 /** This exact URL failed to play recently (a file the player can't decode, a dead link). */
 export function badUrl(url: string) {
-  const at = badUrls[url];
+  const raw = normalizeMediaUrl(url);
+  const at = badUrls[raw] ?? badUrls[url];
   return !!at && Date.now() - at < BAD_URL_MS;
 }
 
@@ -217,14 +260,15 @@ export function recordPlayback(req: PlaybackRequest, c: StreamCandidate, ok: boo
     // an automatic pick never overwrites it with a different provider's "manual" flag.
     const prior = picks[k];
     const manual = opts.manual ?? (prior?.manual && prior.providerId === c.providerId) ?? false;
-    const pick: TitlePick = { providerId: c.providerId, url: c.url, at: Date.now(), ...(manual ? { manual: true } : {}) };
+    const pick: TitlePick = { providerId: c.providerId, url: normalizeMediaUrl(c.url), at: Date.now(), ...(manual ? { manual: true } : {}) };
     picks = { ...picks, [k]: pick, [exactKey(req)]: pick };
     const keys = Object.keys(picks);
     if (keys.length > MAX_PICKS) {
       keys.sort((a, b) => picks[a].at - picks[b].at);
       for (const old of keys.slice(0, keys.length - MAX_PICKS)) delete picks[old];
     }
-    const toClear = [c.url, c.pageUrl].filter((u): u is string => !!u && u in badUrls);
+    const rawUrl = normalizeMediaUrl(c.url);
+    const toClear = [rawUrl, c.url, c.pageUrl].filter((u): u is string => !!u && u in badUrls);
     if (toClear.length) {
       const nextBad = { ...badUrls };
       for (const u of toClear) delete nextBad[u];
@@ -237,17 +281,20 @@ export function recordPlayback(req: PlaybackRequest, c: StreamCandidate, ok: boo
     // A server the viewer chose by hand for the series survives one bad episode: it is only
     // dropped when the failure is on the exact stream it points at.
     const exact = exactKey(req);
-    const same = (p?: TitlePick) => !!p && (p.url === c.url || p.providerId === c.providerId);
+    const rawUrl = normalizeMediaUrl(c.url);
+    const same = (p?: TitlePick) => !!p && (normalizeMediaUrl(p.url) === rawUrl || p.providerId === c.providerId);
     if (same(picks[exact])) delete picks[exact];
-    if (k !== exact && same(picks[k]) && (!picks[k].manual || picks[k].url === c.url)) delete picks[k];
-    const now = Date.now();
-    badUrls = Object.fromEntries(
-      Object.entries({ ...badUrls, [c.url]: now })
-        .filter(([, at]) => now - at < BAD_URL_MS)
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, MAX_BAD),
-    );
-    write(BKEY, badUrls);
+    if (k !== exact && same(picks[k]) && (!picks[k].manual || normalizeMediaUrl(picks[k].url) === rawUrl)) delete picks[k];
+    if (rawUrl) {
+      const now = Date.now();
+      badUrls = Object.fromEntries(
+        Object.entries({ ...badUrls, [rawUrl]: now })
+          .filter(([, at]) => now - at < BAD_URL_MS)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, MAX_BAD),
+      );
+      write(BKEY, badUrls);
+    }
   }
   write(PKEY, picks);
 }
@@ -314,7 +361,8 @@ export function serverHealthScore(providerId: string, basePriority = 0): number 
 export function lookupTimeout(providerId: string, base: number) {
   const h = getHealth(providerId);
   if (h.lookupMs == null || recentlyFailed(providerId)) return base;
-  return Math.round(Math.max(2500, Math.min(base, h.lookupMs * 3 + 1500)));
+  // Never below 60% of the provider's own budget: multi-step extractors vary a lot run to run.
+  return Math.round(Math.max(base * 0.6, Math.min(base, h.lookupMs * 3 + 2000)));
 }
 
 /** Reset persisted health/picks/badUrls for one provider, or clear all when omitted. */

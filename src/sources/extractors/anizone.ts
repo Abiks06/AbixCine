@@ -13,6 +13,7 @@ import {
   titleSimilarity,
   unescapeJsString,
   type RawSubtitleInput,
+  isMovieRequest,
 } from "./common";
 
 const BASE_URL = "https://anizone.to";
@@ -30,16 +31,29 @@ interface AnizonePlayerData {
   subs: RawSubtitleInput[];
 }
 
+function parseAnizoneJson(raw: string): unknown | null {
+  const decoded = decodeHtmlEntities(raw);
+  const unescaped = unescapeJsString(decoded);
+  try {
+    return JSON.parse(unescaped);
+  } catch {
+    // Handle synthetic inputs that escape outer JSON delimiters as `\"` inside JS single quotes.
+    if (!unescaped.replace(/\\"/g, "").includes('"') && unescaped.includes('\\"')) {
+      try {
+        return JSON.parse(unescaped.replace(/\\"/g, '"'));
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+}
+
 /** Parse `items: JSON.parse('...')` cards from AniZone search HTML. */
 export function parseAnizoneCards(html: string): AnizoneCard[] {
   const m = /items:\s*JSON\.parse\('((?:[^'\\]|\\.)*)'\)/.exec(html);
   if (!m) return [];
-  let list: unknown;
-  try {
-    list = JSON.parse(unescapeJsString(m[1]));
-  } catch {
-    return [];
-  }
+  const list = parseAnizoneJson(m[1]);
   if (!Array.isArray(list)) return [];
 
   const out: AnizoneCard[] = [];
@@ -78,13 +92,11 @@ export function parseAnizonePlayer(html: string): AnizonePlayerData {
   const m = /vidstackPlayer\(JSON\.parse\('((?:[^'\\]|\\.)*)'\)/.exec(html);
   if (!m) return { m3u8: "", subs: [] };
 
-  let cfg: Record<string, unknown> | null = null;
-  try {
-    cfg = JSON.parse(unescapeJsString(decodeHtmlEntities(m[1]))) as Record<string, unknown>;
-  } catch {
-    return { m3u8: "", subs: [] };
-  }
-  if (!cfg || typeof cfg !== "object") return { m3u8: "", subs: [] };
+  const parsed = parseAnizoneJson(m[1]);
+  const cfg = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+    ? (parsed as Record<string, unknown>)
+    : null;
+  if (!cfg) return { m3u8: "", subs: [] };
 
   const m3u8 = typeof cfg.src === "string" && /^https?:\/\//i.test(cfg.src) ? cfg.src : "";
   const rawSubs = Array.isArray(cfg.subtitles) ? cfg.subtitles : [];
@@ -122,7 +134,7 @@ function pickBestAnizoneCard(cards: AnizoneCard[], req: PlaybackRequest): Anizon
   const targets = [req.media.title, req.media.originalTitle].filter((t): t is string => Boolean(t?.trim()));
   const year = req.media.year ?? 0;
   const season = req.season ?? 1;
-  const isMovie = req.media.kind === "movie";
+  const isMovie = isMovieRequest(req);
 
   let best: AnizoneCard | null = null;
   let bestScore = -1;
@@ -191,23 +203,36 @@ export const anizoneProvider: SourceProvider = {
         ),
       ).slice(0, 3);
 
-      let cards: AnizoneCard[] = [];
+      let card: AnizoneCard | null = null;
+      let lastErr: unknown;
       for (const q of queries) {
         if (signal.aborted) return [];
-        const res = await fetchWithAbort(
-          `${BASE_URL}/anime?search=${encodeURIComponent(q)}`,
-          headers,
-          undefined,
-          signal,
-          8_000,
-        );
-        if (res.status < 200 || res.status >= 300) continue;
-        cards = parseAnizoneCards(res.body);
-        if (cards.length > 0) break;
+        try {
+          const res = await fetchWithAbort(
+            `${BASE_URL}/anime?search=${encodeURIComponent(q)}`,
+            headers,
+            undefined,
+            signal,
+            8_000,
+          );
+          if (res.status < 200 || res.status >= 300) continue;
+          const cards = parseAnizoneCards(res.body);
+          const match = pickBestAnizoneCard(cards, req);
+          if (match) {
+            card = match;
+            break;
+          }
+        } catch (err) {
+          if (isAbortError(err) || signal.aborted) return [];
+          lastErr = err;
+        }
       }
 
-      const card = pickBestAnizoneCard(cards, req);
-      if (!card || signal.aborted) return [];
+      if (!card) {
+        if (lastErr) throw lastErr;
+        return [];
+      }
+      if (signal.aborted) return [];
 
       const pageUrl = `${BASE_URL}/anime/${card.sid}/${ep}`;
       const epRes = await fetchWithAbort(pageUrl, headers, undefined, signal, 8_000);
@@ -244,8 +269,9 @@ export const anizoneProvider: SourceProvider = {
         },
       ];
     } catch (err) {
-      if (isAbortError(err)) return [];
-      return [];
+      if (isAbortError(err) || signal.aborted) return [];
+      // Unreachable or changed is an error, not "no results": the server's health has to see it.
+      throw err;
     }
   },
 };

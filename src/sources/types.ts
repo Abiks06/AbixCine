@@ -673,5 +673,16 @@ export interface SourceProvider {
   /** Lookup timeout when the provider needs longer than the default (e.g. it captures a page itself). */
   timeoutMs?: number;
   isEnabled(s: Settings): boolean;
-  find(req: PlaybackRequest, s: Settings, signal: AbortSignal): Promise<StreamCandidate[]>;
+  find(req: PlaybackRequest, s: Settings, signal: AbortSignal, ctx?: LookupContext): Promise<StreamCandidate[]>;
+  /**
+   * True when a full lookup changes something outside the app (a Debrid provider adding magnets
+   * to the user's account). Such a provider is first asked in `warm` mode while the title is only
+   * being previewed, and asked again for real once playback is requested.
+   */
+  sideEffectsOnLookup?(s: Settings): boolean;
+}
+
+export interface LookupContext {
+  /** Preview only (a Title page warming its sources): do nothing with side effects. */
+  warm?: boolean;
 }

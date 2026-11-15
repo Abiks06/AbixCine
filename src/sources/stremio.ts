@@ -25,7 +25,8 @@ export const STREMIO_STORAGE_KEY = "abx.stremio.v1";
 
 const DEFAULT_TIMEOUT_MS = 8_000;
 const DEBRID_RESOLVE_CONCURRENCY = 4;
-const DEBRID_MAX_CANDIDATES = 8;
+/** Each resolution adds a torrent to the account: a pick plus two backups is plenty. */
+const DEBRID_MAX_CANDIDATES = 3;
 
 export interface StremioResourceSpec {
   name: string;
@@ -137,6 +138,8 @@ export interface StremioResolveOptions {
   debrid?: DebridConfig | null;
   torrentMode?: boolean;
   settings?: Partial<Settings> & StremioSettingsOverride;
+  /** Preview only: list streams but don't add magnets to the Debrid account. */
+  warm?: boolean;
 }
 
 function makeAbortError(signal?: AbortSignal): Error {
@@ -403,6 +406,77 @@ export async function addStremioAddon(manifestUrl: string, signal?: AbortSignal)
   const next = idx >= 0 ? existing.map((a, i) => (i === idx ? addon : a)) : [...existing, addon];
   saveStremioAddons(next);
   return addon;
+}
+
+export interface StremioAddonPreset {
+  id: string;
+  name: string;
+  manifestUrl: string;
+  types: readonly ("movie" | "series")[];
+  note: string;
+}
+
+/** Curated public direct-HTTP Stremio addons verified without Debrid keys. */
+export const PUBLIC_HTTP_STREMIO_PRESETS: readonly StremioAddonPreset[] = [
+  {
+    id: "absolute-cinema",
+    name: "Absolute Cinema",
+    manifestUrl: "https://cinema.debrid.in/manifest.json",
+    types: ["movie", "series"],
+    note: "Direct HTTP MP4/MKV streams for movies and series",
+  },
+  {
+    id: "flix-streams",
+    name: "Flix-Streams Free",
+    manifestUrl: "https://free.flixnest.app/manifest.json",
+    types: ["movie", "series"],
+    note: "Multi-mirror HTTP streams for movies and series",
+  },
+  {
+    id: "motchill-direct",
+    name: "Motchill Direct Stream",
+    manifestUrl: "https://motchillv.q-1208.fun/manifest.json",
+    types: ["movie"],
+    note: "Direct HLS (.m3u8) streams for movies",
+  },
+  {
+    id: "stravo-ii",
+    name: "Stravo II",
+    manifestUrl: "https://v2.stravo.site/local/manifest.json",
+    types: ["movie"],
+    note: "Direct HTTP MP4 streams for movies",
+  },
+  {
+    id: "hyper-stravo",
+    name: "Hyper",
+    manifestUrl: "https://hyper.stravo.site/local/manifest.json",
+    types: ["movie"],
+    note: "Direct HTTP MP4/DASH streams for movies",
+  },
+];
+
+export async function installPublicHttpStremioPresets(
+  presets: readonly StremioAddonPreset[] = PUBLIC_HTTP_STREMIO_PRESETS,
+  signal?: AbortSignal,
+): Promise<{ installed: StremioAddonConfig[]; failed: string[] }> {
+  const key = (url: string) => {
+    try {
+      return normalizeManifestUrl(url).manifestUrl;
+    } catch {
+      return url;
+    }
+  };
+  const existingUrls = new Set(listStremioAddons().map((a) => key(a.manifestUrl)));
+  const pending = presets.filter((p) => !existingUrls.has(key(p.manifestUrl)));
+  const settled = await Promise.allSettled(pending.map((p) => addStremioAddon(p.manifestUrl, signal)));
+  const installed: StremioAddonConfig[] = [];
+  const failed: string[] = [];
+  for (let i = 0; i < settled.length; i++) {
+    const item = settled[i];
+    if (item.status === "fulfilled") installed.push(item.value);
+    else failed.push(pending[i].manifestUrl);
+  }
+  return { installed, failed };
 }
 
 export function removeStremioAddon(idOrUrl: string): StremioAddonConfig[] {
@@ -813,14 +887,16 @@ export async function resolveStremioStreams(
   const debridActive = Boolean(debrid && debrid.enabled !== false && debrid.apiKey.trim());
   const resolvedHashes = new Set<string>();
 
-  if (debridActive && debrid) {
+  // A preview (Title page) never adds magnets: each resolution creates a torrent in the user's
+  // Debrid account. The session asks again, for real, once playback is requested.
+  if (debridActive && debrid && !options?.warm) {
     const uniqueHashes = [...new Set(pendingTorrents.map((t) => t.infoHash))];
     try {
       const cacheMap = await checkDebridInstantCache(debrid.provider, debrid.apiKey, uniqueHashes, signal);
       if (signal?.aborted) return candidates;
 
       const cachedItems = pendingTorrents
-        .filter((item) => cacheMap[item.infoHash]?.cached)
+        .filter((item) => cacheMap[item.infoHash]?.cached || cacheMap[item.infoHash]?.unknown)
         .sort((a, b) => (b.quality ?? 0) - (a.quality ?? 0))
         .slice(0, DEBRID_MAX_CANDIDATES);
 
@@ -836,6 +912,11 @@ export async function resolveStremioStreams(
             item.magnetUri,
             item.stream.fileIdx,
             signal,
+            {
+              filename: item.stream.behaviorHints?.filename,
+              ...(req.season != null ? { season: req.season } : {}),
+              ...(req.episode != null ? { episode: req.episode } : {}),
+            },
           );
           return { item, res };
         } catch (err) {
@@ -917,8 +998,12 @@ export const stremioProvider: SourceProvider = {
     if (s.disabledSources?.includes("stremio")) return false;
     return listStremioAddons(s as Partial<Settings> & StremioSettingsOverride).some((a) => a.enabled !== false);
   },
-  find: (req, s, signal) =>
-    resolveStremioStreams(req, { settings: s as Partial<Settings> & StremioSettingsOverride }, signal),
+  find: (req, s, signal, ctx) =>
+    resolveStremioStreams(req, { settings: s as Partial<Settings> & StremioSettingsOverride, warm: ctx?.warm }, signal),
+  sideEffectsOnLookup: (s) => {
+    const debrid = getStremioConfig(s as Partial<Settings> & StremioSettingsOverride).debrid;
+    return Boolean(debrid && debrid.enabled !== false && debrid.apiKey.trim());
+  },
 };
 
 /* ------------------------------------------------------------------ */

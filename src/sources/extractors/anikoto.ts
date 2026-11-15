@@ -1,12 +1,8 @@
 import type { Settings } from "../../lib/settings";
 import type { PlaybackRequest } from "../../lib/types";
-import { DEFAULT_UA, proxyUrl } from "../native";
+import { DEFAULT_UA } from "../native";
 import type { SourceProvider, StreamCandidate } from "../types";
 import {
-  aes256CbcDecrypt,
-  base64ToBytes,
-  buildStreamHeaders,
-  buildSubtitleTracks,
   decodeHtmlEntities,
   fetchJsonWithAbort,
   fetchWithAbort,
@@ -14,10 +10,12 @@ import {
   isAnimeRequest,
   isDirectExtractorEnabled,
   titleSimilarity,
-  type RawSubtitleInput,
+  isMovieRequest,
 } from "./common";
+import { decryptMegaPlayEnc, resolveMegaPlayEmbed } from "./megaplay";
 
-const MIRRORS = [
+export const ANIKOTO_MIRRORS = [
+  "https://anikototv.bz",
   "https://anikototv.to",
   "https://anikoto.cz",
   "https://anikoto.me",
@@ -26,8 +24,6 @@ const MIRRORS = [
 ] as const;
 
 const KNOWN_SERVERS = ["Vidstream-2", "HD-2", "HD-1"] as const;
-const DEFAULT_ENC_PAIR = { key: "i?LMTAx0Q6,:}50U", iv: "W0;27ToaUpl_P%'c" };
-
 interface AnikotoCard {
   href: string;
   title: string;
@@ -45,54 +41,8 @@ interface AnikotoEpisodeNode {
   slug: string;
 }
 
-interface AnikotoTrack {
-  file?: string;
-  label?: string;
-  kind?: string;
-  default?: boolean;
-}
-
-interface AnikotoSourcePayload {
-  sources?: { file?: string } | { file?: string }[];
-  tracks?: AnikotoTrack[];
-  enc?: string;
-}
-
-function make32ByteKey(rawKey: string): Uint8Array {
-  const keyBytes = new Uint8Array(32);
-  const encoded = new TextEncoder().encode(rawKey);
-  keyBytes.set(encoded.subarray(0, 32));
-  return keyBytes;
-}
-
-/** Decrypt Anikoto/MegaPlay AES-256-CBC `enc` payload using known/recovered key+IV pairs. */
-export async function decryptAnikotoEnc(
-  enc: string,
-  pairs: { key: string; iv: string }[] = [DEFAULT_ENC_PAIR],
-): Promise<{ file?: string } | null> {
-  if (!enc || enc.length > 65_536) return null;
-  let cipherBytes: Uint8Array;
-  try {
-    cipherBytes = base64ToBytes(enc);
-  } catch {
-    return null;
-  }
-
-  for (const pair of pairs) {
-    const keyBytes = make32ByteKey(pair.key);
-    const ivBytes = new TextEncoder().encode(pair.iv);
-    if (ivBytes.length !== 16) continue;
-    const text = await aes256CbcDecrypt(keyBytes, ivBytes, cipherBytes);
-    if (!text || !text.includes("http")) continue;
-    try {
-      const obj = JSON.parse(text) as { file?: string };
-      if (obj && typeof obj.file === "string") return obj;
-    } catch {
-      /* try next key pair */
-    }
-  }
-  return null;
-}
+/** Alias for existing imports; the decrypt now lives with the shared MegaPlay resolver. */
+export const decryptAnikotoEnc = decryptMegaPlayEnc;
 
 /** Parse Anikoto `/filter?keyword=...` HTML cards. */
 export function parseAnikotoSearchCards(html: string, base: string): AnikotoCard[] {
@@ -100,11 +50,11 @@ export function parseAnikotoSearchCards(html: string, base: string): AnikotoCard
   const blocks = html.split(/<div\s+class="[^"]*\bitem\b[^"]*"[^>]*>/i).slice(1);
 
   for (const block of blocks) {
-    const linkMatch = block.match(/<a[^>]*\bclass="[^"]*\bname\b[^"]*\bd-title\b[^"]*"[^>]*>/i);
+    const linkMatch = block.match(/<a\b[^>]*\bclass=["'][^"']*\bname\b[^"']*\bd-title\b[^"']*["'][^>]*>/i);
     const linkTag = linkMatch?.[0] ?? "";
     const hrefMatch =
-      linkTag.match(/\bhref="([^"]+)"/i) ??
-      block.match(/<a[^>]*\bhref="([^"]*\/watch\/[^"]+)"/i);
+      linkTag.match(/\bhref=["']([^"']+)["']/i) ??
+      block.match(/<a\b[^>]*\bhref=["']([^"']*\/watch\/[^"']+)["']/i);
     if (!hrefMatch) continue;
 
     let href = hrefMatch[1].trim();
@@ -112,9 +62,9 @@ export function parseAnikotoSearchCards(html: string, base: string): AnikotoCard
     else if (!/^https?:\/\//i.test(href)) href = `${base}/${href}`;
     href = href.replace(/[?#][\s\S]*$/, "").replace(/\/ep-[^/]+\/?$/i, "");
 
-    const titleInner = block.match(/<a[^>]*\bclass="[^"]*\bname\b[^"]*\bd-title\b[^"]*"[^>]*>([\s\S]*?)<\/a>/i)?.[1] ?? "";
-    const dataJp = linkTag.match(/\bdata-jp="([^"]*)"/i)?.[1] ?? "";
-    const imgAlt = block.match(/<img[^>]*\balt="([^"]*)"/i)?.[1] ?? "";
+    const titleInner = block.match(/<a\b[^>]*\bclass=["'][^"']*\bname\b[^"']*\bd-title\b[^"']*["'][^>]*>([\s\S]*?)<\/a>/i)?.[1] ?? "";
+    const dataJp = linkTag.match(/\bdata-jp=["']([^"']*)["']/i)?.[1] ?? "";
+    const imgAlt = block.match(/<img\b[^>]*\balt=["']([^"']*)["']/i)?.[1] ?? "";
     const title = decodeHtmlEntities(titleInner.replace(/<[^>]+>/g, "")) || decodeHtmlEntities(dataJp) || decodeHtmlEntities(imgAlt);
     if (!title) continue;
 
@@ -163,12 +113,12 @@ export function parseAnikotoServers(html: string, groups: string[]): { name: str
   const seen = new Set<string>();
 
   for (const group of groups) {
-    const groupRx = new RegExp(`data-type="${group}"[^>]*>([\\s\\S]*?)(?=<div[^>]*data-type=|$)`, "i");
+    const groupRx = new RegExp(`data-type=["']${group}["'][^>]*>([\\s\\S]*?)(?=<div[^>]*data-type=|$)`, "i");
     const section = html.match(groupRx)?.[1] ?? "";
-    const liRx = /<li\b[^>]*\bdata-link-id="([^"]+)"[^>]*>([\s\S]*?)<\/li>/gi;
+    const liRx = /<li\b([^>]*)>([\s\S]*?)<\/li>/gi;
     let m: RegExpExecArray | null;
     while ((m = liRx.exec(section)) !== null) {
-      const linkId = m[1].trim();
+      const linkId = (m[1].match(/\bdata-link-id=["']([^"']+)["']/i)?.[1] ?? "").trim();
       const name = decodeHtmlEntities(m[2].replace(/<[^>]+>/g, ""));
       if (!linkId || !name || seen.has(linkId)) continue;
       seen.add(linkId);
@@ -176,9 +126,11 @@ export function parseAnikotoServers(html: string, groups: string[]): { name: str
     }
   }
 
-  return out
-    .filter((s) => (KNOWN_SERVERS as readonly string[]).includes(s.name))
-    .sort((a, b) => KNOWN_SERVERS.indexOf(a.name as (typeof KNOWN_SERVERS)[number]) - KNOWN_SERVERS.indexOf(b.name as (typeof KNOWN_SERVERS)[number]));
+  const rank = (name: string) => {
+    const idx = (KNOWN_SERVERS as readonly string[]).indexOf(name);
+    return idx === -1 ? KNOWN_SERVERS.length : idx;
+  };
+  return out.sort((a, b) => rank(a.name) - rank(b.name));
 }
 
 function pickBestCard(cards: AnikotoCard[], req: PlaybackRequest, wantDub: boolean): AnikotoCard | null {
@@ -186,7 +138,7 @@ function pickBestCard(cards: AnikotoCard[], req: PlaybackRequest, wantDub: boole
   if (pool.length === 0) return null;
 
   const targets = [req.media.title, req.media.originalTitle].filter((t): t is string => Boolean(t?.trim()));
-  const isMovie = req.media.kind === "movie";
+  const isMovie = isMovieRequest(req);
   let best: AnikotoCard | null = null;
   let bestScore = -1;
 
@@ -208,89 +160,9 @@ function pickBestCard(cards: AnikotoCard[], req: PlaybackRequest, wantDub: boole
   return bestScore >= 0.45 ? best : null;
 }
 
-async function resolveEmbedUrlToCandidate(
-  embedUrl: string,
-  serverName: string,
-  audio: "sub" | "dub",
-  referer: string,
-  signal: AbortSignal,
-): Promise<StreamCandidate | null> {
-  const origin = new URL(embedUrl).origin;
-  const embedRes = await fetchWithAbort(
-    embedUrl,
-    { Referer: referer, "User-Agent": DEFAULT_UA },
-    undefined,
-    signal,
-    8_000,
-  );
-  if (signal.aborted || embedRes.status < 200 || embedRes.status >= 300) return null;
-
-  const embedAudio = embedUrl.match(/\/(sub|dub)(?:[/?#]|$)/i)?.[1]?.toLowerCase();
-  if (embedAudio && embedAudio !== audio) return null;
-
-  const dataId =
-    embedRes.body.match(/id="megaplay-player"[^>]*\bdata-id="([^"]+)"/i)?.[1] ??
-    embedRes.body.match(/\bdata-id="([^"]+)"/i)?.[1];
-  if (!dataId) return null;
-
-  const cdn = embedUrl.match(/[?&]s=([\w-]+)/)?.[1] ?? "";
-  let payload: AnikotoSourcePayload | null = null;
-
-  for (const path of ["stream/getSourcesNew", "stream/getSources"]) {
-    if (signal.aborted) return null;
-    const srcRes = await fetchJsonWithAbort<AnikotoSourcePayload>(
-      `${origin}/${path}?id=${encodeURIComponent(dataId)}${cdn ? `&s=${encodeURIComponent(cdn)}` : ""}`,
-      {
-        Referer: embedUrl,
-        "X-Requested-With": "XMLHttpRequest",
-        "User-Agent": DEFAULT_UA,
-      },
-      undefined,
-      signal,
-      8_000,
-    );
-    if (!srcRes.data) continue;
-    if (!srcRes.data.sources && srcRes.data.enc) {
-      const decoded = await decryptAnikotoEnc(String(srcRes.data.enc));
-      if (decoded?.file) srcRes.data.sources = { file: decoded.file };
-    }
-    if (srcRes.data.sources) {
-      payload = srcRes.data;
-      break;
-    }
-  }
-  if (!payload?.sources) return null;
-
-  const rawFile = Array.isArray(payload.sources) ? payload.sources[0]?.file : payload.sources.file;
-  if (!rawFile || !/^https?:\/\//i.test(rawFile)) return null;
-
-  const streamHeaders = buildStreamHeaders(`${origin}/`, origin);
-  const rawSubs: RawSubtitleInput[] = (payload.tracks ?? [])
-    .filter((t) => typeof t?.file === "string" && (!t.kind || t.kind === "captions" || t.kind === "subtitles"))
-    .map((t) => ({
-      url: t.file,
-      label: t.label,
-      kind: t.kind,
-      isDefault: t.default,
-    }));
-  const subtitles = buildSubtitleTracks(rawSubs, streamHeaders, origin);
-
-  return {
-    providerId: "anikoto",
-    providerName: "Anikoto",
-    label: `${serverName} · ${audio === "dub" ? "English dub" : "Japanese · subtitled"}`,
-    url: proxyUrl(rawFile, streamHeaders, origin),
-    kind: "hls",
-    via: "direct",
-    pageUrl: embedUrl,
-    headers: streamHeaders,
-    audio,
-    subtitles,
-  };
-}
-
 /**
- * Direct Anikoto anime extractor (`anikototv.to` mirrors + MegaPlay direct fallback).
+ * Direct Anikoto anime extractor (`anikototv.bz` mirrors). The id-keyed MegaPlay route lives in its
+ * own `megaplay` extractor, so it runs in parallel instead of waiting on (or duplicating) this one.
  * Ported from `aquaryuo/seanime` (MIT).
  */
 export const anikotoProvider: SourceProvider = {
@@ -308,26 +180,19 @@ export const anikotoProvider: SourceProvider = {
       const audio = req.audio ?? "sub";
       const wantDub = audio === "dub";
 
-      // Fast-path: MegaPlay direct AniList / MAL lookup when IDs are already available.
-      const alId = req.media.anilistId ?? (req.media.key.match(/^anilist:(\d+)$/)?.[1] ? Number(req.media.key.match(/^anilist:(\d+)$/)![1]) : undefined);
-      const mpTargets = [
-        ...(alId ? [`https://megaplay.buzz/stream/ani/${alId}/${ep}/${audio}`] : []),
-        ...(req.media.malId ? [`https://megaplay.buzz/stream/mal/${req.media.malId}/${ep}/${audio}`] : []),
-      ];
-      for (const mpUrl of mpTargets) {
-        if (signal.aborted) return [];
-        const cand = await resolveEmbedUrlToCandidate(mpUrl, "MegaPlay", audio, `${MIRRORS[0]}/`, signal).catch(() => null);
-        if (cand) return [cand];
-      }
-
       const query = (req.media.title || req.media.originalTitle || "").trim();
       if (!query || signal.aborted) return [];
 
-      for (const base of MIRRORS) {
+      for (const base of ANIKOTO_MIRRORS) {
         if (signal.aborted) return [];
-        // One mirror throwing must not cost the rest their turn.
-        const found = await tryMirror(base).catch(() => null);
-        if (found) return [found];
+        // Wrap each mirror attempt so DNS/network failures never abort fallback mirrors.
+        try {
+          const found = await tryMirror(base);
+          if (found) return [found];
+        } catch (err) {
+          if (isAbortError(err) || signal.aborted) return [];
+          continue;
+        }
       }
       return [];
 
@@ -338,8 +203,8 @@ export const anikotoProvider: SourceProvider = {
           undefined,
           signal,
           7_000,
-        ).catch(() => null);
-        if (!searchRes || searchRes.status < 200 || searchRes.status >= 300) return null;
+        );
+        if (searchRes.status < 200 || searchRes.status >= 300) return null;
 
         const cards = parseAnikotoSearchCards(searchRes.body, base);
         const card = pickBestCard(cards, req, wantDub);
@@ -403,14 +268,19 @@ export const anikotoProvider: SourceProvider = {
           const embedUrl = srvRes.data?.result?.url;
           if (!embedUrl || !/^https?:\/\//i.test(embedUrl)) continue;
 
-          const cand = await resolveEmbedUrlToCandidate(embedUrl, srv.name, audio, `${base}/`, signal).catch(() => null);
+          const cand = await resolveMegaPlayEmbed(
+            embedUrl,
+            { providerId: "anikoto", providerName: "Anikoto", serverName: srv.name, audio, referer: `${base}/` },
+            signal,
+          ).catch(() => null);
           if (cand) return cand;
         }
         return null;
       }
     } catch (err) {
-      if (isAbortError(err)) return [];
-      return [];
+      if (isAbortError(err) || signal.aborted) return [];
+      // Unreachable or changed is an error, not "no results": the server's health has to see it.
+      throw err;
     }
   },
 };

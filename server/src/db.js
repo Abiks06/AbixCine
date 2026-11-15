@@ -12,7 +12,13 @@ let embedded = null;
 if (url) {
   // Render's managed Postgres requires TLS from outside its private network.
   const needsSsl = /render\.com|sslmode=require/.test(url) || process.env.PGSSL === "1";
-  pool = new pg.Pool({ connectionString: url, ssl: needsSsl ? { rejectUnauthorized: false } : undefined, max: Number(process.env.PG_POOL_MAX ?? 5) });
+  // Certificate checks are opt-in so existing deployments keep connecting: set PGSSL_VERIFY=1
+  // (optionally with the server's CA in PGSSL_CA) to reject unverified certificates.
+  const verify = process.env.PGSSL_VERIFY === "1";
+  const ssl = needsSsl
+    ? { rejectUnauthorized: verify, ...(process.env.PGSSL_CA ? { ca: process.env.PGSSL_CA } : {}) }
+    : undefined;
+  pool = new pg.Pool({ connectionString: url, ssl, max: Number(process.env.PG_POOL_MAX ?? 5) });
 } else {
   const { PGlite } = await import("@electric-sql/pglite");
   const dir = process.env.PGLITE_DIR ?? "./data/pglite";
@@ -81,5 +87,9 @@ export async function migrate() {
     CREATE INDEX IF NOT EXISTS refresh_tokens_family ON refresh_tokens (family_id);
     CREATE INDEX IF NOT EXISTS refresh_tokens_expiry ON refresh_tokens (expires_at);
     CREATE INDEX IF NOT EXISTS progress_user_updated ON progress (user_id, updated_at DESC);
+
+    -- v3: soft-delete tombstones, so a delete on one device isn't undone by another device's sync
+    ALTER TABLE progress ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
+    ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
   `);
 }

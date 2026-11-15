@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { getDetail } from "../lib/catalog";
 import { fmtRuntime } from "../lib/format";
 import type { Media } from "../lib/types";
+import { isFilm } from "../lib/types";
 import { Card, CardSkeleton, kindLabel } from "./Card";
 import { SectionHead } from "./SectionHead";
 
@@ -101,14 +102,14 @@ export function FitsTonight({ pool, loading }: { pool: Media[]; loading?: boolea
               extra={
                 <div className="fit-end">
                   <span className="fit-clock" aria-hidden />
-                  {m.kind === "movie" ? `Ends ${end}` : `One episode · ends ${end}`}
+                  {isFilm(m) ? `Ends ${end}` : `One episode · ends ${end}`}
                 </div>
               }
               sub={
                 <>
                   <span className="badge">{kindLabel(m.kind)}</span>
                   {fmtRuntime(rt)}
-                  {m.kind !== "movie" ? " per episode" : ""}
+                  {!isFilm(m) ? " per episode" : ""}
                 </>
               }
             />

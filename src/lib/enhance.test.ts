@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { startEnhancer } from "./enhance";
+import { resetWebgl2Probe, startEnhancer } from "./enhance";
 
 const createdPipeOutputs: { destroy: ReturnType<typeof vi.fn> }[] = [];
 
@@ -197,6 +197,7 @@ function makeWebGL2Canvas(opts: { throwSecurityOnUpload?: boolean } = {}) {
 }
 
 beforeEach(() => {
+  resetWebgl2Probe();
   vi.stubGlobal("window", {
     devicePixelRatio: 1,
     setTimeout: globalThis.setTimeout.bind(globalThis),

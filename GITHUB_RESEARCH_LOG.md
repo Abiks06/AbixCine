@@ -85,3 +85,63 @@
   - `src/sources/pluginRunner.ts` (sandboxed WebWorker JS provider runner with SSRF protection)
   - `src/sources/registry.ts`, `src/lib/settings.ts`, `src/pages/Settings.tsx`, `src/components/Player.tsx`: Registered `stremioProvider` and `pluginProvidersSource`, added `#extensions` Settings UI (Stremio Addons, Debrid, JS Provider Plugins, SubDL API key), and wired `magnet:` torrent playback in `Player.tsx`
   - `src-tauri/src/torrent.rs` + `src-tauri/Cargo.toml` + `src-tauri/src/lib.rs`: Feature-gated `librqbit` Rust BitTorrent streaming backend (`--features torrent`, local `127.0.0.1:0` HTTP `Range`-seeking server, plus lean default stubs)
+
+- **Phase 4 — Live-Probe Findings Implemented (2026-11-15):**
+  - New direct extractors in `src/sources/extractors/`: `hexa.ts` (`hexa-direct`, cap-token cached for 18 uses), `vidup.ts` (2-stage token, ≤3 servers in parallel, stage URLs pinned to `vidup.to`), `cinejoy.ts` (binary `/g` envelope; Nebula/Lisbon/Light in parallel, MKV-only Orion as fallback), `meowtv.ts` (single-use ticket per request, subtitles fetched in parallel and capped at 2 per language / 48 total), `megaplay.ts` (standalone MAL/AniList-keyed anime extractor with local AES-256-CBC + intro/outro).
+  - `encdec.ts`: shared `enc-dec.app` client with a 60 s outage cooldown so one outage fails all dependent extractors fast instead of each burning its timeout.
+  - `anikoto.ts` now scrapes mirrors only and reuses `resolveMegaPlayEmbed` (no duplicate MegaPlay requests).
+  - `http_fetch_bytes` (`stream.rs`) + `httpFetchBytes` (`native.ts`) accept a binary request body (`bodyB64`).
+  - Settings → `#extensions`: one-click "Public HTTP stream addons" button (`installPublicHttpStremioPresets`), shown only while presets are missing.
+  - Live-verified through the real extractor code (TMDB `550`, `1399` S1E1, MAL `40748` sub/dub): every candidate returned `200/206 #EXTM3U` with the proxy's exact headers.
+
+---
+
+## Live Probe & Protocol Refresh (2026-11-15)
+
+### Repositories Audited
+- `Inside4ndroid/TMDB-Embed-API`: `hdghartv.cc` returned "Service Closed"; `a.111477.xyz` (`dahmermovies`) listed Fight Club directory but returned 403 on file & `p.111477.xyz/bulk` and 404 on GoT TV; `bb.streamflixserver.site` DNS failed.
+- `itsmeadarsh2008/Streamline`: active provider implementations (`moviebox.js`, `vidfast.js`, `vidcore.js`, `cinejoy.js`, `hexa.js`, `vidlink.js`, `anizone.js`). Note `api.speedracelight.com` (old Videasy) returned 404.
+- `smy778/EncDecEndpoints` (`https://enc-dec.app`): live `200` crypto/parse microservice & updated Python samples (`vidlink.py`, `vidfast.py`, `vidup.py`, `videasy.py`, `hexa.py`, `cinejoy.py`, `meowtv.py`, `animekai.py`, `kisskh.py`, `onetouchtv.py`, `nexa.py`).
+- `SA7ANI/cb-providers` (`Nuvio` ES2020 plugins): `castle.js` (`api.hlowb.com`), `redflix.js` (`redflix.biz`), `kurage.js` (`kurage.live`).
+- `Seanime-contributions/Seanime-Providers` & `Bas1874/Seanime-Marketplace`: `zokoanime`, `animeheaven`, `donghuastream`, `animegg`.
+- `debakarr/kisskh-dl` & `dramabosapi/dramabos-api`: KissKH `kkey` token mechanics & Asian drama ecosystem checks.
+
+### Direct Extractors — Live Test Matrix (TMDB `550`, TMDB `1399` S1E1, MAL `40748`/`38000`, KissKH)
+
+| Source | Status | Verified Details & Headers |
+| --- | --- | --- |
+| **ZXCStreams** (`zxcstreams.ts`) | **FIXED (200)** | Moved from `.xyz` (DNS dead) to `https://zxcstream.cc` / `https://zxcstream.com`. New protocol: `POST /backend/andromeda` + `GET /backend_/sources/{srv}` using module `78863` `FIELD_MAP`, decrypted with OpenSSL AES-256-CBC (`Salted__`, passphrase `7f4c9e2a81d63b05c4f7a9e8126d3b50e1a8c7f23d9465ab0c6e9f1d4a7b832c`). Servers `valstrax` (DASH), `ursa` (HLS), `alatreon` (HLS) on `vidstuck.cc` need `Referer: https://zxcstream.cc/` + `Origin: https://zxcstream.cc`. Server `orion` on `bcdnt.hakunaymatata.com` returns 429 with `Referer`, **200 without Referer/Origin**. (`atlas` 427, `daedalus` empty.) |
+| **Vidrock** (`vidrock.ts`) | **FIXED (200)** | Moved from `vidrock.ru` (DNS dead) to `https://vidrock.net`. Endpoints: `/api/movie/${tmdbId}` and `/api/tv/${tmdbId}/${season}/${episode}` (slashes, **no trailing slash**). Existing `VIDROCK_KEY_HEX` AES-256-GCM decrypts `Atlas`, `Astra`, `Orion` to `200 #EXTM3U`. |
+| **Castle** (`api.hlowb.com`) | **NEW — 206** | Self-contained local AES-128-CBC (zero external decrypt API): `GET /v0.1/system/getSecurityKey/1` -> `searchByKeyword` -> `/film-api/v1.9.9/movie` -> `POST /film-api/v2.0.1/movie/getVideo2` (`User-Agent: okhttp/4.9.3`, `Referer: https://api.hlowb.com`). Key = `concat(b64decode(secKey), "T!BgJB")` truncated/padded to 16B, `iv = key`. Verified 10 streams on `550`, 3 on `1399/1/1` (`img1.hscow.com`, `206 application/vnd.apple.mpegurl`). |
+| **VixSrc** (`vixsrc.ts`) | **LIVE (200)** | Returns `200 application/vnd.apple.mpegurl #EXTM3U` via `/playlist/{id}` (extensionless audio segments). |
+| **Vidlink** (`vidlink.ts`) | **UPDATED (206)** | Bare XSalsa20 token currently returns `200 null` (site added `/fu.wasm` `window.getAdv(id)`). `enc-dec.app/api/enc-vidlink?text=${tmdbId}` produces valid token returning `200` `mwVault` MP4s (`bcdn.hakunaymatata.com`) on `550` & `1399/1/1`. **Header rule:** `*.hakunaymatata.com` returns `429` with `Referer`, `428` with desktop Chrome `User-Agent`, and **`206 video/mp4` with no `Referer` and empty/non-browser `User-Agent`** (`""`, `Lavf/60.3.100`, `curl/8.0`). |
+| **Hexa** (`cap.hexa.su` + `theemoviedb.hexa.su`) | **NEW — 206** | `enc-hexa` / `dec-hexa` (`enc-dec.app`). Extensionless `#EXTM3U` (`206 application/x-mpegurl`) verified on both `550` & `1399/1/1` (with or without Referer). |
+| **Vidup** (`vidup.to`) | **NEW — 200** | 2-stage `enc-vidup` / `dec-vidup` (`enc-dec.app`). Extensionless `/master.m` returns `200 #EXTM3U` on `550` & `1399/1/1` with **`Referer: https://vidup.to/`** (`403` without). |
+| **Cinejoy [Nebula]** (`api.wing.st`) | **NEW — 200/206** | Moved from `api.shegu.st`. `enc-cinejoy` / `dec-cinejoy`. Server `Nebula` returns `#EXTM3U` (`200`/`206` with disguised **`Content-Type: image/jpeg`**) on `550` & `1399/1/1`. (`Light`, `Lisbon`, `Orion` returned `404`.) |
+| **MeowTV** (`api.meowtv.ru`) | **NEW — 206** | `POST /streams/ticket` -> `GET /streams/{movie|tv}/...?s=english` + `dec-meowtv` -> `206 #EXTM3U` on `550` & `1399/1/1`, plus `GET /subs/...` `200` VTTs (`rezesubs.com`). |
+| **MovieBox** (`h5-api.aoneroom.com`) | **PARTIAL (429)** | `/wefeed-h5api-bff/subject/search` + `x-user` header token from `get-latest-app-pkgs` + `fmoviesunblocked.net` Referer yields Fight Club downloads, but `bcdnw.hakunaymatata.com` returned `429` in direct probes and "Game of Thrones" was absent from search results. |
+| **PrimeSrc** (`primesrc.ts`) | **BLOCKED (403)** | `/api/v1/s` works, `/api/v1/l` gated behind Cloudflare Managed Challenge (403 HTML). Embeds available at `/embed/movie?tmdb=...` & `/embed/tv?tmdb=...`. |
+| **VaPlayer** (`vaplayer.ts`) | **DEAD (403)** | `streamdata.vaplayer.ru/api.php` strips `stream_urls`; `nextgencloudfabric.com` returns `403`. |
+| **VidRift** (`embeds.ts`) | **IFRAME-ONLY** | Direct GET returns `403 "Embed this page in an iframe."` (must stay embed/WebView only). |
+| **VidFast** (`vidfast.vc`) / **Videasy** (`api.wecollege.net`) / **Nexa** | **BLOCKED / FAILED** | `vidfast.vc` stage1 POST returned `500` under Node `fetch` (`curl_cffi` TLS expected in upstream); `api.wecollege.net/seed` returned Cloudflare `403`; `nexa.mov` decrypted empty string. |
+| **MegaPlay** (`megaplay.buzz`) | **NEW ANIME (200)** | `GET /stream/mal/${malId}/${ep}/${sub|dub}` -> `data-id` -> `/stream/getSourcesNew?id=...` -> decrypt `enc` (base64url -> AES-256-CBC, key `"i?LMTAx0Q6,:}50U"` zero-padded to 32B, IV `"W0;27ToaUpl_P%'c"`) -> `master.m3u8` + `tracks` VTTs + `intro`/`outro`. **Requires `Referer: https://megaplay.buzz/`** (`403` without; `200 #EXTM3U` & `0x47` TS segments verified on MAL `40748` sub/dub & `38000` sub). |
+| **AniZone** (`anizone.ts`) | **FIXED (200)** | Search moved to Alpine `x-data="{ items: JSON.parse('...') }"`; episode pages `/anime/{slug}/{ep}` moved to `x-data="vidstackPlayer(JSON.parse('...'))"`. Returns `200 #EXTM3U` (`seiryuu.vid-cdn.xyz`, no Referer needed) + `200` `.ass` subtitles on JJK (`tcqul04r`) & Demon Slayer (`knw0pvgz`). |
+| **ZokoAnime** (`zokoanime.video`) | **NEW ANIME (200)** | `GET /stream/mal/${malId}/${ep}/${sub|dub}` -> `/window\.__P\s*=\s*["']([^"']+)["']/` -> base64 decode -> bytewise XOR `"otaku-embed-v1"` -> `{ src, subtitles }`. **Requires `Referer: https://zokoanime.video/`** (`200 #EXTM3U` verified on `40748` sub [9 subs]/dub & `38000` sub). |
+| **AnimeHeaven** (`animeheaven.me`) | **NEW ANIME (206)** | `search.php?s=` -> `anime.php?{id}` -> `<a id="${gateKey}">` + `.watch2` -> `gate.php` (`Cookie: key=${gateKey}`, `Referer: https://animeheaven.me/anime.php`) -> direct `.mp4` (`206 video/mp4` with or without Referer, verified on JJK & Demon Slayer). |
+| **KickAssAnime** (`kickassanime.ts`) | **LIVE (200)** | `POST https://kaa.lt/api/fsearch` (skip PVs without `locales`), `/episodes`, `/episode/...` -> `VidStreaming` (`krussdomi.com/cat-player/player` `<astro-island props>` `manifest[1]`). **Requires `Referer: https://krussdomi.com/`** (`403` without; `200 #EXTM3U` on JJK & Demon Slayer). `BirdStream` (`//bl.krussdomi.com/mpd/...`) returns `404`. |
+| **Anikoto** (`anikoto.ts`) | **MIRROR** | `anikototv.to` redirects to `https://anikototv.bz`. |
+| **AnimeKai** (`animekai.to`) | **UNREACHABLE** | All tested mirrors (`animekai.{to,fi,fo,gs,la}`, `anikai.to`) threw `fetch failed` from current network. |
+| **KissKH** (`kisskh.co`) | **LIVE (200)** | `/api/DramaList/Episode/${id}.png` returns `403` without `kkey`; `enc-dec.app/api/enc-kisskh?text=${id}&type=vid` (`&type=sub`) produces valid `kkey` -> `200 #EXTM3U` (`hls.cdnvideo11.shop`) + 5 SRT tracks (`Lovely Runner` ep 16). |
+| **OneTouchTV** (`onetouchtv.ts`) | **LIVE (200)** | `api3.devcorp.me` -> `kisscloud.online` `master.m3u8` returns `200 #EXTM3U`. |
+
+### Public Stremio HTTP-Stream Addons (Live-Probed)
+- **Working Direct HTTP/HTTPS Streams:**
+  - `https://cinema.debrid.in/manifest.json` (`Absolute Cinema`): Movie `tt0137523` (4 HTTP streams, MovieBox `206 video/mp4`, VixSrc) + Series `tt0944947:1:1` (6 HTTP streams, 4KHDHub `206 video/x-matroska`).
+  - `https://free.flixnest.app/manifest.json` (`Flix-Streams`): Movie (6 HTTP) + Series (17 HTTP, `200/206 video/x-matroska` on live HubCloud/HubDrive mirrors; some links `500`/`502`).
+  - `https://motchillv.q-1208.fun/manifest.json` (`Motchill Direct Stream`): Movie `tt0137523` (2 HTTP streams, `206 application/vnd.apple.mpegurl #EXTM3U`; Series returned 0).
+  - `https://hyper.stravo.site/local/manifest.json` (`Hyper`) & `https://v2.stravo.site/local/manifest.json` (`Stravo II`): Movie `tt0137523` (`206 video/mp4` / DASH `.mpd`; Series returned `404`).
+- **Dead / Deprecated / Auth-Blocked:** `webstreamr.hayd.uk` (deprecated HTML), `nuviostreams.hayd.uk` (deprecated HTML), `streamvix.hayd.uk` & `stremify.hayd.uk` (HTML guides), `nodebrid.fly.dev` & `torrentless.strem.fun` (DNS failed), `87d6a6ef6b58-webstreamrmbg.baby-beamup.club` (timeout), `addon.notorrent2.workers.dev` (timeout), `lat-add.lzid.me` (`401`), `froststream.cloutteam.com` (unauthenticated stub), `pengu.uk` (`signin.mp4` stub).
+
+### Embed Players (`embeds.ts`) Probe Summary (TMDB `550`)
+- **Timeout / Dead:** `vidsrc.cc`, `embed.su`, `frembed.uno`.
+- **Verified `200` (no `X-Frame-Options` block, no CF challenge):** `https://vidsrcme.ru/embed/movie/550` (replacement for `vidsrc.cc`), `https://vidrock.net/movie/550`, `https://zxcstream.cc/player/movie/550`, `https://primesrc.me/embed/movie?tmdb=550` (`frame-ancestors *`), `https://hexa.su/watch/movie/550`, `vidlink.pro`, `vidfast.vc`, `vidnest.fun`, `vidsrc.su`, `aether.ist`, `vidsrc.to`, `vidsrc.rip`, `2embed.cc`.

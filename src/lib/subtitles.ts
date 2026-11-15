@@ -1423,6 +1423,15 @@ function writeMemoryMap(map: Map<string, SubTrackMemoryEntry>) {
   }
 }
 
+/** Forget every per-title subtitle choice (sign-out: they belong to the account that made them). */
+export function clearSubTrackMemory(): void {
+  try {
+    localStorage.removeItem(SUB_MEM_KEY);
+  } catch {
+    /* storage blocked */
+  }
+}
+
 export function loadSubTrackMemory(mediaKey: string): SubTrackMemoryEntry | null {
   if (!mediaKey) return null;
   const entry = readMemoryMap().get(mediaKey);

@@ -656,12 +656,20 @@ export async function searchOnlineSubtitles(
   if (signal?.aborted) return [];
 
   let anySucceeded = false;
+  let anyFailed = false;
   const raw: RawOnlineSub[] = [];
   for (const outcome of settled) {
     if (outcome.status === "fulfilled" && outcome.value.ok && outcome.value.queried) {
       anySucceeded = true;
       raw.push(...outcome.value.items);
+    } else if (outcome.status === "rejected" || outcome.value.queried) {
+      anyFailed = true;
     }
+  }
+  // Every provider that was asked failed: say so, instead of "no subtitles matched", which reads as
+  // "there are none for this title".
+  if (!anySucceeded && anyFailed) {
+    throw new Error("Online subtitle services are unreachable right now. Try again in a moment.");
   }
 
   const scored: OnlineSubtitleResult[] = raw.map((item) => ({

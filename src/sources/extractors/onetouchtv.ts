@@ -16,6 +16,7 @@ import {
   isDirectExtractorEnabled,
   normalizeQuality,
   titleSimilarity,
+  isMovieRequest,
 } from "./common";
 
 const MAIN_URL = "https://api3.devcorp.me";
@@ -64,7 +65,9 @@ interface OttEpisodeStreams {
 
 /**
  * Decrypt OneTouchTV's AES-256-CBC encoded API response payload.
- * Normalizes `-_.` -> `/` and `@` -> `+` before base64 decoding.
+ * The API encodes `/` as the literal three-character sequence `-_.` and `+` as `@`. This is not
+ * base64url: `-`, `_` and `.` never appear on their own, so do not "fix" the regex into a character
+ * class (verified against live payloads, 2026-11-15).
  */
 export async function decryptOneTouchPayload<T = unknown>(encoded: string): Promise<T | null> {
   if (!encoded || typeof encoded !== "string") return null;
@@ -167,11 +170,11 @@ export const onetouchtvProvider: SourceProvider = {
   isEnabled: (s: Settings) => isDirectExtractorEnabled("onetouchtv", s),
   async find(req: PlaybackRequest, _s: Settings, signal: AbortSignal): Promise<StreamCandidate[]> {
     if (signal.aborted || isAnimeRequest(req)) return [];
-    const lang = (req.media as MediaDetail).originalLanguage?.toLowerCase();
+    const lang = (req.media as MediaDetail).originalLanguage?.toLowerCase().split(/[-_]/)[0];
     if (!lang || !ASIAN_DRAMA_LANGS.has(lang)) return [];
 
     try {
-      const isMovie = req.media.kind === "movie";
+      const isMovie = isMovieRequest(req);
       const season = req.season ?? 1;
       const episode = req.episode ?? 1;
       const baseTitle = req.media.title?.trim() || "";
@@ -200,7 +203,7 @@ export const onetouchtvProvider: SourceProvider = {
 
       const targetEp = isMovie
         ? detail.episodes[0]
-        : detail.episodes.find((e) => Math.round(Number(e.episode)) === episode) ?? null;
+        : detail.episodes.find((e) => Number(e.episode) === episode) ?? null;
       if (!targetEp?.playId) return [];
 
       const streamData = await fetchOttEncrypted<OttEpisodeStreams>(
@@ -238,7 +241,6 @@ export const onetouchtvProvider: SourceProvider = {
           url: proxyUrl(rawUrl, streamHeaders, MAIN_URL),
           kind,
           via: "direct",
-          pageUrl: `${REFERER_URL}`,
           headers: streamHeaders,
           subtitles,
           ...(q ? { quality: q } : {}),
@@ -247,8 +249,9 @@ export const onetouchtvProvider: SourceProvider = {
 
       return out.sort((a, b) => (b.quality ?? 0) - (a.quality ?? 0));
     } catch (err) {
-      if (isAbortError(err)) return [];
-      return [];
+      if (isAbortError(err) || signal.aborted) return [];
+      // Unreachable or changed is an error, not "no results": the server's health has to see it.
+      throw err;
     }
   },
 };

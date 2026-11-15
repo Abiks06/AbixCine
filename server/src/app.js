@@ -1,7 +1,7 @@
 import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
 import Fastify from "fastify";
-import { checkPassword, hashPassword, issueTokens, MAX_PASSWORD, pruneTokens, publicUser, requireUser, revokeAll, revokeRefresh, rotateRefresh } from "./auth.js";
+import { checkPassword, forgetTokenVersion, hashPassword, issueTokens, MAX_PASSWORD, pruneTokens, publicUser, requireUser, revokeAll, revokeRefresh, rotateRefresh } from "./auth.js";
 import { q } from "./db.js";
 import { tmdbProxy } from "./tmdb.js";
 
@@ -232,20 +232,27 @@ export async function buildApp({ logger = true } = {}) {
 
   app.delete("/me", { preHandler: requireUser }, async (req) => {
     await q(`DELETE FROM users WHERE id = $1`, [req.userId]);
+    forgetTokenVersion(req.userId);
     return { ok: true };
   });
 
   // ---------- sync ----------
   app.get("/sync", { preHandler: requireUser }, async (req) => {
-    const [p, w, s] = await Promise.all([
-      q(`SELECT media_key, data, updated_at FROM progress WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 500`, [req.userId]),
-      q(`SELECT media_key, media, added_at FROM watchlist WHERE user_id = $1 ORDER BY added_at DESC LIMIT ${MAX_WATCHLIST}`, [req.userId]),
+    const [p, w, s, pd, wd] = await Promise.all([
+      q(`SELECT media_key, data, updated_at FROM progress WHERE user_id = $1 AND deleted_at IS NULL ORDER BY updated_at DESC LIMIT 500`, [req.userId]),
+      q(`SELECT media_key, media, added_at FROM watchlist WHERE user_id = $1 AND deleted_at IS NULL ORDER BY added_at DESC LIMIT ${MAX_WATCHLIST}`, [req.userId]),
       q(`SELECT data FROM user_settings WHERE user_id = $1`, [req.userId]),
+      q(`SELECT media_key, deleted_at FROM progress WHERE user_id = $1 AND deleted_at IS NOT NULL ORDER BY deleted_at DESC LIMIT 500`, [req.userId]),
+      q(`SELECT media_key, deleted_at FROM watchlist WHERE user_id = $1 AND deleted_at IS NOT NULL ORDER BY deleted_at DESC LIMIT 500`, [req.userId]),
     ]);
+    const tomb = (rows) => rows.map((r) => ({ key: r.media_key, deletedAt: new Date(r.deleted_at).getTime() }));
     return {
       progress: p.rows.map((r) => ({ ...r.data, updatedAt: new Date(r.updated_at).getTime() })),
       watchlist: w.rows.map((r) => ({ media: r.media, addedAt: new Date(r.added_at).getTime() })),
       settings: s.rows[0]?.data ?? {},
+      // Deleted on some device: other devices drop their copy instead of pushing it back.
+      progressDeleted: tomb(pd.rows),
+      watchlistDeleted: tomb(wd.rows),
     };
   });
 
@@ -261,15 +268,17 @@ export async function buildApp({ logger = true } = {}) {
     // Last write wins, but never let an older device overwrite a newer one.
     await q(
       `INSERT INTO progress (user_id, media_key, data, updated_at) VALUES ($1, $2, $3, $4)
-       ON CONFLICT (user_id, media_key) DO UPDATE SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at
-       WHERE progress.updated_at < EXCLUDED.updated_at`,
+       ON CONFLICT (user_id, media_key) DO UPDATE SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at, deleted_at = NULL
+       WHERE progress.updated_at < EXCLUDED.updated_at
+         AND (progress.deleted_at IS NULL OR progress.deleted_at < EXCLUDED.updated_at)`,
       [req.userId, key, JSON.stringify({ media: e.media, season: e.season ?? undefined, episode: e.episode ?? undefined, audio: e.audio ?? undefined, position: e.position, duration: e.duration, ...(e.upNext === true ? { upNext: true } : {}), ...(e.finished === true ? { finished: true } : {}) }), updatedAt],
     );
     return { ok: true };
   });
 
   app.delete("/progress/:key", { preHandler: requireUser }, async (req) => {
-    await q(`DELETE FROM progress WHERE user_id = $1 AND media_key = $2`, [req.userId, req.params.key]);
+    // Soft delete: the tombstone tells other devices this was removed (a newer watch revives it).
+    await q(`UPDATE progress SET deleted_at = now() WHERE user_id = $1 AND media_key = $2 AND deleted_at IS NULL`, [req.userId, req.params.key]);
     return { ok: true };
   });
 
@@ -281,9 +290,12 @@ export async function buildApp({ logger = true } = {}) {
     const { rowCount } = await q(
       `INSERT INTO watchlist (user_id, media_key, media)
        SELECT $1, $2, $3::jsonb
-       WHERE (SELECT count(*) FROM watchlist WHERE user_id = $1) < $4
-          OR EXISTS (SELECT 1 FROM watchlist WHERE user_id = $1 AND media_key = $2)
-       ON CONFLICT (user_id, media_key) DO UPDATE SET media = EXCLUDED.media`,
+       WHERE (SELECT count(*) FROM watchlist WHERE user_id = $1 AND deleted_at IS NULL) < $4
+          OR EXISTS (SELECT 1 FROM watchlist WHERE user_id = $1 AND media_key = $2 AND deleted_at IS NULL)
+       ON CONFLICT (user_id, media_key) DO UPDATE SET
+         media = EXCLUDED.media,
+         added_at = CASE WHEN watchlist.deleted_at IS NULL THEN watchlist.added_at ELSE now() END,
+         deleted_at = NULL`,
       [req.userId, key, JSON.stringify(req.body.media), MAX_WATCHLIST],
     );
     if (!rowCount) return reply.code(413).send({ error: "watchlist_full" });
@@ -291,7 +303,7 @@ export async function buildApp({ logger = true } = {}) {
   });
 
   app.delete("/watchlist/:key", { preHandler: requireUser }, async (req) => {
-    await q(`DELETE FROM watchlist WHERE user_id = $1 AND media_key = $2`, [req.userId, req.params.key]);
+    await q(`UPDATE watchlist SET deleted_at = now() WHERE user_id = $1 AND media_key = $2 AND deleted_at IS NULL`, [req.userId, req.params.key]);
     return { ok: true };
   });
 

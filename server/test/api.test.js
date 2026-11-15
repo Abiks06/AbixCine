@@ -59,6 +59,35 @@ test("progress sync keeps the newest write", async () => {
   assert.deepEqual(s.settings, { preferredQuality: 720, animeAudio: "dub" }); // libraryPaths stays local
 });
 
+test("deletes leave tombstones so another device's sync can't resurrect them", async () => {
+  const t = tokens.accessToken;
+  const media = { key: "tmdb:tv:1399", kind: "tv", title: "GoT", genres: [], overview: "" };
+  const now = Date.now();
+  await call("PUT", "/progress/tmdb:tv:1399", { media, season: 1, episode: 1, position: 10, duration: 3000, updatedAt: now - 5000 }, t);
+  await call("PUT", "/watchlist/tmdb:tv:1399", { media }, t);
+  await call("DELETE", "/progress/tmdb:tv:1399", null, t);
+  await call("DELETE", "/watchlist/tmdb:tv:1399", null, t);
+
+  let s = (await call("GET", "/sync", null, t)).json();
+  assert.equal(s.progress.some((p) => p.media.key === "tmdb:tv:1399"), false);
+  assert.equal(s.watchlist.some((w) => w.media.key === "tmdb:tv:1399"), false);
+  assert.ok(s.progressDeleted.some((d) => d.key === "tmdb:tv:1399" && d.deletedAt > 0));
+  assert.ok(s.watchlistDeleted.some((d) => d.key === "tmdb:tv:1399"));
+
+  // A stale device pushing its older copy doesn't bring the progress back...
+  await call("PUT", "/progress/tmdb:tv:1399", { media, season: 1, episode: 1, position: 10, duration: 3000, updatedAt: now - 4000 }, t);
+  s = (await call("GET", "/sync", null, t)).json();
+  assert.equal(s.progress.some((p) => p.media.key === "tmdb:tv:1399"), false);
+
+  // ...but watching it again (a newer write) and re-adding it to the list do.
+  await call("PUT", "/progress/tmdb:tv:1399", { media, season: 1, episode: 2, position: 20, duration: 3000, updatedAt: Date.now() + 1000 }, t);
+  await call("PUT", "/watchlist/tmdb:tv:1399", { media }, t);
+  s = (await call("GET", "/sync", null, t)).json();
+  assert.equal(s.progress.find((p) => p.media.key === "tmdb:tv:1399")?.episode, 2);
+  assert.ok(s.watchlist.some((w) => w.media.key === "tmdb:tv:1399"));
+  assert.equal(s.watchlistDeleted.some((d) => d.key === "tmdb:tv:1399"), false);
+});
+
 test("refresh rotation, retry grace and reuse detection", async () => {
   let r = await call("POST", "/auth/refresh", { refreshToken: tokens.refreshToken });
   assert.equal(r.statusCode, 200);

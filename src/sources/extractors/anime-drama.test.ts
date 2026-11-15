@@ -2,8 +2,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Settings } from "../../lib/settings";
 import type { MediaDetail, PlaybackRequest } from "../../lib/types";
 
-const { mockHttpFetch } = vi.hoisted(() => ({
+const { mockHttpFetch, mockSniff } = vi.hoisted(() => ({
   mockHttpFetch: vi.fn(),
+  mockSniff: vi.fn(),
 }));
 
 vi.mock("../native", async (importOriginal) => {
@@ -12,10 +13,19 @@ vi.mock("../native", async (importOriginal) => {
     ...actual,
     native: true,
     httpFetch: mockHttpFetch,
+    sniff: mockSniff,
   };
 });
 
 import { unwrapProxyUrl } from "../native";
+import { animeDirectProvider } from "../anime-direct";
+import { kisskhProvider } from "../kisskh";
+import {
+  animeheavenProvider,
+  parseAnimeHeavenPage,
+  parseAnimeHeavenSearch,
+  parseAnimeHeavenVideoUrls,
+} from "./animeheaven";
 import {
   anikotoProvider,
   decryptAnikotoEnc,
@@ -40,6 +50,7 @@ import {
   kickassanimeProvider,
   parseKaaPlayerHtml,
 } from "./kickassanime";
+import { extractMegaPlayContentId, megaplayProvider } from "./megaplay";
 import { decryptOneTouchPayload, onetouchtvProvider } from "./onetouchtv";
 
 function makeSettings(overrides: Partial<Settings> = {}): Settings {
@@ -92,6 +103,7 @@ async function encryptAesCbc(keyBytes: Uint8Array, ivBytes: Uint8Array, plaintex
 
 beforeEach(() => {
   mockHttpFetch.mockReset();
+  mockSniff.mockReset();
 });
 
 describe("anizoneProvider", () => {
@@ -272,7 +284,7 @@ describe("anikotoProvider", () => {
     expect(servers.map((s) => s.name)).toEqual(["Vidstream-2", "HD-1"]);
   });
 
-  it("uses MegaPlay fast-path when anilistId is present and falls back to mirror scraping", async () => {
+  it("leaves the id-keyed MegaPlay route to the megaplay extractor and scrapes mirrors", async () => {
     const keyBytes = new Uint8Array(32);
     keyBytes.set(new TextEncoder().encode("i?LMTAx0Q6,:}50U"), 0);
     const ivBytes = new TextEncoder().encode("W0;27ToaUpl_P%'c");
@@ -295,14 +307,21 @@ describe("anikotoProvider", () => {
       return { status: 404, url, body: "" };
     });
 
-    const fastOut = await anikotoProvider.find(
+    const fastOut = await megaplayProvider.find(
       { media: makeMedia(), episode: 2, audio: "sub" },
       makeSettings(),
       new AbortController().signal,
     );
     expect(fastOut).toHaveLength(1);
+    expect(fastOut[0].providerId).toBe("megaplay");
     expect(unwrapProxyUrl(fastOut[0].url).url).toBe("https://cdn.mp.example/ep2.m3u8");
+    expect(unwrapProxyUrl(fastOut[0].url).headers.referer).toBe("https://megaplay.buzz/");
     expect(fastOut[0].subtitles).toHaveLength(1);
+
+    // Anikoto no longer duplicates the MegaPlay requests itself.
+    mockHttpFetch.mockClear();
+    await anikotoProvider.find({ media: makeMedia(), episode: 2, audio: "sub" }, makeSettings(), new AbortController().signal);
+    expect(mockHttpFetch.mock.calls.some(([u]) => String(u).startsWith("https://megaplay.buzz/"))).toBe(false);
 
     // Mirror fallback when no AniList/MAL IDs exist
     mockHttpFetch.mockImplementation(async (url: string) => {
@@ -351,6 +370,51 @@ describe("anikotoProvider", () => {
     expect(mirrorOut).toHaveLength(1);
     expect(mirrorOut[0].label).toContain("HD-2");
     expect(unwrapProxyUrl(mirrorOut[0].url).url).toBe("https://cdn.ak.example/mirror.m3u8");
+  });
+});
+
+describe("megaplayProvider", () => {
+  beforeEach(() => mockHttpFetch.mockReset());
+
+  it("reads the content id from the player div or the page title", () => {
+    expect(extractMegaPlayContentId(`<div data-id="9" id="megaplay-player"></div>`)).toBe("9");
+    expect(extractMegaPlayContentId(`<title>File 12345 - MegaPlay</title>`)).toBe("12345");
+    expect(extractMegaPlayContentId(`<title>Error - MegaPlay</title>`)).toBeNull();
+  });
+
+  it("prefers the MAL route, carries intro/outro, and skips non-anime requests", async () => {
+    mockHttpFetch.mockImplementation(async (url: string) => {
+      if (url === "https://megaplay.buzz/stream/mal/52991/3/dub") {
+        return { status: 200, url, body: `<html><title>File 777 - MegaPlay</title></html>` };
+      }
+      if (url === "https://megaplay.buzz/stream/getSourcesNew?id=777") {
+        return {
+          status: 200,
+          url,
+          body: JSON.stringify({
+            sources: { file: "https://cdn.mp.example/777.m3u8" },
+            intro: { start: 10, end: 95 },
+            outro: { start: 1300, end: 1390 },
+          }),
+        };
+      }
+      return { status: 404, url, body: "" };
+    });
+
+    const out = await megaplayProvider.find({ media: makeMedia(), episode: 3, audio: "dub" }, makeSettings(), new AbortController().signal);
+    expect(out).toHaveLength(1);
+    expect(out[0].audio).toBe("dub");
+    expect(out[0].skip).toEqual({ intro: [10, 95], outro: [1300, 1390] });
+    expect(mockHttpFetch.mock.calls.some(([u]) => String(u).includes("/stream/ani/"))).toBe(false);
+
+    mockHttpFetch.mockClear();
+    const movie = await megaplayProvider.find(
+      { media: makeMedia({ key: "tmdb:movie:550", kind: "movie", anilistId: undefined, malId: undefined }) },
+      makeSettings(),
+      new AbortController().signal,
+    );
+    expect(movie).toEqual([]);
+    expect(mockHttpFetch).not.toHaveBeenCalled();
   });
 });
 
@@ -432,15 +496,202 @@ describe("onetouchtvProvider", () => {
   });
 });
 
+describe("animeheavenProvider", () => {
+  it("parses search cards, .infotitlejp aliases, spaced episode attributes, and uncommented gate.php sources", async () => {
+    const cards = parseAnimeHeavenSearch(`
+      <div class='similarimg'><div class='p1'>
+        <a href='anime.php?62reo'><img class='coverimg' src='image.php?a308n' alt='Sorcery Fight'></a>
+        <div class='similarname c'><a href='anime.php?62reo' class='c'>Sorcery Fight</a></div>
+      </div></div>
+    `);
+    expect(cards).toEqual([{ href: "https://animeheaven.me/anime.php?62reo", title: "Sorcery Fight" }]);
+
+    const page = parseAnimeHeavenPage(`
+      <div class='infotitle c'>Sorcery Fight</div>
+      <div class='infotitlejp c'>Jujutsu Kaisen, jjk</div>
+      <a class='c' id ="gate123"><div class='watch1 bc c'>Episode</div><div class= ' watch2 bc ' >1</div></a>
+    `);
+    expect(page.titles).toContain("Jujutsu Kaisen");
+    expect(page.episodes).toEqual([{ num: 1, key: "gate123" }]);
+
+    const srcs = parseAnimeHeavenVideoUrls(`
+      <!-- <source src='https://stale.example/old.mp4' type='video/mp4'> -->
+      <source src='https://cu.animeheaven.me/video.mp4?gate123' type='video/mp4'>
+    `);
+    expect(srcs).toEqual(["https://cu.animeheaven.me/video.mp4?gate123"]);
+
+    let gateCookie = "";
+    mockHttpFetch.mockImplementation(async (url: string, headers: Record<string, string> = {}) => {
+      if (url.startsWith("https://animeheaven.me/search.php?s=")) {
+        return {
+          status: 200,
+          url,
+          body: `<div class='similarname c'><a href='anime.php?62reo' class='c'>Sorcery Fight</a></div>`,
+        };
+      }
+      if (url === "https://animeheaven.me/anime.php?62reo") {
+        return {
+          status: 200,
+          url,
+          body: `<div class='infotitlejp c'>Jujutsu Kaisen</div><a id ="k1"><div class=' watch2 '>1</div></a>`,
+        };
+      }
+      if (url === "https://animeheaven.me/gate.php") {
+        gateCookie = headers.Cookie ?? "";
+        return {
+          status: 200,
+          url,
+          body: `<!-- <source src='https://old.example/1.mp4'> --><source src='https://cu.animeheaven.me/ep1.mp4'>`,
+        };
+      }
+      return { status: 404, url, body: "" };
+    });
+
+    const out = await animeheavenProvider.find(
+      { media: makeMedia({ title: "Jujutsu Kaisen", originalTitle: "Jujutsu Kaisen" }), episode: 1, audio: "sub" },
+      makeSettings(),
+      new AbortController().signal,
+    );
+    expect(gateCookie).toBe("key=k1");
+    expect(out).toHaveLength(1);
+    expect(out[0].kind).toBe("file");
+    expect(unwrapProxyUrl(out[0].url).url).toBe("https://cu.animeheaven.me/ep1.mp4");
+  });
+});
+
+describe("animeDirectProvider & kisskhProvider updates", () => {
+  it("allows anime movies and sends zokoanime.video Referer", async () => {
+    const payload = JSON.stringify({ src: "https://cdn.zoko.example/jjk0/master.m3u8", subtitles: [] });
+    const key = "otaku-embed-v1";
+    const xored = new Uint8Array(payload.length);
+    for (let i = 0; i < payload.length; i++) {
+      xored[i] = payload.charCodeAt(i) ^ key.charCodeAt(i % key.length);
+    }
+    const enc = bytesToB64(xored);
+
+    let streamPageRef = "";
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        data: { Page: { media: [{ idMal: 48561, format: "MOVIE", seasonYear: 2021 }] } },
+      }),
+    } as Response);
+    mockHttpFetch.mockImplementation(async (url: string, headers: Record<string, string> = {}) => {
+      if (url === "https://zokoanime.video/stream/mal/48561/1/sub") {
+        streamPageRef = headers.Referer ?? "";
+        return { status: 200, url, body: `<script>window.__P="${enc}";</script>` };
+      }
+      return { status: 404, url, body: "" };
+    });
+
+    try {
+      const out = await animeDirectProvider.find(
+        {
+          media: makeMedia({
+            key: "tmdb:movie:810693",
+            kind: "movie",
+            title: "Jujutsu Kaisen 0",
+            originalTitle: "Jujutsu Kaisen 0",
+            year: 2021,
+            anilistId: undefined,
+            malId: undefined,
+          }),
+          isAnimeMovie: true,
+          audio: "sub",
+        } as PlaybackRequest,
+        makeSettings(),
+        new AbortController().signal,
+      );
+      expect(streamPageRef).toBe("https://zokoanime.video/");
+      expect(out).toHaveLength(1);
+      expect(out[0].headers?.referer).toBe("https://zokoanime.video/");
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it("uses enc-kisskh direct video when available and falls back to sniff when unavailable", async () => {
+    mockHttpFetch.mockImplementation(async (url: string) => {
+      if (url.includes("/Search?q=Test%20Kisskh%20Direct")) {
+        return { status: 200, url, body: JSON.stringify([{ id: 8792, title: "Test Kisskh Direct", episodesCount: 16 }]) };
+      }
+      if (url.includes("/Drama/8792?")) {
+        return { status: 200, url, body: JSON.stringify({ id: 8792, title: "Test Kisskh Direct", episodes: [{ id: 154879, number: 1 }] }) };
+      }
+      if (url === "https://enc-dec.app/api/enc-kisskh?text=154879&type=vid") {
+        return { status: 200, url, body: JSON.stringify({ result: "vid-key" }) };
+      }
+      if (url === "https://enc-dec.app/api/enc-kisskh?text=154879&type=sub") {
+        return { status: 200, url, body: JSON.stringify({ result: "sub-key" }) };
+      }
+      if (url.startsWith("https://kisskh.co/api/DramaList/Episode/154879.png?") && url.includes("kkey=vid-key")) {
+        return { status: 200, url, body: JSON.stringify({ Video: "https://hls.kiss.example/ep1.m3u8" }) };
+      }
+      if (url.startsWith("https://kisskh.co/api/Sub/154879?kkey=sub-key")) {
+        return { status: 200, url, body: JSON.stringify([]) };
+      }
+      return { status: 404, url, body: "" };
+    });
+
+    const directOut = await kisskhProvider.find(
+      {
+        media: makeMedia({ key: "tmdb:tv:90001", kind: "tv", title: "Test Kisskh Direct", originalTitle: "Test Kisskh Direct", originalLanguage: "ko" }),
+        season: 1,
+        episode: 1,
+      },
+      makeSettings(),
+      new AbortController().signal,
+    );
+    expect(mockSniff).not.toHaveBeenCalled();
+    expect(directOut).toHaveLength(1);
+    expect(directOut[0].via).toBe("direct");
+    expect(unwrapProxyUrl(directOut[0].url).url).toBe("https://hls.kiss.example/ep1.m3u8");
+
+    // Fallback to sniff when enc-kisskh is unavailable
+    mockHttpFetch.mockImplementation(async (url: string) => {
+      if (url.includes("/Search?q=Test%20Kisskh%20Fallback")) {
+        return { status: 200, url, body: JSON.stringify([{ id: 8888, title: "Test Kisskh Fallback", episodesCount: 16 }]) };
+      }
+      if (url.includes("/Drama/8888?")) {
+        return { status: 200, url, body: JSON.stringify({ id: 8888, title: "Test Kisskh Fallback", episodes: [{ id: 160000, number: 1 }] }) };
+      }
+      return { status: 500, url, body: "" };
+    });
+    mockSniff.mockResolvedValue({
+      url: "https://sniffed.kiss.example/ep1.m3u8",
+      kind: "hls",
+      headers: {},
+      subtitles: [],
+      verified: true,
+      quality: 1080,
+    });
+    const fallbackOut = await kisskhProvider.find(
+      {
+        media: makeMedia({ key: "tmdb:tv:90002", kind: "tv", title: "Test Kisskh Fallback", originalTitle: "Test Kisskh Fallback", originalLanguage: "ko" }),
+        season: 1,
+        episode: 1,
+      },
+      makeSettings(),
+      new AbortController().signal,
+    );
+    expect(mockSniff).toHaveBeenCalledTimes(1);
+    expect(fallbackOut[0].via).toBe("sniffed");
+  });
+});
+
 describe("extractors barrel index", () => {
-  it("exports all 10 extractors with unique IDs and functional isEnabled hooks", () => {
-    expect(MOVIE_TV_EXTRACTORS).toHaveLength(6);
-    expect(ANIME_EXTRACTORS).toHaveLength(3);
+  it("exports all 15 extractors with unique IDs and functional isEnabled hooks", () => {
+    expect(MOVIE_TV_EXTRACTORS).toHaveLength(9);
+    expect(ANIME_EXTRACTORS).toHaveLength(5);
     expect(ASIAN_DRAMA_EXTRACTORS).toHaveLength(1);
-    expect(DIRECT_EXTRACTORS).toHaveLength(10);
+    expect(DIRECT_EXTRACTORS).toHaveLength(15);
 
     const ids = DIRECT_EXTRACTORS.map((p) => p.id);
-    expect(new Set(ids).size).toBe(10);
+    for (const id of ["castle", "animeheaven", "hexa-direct", "vidup", "cinejoy", "meowtv", "megaplay"]) {
+      expect(ids).toContain(id);
+    }
+    expect(new Set(ids).size).toBe(15);
 
     const settings = makeSettings();
     for (const p of DIRECT_EXTRACTORS) {
