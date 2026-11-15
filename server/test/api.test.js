@@ -246,3 +246,36 @@ test("settings sync drops malformed fields and keeps source toggles", async () =
   assert.ok(!("junk" in s));
   assert.notEqual(s.preferredQuality, "huge");
 });
+
+test("batched writes apply in order and answer each one", async () => {
+  const t = tokens.accessToken;
+  const media = { key: "anilist:5114", kind: "anime", title: "FMA", genres: [], overview: "" };
+  const now = Date.now();
+  let r = await call(
+    "POST",
+    "/sync/batch",
+    {
+      ops: [
+        { path: "/progress/anilist%3A5114", method: "PUT", body: { media, episode: 4, position: 30, duration: 1400, updatedAt: now - 2000 } },
+        { path: "/watchlist/anilist:5114", method: "PUT", body: { media } },
+        { path: "/settings", method: "PUT", body: { autoplayNext: false } },
+        { path: "/progress/anilist:5114", method: "PUT", body: { media, position: -1, duration: 1 } },
+        { path: "/nope", method: "PUT", body: {} },
+        { path: "/watchlist/anilist:5114", method: "DELETE" },
+      ],
+    },
+    t,
+  );
+  assert.equal(r.statusCode, 200);
+  assert.deepEqual(r.json().results.map((x) => x.status), [200, 200, 200, 400, 400, 200]);
+  r = await call("GET", "/sync", null, t);
+  const s = r.json();
+  assert.equal(s.progress.find((p) => p.media.key === "anilist:5114")?.episode, 4);
+  assert.equal(s.settings.autoplayNext, false);
+  assert.ok(!s.watchlist.some((w) => w.media.key === "anilist:5114"));
+  assert.ok(s.watchlistDeleted.some((w) => w.key === "anilist:5114"));
+  // Too many at once, or no list at all, is refused whole.
+  assert.equal((await call("POST", "/sync/batch", { ops: Array.from({ length: 51 }, () => ({ path: "/settings", method: "PUT", body: {} })) }, t)).statusCode, 400);
+  assert.equal((await call("POST", "/sync/batch", { ops: "x" }, t)).statusCode, 400);
+  assert.equal((await call("POST", "/sync/batch", { ops: [] })).statusCode, 401);
+});

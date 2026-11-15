@@ -2,11 +2,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetWebgl2Probe, startEnhancer } from "./enhance";
 
 const createdPipeOutputs: { destroy: ReturnType<typeof vi.fn> }[] = [];
+/** Textures a pass creates for itself and keeps only internally (like ClampHighlights' stats maps). */
+const hiddenPassTextures: { destroy?: ReturnType<typeof vi.fn> }[] = [];
 
 vi.mock("anime4k-webgpu", () => {
   class FakePipe {
     out: { width: number; height: number; createView: ReturnType<typeof vi.fn>; destroy: ReturnType<typeof vi.fn> };
-    constructor() {
+    constructor(opts?: { device?: { createTexture?: (d: unknown) => unknown } }) {
+      const hidden = opts?.device?.createTexture?.({ size: [1, 1, 1] }) as { destroy?: ReturnType<typeof vi.fn> } | undefined;
+      if (hidden) hiddenPassTextures.push(hidden);
       this.out = {
         width: 1280,
         height: 720,
@@ -395,6 +399,8 @@ describe("video upscaler lifecycle & hardware fallback", () => {
     // old input texture and pipeline output textures must be retired and destroyed only after in-flight work finishes.
     const firstInputTex = createdTextures[0];
     const firstPipeOut = createdPipeOutputs[0];
+    const firstChainHidden = hiddenPassTextures.filter((t) => typeof t.destroy === "function");
+    expect(firstChainHidden.length).toBeGreaterThan(0);
     Object.assign(video, { videoWidth: 1920, videoHeight: 1080 });
     video.dispatchEvent({ type: "resize" });
     expect(firstInputTex.destroy).not.toHaveBeenCalled();
@@ -407,6 +413,8 @@ describe("video upscaler lifecycle & hardware fallback", () => {
     expect(rbuf.mapAsync).toHaveBeenCalledTimes(1);
     expect(firstInputTex.destroy).toHaveBeenCalled();
     expect(firstPipeOut.destroy).toHaveBeenCalled();
+    // Textures the passes made for themselves are freed with the chain, not left for GC.
+    for (const t of firstChainHidden) expect(t.destroy).toHaveBeenCalled();
 
     enh.stop();
     expect(qset.destroy).toHaveBeenCalled();

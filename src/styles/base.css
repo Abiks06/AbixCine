@@ -377,3 +377,7 @@ button.chip:hover:not(.on):not(:disabled) { color: var(--fg); background: rgb(25
   .dock, .menu, .toast, .palette, .psheet { backdrop-filter: none; background: #0d0d13f2; }
   .ptop-actions, .pbot, .cc-btn, .smart, .race-grid-wrap, .auth-card { backdrop-filter: none !important; }
 }
+
+/* Controller in use: a focus ring you can see from the couch. */
+:root.gamepad-active :focus-visible { outline: none !important; box-shadow: 0 0 0 3px var(--bg), 0 0 0 6px var(--tone-ink), 0 0 30px -4px var(--glow) !important; border-radius: var(--r-sm); }
+:root.gamepad-active .card:focus-visible, :root.gamepad-active a:focus-visible .art { transform: scale(1.04); }

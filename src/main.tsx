@@ -11,8 +11,13 @@ import "./styles/browse.css";
 import "./styles/player.css";
 import "./styles/frost.css";
 import { installPointerLight } from "./lib/pointerLight";
+import { installGamepad } from "./lib/gamepad";
+import { kick as retryScrobbles } from "./lib/scrobble";
 
 installPointerLight();
+installGamepad();
+// Finishes that couldn't reach a tracker last time (offline) go up now.
+setTimeout(retryScrobbles, 8000);
 
 // Dev-only hooks for the native test harness (src-tauri/src/lib.rs, ABX_JS_TEST).
 if (import.meta.env.DEV) {

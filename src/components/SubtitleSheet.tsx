@@ -11,7 +11,7 @@ import type { OnlineSubtitleResult } from "../lib/subtitleProviders";
 import type { SubtitleFormat, SubtitleSource } from "../sources/types";
 import { Icon } from "./Icon";
 
-export type SubTrackOrigin = SubtitleSource | "hls" | "native";
+export type SubTrackOrigin = SubtitleSource | "hls" | "native" | "dash";
 
 export interface UnifiedSubTrack {
   id: string;
@@ -26,6 +26,8 @@ export interface UnifiedSubTrack {
   raw?: string;
   streamIndex?: number;
   hlsIndex?: number;
+  /** Shaka text track id (DASH streams). */
+  dashTrackId?: number;
   nativeTrack?: TextTrack;
   provider?: "wyzie" | "opensubtitles" | "subdl";
   release?: string;
@@ -42,9 +44,13 @@ export interface SubtitleSheetProps {
   onSelectPrimary: (id: string | null) => void;
   onSelectSecondary: (id: string | null) => void;
   offset: number;
+  /** Timing of the second (dual) subtitle; adjusted separately when one is on. */
+  secondaryOffset?: number;
   timingUnsupported?: boolean;
   onNudge: (delta: number) => void;
   onResetOffset: () => void;
+  onNudgeSecondary?: (delta: number) => void;
+  onResetSecondaryOffset?: () => void;
   onUploadFiles: (files: FileList | File[]) => void;
   subPref: SubPref;
   onPatchPref: (patch: Partial<SubPref>) => void;
@@ -78,6 +84,7 @@ const ORIGIN_LABELS: Record<SubTrackOrigin, string> = {
   sidecar: "Sidecar",
   stream: "Stream",
   hls: "HLS",
+  dash: "DASH",
   native: "Media",
   online: "Online",
   user: "File",
@@ -97,9 +104,12 @@ export const SubtitleSheet = memo(function SubtitleSheet({
   onSelectPrimary,
   onSelectSecondary,
   offset,
+  secondaryOffset = 0,
   timingUnsupported = false,
   onNudge,
   onResetOffset,
+  onNudgeSecondary,
+  onResetSecondaryOffset,
   onUploadFiles,
   subPref,
   onPatchPref,
@@ -147,6 +157,14 @@ export const SubtitleSheet = memo(function SubtitleSheet({
       : null;
 
   const secondaryTrack = tracks.find((t) => t.id === secondaryId) ?? null;
+  const [timingTargetRaw, setTimingTarget] = useState<"primary" | "secondary">("primary");
+  const canTimeSecondary = Boolean(selectedId && secondaryId && onNudgeSecondary);
+  // Only with two subtitles on is there a choice; with one, the buttons adjust that one.
+  const timingTarget: "primary" | "secondary" = canTimeSecondary ? timingTargetRaw : secondaryId && !selectedId ? "secondary" : "primary";
+  const shownOffset = timingTarget === "secondary" ? secondaryOffset : offset;
+  const timingLocked = timingTarget === "primary" && timingUnsupported;
+  const nudgeTarget = (d: number) => (timingTarget === "secondary" && onNudgeSecondary ? onNudgeSecondary(d) : onNudge(d));
+  const resetTarget = () => (timingTarget === "secondary" && onResetSecondaryOffset ? onResetSecondaryOffset() : onResetOffset());
   const fallbackDualCandidate =
     tracks.find(
       (t) =>
@@ -261,7 +279,7 @@ export const SubtitleSheet = memo(function SubtitleSheet({
         </div>
       </div>
 
-      {/* Timing Offset — works for ALL tracks */}
+      {/* Timing Offset — works for ALL tracks; the dual subtitle has its own. */}
       {(selectedId || secondaryId) && (
         <div className="ps-block">
           <div className="sub-sheet-head-row">
@@ -269,19 +287,45 @@ export const SubtitleSheet = memo(function SubtitleSheet({
               <Icon name="clock" size={12} /> Timing <kbd>[</kbd><kbd>]</kbd>
             </div>
             <span className="ps-sub">
-              {timingUnsupported ? "Active cues only" : offset === 0 ? "In sync" : `${offset > 0 ? "+" : ""}${offset.toFixed(1)}s`}
+              {timingLocked
+                ? "Active cues only"
+                : shownOffset === 0
+                  ? "In sync"
+                  : `${shownOffset > 0 ? "+" : ""}${shownOffset.toFixed(1)}s`}
             </span>
           </div>
+          {canTimeSecondary && (
+            <div className="sub-timing-target" role="radiogroup" aria-label="Which subtitle to adjust">
+              <button
+                type="button"
+                role="radio"
+                aria-checked={timingTarget === "primary"}
+                className={`chip ${timingTarget === "primary" ? "on" : ""}`}
+                onClick={() => setTimingTarget("primary")}
+              >
+                Main{offset !== 0 ? ` ${offset > 0 ? "+" : ""}${offset.toFixed(1)}s` : ""}
+              </button>
+              <button
+                type="button"
+                role="radio"
+                aria-checked={timingTarget === "secondary"}
+                className={`chip ${timingTarget === "secondary" ? "on" : ""}`}
+                onClick={() => setTimingTarget("secondary")}
+              >
+                Second{secondaryOffset !== 0 ? ` ${secondaryOffset > 0 ? "+" : ""}${secondaryOffset.toFixed(1)}s` : ""}
+              </button>
+            </div>
+          )}
           <div className="sub-timing-grid">
-            <button type="button" disabled={timingUnsupported} onClick={() => onNudge(-1)}>−1s</button>
-            <button type="button" disabled={timingUnsupported} onClick={() => onNudge(-0.5)}>−0.5</button>
-            <button type="button" disabled={timingUnsupported} onClick={() => onNudge(-0.1)}>−0.1</button>
-            <button type="button" disabled={timingUnsupported} className={offset === 0 ? "on" : ""} onClick={onResetOffset}>
+            <button type="button" disabled={timingLocked} onClick={() => nudgeTarget(-1)}>−1s</button>
+            <button type="button" disabled={timingLocked} onClick={() => nudgeTarget(-0.5)}>−0.5</button>
+            <button type="button" disabled={timingLocked} onClick={() => nudgeTarget(-0.1)}>−0.1</button>
+            <button type="button" disabled={timingLocked} className={shownOffset === 0 ? "on" : ""} onClick={resetTarget}>
               Reset
             </button>
-            <button type="button" disabled={timingUnsupported} onClick={() => onNudge(0.1)}>+0.1</button>
-            <button type="button" disabled={timingUnsupported} onClick={() => onNudge(0.5)}>+0.5</button>
-            <button type="button" disabled={timingUnsupported} onClick={() => onNudge(1)}>+1s</button>
+            <button type="button" disabled={timingLocked} onClick={() => nudgeTarget(0.1)}>+0.1</button>
+            <button type="button" disabled={timingLocked} onClick={() => nudgeTarget(0.5)}>+0.5</button>
+            <button type="button" disabled={timingLocked} onClick={() => nudgeTarget(1)}>+1s</button>
           </div>
           {timingUnsupported && (
             <p className="ps-note">Timing offset isn't supported for this track because the player only exposes live active cues.</p>

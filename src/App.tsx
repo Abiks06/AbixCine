@@ -9,6 +9,7 @@ import { Toasts } from "./components/Toasts";
 import { UpdateToast } from "./components/UpdateToast";
 import { bootAccount, useAuth } from "./lib/account";
 import { getSettings, useSettings } from "./lib/settings";
+import { installTvMode, setTvMode } from "./lib/tvMode";
 import { Auth } from "./pages/Auth";
 import { Home } from "./pages/Home";
 
@@ -101,6 +102,12 @@ function Shell() {
   useEffect(() => {
     document.documentElement.classList.toggle("reduce-motion", s.reduceMotion);
   }, [s.reduceMotion]);
+
+  // TV mode (lib/tvMode): larger everything, on its own or while a controller is connected.
+  useEffect(() => {
+    installTvMode();
+    setTvMode(s.tvMode ?? "off");
+  }, [s.tvMode]);
 
   useEffect(() => {
     if (inApp) preloadPages();

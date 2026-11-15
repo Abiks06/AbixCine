@@ -17,7 +17,8 @@ import {
   resolvePlaybackRequest,
 } from "../lib/catalog";
 import type { MediaDetail } from "../lib/types";
-import { getEntry, getProgress, saveProgress } from "../lib/progress";
+import { getEntry, getProgress, isDone, saveProgress } from "../lib/progress";
+import { scrobble, watchedFrom } from "../lib/scrobble";
 import { useWatchlist } from "../lib/watchlist";
 import { audioFor, setAudioFor, useSettings, type Audio } from "../lib/settings";
 import { animeEpisodes } from "../lib/anilist";
@@ -182,14 +183,22 @@ export function Watch() {
     nav(href(season, episode, a), { replace: true, state: forwardState({ quick: true }) });
   };
 
+  // Trackers (lib/scrobble) hear about each film or episode once, when it is watched to the end.
+  const scrobbled = useRef("");
   const onProgress = useCallback(
-    (position: number, duration: number) =>
-      d &&
+    (position: number, duration: number) => {
+      if (!d) return;
       saveProgress(
         { media: { ...d, key: canonicalKey, canonicalKey }, season, episode, audio, position, duration },
         next && { season: next.s, episode: next.e },
-      ),
-    [d, canonicalKey, season, episode, audio, next],
+      );
+      const id = `${key}|${season ?? ""}|${episode ?? ""}`;
+      if (scrobbled.current !== id && isDone(position, duration)) {
+        scrobbled.current = id;
+        scrobble(watchedFrom(d, key, season, episode));
+      }
+    },
+    [d, key, canonicalKey, season, episode, audio, next],
   );
 
   // Back returns to wherever Play was pressed. Opened from outside the app (or a reload), go to the

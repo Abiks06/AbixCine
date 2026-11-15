@@ -95,3 +95,47 @@ export async function idbSet(key: string, value: unknown): Promise<boolean> {
 export function idbDelete(key: string): Promise<unknown> {
   return run("readwrite", (s) => s.delete(key));
 }
+
+/** Every entry whose key starts with `prefix`, as [key, value] pairs (empty without IndexedDB). */
+export async function idbScan<T>(prefix: string): Promise<[string, T][]> {
+  const db = await open();
+  if (!db) return [];
+  return new Promise((resolve) => {
+    try {
+      const out: [string, T][] = [];
+      const tx = db.transaction(STORE, "readonly");
+      const req = tx.objectStore(STORE).openCursor(IDBKeyRange.bound(prefix, prefix + "￿"));
+      req.onsuccess = () => {
+        const c = req.result;
+        if (!c) return;
+        out.push([String(c.key), c.value as T]);
+        c.continue();
+      };
+      tx.oncomplete = () => resolve(out);
+      tx.onerror = () => resolve(out);
+      tx.onabort = () => resolve(out);
+    } catch {
+      resolve([]);
+    }
+  });
+}
+
+/** Many puts and deletes in one transaction: one commit instead of one per key. */
+export async function idbWriteMany(puts: [string, unknown][], deletes: string[] = []): Promise<boolean> {
+  if (!puts.length && !deletes.length) return true;
+  const db = await open();
+  if (!db) return false;
+  return new Promise<boolean>((resolve) => {
+    try {
+      const tx = db.transaction(STORE, "readwrite");
+      const s = tx.objectStore(STORE);
+      for (const k of deletes) s.delete(k);
+      for (const [k, v] of puts) s.put(v, k);
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => resolve(false);
+      tx.onabort = () => resolve(false);
+    } catch {
+      resolve(false);
+    }
+  });
+}

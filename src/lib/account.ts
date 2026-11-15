@@ -404,49 +404,104 @@ function clearOutbox() {
 }
 const retryable = (e: unknown) => e instanceof ApiError && (e.status === 0 || e.status >= 500);
 
-/** Write to the server; if it can't be reached, keep the latest write per path and retry later. */
+/** Each queued write gets a strictly increasing stamp, so a newer write to a path is never mistaken for an older one. */
+let lastStamp = 0;
+let kickQueued = false;
+/** Writes are waiting that no send has picked up yet. */
+let dirty = false;
+
+/**
+ * Write to the server; if it can't be reached, keep the latest write per path and retry later.
+ * Writes made in the same tick (a list import, every title's position when the app closes) go up
+ * together in one request; a lone write is sent as before.
+ */
 export function push(path: string, method: "PUT" | "DELETE", body?: unknown) {
   if (!state.user) return;
-  const at = Date.now();
-  writeOutbox({ ...readOutbox(), [path]: { method, body, at } });
-  const settle = () => {
-    const o = readOutbox();
-    if (o[path]?.at === at) {
-      delete o[path];
-      writeOutbox(o);
-    }
-  };
-  const send = () =>
-    api(path, { method, body: body ? JSON.stringify(body) : undefined }).then(settle, (e) => {
-      if (!retryable(e)) settle();
-    });
-  // A replay in progress goes first: otherwise an older queued write could land after this one.
-  if (flushing) {
-    void flushing.then(() => {
-      if (readOutbox()[path]?.at === at) void send();
-    });
+  lastStamp = Math.max(Date.now(), lastStamp + 1);
+  writeOutbox({ ...readOutbox(), [path]: { method, body, at: lastStamp } });
+  dirty = true;
+  if (kickQueued) return;
+  kickQueued = true;
+  queueMicrotask(() => {
+    kickQueued = false;
+    void flushOutbox();
+  });
+}
+
+const BATCH_MAX = 25;
+/** An older server without /sync/batch: send one by one for the rest of the session. */
+let batchUnsupported = false;
+
+function settle(path: string, at: number) {
+  const o = readOutbox();
+  if (o[path]?.at === at) {
+    delete o[path];
+    writeOutbox(o);
   }
-  else void send();
+}
+
+/** Send one write. False when the server couldn't be reached (the write stays queued). */
+async function sendOne(path: string, p: Pending): Promise<boolean> {
+  try {
+    await api(path, { method: p.method, body: p.body ? JSON.stringify(p.body) : undefined });
+  } catch (e) {
+    if (retryable(e)) return false;
+    // Refused for good (bad data, list full): retrying would never succeed.
+  }
+  settle(path, p.at);
+  return true;
+}
+
+/** Send queued writes oldest first. True when sending stalled (offline): the rest stay queued, in order. */
+async function sendQueued(entries: [string, Pending][]): Promise<boolean> {
+  if (entries.length === 1 || batchUnsupported) {
+    for (const [path, p] of entries) if (!(await sendOne(path, p))) return true;
+    return false;
+  }
+  for (let i = 0; i < entries.length; i += BATCH_MAX) {
+    const chunk = entries.slice(i, i + BATCH_MAX);
+    let res: { results?: { status?: number }[] } | undefined;
+    try {
+      res = await api("/sync/batch", {
+        method: "POST",
+        body: JSON.stringify({ ops: chunk.map(([path, p]) => ({ path, method: p.method, body: p.body })) }),
+      });
+    } catch (e) {
+      if (retryable(e)) return true;
+      if (e instanceof ApiError && (e.status === 404 || e.status === 405)) batchUnsupported = true;
+      // Not understood as a whole: fall back to one by one for what is left.
+      for (const [path, p] of entries.slice(i)) if (!(await sendOne(path, p))) return true;
+      return false;
+    }
+    const results = Array.isArray(res?.results) ? res.results : [];
+    for (let j = 0; j < chunk.length; j++) {
+      const st = results[j]?.status;
+      // The server stopped here (its own error): keep this write and everything after it.
+      if (typeof st !== "number" || st >= 500) return true;
+      settle(chunk[j][0], chunk[j][1].at);
+    }
+  }
+  return false;
 }
 
 let flushing: Promise<void> | null = null;
-export function flushOutbox() {
+let stalled = false;
+export function flushOutbox(): Promise<void> {
   if (!state.user) return Promise.resolve();
+  dirty = true;
   flushing ??= (async () => {
-    const entries = Object.entries(readOutbox()).sort((a, b) => a[1].at - b[1].at);
-    for (const [path, p] of entries) {
-      try {
-        await api(path, { method: p.method, body: p.body ? JSON.stringify(p.body) : undefined });
-      } catch (e) {
-        if (retryable(e)) break; // still offline: keep the rest
-      }
-      const o = readOutbox();
-      if (o[path]?.at === p.at) {
-        delete o[path];
-        writeOutbox(o);
-      }
+    stalled = false;
+    while (dirty && !stalled) {
+      dirty = false;
+      const entries = Object.entries(readOutbox()).sort((a, b) => a[1].at - b[1].at);
+      if (!entries.length) break;
+      stalled = await sendQueued(entries);
     }
-  })().finally(() => (flushing = null));
+  })().finally(() => {
+    flushing = null;
+    // A write queued just as the last send finished: pick it up now rather than at the next resync.
+    if (dirty && !stalled) void flushOutbox();
+  });
   return flushing;
 }
 
@@ -458,8 +513,10 @@ async function resync() {
 }
 
 export async function bootAccount() {
-  const up = await checkServer();
-  if (up) await resync();
+  if (await checkServer()) return resync();
+  // A sleeping free-tier server takes up to a minute to boot: keep knocking in the background and
+  // sync once it answers, instead of skipping this session's sync after one 10 s timeout.
+  if (state.user && (await wakeServer(undefined, 120_000))) await resync();
 }
 
 // Coming back online: replay queued writes, then catch up with other devices.

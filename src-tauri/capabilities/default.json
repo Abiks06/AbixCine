@@ -15,6 +15,7 @@
     "core:window:allow-set-fullscreen",
     "updater:default",
     "process:allow-restart",
-    "core:app:allow-version"
+    "core:app:allow-version",
+    "core:webview:allow-set-webview-zoom"
   ]
 }

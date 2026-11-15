@@ -6,9 +6,16 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExterna
 import { fmtTime } from "../lib/format";
 import { ENHANCE_MODES, startEnhancer, upscalerAvailable, type EnhanceMode, type Enhancer, type EnhancerStats } from "../lib/enhance";
 import { fetchSkipSegments, mergeSkipRanges, type SkipSegments } from "../lib/skipSegments";
+import { createHlsSideLoader } from "../lib/hlsSideSubs";
+import { TrickplayEngine } from "../lib/trickplay";
+import { TranscriptSheet } from "./TranscriptSheet";
+import { hasAudioFx, loadAudioFx, releaseAudioFx, resumeAudioFx, saveAudioFx, setAudioFx, type AudioFx } from "../lib/audioFx";
+import { createPlayhead, Scrubber, TimeReadout, usePlayhead } from "./Playhead";
+import { DashCueCollector } from "../lib/dashCues";
 import {
   SUB_PREF_EVENT,
   activeCuesAt,
+  langLabel,
   nextCueBoundaryAfter,
   cuesToVtt,
   decodeSubtitle,
@@ -110,9 +117,10 @@ interface TrackCueCache {
   error?: string;
 }
 
-type Sheet = "servers" | "episodes" | "subtitles" | "audio" | "picture";
+type Sheet = "servers" | "episodes" | "subtitles" | "transcript" | "audio" | "picture";
 
 const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2];
+const MAX_VOL = 2; // Up to 200% pre-amp boost via Web Audio + brickwall safety limiter
 const UP_NEXT_AT = 25; // seconds before the end
 const TIME_LEFT_KEY = "abx.timeLeft";
 const SHORTCUTS: [string, string][] = [
@@ -257,6 +265,19 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
   const video = useRef<HTMLVideoElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
   const hlsRef = useRef<Hls | null>(null);
+  /** The HLS stream's first presentation timestamp (s), for aligning side-loaded subtitle segments. */
+  const initPtsRef = useRef<number | null>(null);
+  /** Night mode / dialogue boost (lib/audioFx), remembered across sessions. */
+  const [audioFx, setAudioFxState] = useState<AudioFx>(() => loadAudioFx());
+  /**
+   * Local files with several audio tracks: WebView2 can't switch them (no audioTracks API), so the
+   * chosen track is prepared as its own file. `localAudioMode` marks that the list is ours.
+   */
+  const localAudioRef = useRef<number | null>(null);
+  const localAudioModeRef = useRef(false);
+  /** DASH: Shaka's cues for the selected text track are collected here and shown by our renderer. */
+  const dashCollectorRef = useRef<DashCueCollector | null>(null);
+  const dashSubIdRef = useRef<string | null>(null);
   const shakaRef = useRef<shaka.Player | null>(null);
   const dashHeightsRef = useRef<number[]>([]);
   const resumeAt = useRef(startAt ?? 0);
@@ -272,11 +293,13 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
   const [playing, setPlaying] = useState(false);
   const [hasStarted, setHasStarted] = useState(false);
   const [liveStreamId, setLiveStreamId] = useState<string | null>(null);
-  const [time, setTime] = useState(0);
+  // The playhead is a store, not state: see components/Playhead.tsx.
+  const playhead = useMemo(() => createPlayhead(), []);
+  const setTime = playhead.set;
   const [dur, setDur] = useState(0);
-  const [buffered, setBuffered] = useState(0);
-  // Never start silent: a saved volume of zero (or an unreadable one) comes back as full. A quiet
-  // one is kept as it was: turning a deliberate 4% into 100% on the next launch is a jump scare.
+  const setBuffered = playhead.setBuffered;
+  // Never start nearly silent: a saved volume under 15% (or an unreadable one) resets to 100%,
+  // preventing accidental trackpad wheel drains from keeping every future launch quiet.
   const [vol, setVol] = useState(() => {
     let v = NaN;
     try {
@@ -284,9 +307,13 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     } catch {
       /* storage blocked */
     }
-    return Number.isFinite(v) && v > 0 ? Math.min(1, v) : 1;
+    return Number.isFinite(v) && v >= 0.15 ? Math.min(MAX_VOL, v) : 1;
   });
   const [muted, setMuted] = useState(false);
+  const volRef = useRef(vol);
+  volRef.current = vol;
+  const wheelAccumRef = useRef(0);
+  const wheelStampRef = useRef(0);
   const [speed, setSpeed] = useState(1);
   const [waiting, setWaiting] = useState(true);
   const [preparingLocal, setPreparingLocal] = useState(false);
@@ -309,6 +336,10 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
   const [activeLevel, setActiveLevel] = useState(-1);
   const [videoHeight, setVideoHeight] = useState<number | undefined>(undefined);
   const [hover, setHover] = useState<{ x: number; t: number; w: number } | null>(null);
+  // Scrub previews (lib/trickplay): the engine opens on the first hover of a stream.
+  const trickRef = useRef<TrickplayEngine | null>(null);
+  const [thumb, setThumb] = useState<string | null>(null);
+  const hoverBucket = hover ? Math.floor(hover.t / 5) : -1;
   /** The ±seconds badge that appears on the side you skipped towards; repeated presses add up. */
   const [bump, setBump] = useState<{ total: number; n: number } | null>(null);
   const bumpTimer = useRef<number>();
@@ -501,6 +532,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     selectedLabel?: string;
     secondaryLang?: string;
     offsetSec?: number;
+    secondaryOffsetSec?: number;
     enabled?: boolean;
   }) => {
     const key = subMemoryKeyRef.current;
@@ -637,6 +669,10 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
   const [offset, setOffset] = useState(() => (subMemoryKey ? loadSubTrackMemory(subMemoryKey)?.offsetSec ?? 0 : 0));
   const offsetRef = useRef(offset);
   offsetRef.current = offset;
+  // The second (dual) subtitle often comes from another release with its own timing.
+  const [secOffset, setSecOffset] = useState(() => (subMemoryKey ? loadSubTrackMemory(subMemoryKey)?.secondaryOffsetSec ?? 0 : 0));
+  const secOffsetRef = useRef(secOffset);
+  secOffsetRef.current = secOffset;
   const [timingShiftUnsupported, setTimingShiftUnsupported] = useState(false);
   const timingShiftUnsupportedRef = useRef(false);
 
@@ -741,6 +777,16 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
             ? sec.hlsIndex
             : -1;
       hls.subtitleTrack = activeHlsIdx;
+    }
+    const shk = shakaRef.current;
+    if (shk) {
+      // Shaka streams one text track at a time: the main subtitle's, else the second's.
+      const dashSel = prim?.origin === "dash" ? prim : sec?.origin === "dash" ? sec : undefined;
+      if (dashSubIdRef.current !== (dashSel?.id ?? null)) dashCollectorRef.current?.reset();
+      dashSubIdRef.current = dashSel?.id ?? null;
+      const tt = dashSel?.dashTrackId != null ? shk.getTextTracks().find((t) => t.id === dashSel.dashTrackId) : undefined;
+      // Shaka 5: selecting a track turns text on; null turns it off (no more visibility toggle).
+      shk.selectTextTrack(tt ?? null);
     }
 
     if (v) {
@@ -854,9 +900,13 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     setActiveSecondaryCues([]);
     timingShiftUnsupportedRef.current = false;
     setTimingShiftUnsupported(false);
-    const restoredOffset = subMemoryKeyRef.current ? (loadSubTrackMemory(subMemoryKeyRef.current)?.offsetSec ?? 0) : 0;
+    const restoredMemory = subMemoryKeyRef.current ? loadSubTrackMemory(subMemoryKeyRef.current) : null;
+    const restoredOffset = restoredMemory?.offsetSec ?? 0;
     offsetRef.current = restoredOffset;
     setOffset(restoredOffset);
+    const restoredSecOffset = restoredMemory?.secondaryOffsetSec ?? 0;
+    secOffsetRef.current = restoredSecOffset;
+    setSecOffset(restoredSecOffset);
   }, [activeCurUrl]);
 
   // Apply pending user-loaded tracks or auto-pick best primary + optional dual track when available tracks change.
@@ -1019,6 +1069,21 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     setOffset(0);
     persistTrackMemory({ offsetSec: 0 });
     flash("Subtitle timing reset (0.0s)");
+  }, [persistTrackMemory]);
+
+  const nudgeSecondary = useCallback((delta: number) => {
+    const n = Math.round((secOffsetRef.current + delta) * 10) / 10;
+    secOffsetRef.current = n;
+    setSecOffset(n);
+    persistTrackMemory({ secondaryOffsetSec: n });
+    flash(`Second subtitle timing ${n > 0 ? "+" : ""}${n.toFixed(1)}s`);
+  }, [persistTrackMemory]);
+
+  const resetSecondaryOffset = useCallback(() => {
+    secOffsetRef.current = 0;
+    setSecOffset(0);
+    persistTrackMemory({ secondaryOffsetSec: 0 });
+    flash("Second subtitle timing reset (0.0s)");
   }, [persistTrackMemory]);
 
   const readOptionalSubdlApiKey = useCallback((): string | undefined => {
@@ -1307,10 +1372,9 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     const primTrack = selectedSubRef.current ? list.find((t) => t.id === selectedSubRef.current) : undefined;
     const secTrack = secondarySubRef.current ? list.find((t) => t.id === secondarySubRef.current) : undefined;
     const tSec = v.currentTime || 0;
-    const offSec = offsetRef.current;
     const hls = hlsRef.current;
 
-    const resolve = (track: UnifiedSubTrack | undefined): { cues: SubtitleCue[]; activeFallback: boolean } => {
+    const resolve = (track: UnifiedSubTrack | undefined, offSec: number): { cues: SubtitleCue[]; activeFallback: boolean } => {
       if (!track) return { cues: [], activeFallback: false };
       const cached = trackDataRef.current[track.id]?.cues ?? track.cues;
       if (cached) return { cues: activeCuesAt(cached, tSec, offSec), activeFallback: false };
@@ -1330,8 +1394,8 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
       return { cues: [], activeFallback: false };
     };
 
-    const primRes = resolve(primTrack);
-    const secRes = resolve(secTrack);
+    const primRes = resolve(primTrack, offsetRef.current);
+    const secRes = resolve(secTrack, secOffsetRef.current);
     const nextPrim = primRes.cues;
     const nextSec = secRes.cues;
     const nextUnsupported = primTrack ? primRes.activeFallback : secTrack ? secRes.activeFallback : false;
@@ -1438,7 +1502,8 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
         const track = list.find((x) => x.id === id);
         const cues = track ? trackDataRef.current[track.id]?.cues ?? track.cues : undefined;
         if (!cues) return 60; // live text track: keep polling
-        boundary = Math.min(boundary, nextCueBoundaryAfter(cues, t, offsetRef.current));
+        const off = id === selectedSubRef.current ? offsetRef.current : secOffsetRef.current;
+        boundary = Math.min(boundary, nextCueBoundaryAfter(cues, t, off));
       }
       if (!Number.isFinite(boundary)) return 250;
       const ms = ((boundary - t) * 1000) / (v.playbackRate || 1);
@@ -1462,12 +1527,97 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
       v.removeEventListener("seeked", resync);
       v.removeEventListener("ratechange", resync);
     };
-  }, [isEmbed, playing, selectedSub, secondarySub, offset, trackData]);
+  }, [isEmbed, playing, selectedSub, secondarySub, offset, secOffset, trackData]);
+
+  // Scrub previews: one engine per stream, opened lazily on hover.
+  useEffect(() => {
+    setThumb(null);
+    return () => {
+      trickRef.current?.dispose();
+      trickRef.current = null;
+    };
+  }, [cur?.url, retrySeq]);
+  useEffect(() => {
+    if (hoverBucket < 0) return;
+    const c = curRef.current;
+    const v = video.current;
+    if (!c || !v || isEmbed || /^magnet:/i.test(c.url)) return;
+    const kind = c.kind === "hls" ? "hls" : c.kind === "file" ? "file" : null;
+    if (!kind) return;
+    // Files play from what the player actually loaded (a converted copy, a torrent's local URL).
+    const src = kind === "file" ? v.currentSrc || c.url : c.url;
+    if (!src) return;
+    let live = true;
+    const t = window.setTimeout(() => {
+      trickRef.current ??= new TrickplayEngine(kind, src);
+      void trickRef.current.frameAt(hoverBucket * 5 + 2.5).then((url) => {
+        if (live && url) setThumb(url);
+      });
+    }, 90);
+    return () => {
+      live = false;
+      window.clearTimeout(t);
+    };
+  }, [hoverBucket, isEmbed]);
+
+  // Sound effects and >100% pre-amp boost follow the <video> element, which is replaced per
+  // stream: apply them to each new one when needed, and release the old one's nodes when it goes.
+  useEffect(() => {
+    const v = video.current;
+    if (!v || isEmbed) return;
+    const boost = muted ? 1 : Math.max(1, vol);
+    if (audioFx.night || audioFx.dialogue || boost > 1.001 || hasAudioFx(v)) {
+      setAudioFx(v, { ...audioFx, boost });
+    }
+  }, [audioFx, muted, vol, isEmbed, cur?.url, retrySeq]);
+  useEffect(() => {
+    const v = video.current;
+    return () => {
+      if (v) releaseAudioFx(v);
+    };
+  }, [cur?.url, retrySeq]);
+
+  // Dual subtitles from two HLS tracks: hls.js loads only one subtitle track, so the other is
+  // fetched beside it (lib/hlsSideSubs) and handed to the cue engine as parsed cues.
+  const sideHlsTrack = useMemo(() => {
+    const prim = selectedSub ? hlsSubs.find((t) => t.id === selectedSub) : undefined;
+    const sec = secondarySub ? hlsSubs.find((t) => t.id === secondarySub) : undefined;
+    // hls.js serves the primary's HLS track when it has one (see applySubPair); the other is ours.
+    if (prim?.hlsIndex != null && sec?.hlsIndex != null && prim.hlsIndex !== sec.hlsIndex) return sec;
+    return undefined;
+  }, [selectedSub, secondarySub, hlsSubs]);
+  useEffect(() => {
+    const v = video.current;
+    const hls = hlsRef.current;
+    const track = sideHlsTrack;
+    if (!v || !hls || !track || track.hlsIndex == null) return;
+    const playlistUrl = hls.subtitleTracks[track.hlsIndex]?.url;
+    if (!playlistUrl) return;
+    const activeUrl = activeCurUrlRef.current;
+    patchTrackData(activeUrl, track.id, { loading: true });
+    const loader = createHlsSideLoader({
+      playlistUrl,
+      getInitPtsSec: () => initPtsRef.current,
+      onCues: (cues) => {
+        if (activeCurUrlRef.current !== activeUrl) return;
+        patchTrackData(activeUrl, track.id, { cues, format: "vtt", loading: false });
+      },
+    });
+    const onTime = () => loader.ensure(v.currentTime);
+    onTime();
+    v.addEventListener("timeupdate", onTime);
+    v.addEventListener("seeked", onTime);
+    return () => {
+      loader.dispose();
+      v.removeEventListener("timeupdate", onTime);
+      v.removeEventListener("seeked", onTime);
+    };
+  }, [sideHlsTrack, activeCurUrl, patchTrackData]);
 
   // Re-evaluate immediately when offset, selection, or cached parsed cues change (even while paused).
   useEffect(() => {
     evaluateCues();
-  }, [selectedSub, secondarySub, offset, trackData, evaluateCues]);
+  }, [selectedSub, secondarySub, offset, secOffset, trackData, evaluateCues]);
 
   // Cleanup any in-flight subtitle requests on unmount.
   useEffect(() => () => {
@@ -1532,6 +1682,19 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
   const chooseAudioTrack = (id: number) => {
     const hls = hlsRef.current;
     const sp = shakaRef.current;
+    if (localAudioModeRef.current && curRef.current?.localPath) {
+      if (id === selectedAudioTrack) return;
+      // Prepare (or reuse) the copy with this track, and pick up where the viewer was.
+      const v = video.current;
+      manualAudio.current = true;
+      localAudioRef.current = id;
+      if (v && v.currentTime > 1) resumeAt.current = v.currentTime;
+      keepPausedRef.current = Boolean(v?.paused && v.currentTime > 1);
+      setSelectedAudioTrack(id);
+      flash(`Audio: ${audioTracks.find((t) => t.id === id)?.label ?? `Track ${id + 1}`} · preparing…`);
+      setRetrySeq((n) => n + 1);
+      return;
+    }
     if (hls?.audioTracks[id]) {
       manualAudio.current = true;
       hls.audioTrack = id;
@@ -1561,6 +1724,8 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     let audioList: NativeAudioTrackList | undefined;
 
     const refreshAudio = () => {
+      // The list comes from the file itself (probe_local_audio): the WebView's empty one mustn't replace it.
+      if (localAudioModeRef.current) return;
       const next = nativeVideo.audioTracks;
       if (next !== audioList) {
         audioList?.removeEventListener("addtrack", refreshAudio);
@@ -1691,7 +1856,9 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
       setSelectedAudioTrack(-1);
       manualAudio.current = false;
       keepPausedRef.current = false;
+      localAudioRef.current = null;
     }
+    localAudioModeRef.current = false;
     setLevels([]);
     setLevel(-1);
     setActiveLevel(-1);
@@ -1798,6 +1965,10 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
       let lastRecoveryAt = 0;
       let midStreamRefreshing = false;
       let lastNetErrCode: number | undefined;
+      initPtsRef.current = null;
+      hls.on(H.Events.INIT_PTS_FOUND, (_, d) => {
+        if (initPtsRef.current == null && d.initPTS != null && d.timescale) initPtsRef.current = d.initPTS / d.timescale;
+      });
       hls.on(H.Events.MANIFEST_PARSED, (_, d) => {
         if (cancelled) return;
         lastNetErrCode = undefined;
@@ -1900,6 +2071,13 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
       }
       const player = new shakaMod.Player();
       shakaRef.current = player;
+      const collector = new DashCueCollector((cues) => {
+        const id = dashSubIdRef.current;
+        if (cancelled || !id || shakaRef.current !== player) return;
+        patchTrackData(activeCurUrlRef.current, id, { cues, format: "vtt", loading: false });
+      });
+      dashCollectorRef.current = collector;
+      dashSubIdRef.current = null;
       player.configure({
         streaming: {
           bufferingGoal: 60,
@@ -1907,7 +2085,8 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
           bufferBehind: 30,
         },
         abr: { enabled: true },
-        textDisplayFactory: () => new shakaMod.text.StubTextDisplayer(),
+        // Shaka parses the DASH text tracks; our renderer draws them (styling, dual subs, timing).
+        textDisplayFactory: () => collector as unknown as shaka.extern.TextDisplayer,
       });
 
       const syncDashTracks = () => {
@@ -1931,6 +2110,18 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
         );
         const activeAudioIdx = dashAudio.findIndex((t) => t.active);
         if (activeAudioIdx >= 0) setSelectedAudioTrack(activeAudioIdx);
+
+        setHlsSubs(
+          player.getTextTracks().map((t, i) => ({
+            id: `dash-${t.id}`,
+            label: t.label || t.language || `Track ${i + 1}`,
+            lang: t.language || "und",
+            origin: "dash" as const,
+            isDefault: Boolean(t.primary),
+            isForced: Boolean(t.forced),
+            dashTrackId: t.id,
+          })),
+        );
       };
 
       player.addEventListener("trackschanged", () => {
@@ -2084,11 +2275,31 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
         })();
       } else if (target.localPath) {
         setPreparingLocal(true);
-        invoke<string>("prepare_local_media", { path: target.localPath })
+        const localPath = target.localPath;
+        const audioIndex = localAudioRef.current;
+        invoke<string>("prepare_local_media", { path: localPath, ...(audioIndex != null ? { audioIndex } : {}) })
           .then((path) => {
             if (cancelled) return;
             setPreparingLocal(false);
             loadFile(convertFileSrc(path));
+            // Offer the file's audio tracks (WebView2 can't list or switch them itself).
+            invoke<{ index: number; codec: string; channels?: number; language?: string; title?: string; isDefault: boolean }[]>(
+              "probe_local_audio",
+              { path: localPath },
+            )
+              .then((list) => {
+                if (cancelled || list.length < 2) return;
+                localAudioModeRef.current = true;
+                setAudioTracks(
+                  list.map((a) => {
+                    const ch = a.channels === 6 ? " 5.1" : a.channels === 8 ? " 7.1" : a.channels === 1 ? " mono" : "";
+                    const base = a.title || (a.language ? langLabel(a.language) : `Track ${a.index + 1}`);
+                    return { id: a.index, label: `${base}${ch}`, lang: a.language ?? "und" };
+                  }),
+                );
+                setSelectedAudioTrack(audioIndex ?? Math.max(0, list.findIndex((a) => a.isDefault)));
+              })
+              .catch(() => {});
           })
           .catch((error: unknown) => {
             if (cancelled) return;
@@ -2187,6 +2398,30 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
 
   const [enhance, setEnhance] = useState<EnhanceMode>(loadEnhance);
   const [enhancing, setEnhancing] = useState<"idle" | "starting" | "on" | "error">("idle");
+  const toggleAudioFx = (k: keyof AudioFx) => {
+    setAudioFxState((prev) => {
+      const next = { ...prev, [k]: !prev[k] };
+      saveAudioFx(next);
+      const v = video.current;
+      const boost = muted ? 1 : Math.max(1, volRef.current);
+      // Applied inside the click (a user gesture), so a new AudioContext starts running.
+      if (v && !isEmbed && !setAudioFx(v, { ...next, boost })) flash("Sound effects aren't available in this player");
+      return next;
+    });
+  };
+  /**
+   * Before/after: the upscaled canvas sits exactly over the video, so clipping it shows the original
+   * on the left of the line and Anime4K on the right, live, at no GPU cost. null = off.
+   */
+  const [compareAt, setCompareAt] = useState<number | null>(null);
+  const comparing = compareAt != null && enhancing === "on";
+  const onCompareDrag = (e: React.PointerEvent<HTMLDivElement>) => {
+    const box = canvas.current?.parentElement?.getBoundingClientRect();
+    if (!box || !box.width) return;
+    if (e.type === "pointerdown") e.currentTarget.setPointerCapture(e.pointerId);
+    else if (!e.currentTarget.hasPointerCapture(e.pointerId)) return;
+    setCompareAt(Math.max(2, Math.min(98, ((e.clientX - box.left) / box.width) * 100)));
+  };
   const [enhError, setEnhError] = useState<string | null>(null);
   const [enhStats, setEnhStats] = useState<EnhancerStats | null>(null);
   /** Embeds get a CSS colour/contrast lift instead: their pixels are cross-origin. */
@@ -2270,11 +2505,17 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
   useEffect(() => {
     const v = video.current;
     if (!v) return;
-    v.volume = vol;
+    v.volume = Math.max(0, Math.min(1, vol));
     v.muted = muted;
     v.playbackRate = speed;
+    if (!isEmbed) {
+      const boost = muted ? 1 : Math.max(1, vol);
+      if (audioFx.night || audioFx.dialogue || boost > 1.001 || hasAudioFx(v)) {
+        setAudioFx(v, { ...audioFx, boost });
+      }
+    }
     try { localStorage.setItem("abx.vol", String(vol)); } catch { /* ignore */ }
-  }, [vol, muted, speed, cur?.url]);
+  }, [vol, muted, speed, isEmbed, audioFx, cur?.url]);
 
   // Report progress every 5s (video element or the embed's last report).
   useEffect(() => {
@@ -2320,16 +2561,22 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     clearTimeout(bumpTimer.current);
     bumpTimer.current = window.setTimeout(() => setBump(null), 750);
   };
-  const volRef = useRef(vol);
-  volRef.current = vol;
-  const changeVol = (d: number) => {
-    // Worked out here rather than inside the state updater: updaters must be pure (StrictMode
-    // runs them twice, which fired the toast twice).
-    const n = Math.max(0, Math.min(1, +(volRef.current + d).toFixed(2)));
+  const setVolumeLevel = (target: number) => {
+    const n = Math.max(0, Math.min(MAX_VOL, +target.toFixed(2)));
     volRef.current = n;
     setMuted(false);
     setVol(n);
-    flash(`Volume ${Math.round(n * 100)}%`);
+    const v = video.current;
+    if (v && !isEmbed && (n > 1.001 || audioFx.night || audioFx.dialogue || hasAudioFx(v))) {
+      setAudioFx(v, { ...audioFx, boost: Math.max(1, n) });
+    }
+    return n;
+  };
+  const changeVol = (d: number) => {
+    // Worked out here rather than inside the state updater: updaters must be pure (StrictMode
+    // runs them twice, which fired the toast twice).
+    const n = setVolumeLevel(volRef.current + d);
+    flash(`Volume ${Math.round(n * 100)}%${n > 1.001 ? " (Boost)" : ""}`);
   };
   const changeSpeed = (dir: 1 | -1) => {
     const i = SPEEDS.indexOf(speed);
@@ -2484,8 +2731,17 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
 
   /* ---------------------------------------------------------------- up next */
 
-  const clock = isEmbed ? embedClock : { time, duration: dur };
-  const remaining = clock.duration ? clock.duration - clock.time : Infinity;
+  // Seconds left, but only while it matters (the last UP_NEXT_AT seconds): the player re-renders
+  // for the countdown, not for every tick of a two-hour film.
+  const nativeRemaining = usePlayhead(playhead, (t) => {
+    if (isEmbed || !dur) return null;
+    const left = dur - t;
+    return left <= UP_NEXT_AT && left > 0.5 ? Math.ceil(left) : null;
+  });
+  const clock = isEmbed ? embedClock : { time: 0, duration: dur };
+  const remaining = isEmbed
+    ? (embedClock.duration ? embedClock.duration - embedClock.time : Infinity)
+    : nativeRemaining ?? Infinity;
   const [upNextDismissed, setUpNextDismissed] = useState(false);
   const upNextDismissedRef = useRef(false);
   upNextDismissedRef.current = upNextDismissed;
@@ -2658,10 +2914,21 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     setDragging(false);
     seekTo(atX(e.clientX).t);
   };
+  const toggleTimeLeft = useCallback(
+    () =>
+      setTimeLeft((x) => {
+        try {
+          localStorage.setItem(TIME_LEFT_KEY, x ? "0" : "1");
+        } catch {
+          /* ignore */
+        }
+        return !x;
+      }),
+    [],
+  );
   /** What the scrubber tooltip calls the stretch you're pointing at. */
   const partAt = (t: number) => (sk?.intro && t >= sk.intro[0] && t < sk.intro[1] ? "Intro" : sk?.outro && t >= sk.outro[0] && t < sk.outro[1] ? "Credits" : null);
 
-  const pct = dur ? (time / dur) * 100 : 0;
   const hide = idle && playing && !sheet && !showUpNext && !dragging;
   const embedHide = isEmbed && idle && !sheet;
   const q = cur?.probe?.quality ?? cur?.quality;
@@ -2734,8 +3001,8 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
 
   const sk = useMemo(() => mergeSkipRanges(cur?.skip, fetchedSkip), [cur?.skip, fetchedSkip]);
   const outroEnd = sk?.outro ? (Number.isFinite(sk.outro[1]) ? sk.outro[1] : (dur > 0 ? dur : Infinity)) : undefined;
-  const inIntro = !!sk?.intro && time >= sk.intro[0] && time < sk.intro[1] - 1.5;
-  const inOutro = !!sk?.outro && outroEnd != null && time >= sk.outro[0] && time < outroEnd - 1.5;
+  const inIntro = usePlayhead(playhead, (t) => !!sk?.intro && t >= sk.intro[0] && t < sk.intro[1] - 1.5);
+  const inOutro = usePlayhead(playhead, (t) => !!sk?.outro && outroEnd != null && t >= sk.outro[0] && t < outroEnd - 1.5);
   const isPrimAss = Boolean(primTrack && (primTrack.format === "ass" || primTrack.format === "ssa") && primTrack.raw);
   // Subtitles toggled off with C: keep handing the overlay the ASS track it was rendering (marked
   // disabled), so it hides the renderer instead of destroying and later reloading its WASM worker.
@@ -2791,9 +3058,22 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
           toggleFull();
         }}
         onWheel={(e) => {
-          if (isEmbed || !e.deltaY) return;
+          if (isEmbed || sheet || !e.deltaY) return;
           poke();
-          changeVol(e.deltaY < 0 ? 0.05 : -0.05);
+          if (e.deltaMode === 1) {
+            changeVol(e.deltaY < 0 ? 0.05 : -0.05);
+            return;
+          }
+          const now = performance.now();
+          if (now - wheelStampRef.current > 250) wheelAccumRef.current = 0;
+          wheelStampRef.current = now;
+          wheelAccumRef.current += e.deltaY;
+          const stepPx = 60;
+          if (Math.abs(wheelAccumRef.current) >= stepPx) {
+            const steps = Math.trunc(wheelAccumRef.current / stepPx);
+            wheelAccumRef.current -= steps * stepPx;
+            changeVol(-steps * 0.05);
+          }
         }}
       >
         {isEmbed ? (
@@ -2819,7 +3099,10 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
               playsInline
               crossOrigin="anonymous"
               className={enhancing === "on" ? "under" : ""}
-              onPlay={() => setPlaying(true)}
+              onPlay={() => {
+                setPlaying(true);
+                resumeAudioFx();
+              }}
               onPause={() => {
                 setPlaying(false);
                 // Pausing is often the last thing you do before closing the app.
@@ -2869,7 +3152,39 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
                 if (cur && cur.kind !== "embed" && !hlsRef.current && !shakaRef.current) failover("unsupported or unreachable stream");
               }}
             />
-            <canvas key={`${enhance}:${cur?.url ?? ""}`} ref={canvas} className={`enhance-canvas ${enhancing === "on" ? "on" : ""}`} aria-hidden />
+            <canvas
+              key={`${enhance}:${cur?.url ?? ""}`}
+              ref={canvas}
+              className={`enhance-canvas ${enhancing === "on" ? "on" : ""}`}
+              style={comparing ? { clipPath: `inset(0 0 0 ${compareAt}%)` } : undefined}
+              aria-hidden
+            />
+            {comparing && (
+              <div className="compare" style={{ ["--at" as string]: `${compareAt}%` }} onClick={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()}>
+                <span className="compare-tag left">Original</span>
+                <span className="compare-tag right">Anime4K</span>
+                <div
+                  className="compare-handle"
+                  role="slider"
+                  aria-label="Before and after divider"
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={Math.round(compareAt ?? 50)}
+                  tabIndex={0}
+                  onPointerDown={onCompareDrag}
+                  onPointerMove={onCompareDrag}
+                  onKeyDown={(e) => {
+                    if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setCompareAt((x) => Math.max(2, Math.min(98, (x ?? 50) + (e.key === "ArrowLeft" ? -2 : 2))));
+                    }
+                  }}
+                >
+                  <span />
+                </div>
+              </div>
+            )}
             <SubtitleOverlay
               cues={activePrimaryCues}
               secondaryCues={activeSecondaryCues}
@@ -2947,35 +3262,21 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
 
         {!isEmbed && (
           <footer className="pbot" onClick={(e) => e.stopPropagation()} onMouseMove={poke}>
-            <div
-              ref={scrubRef}
-              className={`scrub ${dragging ? "drag" : ""}`}
-              role="slider"
-              aria-label="Seek"
-              aria-valuemin={0}
-              aria-valuemax={Math.round(dur)}
-              aria-valuenow={Math.round(time)}
-              aria-valuetext={`${fmtTime(time)} of ${fmtTime(dur)}`}
+            <Scrubber
+              ph={playhead}
+              dur={dur}
+              thumb={hover ? thumb : null}
+              dragging={dragging}
+              hover={hover}
+              intro={sk?.intro}
+              outro={sk?.outro}
+              scrubRef={scrubRef}
+              partAt={partAt}
               onPointerDown={onScrubDown}
               onPointerMove={onScrubMove}
               onPointerUp={onScrubUp}
               onPointerLeave={() => !dragging && setHover(null)}
-            >
-              <div className="c">
-                <span className="buf" style={{ width: `${dur ? (buffered / dur) * 100 : 0}%` }} />
-                {hover && <span className="ghost" style={{ width: hover.x }} />}
-                <i style={{ width: `${pct}%` }} />
-                {dur > 0 && sk?.intro && sk.intro[0] < dur && <span className="part" style={{ left: `${(sk.intro[0] / dur) * 100}%`, width: `${((Math.min(dur, sk.intro[1]) - sk.intro[0]) / dur) * 100}%` }} />}
-                {dur > 0 && sk?.outro && <span className="part" style={{ left: `${(sk.outro[0] / dur) * 100}%`, width: `${((Math.min(dur, sk.outro[1]) - sk.outro[0]) / dur) * 100}%` }} />}
-              </div>
-              <span className="knob" style={{ left: `${pct}%` }} />
-              {hover && dur > 0 && (
-                <span className="scrub-tip" style={{ left: Math.max(34, Math.min(hover.w - 34, hover.x)) }}>
-                  {partAt(hover.t) && <em>{partAt(hover.t)}</em>}
-                  {fmtTime(hover.t)}
-                </span>
-              )}
-            </div>
+            />
             <div className="prow">
               <div className="pc">
                 <button className="pbtn round big" onClick={toggle} aria-label={playing ? "Pause" : "Play"}><Icon name={playing ? "pause" : "play"} size={20} /></button>
@@ -2984,18 +3285,19 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
                 {onNext && <button className="pbtn icon" onClick={goNext} aria-label="Next episode" title="Next episode (N)"><Icon name="next" size={20} /></button>}
                 <div className="vol">
                   <button className="pbtn icon" onClick={() => setMuted((m) => !m)} aria-label="Mute"><Icon name={muted || vol === 0 ? "mute" : "vol"} size={20} /></button>
-                  <input type="range" min={0} max={1} step={0.02} value={muted ? 0 : vol} style={{ ["--v" as any]: `${(muted ? 0 : vol) * 100}%` }} onChange={(e) => { setMuted(false); setVol(Number(e.target.value)); }} aria-label="Volume" />
+                  <input
+                    type="range"
+                    min={0}
+                    max={MAX_VOL}
+                    step={0.05}
+                    value={muted ? 0 : vol}
+                    style={{ ["--v" as any]: `${((muted ? 0 : vol) / MAX_VOL) * 100}%` }}
+                    onChange={(e) => setVolumeLevel(Number(e.target.value))}
+                    aria-label="Volume"
+                  />
+                  {!muted && vol > 1.001 && <span className="vol-boost">{Math.round(vol * 100)}%</span>}
                 </div>
-                <button
-                  className="time"
-                  title={timeLeft ? "Show total length" : "Show time left"}
-                  onClick={() => setTimeLeft((x) => {
-                    try { localStorage.setItem(TIME_LEFT_KEY, x ? "0" : "1"); } catch { /* ignore */ }
-                    return !x;
-                  })}
-                >
-                  {fmtTime(time)}<em> / {timeLeft ? `-${fmtTime(Math.max(0, dur - time))}` : fmtTime(dur)}</em>
-                </button>
+                <TimeReadout ph={playhead} dur={dur} timeLeft={timeLeft} onToggle={toggleTimeLeft} />
               </div>
               <div className="pc">
                 {audio && onAudio && <AudioToggle compact value={audio} onChange={changeAudio} />}
@@ -3069,6 +3371,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
             <button role="tab" className={sheet === "servers" ? "on" : ""} onClick={() => setSheet("servers")}>Servers</button>
             {episodes && <button role="tab" className={sheet === "episodes" ? "on" : ""} onClick={() => setSheet("episodes")}>Episodes</button>}
             <button role="tab" className={sheet === "subtitles" ? "on" : ""} onClick={() => setSheet("subtitles")}>Subtitles</button>
+            {!isEmbed && <button role="tab" className={sheet === "transcript" ? "on" : ""} onClick={() => setSheet("transcript")}>Transcript</button>}
             <button role="tab" className={sheet === "audio" ? "on" : ""} onClick={() => setSheet("audio")}>Audio</button>
             <button role="tab" className={sheet === "picture" ? "on" : ""} onClick={() => setSheet("picture")}>Picture</button>
           </div>
@@ -3100,9 +3403,12 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
               onSelectPrimary={chooseSub}
               onSelectSecondary={chooseSecondary}
               offset={offset}
+              secondaryOffset={secOffset}
               timingUnsupported={timingShiftUnsupported}
               onNudge={nudge}
               onResetOffset={resetOffset}
+              onNudgeSecondary={nudgeSecondary}
+              onResetSecondaryOffset={resetSecondaryOffset}
               onUploadFiles={(files) => void addSubtitleFiles(files)}
               subPref={pref}
               onPatchPref={patchPref}
@@ -3152,16 +3458,64 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
                   </div>
                 </div>
               )}
-              {!audio && audioTracks.length === 0 && (
+              {!isEmbed && (
+                <>
+                  <div className="ps-block">
+                    <div className="ps-label">Volume boost <span className="ps-sub">{muted ? "Muted" : `${Math.round(vol * 100)}%`}</span></div>
+                    <div className="seg3 wrap">
+                      {[1, 1.25, 1.5, 2].map((lvl) => (
+                        <button
+                          key={lvl}
+                          className={!muted && Math.abs(vol - lvl) < 0.03 ? "on" : ""}
+                          onClick={() => {
+                            const n = setVolumeLevel(lvl);
+                            flash(`Volume ${Math.round(n * 100)}%${n > 1.001 ? " (Boost)" : ""}`);
+                          }}
+                        >
+                          {Math.round(lvl * 100)}%
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="ps-block">
+                    <div className="ps-label">Sound enhancement</div>
+                    <div className="opt-list">
+                      <button className={`opt ${audioFx.night ? "on" : ""}`} onClick={() => toggleAudioFx("night")} aria-pressed={audioFx.night}>
+                        <span>Night mode</span>
+                        <small>Boosts quiet voices and softens sudden loud peaks</small>
+                      </button>
+                      <button className={`opt ${audioFx.dialogue ? "on" : ""}`} onClick={() => toggleAudioFx("dialogue")} aria-pressed={audioFx.dialogue}>
+                        <span>Dialogue boost</span>
+                        <small>Lifts vocal clarity above music and background effects</small>
+                      </button>
+                    </div>
+                  </div>
+                </>
+              )}
+              {(isEmbed || (!audio && audioTracks.length === 0)) && (
                 <p className="ps-note">
                   {isEmbed
-                    ? "Audio tracks are controlled inside this stream's player."
+                    ? "Audio tracks and sound enhancements are controlled inside this stream's player."
                     : cur?.kind === "file"
                       ? "Audio is selected by the media engine for this file. If it is silent, its audio codec may not be supported."
                       : "This stream provides a single audio track."}
                 </p>
               )}
             </div>
+          )}
+
+          {sheet === "transcript" && !isEmbed && (
+            <TranscriptSheet
+              ph={playhead}
+              primary={primTrack ? trackData[primTrack.id]?.cues ?? primTrack.cues : undefined}
+              secondary={secTrack ? trackData[secTrack.id]?.cues ?? secTrack.cues : undefined}
+              primaryOffset={offset}
+              secondaryOffset={secOffset}
+              primaryLabel={primTrack?.label}
+              secondaryLabel={secTrack?.label}
+              onSeek={seekTo}
+              onSyncTo={(n) => nudge(n - offsetRef.current)}
+            />
           )}
 
           {sheet === "picture" && (
@@ -3185,6 +3539,12 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
                         <strong>Playing native video</strong> — {enhError ?? "GPU enhancement unavailable for this stream."}
                       </div>
                     )}
+                    {enhancing === "on" && (
+                      <button className={`opt ${comparing ? "on" : ""}`} onClick={() => setCompareAt((x) => (x == null ? 50 : null))}>
+                        <span>Before / after</span>
+                        <small>{comparing ? "Drag the line across the picture · tap again to hide" : "Split the picture: original on the left, Anime4K on the right"}</small>
+                      </button>
+                    )}
                     <div className="opt-list">
                       {ENHANCE_MODES.map((m) => (
                         <button key={m.id} className={`opt big ${enhance === m.id ? "on" : ""}`} onClick={() => pickEnhance(m.id)}>
@@ -3204,6 +3564,21 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
                   </>
                 )}
               </div>
+              {!isEmbed && (
+                <div className="ps-block">
+                  <div className="ps-label">Sound</div>
+                  <div className="opt-list">
+                    <button className={`opt ${audioFx.night ? "on" : ""}`} onClick={() => toggleAudioFx("night")} aria-pressed={audioFx.night}>
+                      <span>Night mode</span>
+                      <small>Evens out loud and quiet scenes, so explosions don't wake the house</small>
+                    </button>
+                    <button className={`opt ${audioFx.dialogue ? "on" : ""}`} onClick={() => toggleAudioFx("dialogue")} aria-pressed={audioFx.dialogue}>
+                      <span>Dialogue boost</span>
+                      <small>Lifts voices above music and effects</small>
+                    </button>
+                  </div>
+                </div>
+              )}
               {!isEmbed && (
                 <div className="ps-block">
                   <div className="ps-label">Speed</div>

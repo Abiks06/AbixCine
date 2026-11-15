@@ -1,5 +1,5 @@
 import { whenAnimeMappingsHydrated } from "./animeMapping";
-import { cached, peekCache, seedCache } from "./cache";
+import { cached, cacheReady, peekCache, seedCache } from "./cache";
 import { stripHtml } from "./format";
 import {
   normalizeEpisodes,
@@ -247,6 +247,7 @@ export async function animeFranchiseNodes(key: string): Promise<RawAnilistNode[]
   const start = Number(key.split(":")[1]);
   if (!start || !Number.isFinite(start)) return [];
 
+  await cacheReady();
   const cachedHit = peekCache<RawAnilistNode[]>(`${FRANCHISE_CACHE_PREFIX}${start}`, 24 * HOUR);
   if (cachedHit) return cachedHit;
 
@@ -415,6 +416,7 @@ export async function animeEpisodes(key: string, seasonNumber = 1, expectedCount
     }
     if (![...byNo.values()].some((e) => e.still)) {
       try {
+        await cacheReady();
         let streaming = peekCache<{ title?: string; thumbnail?: string }[]>(`${STREAMING_EPS_CACHE_PREFIX}${id}`, 12 * HOUR);
         if (!streaming) {
           const d = await gql<{ Media?: { streamingEpisodes?: { title?: string; thumbnail?: string }[] } }>(`query($id:Int){ Media(id:$id){ streamingEpisodes { title thumbnail } } }`, { id });

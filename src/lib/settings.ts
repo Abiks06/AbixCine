@@ -40,6 +40,8 @@ export interface Settings {
   subtitlePref?: SyncedSubtitlePref;
   /** Optional local-only SubDL API key for online subtitle search (never synced). */
   subdlApiKey?: string;
+  /** TV mode for a screen across the room: off, on while a controller is connected, or always. Device only. */
+  tvMode?: "off" | "auto" | "on";
 }
 
 /** Settings that follow the account. Library folders and server credentials stay on this device. */

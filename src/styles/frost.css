@@ -1,28 +1,91 @@
 /* =========================================================
-   AbixCine — "Frost" material layer (loaded last)
-   Frosted glass over the Projection system without changing its performance rule:
-   only tier-2 floating glass blurs what's behind it. Everything else is frosted with
-   static layers that cost a composite, not a blur:
-     --frost-grain  the baked 128 px noise tile (alpha <= 8/255): the "ground" in ground glass
-     --frost-sheen  a top-lit gradient carrying a breath of the film's tone
-     --rim (base)   a lit top edge + hairline + a shadowed bottom edge, set in base.css
-   This file only adds background images and fill colours. It never sets backdrop-filter,
-   so the reduced-motion and reduced-transparency rules keep full control of blur.
+   AbixCine — "Frost" material layer, v2 (loaded last)
+   Ground glass over the Projection system:
+     grain     a fractal frost texture (SVG turbulence, rasterised once and cached as a tile)
+     sheen     light falling from the top-left, carrying a breath of the film's tone
+     edge      a 1px light-catching rim, brightest where the light hits (::before, masked)
+     bloom     a soft glow of the film's colour under floating panes
+   Performance rule (unchanged): only floating panes and a few small hero controls blur what
+   is behind them. Plates and the top bar are frosted with static layers, which cost a
+   composite rather than a blur, so scrolling never pays for it. This file never touches
+   backdrop-filter on anything the reduced-motion / reduced-transparency rules switch off.
    ========================================================= */
 
 :root {
-  --frost-grain: url("../assets/noise.png");
+  /* white fractal noise at ~8% alpha: the "ground" in ground glass */
+  --frost-grain: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='180' height='180'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.92' numOctaves='3' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0.085 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
+  --frost-light: radial-gradient(120% 70% at 12% -12%, rgb(255 255 255 / 0.16), rgb(255 255 255 / 0.04) 45%, transparent 70%);
   --frost-sheen: linear-gradient(
     180deg,
-    color-mix(in oklab, var(--tone) 6%, rgb(255 255 255 / 0.095)) 0%,
-    rgb(255 255 255 / 0.03) 38%,
-    rgb(255 255 255 / 0.012) 100%
+    color-mix(in oklab, var(--tone) 9%, rgb(255 255 255 / 0.07)) 0%,
+    rgb(255 255 255 / 0.02) 46%,
+    rgb(0 0 0 / 0.06) 100%
   );
-  /* tier 0: plates read as frosted acrylic, lit from above, no blur */
-  --frost-plate: linear-gradient(180deg, rgb(255 255 255 / 0.07), rgb(255 255 255 / 0.022) 55%, rgb(255 255 255 / 0.015));
-  /* tier 2 fills: translucent enough that the blurred room shows through as frost */
-  --frost-fill: color-mix(in oklab, var(--s1) 66%, transparent);
-  --frost-fill-dense: color-mix(in oklab, var(--s1) 76%, transparent);
+  --frost-plate: linear-gradient(180deg, rgb(255 255 255 / 0.075), rgb(255 255 255 / 0.02) 55%, rgb(255 255 255 / 0.012));
+  /* tier 2 fills: see-through enough that the blurred room reads as frost, dense enough for text */
+  --frost-fill: color-mix(in oklab, var(--s1) 52%, transparent);
+  --frost-fill-dense: color-mix(in oklab, var(--s1) 64%, transparent);
+  --frost-blur: blur(40px) saturate(1.9) brightness(1.1);
+  /* the light-catching rim, painted by ::before through a mask */
+  --frost-edge: linear-gradient(
+    150deg,
+    rgb(255 255 255 / 0.5) 0%,
+    rgb(255 255 255 / 0.14) 22%,
+    rgb(255 255 255 / 0.04) 48%,
+    rgb(255 255 255 / 0.03) 70%,
+    color-mix(in oklab, var(--tone) 35%, rgb(255 255 255 / 0.14)) 100%
+  );
+  --frost-bloom: 0 30px 70px -36px color-mix(in oklab, var(--tone) 40%, transparent);
+}
+
+/* ---------- shared: the rim ---------- */
+.dock,
+.menu,
+.toast,
+.palette,
+.psheet,
+.smart,
+.race-grid-wrap,
+.auth-card,
+.hero-queue,
+.ptop-actions,
+.pbot,
+.panel,
+.source-block,
+.notice {
+  isolation: isolate;
+}
+.toast,
+.ptop-actions,
+.hero-queue,
+.source-block,
+.notice {
+  position: relative;
+}
+.dock::before,
+.menu::before,
+.toast::before,
+.palette::before,
+.psheet::before,
+.smart::before,
+.race-grid-wrap::before,
+.auth-card::before,
+.hero-queue::before,
+.ptop-actions::before,
+.pbot::before,
+.panel::before,
+.notice::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  padding: 1px;
+  background: var(--frost-edge);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0);
+  pointer-events: none;
 }
 
 /* ---------- tier 2: floating glass ---------- */
@@ -30,17 +93,57 @@
 .menu,
 .toast {
   background-color: var(--frost-fill);
-  background-image: var(--frost-grain), var(--frost-sheen);
+  background-image: var(--frost-grain), var(--frost-light), var(--frost-sheen);
+  backdrop-filter: var(--frost-blur);
 }
 .palette,
 .auth-card,
 .smart,
 .race-grid-wrap {
   background-color: var(--frost-fill-dense);
-  background-image: var(--frost-grain), var(--frost-sheen);
+  background-image: var(--frost-grain), var(--frost-light), var(--frost-sheen);
+  backdrop-filter: var(--frost-blur);
+  box-shadow: var(--rim), var(--frost-bloom), var(--float);
+}
+.menu,
+.toast {
+  box-shadow: var(--rim), var(--frost-bloom), var(--float);
+}
+.dock {
+  box-shadow: var(--rim), var(--frost-bloom), 0 14px 40px -18px #000;
 }
 .psheet {
-  background-image: var(--frost-grain), var(--frost-sheen);
+  background-image: var(--frost-grain), var(--frost-light), var(--frost-sheen);
+}
+/* The palette's scrim dims the page so the pane reads as lifted off it. */
+.palette-scrim {
+  background: radial-gradient(80% 70% at 50% 30%, rgb(4 4 7 / 0.35), rgb(4 4 7 / 0.7));
+}
+
+/* The film's programme over the hero art: real glass, the art blurred through it. */
+.hero-queue {
+  background-color: rgb(12 12 17 / 0.34);
+  background-image: var(--frost-grain), var(--frost-light), var(--frost-sheen);
+  backdrop-filter: blur(30px) saturate(1.7) brightness(1.05);
+  box-shadow: var(--rim), var(--frost-bloom), 0 24px 60px -28px rgb(0 0 0 / 0.8);
+}
+.hero-queue .hq.on {
+  background: rgb(255 255 255 / 0.12);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.12);
+}
+
+/* Glass buttons: frosted pills over whatever art is behind them (a few at a time). */
+.btn.glass,
+.btn-glass {
+  background-color: rgb(255 255 255 / 0.1);
+  background-image: var(--frost-grain), linear-gradient(180deg, rgb(255 255 255 / 0.14), rgb(255 255 255 / 0.02));
+  backdrop-filter: blur(16px) saturate(1.6);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.22), inset 0 0 0 1px rgb(255 255 255 / 0.14), 0 10px 26px -14px rgb(0 0 0 / 0.7);
+}
+.btn.glass:hover:not(:disabled),
+.btn-glass:hover:not(:disabled) {
+  background-color: rgb(255 255 255 / 0.17);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.3), inset 0 0 0 1px rgb(255 255 255 / 0.24), 0 12px 30px -14px rgb(0 0 0 / 0.75);
 }
 
 /* The player HUD sits over moving video: keep its fill, add only the frosted surface. */
@@ -48,39 +151,60 @@
 .pbot,
 .pbtn.round,
 .cc-btn:not(.main) {
-  background-image: var(--frost-grain), linear-gradient(180deg, rgb(255 255 255 / 0.08), rgb(255 255 255 / 0.015) 60%);
+  background-image: var(--frost-grain), linear-gradient(180deg, rgb(255 255 255 / 0.1), rgb(255 255 255 / 0.015) 60%);
 }
 
 /* ---------- tier 1: the top bar once the page slides underneath ---------- */
-/* Still no blur on a full-width strip that repaints on every scroll frame: grain and a lit hairline
-   give it the frosted edge instead. */
+/* No blur on a full-width strip that repaints on every scroll frame: grain and a lit hairline. */
 .top::before {
   background:
     var(--frost-grain),
-    linear-gradient(180deg, rgb(12 12 17 / 0.96) 0%, rgb(10 10 14 / 0.9) 62%, rgb(7 7 10 / 0.55) 82%, transparent);
+    linear-gradient(180deg, rgb(12 12 17 / 0.95) 0%, rgb(10 10 14 / 0.88) 62%, rgb(7 7 10 / 0.5) 82%, transparent);
 }
 .app[data-scrolled] .top::before {
-  box-shadow: inset 0 -1px 0 rgb(255 255 255 / 0.05);
+  box-shadow: inset 0 -1px 0 rgb(255 255 255 / 0.06);
+}
+.top-search {
+  background-image: var(--frost-grain), linear-gradient(180deg, rgb(255 255 255 / 0.07), rgb(255 255 255 / 0.02));
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.1), inset 0 0 0 1px var(--line);
 }
 
 /* ---------- tier 0: plates ---------- */
-.panel,
+.notice {
+  background-image: var(--frost-grain), var(--frost-light), linear-gradient(180deg, color-mix(in oklab, var(--tone) 10%, rgb(255 255 255 / 0.05)), transparent);
+}
+.panel {
+  background-image: var(--frost-grain), var(--frost-light), var(--frost-plate);
+}
 .file,
 .source-block {
   background-image: var(--frost-grain), var(--frost-plate);
 }
+.source-block {
+  border-radius: var(--r-md);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.07), inset 0 0 0 1px var(--line);
+}
 .source-tile {
-  background-image: var(--frost-grain), linear-gradient(180deg, rgb(255 255 255 / 0.06), rgb(255 255 255 / 0.025));
+  background-image: var(--frost-grain), linear-gradient(180deg, rgb(255 255 255 / 0.065), rgb(255 255 255 / 0.02));
+}
+.chip:not(.on):not(.hi):not(.score):not(.cert) {
+  background-image: linear-gradient(180deg, rgb(255 255 255 / 0.07), rgb(255 255 255 / 0.02));
 }
 
-/* Inputs read as wells cut into the frost rather than plates on top of it. */
-/* Fill only: the focus ring and hairline stay browse.css's. */
+/* Settings' current section: a small frosted pill with a lit top edge and a hint of the tone. */
+.set-nav button.on {
+  background-color: rgb(255 255 255 / 0.07);
+  background-image: var(--frost-grain), linear-gradient(180deg, color-mix(in oklab, var(--tone) 12%, rgb(255 255 255 / 0.06)), rgb(255 255 255 / 0.015));
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.14), inset 0 0 0 1px rgb(255 255 255 / 0.07), 0 10px 24px -16px color-mix(in oklab, var(--tone) 50%, transparent);
+}
+
+/* Inputs read as wells cut into the frost. Fill only: the focus ring stays browse.css's. */
 .panel input:not([type]),
 .panel input[type="text"],
 .panel input[type="url"],
 .panel input[type="password"],
 .panel textarea {
-  background-color: rgb(0 0 0 / 0.22);
+  background-color: rgb(0 0 0 / 0.26);
 }
 
 /* ---------- accessibility & low-power fallbacks ---------- */
@@ -94,11 +218,14 @@
   .smart,
   .race-grid-wrap,
   .psheet,
+  .hero-queue,
   .ptop-actions,
   .pbot,
   .pbtn.round,
-  .cc-btn:not(.main) {
-    background-color: #111118;
+  .cc-btn:not(.main),
+  .btn.glass,
+  .btn-glass {
+    background-color: #15151c;
     background-image: none;
     backdrop-filter: none !important;
   }
@@ -107,16 +234,34 @@
 :root.reduce-motion .menu,
 :root.reduce-motion .toast,
 :root.reduce-motion .palette,
-:root.reduce-motion .psheet {
+:root.reduce-motion .psheet,
+:root.reduce-motion .hero-queue,
+:root.reduce-motion .smart,
+:root.reduce-motion .race-grid-wrap,
+:root.reduce-motion .auth-card {
   /* base.css turns the blur off here; without it, a translucent fill would show sharp content. */
+  backdrop-filter: none;
   background-color: #0d0d13f2;
+}
+:root.reduce-motion .btn.glass,
+:root.reduce-motion .btn-glass {
+  backdrop-filter: none;
 }
 @media (prefers-reduced-motion: reduce) {
   .dock,
   .menu,
   .toast,
   .palette,
-  .psheet {
+  .psheet,
+  .hero-queue,
+  .smart,
+  .race-grid-wrap,
+  .auth-card {
+    backdrop-filter: none;
     background-color: #0d0d13f2;
+  }
+  .btn.glass,
+  .btn-glass {
+    backdrop-filter: none;
   }
 }

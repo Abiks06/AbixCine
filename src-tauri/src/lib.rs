@@ -485,7 +485,28 @@ fn is_text_sub_codec(codec: &str) -> bool {
     )
 }
 
+fn has_multichannel_audio(probe: &serde_json::Value) -> bool {
+    probe
+        .get("streams")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|s| s.get("codec_type").and_then(serde_json::Value::as_str) == Some("audio"))
+        .any(|s| s.get("channels").and_then(serde_json::Value::as_u64).is_some_and(|ch| ch > 2))
+}
+
+fn audio_downmix_filter(channels: Option<u64>) -> &'static str {
+    if channels.unwrap_or(2) > 2 {
+        "pan=stereo|FL=0.5*FL+0.707*FC+0.35*BL+0.35*SL+0.35*LFE|FR=0.5*FR+0.707*FC+0.35*BR+0.35*SR+0.35*LFE,dynaudnorm=f=150:g=15:p=0.92:m=4"
+    } else {
+        "dynaudnorm=f=150:g=15:p=0.92:m=4"
+    }
+}
+
 fn media_needs_audio_conversion(path: &Path, probe: &serde_json::Value) -> bool {
+    if has_multichannel_audio(probe) {
+        return true;
+    }
     let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let audio_codecs: Vec<&str> = probe
         .get("streams")
@@ -515,8 +536,12 @@ fn stable_hash(parts: &[&[u8]]) -> u64 {
     h
 }
 
-/// The audio codecs a browser plays inside MP4 (these can be copied instead of re-encoded).
+/// The stereo audio codecs a browser plays natively inside MP4 (these can be copied instead of
+/// downmixed/normalized; 5.1/7.1 streams are re-encoded with dialogue-focused stereo matrices).
 fn mp4_audio_compatible(probe: &serde_json::Value) -> bool {
+    if has_multichannel_audio(probe) {
+        return false;
+    }
     let codecs: Vec<&str> = probe
         .get("streams")
         .and_then(serde_json::Value::as_array)
@@ -593,6 +618,23 @@ mod local_media_tests {
     }
 
     #[test]
+    fn downmixes_multichannel_mp4_audio_with_center_dialogue_matrix() {
+        let surround = serde_json::json!({
+            "streams": [
+                { "index": 0, "codec_type": "video", "codec_name": "h264" },
+                { "index": 1, "codec_type": "audio", "codec_name": "aac", "channels": 6 }
+            ]
+        });
+        assert!(has_multichannel_audio(&surround));
+        assert!(!mp4_audio_compatible(&surround));
+        assert!(media_needs_audio_conversion(Path::new("Film.mp4"), &surround));
+        assert!(audio_downmix_filter(Some(6)).contains("pan=stereo"));
+        assert!(audio_downmix_filter(Some(6)).contains("dynaudnorm="));
+        assert!(!audio_downmix_filter(Some(2)).contains("pan=stereo"));
+        assert!(audio_downmix_filter(Some(2)).contains("dynaudnorm="));
+    }
+
+    #[test]
     fn keeps_text_subtitle_streams_and_skips_bitmap_subtitles() {
         let streams = serde_json::json!({
             "streams": [
@@ -602,6 +644,33 @@ mod local_media_tests {
             ]
         });
         assert_eq!(compatible_subtitle_indices(&streams), vec![2, 4]);
+    }
+
+    #[test]
+    fn lists_audio_tracks_and_picks_the_chosen_codec() {
+        let audio_only = serde_json::json!({ "streams": [
+            { "index": 1, "codec_name": "eac3", "channels": 6, "tags": { "language": "jpn", "title": "Japanese 5.1" }, "disposition": { "default": 1 } },
+            { "index": 2, "codec_name": "aac", "channels": 2, "tags": { "language": "eng" }, "disposition": { "default": 0 } },
+            { "index": 3, "codec_name": "aac", "tags": { "language": "und" } }
+        ]});
+        let tracks = parse_local_audio_tracks(&audio_only);
+        assert_eq!(tracks.len(), 3);
+        assert_eq!(tracks[0].index, 0);
+        assert!(tracks[0].is_default);
+        assert_eq!(tracks[0].channels, Some(6));
+        assert_eq!(tracks[1].language.as_deref(), Some("eng"));
+        assert_eq!(tracks[2].language, None); // "und" means unknown
+
+        let full = serde_json::json!({ "streams": [
+            { "index": 0, "codec_type": "video", "codec_name": "h264" },
+            { "index": 1, "codec_type": "audio", "codec_name": "eac3" },
+            { "index": 2, "codec_type": "subtitle", "codec_name": "ass" },
+            { "index": 3, "codec_type": "audio", "codec_name": "aac" }
+        ]});
+        assert_eq!(audio_stream_count(&full), 2);
+        assert_eq!(nth_audio_codec(&full, 0).as_deref(), Some("eac3"));
+        assert_eq!(nth_audio_codec(&full, 1).as_deref(), Some("aac"));
+        assert_eq!(nth_audio_codec(&full, 2), None);
     }
 
     struct TempDirGuard(PathBuf);
@@ -884,11 +953,46 @@ mod local_media_tests {
     }
 }
 
+/// The codec of the `n`-th audio stream (audio-relative, as in `-map 0:a:n`).
+fn nth_audio_codec(probe: &serde_json::Value, n: u32) -> Option<String> {
+    probe
+        .get("streams")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|s| s.get("codec_type").and_then(serde_json::Value::as_str) == Some("audio"))
+        .nth(n as usize)
+        .and_then(|s| s.get("codec_name").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+}
+
+fn nth_audio_channels(probe: &serde_json::Value, n: u32) -> Option<u64> {
+    probe
+        .get("streams")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|s| s.get("codec_type").and_then(serde_json::Value::as_str) == Some("audio"))
+        .nth(n as usize)
+        .and_then(|s| s.get("channels").and_then(serde_json::Value::as_u64))
+}
+
+fn audio_stream_count(probe: &serde_json::Value) -> u32 {
+    probe
+        .get("streams")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|s| s.get("codec_type").and_then(serde_json::Value::as_str) == Some("audio"))
+        .count() as u32
+}
+
 fn prepare_local_media_file(
     path: PathBuf,
     cache_dir: PathBuf,
     ffmpeg: Result<PathBuf, String>,
     ffprobe: PathBuf,
+    audio_index: Option<u32>,
 ) -> Result<String, String> {
     let canonical = ensure_in_library_roots(&path)?;
     let extension = canonical.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
@@ -897,7 +1001,7 @@ fn prepare_local_media_file(
     }
 
     let probe = background_command(&ffprobe)
-        .args(["-v", "error", "-show_entries", "stream=index,codec_type,codec_name", "-of", "json"])
+        .args(["-v", "error", "-show_entries", "stream=index,codec_type,codec_name,channels", "-of", "json"])
         .arg(&canonical)
         .output()
         .map_err(|e| format!("Could not inspect local media: {e}"))?;
@@ -905,7 +1009,10 @@ fn prepare_local_media_file(
         return Err(format!("Could not inspect local media: {}", String::from_utf8_lossy(&probe.stderr)));
     }
     let probe: serde_json::Value = serde_json::from_slice(&probe.stdout).map_err(|e| e.to_string())?;
-    if !media_needs_audio_conversion(&canonical, &probe) {
+    // WebView2 can't switch audio tracks itself (no HTMLMediaElement.audioTracks), so a chosen
+    // non-default track gets its own copy of the file with only that track in it.
+    let chosen_audio = audio_index.filter(|&i| i > 0 && i < audio_stream_count(&probe));
+    if chosen_audio.is_none() && !media_needs_audio_conversion(&canonical, &probe) {
         return Ok(canonical.to_string_lossy().into_owned());
     }
     let ffmpeg = ffmpeg?;
@@ -922,7 +1029,8 @@ fn prepare_local_media_file(
         canonical.to_string_lossy().as_bytes(),
         &metadata.len().to_le_bytes(),
         &modified.to_le_bytes(),
-        b"abixcine-local-mp4-aac-v3",
+        b"abixcine-local-mp4-aac-v4",
+        &chosen_audio.map(|i| i.to_le_bytes()).unwrap_or([0xff; 4]),
     ]);
     let output = cache_dir.join(format!("{key:016x}.mp4"));
     if output.metadata().map(|m| m.len() > 0).unwrap_or(false) {
@@ -936,17 +1044,45 @@ fn prepare_local_media_file(
         .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i"])
         .arg(&canonical)
         // `V` (capital) skips attached pictures: `v:0` picked an MKV's embedded cover JPEG over the film.
-        .args(["-map", "0:V:0", "-map", "0:a?"]);
+        .args(["-map", "0:V:0", "-map"])
+        .arg(match chosen_audio {
+            Some(i) => format!("0:a:{i}"),
+            None => "0:a?".to_string(),
+        });
     for index in &subtitle_indices {
         command.arg("-map").arg(format!("0:{index}"));
     }
     // Audio the browser already plays is copied (a remux takes seconds, not minutes). Anything
     // else becomes stereo AAC: 5.1 squeezed into 192k sounded thin, and browsers downmix
     // multichannel AAC unpredictably.
-    if mp4_audio_compatible(&probe) {
+    let copy_audio = match chosen_audio {
+        Some(i) => {
+            nth_audio_codec(&probe, i).is_some_and(|c| c == "aac" || c == "mp3")
+                && nth_audio_channels(&probe, i).is_none_or(|ch| ch <= 2)
+        }
+        None => mp4_audio_compatible(&probe),
+    };
+    if copy_audio {
         command.args(["-c:v", "copy", "-c:a", "copy", "-map_metadata", "0", "-dn"]);
     } else {
-        command.args(["-c:v", "copy", "-c:a", "aac", "-ac", "2", "-b:a", "192k", "-map_metadata", "0", "-dn"]);
+        let target_channels = chosen_audio
+            .and_then(|i| nth_audio_channels(&probe, i))
+            .or_else(|| nth_audio_channels(&probe, 0));
+        command.args([
+            "-c:v",
+            "copy",
+            "-af",
+            audio_downmix_filter(target_channels),
+            "-c:a",
+            "aac",
+            "-ac",
+            "2",
+            "-b:a",
+            "256k",
+            "-map_metadata",
+            "0",
+            "-dn",
+        ]);
     }
     if !subtitle_indices.is_empty() {
         command.args(["-c:s", "mov_text"]);
@@ -969,8 +1105,81 @@ fn prepare_local_media_file(
     Ok(output.to_string_lossy().into_owned())
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalAudioTrack {
+    /// Audio-relative index, as `prepare_local_media`'s `audioIndex` takes it.
+    index: u32,
+    codec: String,
+    channels: Option<u64>,
+    language: Option<String>,
+    title: Option<String>,
+    is_default: bool,
+}
+
+/// The audio streams of a library file, so the player can offer a choice WebView2 can't make itself.
 #[tauri::command]
-async fn prepare_local_media(app: tauri::AppHandle, path: String) -> Result<String, String> {
+async fn probe_local_audio(app: tauri::AppHandle, path: String) -> Result<Vec<LocalAudioTrack>, String> {
+    let path = PathBuf::from(path);
+    let ffprobe = ffprobe_tool(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let canonical = ensure_in_library_roots(&path)?;
+        let out = background_command(&ffprobe)
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "a",
+                "-show_entries",
+                "stream=index,codec_name,channels:stream_tags=language,title:stream_disposition=default",
+                "-of",
+                "json",
+            ])
+            .arg(&canonical)
+            .output()
+            .map_err(|e| format!("Could not inspect local audio: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("Could not inspect local audio: {}", String::from_utf8_lossy(&out.stderr)));
+        }
+        let probe: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
+        Ok(parse_local_audio_tracks(&probe))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn parse_local_audio_tracks(probe: &serde_json::Value) -> Vec<LocalAudioTrack> {
+    let tag = |s: &serde_json::Value, k: &str| {
+        s.get("tags")
+            .and_then(|t| t.get(k))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    probe
+        .get("streams")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(i, s)| LocalAudioTrack {
+            index: i as u32,
+            codec: s.get("codec_name").and_then(serde_json::Value::as_str).unwrap_or("").to_string(),
+            channels: s.get("channels").and_then(serde_json::Value::as_u64),
+            language: tag(s, "language").filter(|l| l != "und"),
+            title: tag(s, "title"),
+            is_default: s
+                .get("disposition")
+                .and_then(|d| d.get("default"))
+                .and_then(serde_json::Value::as_u64)
+                == Some(1),
+        })
+        .collect()
+}
+
+#[tauri::command]
+async fn prepare_local_media(app: tauri::AppHandle, path: String, audio_index: Option<u32>) -> Result<String, String> {
     let path = PathBuf::from(path);
     let cache_dir = app.path().app_cache_dir().map_err(|e| e.to_string())?.join("local-media");
     std::fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
@@ -980,7 +1189,7 @@ async fn prepare_local_media(app: tauri::AppHandle, path: String) -> Result<Stri
     let ffprobe = ffprobe_tool(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = MEDIA_PREPARE_LOCK.lock().map_err(|e| e.to_string())?;
-        prepare_local_media_file(path, cache_dir, ffmpeg, ffprobe)
+        prepare_local_media_file(path, cache_dir, ffmpeg, ffprobe, audio_index)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1518,6 +1727,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             scan_library,
             prepare_local_media,
+            probe_local_audio,
             probe_local_subtitles,
             extract_local_subtitle,
             save_sidecar_subtitle,

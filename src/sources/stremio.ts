@@ -753,6 +753,67 @@ async function mapWithConcurrency<T, R>(
 /* Main Stremio Source Resolution                                     */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* Per-addon health (shown on each addon's Settings tile)              */
+/* ------------------------------------------------------------------ */
+
+export interface AddonStat {
+  lookups: number;
+  failures: number;
+  /** Exponentially weighted response time (ms) of answered lookups. */
+  avgMs?: number;
+  /** Streams returned by the last answered lookup. */
+  lastCount?: number;
+  lastError?: string;
+  /** Last lookup, and last failure, as epoch ms. */
+  at: number;
+  failedAt?: number;
+}
+
+const ADDON_STATS_KEY = "abx.addonstats.v1";
+let addonStats: Record<string, AddonStat> | null = null;
+const statListeners = new Set<() => void>();
+
+export function getAddonStats(): Record<string, AddonStat> {
+  if (!addonStats) {
+    try {
+      const raw = JSON.parse(localStorage.getItem(ADDON_STATS_KEY) ?? "{}") as unknown;
+      addonStats = raw && typeof raw === "object" ? (raw as Record<string, AddonStat>) : {};
+    } catch {
+      addonStats = {};
+    }
+  }
+  return addonStats;
+}
+
+export function subscribeAddonStats(cb: () => void): () => void {
+  statListeners.add(cb);
+  return () => statListeners.delete(cb);
+}
+
+export function recordAddonStat(id: string, outcome: { ok: boolean; ms: number; count?: number; error?: string }): void {
+  const prev = getAddonStats()[id] ?? { lookups: 0, failures: 0, at: 0 };
+  const next: AddonStat = {
+    ...prev,
+    lookups: prev.lookups + 1,
+    at: Date.now(),
+    ...(outcome.ok
+      ? {
+          avgMs: prev.avgMs == null ? outcome.ms : Math.round(prev.avgMs * 0.7 + outcome.ms * 0.3),
+          lastCount: outcome.count ?? 0,
+          lastError: undefined,
+        }
+      : { failures: prev.failures + 1, failedAt: Date.now(), lastError: outcome.error }),
+  };
+  addonStats = { ...getAddonStats(), [id]: next };
+  try {
+    localStorage.setItem(ADDON_STATS_KEY, JSON.stringify(addonStats));
+  } catch {
+    /* storage full or blocked */
+  }
+  statListeners.forEach((f) => f());
+}
+
 async function queryAddonStreams(
   addon: StremioAddonConfig,
   kind: "movie" | "tv" | "anime",
@@ -770,21 +831,37 @@ async function queryAddonStreams(
     .map((part) => encodeURIComponent(part))
     .join(":");
   const url = buildAddonEndpoint(addon.baseUrl, `/stream/${encodeURIComponent(addonType)}/${encodedId}.json`, addon.manifestUrl);
-  const res = await fetchWithAbort(url, { Accept: "application/json" }, signal);
-  if (res.status < 200 || res.status >= 300) return { addon, streams: [] };
+  const t0 = performance.now();
+  let res: Awaited<ReturnType<typeof fetchWithAbort>>;
+  try {
+    res = await fetchWithAbort(url, { Accept: "application/json" }, signal);
+  } catch (err) {
+    if (!signal?.aborted && !isAbortErr(err)) {
+      recordAddonStat(addon.id, { ok: false, ms: performance.now() - t0, error: err instanceof Error ? err.message : "unreachable" });
+    }
+    throw err;
+  }
+  const ms = Math.round(performance.now() - t0);
+  if (res.status < 200 || res.status >= 300) {
+    recordAddonStat(addon.id, { ok: false, ms, error: `HTTP ${res.status}` });
+    return { addon, streams: [] };
+  }
 
   let parsed: unknown;
   try {
     parsed = JSON.parse(res.body);
   } catch {
+    recordAddonStat(addon.id, { ok: false, ms, error: "not JSON" });
     return { addon, streams: [] };
   }
   if (!parsed || typeof parsed !== "object" || !Array.isArray((parsed as { streams?: unknown }).streams)) {
+    recordAddonStat(addon.id, { ok: false, ms, error: "unexpected answer" });
     return { addon, streams: [] };
   }
   const streams = (parsed as { streams: unknown[] }).streams.filter(
     (s): s is StremioStreamObject => Boolean(s && typeof s === "object"),
   );
+  recordAddonStat(addon.id, { ok: true, ms, count: streams.length });
   return { addon, streams };
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "abixcine"
-version = "1.8.1"
+version = "1.8.2"
 description = "AbixCine: a desktop player for movies, series and anime"
 edition = "2021"
 

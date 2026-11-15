@@ -216,8 +216,59 @@ function destroyPipe(p: unknown) {
   }
 }
 
+/** GPU resources a chain's constructors created (see `trackingDevice`). */
+type Owned = { textures: GPUTexture[]; buffers: GPUBuffer[] };
+
+/**
+ * The device as the anime4k-webgpu constructors see it: every texture and buffer they create is
+ * recorded, so a rebuild can free all of them. Some passes (ClampHighlights' two full-size stats
+ * textures) keep theirs only inside bind groups, out of `destroyPipe`'s reach: ~33 MB of VRAM per
+ * 1080p rebuild waited for garbage collection.
+ */
+function trackingDevice(device: GPUDevice, owned: Owned): GPUDevice {
+  return new Proxy(device, {
+    get(target, prop) {
+      if (prop === "createTexture") {
+        return (d: GPUTextureDescriptor) => {
+          const t = target.createTexture(d);
+          owned.textures.push(t);
+          return t;
+        };
+      }
+      if (prop === "createBuffer") {
+        return (d: GPUBufferDescriptor) => {
+          const b = target.createBuffer(d);
+          owned.buffers.push(b);
+          return b;
+        };
+      }
+      const v = Reflect.get(target, prop, target) as unknown;
+      return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+    },
+  });
+}
+
 function destroyChain(pipes: Pipe[]) {
   for (const p of pipes) destroyPipe(p);
+  const owned = (pipes as Pipe[] & { owned?: Owned }).owned;
+  if (owned) {
+    for (const t of owned.textures) {
+      try {
+        t.destroy();
+      } catch {
+        /* already destroyed or device lost */
+      }
+    }
+    for (const b of owned.buffers) {
+      try {
+        b.destroy();
+      } catch {
+        /* already destroyed or device lost */
+      }
+    }
+    owned.textures.length = 0;
+    owned.buffers.length = 0;
+  }
 }
 
 /**
@@ -289,20 +340,23 @@ function computeTargetSize(canvas: HTMLCanvasElement, w: number, h: number, maxD
  */
 function buildChain(
   A: Lib,
-  device: GPUDevice,
+  realDevice: GPUDevice,
   input: GPUTexture,
   mode: Exclude<EnhanceMode, "off">,
   native: { width: number; height: number },
   target: { width: number; height: number },
 ) {
-  const maxDim = device.limits?.maxTextureDimension2D ?? 4096;
+  const maxDim = realDevice.limits?.maxTextureDimension2D ?? 4096;
+  const owned: Owned = { textures: [], buffers: [] };
+  const device = trackingDevice(realDevice, owned);
   const canDouble = native.width * 2 <= maxDim && native.height * 2 <= maxDim;
   const needsUp =
     canDouble &&
     native.height < 900 &&
     target.width > native.width * 1.25 &&
     target.height > native.height * 1.25;
-  const pipes: Pipe[] = [];
+  // The resources travel with the chain: every path that frees a chain calls destroyChain(pipes).
+  const pipes: Pipe[] = Object.assign([] as Pipe[], { owned });
   const add = (p: Pipe) => (pipes.push(p), p.getOutputTexture());
   let tex = input;
   if (mode === "clarity") {

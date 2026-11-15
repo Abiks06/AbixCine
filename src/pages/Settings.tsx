@@ -1,9 +1,10 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useLocation } from "react-router-dom";
 import { AudioToggle } from "../components/AudioToggle";
 import { Avatar } from "../components/Avatar";
+import { TrackersPanel } from "../components/TrackersPanel";
 import { Icon } from "../components/Icon";
 import { SubtitleOverlay } from "../components/SubtitleOverlay";
 import { errorMessage, getApiBase, leaveGuest, signOut, updateProfile, useAuth } from "../lib/account";
@@ -48,6 +49,10 @@ import {
   installPublicHttpStremioPresets,
   normalizeManifestUrl,
   PUBLIC_HTTP_STREMIO_PRESETS,
+  type StremioAddonPreset,
+  getAddonStats,
+  subscribeAddonStats,
+  type AddonStat,
   removeStremioAddon,
   toggleStremioAddon,
   updateStremioConfig,
@@ -95,6 +100,7 @@ const SECTIONS = [
   { id: "extensions", label: "Addons & plugins", icon: "puzzle" },
   { id: "playback", label: "Playback", icon: "play" },
   { id: "subtitles", label: "Subtitles", icon: "subtitles" },
+  { id: "trackers", label: "Trackers", icon: "check" },
   { id: "catalog", label: "Catalog", icon: "film" },
   { id: "about", label: "About", icon: "info" },
 ] as const;
@@ -161,6 +167,7 @@ export function Settings() {
   const pluginCtlRef = useRef<AbortController | null>(null);
 
   const [stremioAddons, setStremioAddons] = useState<StremioAddonConfig[]>(() => getStremioConfig().addons);
+  const addonStats = useSyncExternalStore(subscribeAddonStats, getAddonStats);
   const [torrentMode, setTorrentMode] = useState<boolean>(() => Boolean(getStremioConfig().torrentMode));
   const [torrentSupported, setTorrentSupported] = useState(false);
   const [stremioUrl, setStremioUrl] = useState("");
@@ -258,15 +265,17 @@ export function Settings() {
   const installedManifestUrls = new Set(stremioAddons.map((a) => manifestKey(a.manifestUrl)));
   const missingPresets = PUBLIC_HTTP_STREMIO_PRESETS.filter((p) => !installedManifestUrls.has(manifestKey(p.manifestUrl)));
 
-  const handleInstallStremioPresets = async () => {
-    if (stremioBusy || missingPresets.length === 0) return;
+  const [presetBusyId, setPresetBusyId] = useState<string | null>(null);
+  const handleInstallStremioPresets = async (list: readonly StremioAddonPreset[] = missingPresets) => {
+    if (stremioBusy || list.length === 0) return;
     stremioCtlRef.current?.abort();
     const ctl = new AbortController();
     stremioCtlRef.current = ctl;
     setStremioBusy(true);
-    setStremioMsg(`Loading ${missingPresets.length} public HTTP addon${missingPresets.length === 1 ? "" : "s"}...`);
+    setPresetBusyId(list.length === 1 ? list[0].id : "all");
+    setStremioMsg(`Loading ${list.length === 1 ? list[0].name : `${list.length} public HTTP addons`}...`);
     try {
-      const { installed, failed } = await installPublicHttpStremioPresets(missingPresets, ctl.signal);
+      const { installed, failed } = await installPublicHttpStremioPresets(list, ctl.signal);
       if (installed.length) invalidateSessions();
       if (!mountedRef.current || ctl.signal.aborted) return;
       refreshStremioState();
@@ -283,7 +292,10 @@ export function Settings() {
       if (!mountedRef.current || ctl.signal.aborted) return;
       setStremioMsg(err instanceof Error ? err.message : "Could not load public addons");
     } finally {
-      if (mountedRef.current) setStremioBusy(false);
+      if (mountedRef.current) {
+        setStremioBusy(false);
+        setPresetBusyId(null);
+      }
     }
   };
 
@@ -782,24 +794,51 @@ export function Settings() {
               <Icon name="plus" size={14} /> {stremioBusy ? "Adding..." : "Add addon"}
             </button>
           </form>
-          {missingPresets.length > 0 && (
-            <div className="setting-line" style={{ marginTop: 10 }}>
-              <div>
-                <strong>Public HTTP stream addons</strong>
-                <span className="muted">
-                  {missingPresets.map((p) => p.name).join(", ")} · direct streams, no Debrid key needed
-                </span>
-              </div>
-              <button
-                type="button"
-                className="btn btn-glass sm"
-                onClick={() => void handleInstallStremioPresets()}
-                disabled={stremioBusy}
-              >
-                <Icon name="plus" size={14} /> {stremioBusy ? "Loading..." : `Load ${missingPresets.length === PUBLIC_HTTP_STREMIO_PRESETS.length ? "all" : missingPresets.length}`}
-              </button>
+          <div className="preset-head">
+            <div>
+              <strong>Public HTTP stream addons</strong>
+              <span className="muted">Direct streams, no Debrid key needed. Checked working on 2026-11-15.</span>
             </div>
-          )}
+            {missingPresets.length > 1 && (
+              <button type="button" className="btn btn-glass sm" onClick={() => void handleInstallStremioPresets()} disabled={stremioBusy}>
+                <Icon name="plus" size={14} /> {stremioBusy && presetBusyId === "all" ? "Adding…" : "Add all"}
+              </button>
+            )}
+          </div>
+          <div className="preset-grid">
+            {PUBLIC_HTTP_STREMIO_PRESETS.map((p) => {
+              const added = installedManifestUrls.has(manifestKey(p.manifestUrl));
+              const busy = stremioBusy && (presetBusyId === p.id || presetBusyId === "all") && !added;
+              return (
+                <div key={p.id} className={`preset-card ${added ? "added" : ""}`}>
+                  <div className="preset-card-top">
+                    <strong>{p.name}</strong>
+                    <span className="preset-kinds">
+                      {p.types.map((t) => (
+                        <span key={t} className="badge dim">{t === "series" ? "Series" : "Films"}</span>
+                      ))}
+                    </span>
+                  </div>
+                  <p className="muted">{p.note}</p>
+                  {added ? (
+                    <span className="preset-added">
+                      <Icon name="check" size={13} /> Added
+                    </span>
+                  ) : (
+                    <button
+                      type="button"
+                      className="btn btn-glass sm"
+                      onClick={() => void handleInstallStremioPresets([p])}
+                      disabled={stremioBusy}
+                      aria-label={`Add ${p.name}`}
+                    >
+                      <Icon name="plus" size={13} /> {busy ? "Adding…" : "Add"}
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+          </div>
           {stremioMsg && <p className="muted" style={{ marginTop: 8 }}>{stremioMsg}</p>}
 
           {stremioAddons.length > 0 && (
@@ -812,6 +851,7 @@ export function Settings() {
                       <span className="muted">
                         v{addon.version} · {(addon.types ?? []).join(", ") || "streams"}
                       </span>
+                      <AddonHealth stat={addonStats[addon.id]} />
                     </div>
                     <input
                       type="checkbox"
@@ -1009,6 +1049,19 @@ export function Settings() {
           <div><strong>Autoplay next episode</strong></div>
           <input type="checkbox" className="switch" checked={s.autoplayNext} onChange={(e) => updateSettings({ autoplayNext: e.target.checked })} />
         </label>
+        <div className="setting-line">
+          <div>
+            <strong>TV mode</strong>
+            <span className="muted">Everything larger, for a screen across the room. Works with a game controller: D-pad to move, A to select, B to go back.</span>
+          </div>
+          <div className="tabs">
+            {(["off", "auto", "on"] as const).map((m) => (
+              <button key={m} className={`chip ${(s.tvMode ?? "off") === m ? "on" : ""}`} onClick={() => updateSettings({ tvMode: m })}>
+                {m === "off" ? "Off" : m === "auto" ? "With a controller" : "Always"}
+              </button>
+            ))}
+          </div>
+        </div>
         <label className="setting-line toggle">
           <div><strong>Reduce motion</strong><span className="muted">Turns off the intro, page morphs and card tilt.</span></div>
           <input type="checkbox" className="switch" checked={s.reduceMotion} onChange={(e) => updateSettings({ reduceMotion: e.target.checked })} />
@@ -1308,6 +1361,8 @@ export function Settings() {
         </div>
       </section>
 
+      <TrackersPanel />
+
       <section className="panel" id="catalog">
         <h2>Catalog</h2>
         <p className="muted">
@@ -1350,5 +1405,22 @@ export function Settings() {
       </section>
       </div>
     </div>
+  );
+}
+
+/** One line of live health for a Stremio addon: how fast it answers and what it returned last. */
+function AddonHealth({ stat }: { stat?: AddonStat }) {
+  if (!stat || !stat.lookups) return <span className="addon-health">Not used yet</span>;
+  const recentFail = stat.failedAt != null && (stat.lastError != null || Date.now() - stat.failedAt < 10 * 60_000);
+  const rate = stat.lookups ? Math.round(((stat.lookups - stat.failures) / stat.lookups) * 100) : 0;
+  return (
+    <span className={`addon-health ${recentFail && stat.lastError ? "bad" : rate >= 80 ? "ok" : "warn"}`}>
+      <i aria-hidden />
+      {stat.lastError
+        ? `Last lookup failed (${stat.lastError})`
+        : `${stat.avgMs != null ? `${stat.avgMs} ms` : "–"} · ${stat.lastCount ?? 0} stream${stat.lastCount === 1 ? "" : "s"} last time`}
+      {" · "}
+      {rate}% answered over {stat.lookups} lookup{stat.lookups === 1 ? "" : "s"}
+    </span>
   );
 }

@@ -256,35 +256,36 @@ export async function buildApp({ logger = true } = {}) {
     };
   });
 
-  app.put("/progress/:key", { preHandler: requireUser }, async (req, reply) => {
-    const key = req.params.key;
-    const e = req.body ?? {};
+  // Each write is a plain function so the single-write routes and the batch route share it.
+  const bad = { status: 400, body: { error: "bad_request" } };
+  const ok = { status: 200, body: { ok: true } };
+
+  async function putProgress(userId, key, e = {}) {
     const num = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0 && v < 1e7;
-    if (!KEY_RX.test(key) || !num(e.position) || !num(e.duration)) return reply.code(400).send({ error: "bad_request" });
+    if (!KEY_RX.test(key) || !isPlainObject(e) || !num(e.position) || !num(e.duration)) return bad;
     const updatedAt = clientTime(e.updatedAt);
     // Every client reads `media.key` off these rows: a row without its title would break their sync.
-    if (!updatedAt || !mediaOk(e.media) || !optInt(e.season) || !optInt(e.episode)) return reply.code(400).send({ error: "bad_request" });
-    if (e.audio !== undefined && e.audio !== null && !AUDIO.has(e.audio)) return reply.code(400).send({ error: "bad_request" });
+    if (!updatedAt || !mediaOk(e.media) || !optInt(e.season) || !optInt(e.episode)) return bad;
+    if (e.audio !== undefined && e.audio !== null && !AUDIO.has(e.audio)) return bad;
     // Last write wins, but never let an older device overwrite a newer one.
     await q(
       `INSERT INTO progress (user_id, media_key, data, updated_at) VALUES ($1, $2, $3, $4)
        ON CONFLICT (user_id, media_key) DO UPDATE SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at, deleted_at = NULL
        WHERE progress.updated_at < EXCLUDED.updated_at
          AND (progress.deleted_at IS NULL OR progress.deleted_at < EXCLUDED.updated_at)`,
-      [req.userId, key, JSON.stringify({ media: e.media, season: e.season ?? undefined, episode: e.episode ?? undefined, audio: e.audio ?? undefined, position: e.position, duration: e.duration, ...(e.upNext === true ? { upNext: true } : {}), ...(e.finished === true ? { finished: true } : {}) }), updatedAt],
+      [userId, key, JSON.stringify({ media: e.media, season: e.season ?? undefined, episode: e.episode ?? undefined, audio: e.audio ?? undefined, position: e.position, duration: e.duration, ...(e.upNext === true ? { upNext: true } : {}), ...(e.finished === true ? { finished: true } : {}) }), updatedAt],
     );
-    return { ok: true };
-  });
+    return ok;
+  }
 
-  app.delete("/progress/:key", { preHandler: requireUser }, async (req) => {
+  async function deleteProgress(userId, key) {
     // Soft delete: the tombstone tells other devices this was removed (a newer watch revives it).
-    await q(`UPDATE progress SET deleted_at = now() WHERE user_id = $1 AND media_key = $2 AND deleted_at IS NULL`, [req.userId, req.params.key]);
-    return { ok: true };
-  });
+    await q(`UPDATE progress SET deleted_at = now() WHERE user_id = $1 AND media_key = $2 AND deleted_at IS NULL`, [userId, key]);
+    return ok;
+  }
 
-  app.put("/watchlist/:key", { preHandler: requireUser }, async (req, reply) => {
-    const key = req.params.key;
-    if (!KEY_RX.test(key) || !mediaOk(req.body?.media)) return reply.code(400).send({ error: "bad_request" });
+  async function putWatchlist(userId, key, body) {
+    if (!KEY_RX.test(key) || !mediaOk(body?.media)) return bad;
     // One statement: the cap is checked and the row written together, so two devices adding at
     // once can't both slip past it; an existing row refreshes its artwork instead of going stale.
     const { rowCount } = await q(
@@ -296,32 +297,81 @@ export async function buildApp({ logger = true } = {}) {
          media = EXCLUDED.media,
          added_at = CASE WHEN watchlist.deleted_at IS NULL THEN watchlist.added_at ELSE now() END,
          deleted_at = NULL`,
-      [req.userId, key, JSON.stringify(req.body.media), MAX_WATCHLIST],
+      [userId, key, JSON.stringify(body.media), MAX_WATCHLIST],
     );
-    if (!rowCount) return reply.code(413).send({ error: "watchlist_full" });
-    return { ok: true };
-  });
+    if (!rowCount) return { status: 413, body: { error: "watchlist_full" } };
+    return ok;
+  }
 
-  app.delete("/watchlist/:key", { preHandler: requireUser }, async (req) => {
-    await q(`UPDATE watchlist SET deleted_at = now() WHERE user_id = $1 AND media_key = $2 AND deleted_at IS NULL`, [req.userId, req.params.key]);
-    return { ok: true };
-  });
+  async function deleteWatchlist(userId, key) {
+    await q(`UPDATE watchlist SET deleted_at = now() WHERE user_id = $1 AND media_key = $2 AND deleted_at IS NULL`, [userId, key]);
+    return ok;
+  }
 
-  app.put("/settings", { preHandler: requireUser }, async (req, reply) => {
-    const body = req.body ?? {};
-    if (!isPlainObject(body)) return reply.code(400).send({ error: "bad_request" });
+  async function putSettings(userId, body = {}) {
+    if (!isPlainObject(body)) return bad;
     const clean = sanitizeSettings(body);
     if ("subtitlePref" in clean) {
       const sanitized = sanitizeSubtitlePref(clean.subtitlePref);
-      if (!sanitized) return reply.code(400).send({ error: "bad_request" });
+      if (!sanitized) return bad;
       clean.subtitlePref = sanitized;
     }
     await q(
       `INSERT INTO user_settings (user_id, data, updated_at) VALUES ($1, $2, now())
        ON CONFLICT (user_id) DO UPDATE SET data = user_settings.data || EXCLUDED.data, updated_at = now()`,
-      [req.userId, JSON.stringify(clean)],
+      [userId, JSON.stringify(clean)],
     );
-    return { ok: true };
+    return ok;
+  }
+
+  const answer = (reply, r) => reply.code(r.status).send(r.body);
+  app.put("/progress/:key", { preHandler: requireUser }, async (req, reply) => answer(reply, await putProgress(req.userId, req.params.key, req.body ?? {})));
+  app.delete("/progress/:key", { preHandler: requireUser }, async (req, reply) => answer(reply, await deleteProgress(req.userId, req.params.key)));
+  app.put("/watchlist/:key", { preHandler: requireUser }, async (req, reply) => answer(reply, await putWatchlist(req.userId, req.params.key, req.body)));
+  app.delete("/watchlist/:key", { preHandler: requireUser }, async (req, reply) => answer(reply, await deleteWatchlist(req.userId, req.params.key)));
+  app.put("/settings", { preHandler: requireUser }, async (req, reply) => answer(reply, await putSettings(req.userId, req.body ?? {})));
+
+  /**
+   * Many queued writes in one request (a device coming back online, the player closing): the same
+   * writes as the routes above, applied in order, each answered on its own. A write that fails on
+   * the server stops the batch there, so the client keeps it and everything after it, in order.
+   */
+  const MAX_BATCH = 50;
+  function route(path, method) {
+    const m = /^\/(progress|watchlist)\/([^/?#]+)$/.exec(path);
+    if (m) {
+      let key;
+      try {
+        key = decodeURIComponent(m[2]);
+      } catch {
+        return null;
+      }
+      if (m[1] === "progress") return method === "PUT" ? (u, b) => putProgress(u, key, b ?? {}) : method === "DELETE" ? (u) => deleteProgress(u, key) : null;
+      return method === "PUT" ? (u, b) => putWatchlist(u, key, b) : method === "DELETE" ? (u) => deleteWatchlist(u, key) : null;
+    }
+    if (path === "/settings" && method === "PUT") return (u, b) => putSettings(u, b ?? {});
+    return null;
+  }
+  app.post("/sync/batch", { preHandler: requireUser, bodyLimit: 512 * 1024 }, async (req, reply) => {
+    const ops = req.body?.ops;
+    if (!Array.isArray(ops) || ops.length > MAX_BATCH) return reply.code(400).send({ error: "bad_request" });
+    const results = [];
+    for (const op of ops) {
+      const run = isPlainObject(op) && typeof op.path === "string" && op.path.length <= 300 ? route(op.path, op.method) : null;
+      if (!run) {
+        results.push({ status: 400 });
+        continue;
+      }
+      try {
+        results.push({ status: (await run(req.userId, op.body)).status });
+      } catch (err) {
+        if (err?.code === "23503") return reply.code(401).send({ error: "unauthorized" });
+        req.log.error(err);
+        results.push({ status: 500 });
+        break; // the rest stay queued on the device, still in order
+      }
+    }
+    return { results };
   });
 
   // ---------- catalog proxy ----------

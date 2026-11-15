@@ -81,6 +81,8 @@ export interface SubTrackMemoryEntry {
   selectedLabel?: string;
   secondaryLang?: string;
   offsetSec?: number;
+  /** Timing of the second (dual) subtitle, independent of the main one. */
+  secondaryOffsetSec?: number;
   enabled?: boolean;
   updatedAt?: number;
 }

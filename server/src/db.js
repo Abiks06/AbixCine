@@ -10,8 +10,8 @@ const url = process.env.DATABASE_URL;
 let pool;
 let embedded = null;
 if (url) {
-  // Render's managed Postgres requires TLS from outside its private network.
-  const needsSsl = /render\.com|sslmode=require/.test(url) || process.env.PGSSL === "1";
+  // Managed Postgres (Supabase, Render's external URL) requires TLS.
+  const needsSsl = /render\.com|supabase\.(?:co|com)|sslmode=require/.test(url) || process.env.PGSSL === "1";
   // Certificate checks are opt-in so existing deployments keep connecting: set PGSSL_VERIFY=1
   // (optionally with the server's CA in PGSSL_CA) to reject unverified certificates.
   const verify = process.env.PGSSL_VERIFY === "1";
@@ -26,7 +26,14 @@ if (url) {
   const { dirname } = await import("node:path");
   mkdirSync(dirname(dir), { recursive: true });
   embedded = new PGlite(dir);
-  pool = { query: (t, p) => embedded.query(t, p), end: () => embedded.close() };
+  // PGlite reports changed rows as `affectedRows`; callers read node-postgres's `rowCount`.
+  pool = {
+    query: async (t, p) => {
+      const r = await embedded.query(t, p);
+      return { ...r, rowCount: r.affectedRows ?? r.rows?.length ?? 0 };
+    },
+    end: () => embedded.close(),
+  };
   console.log("[db] DATABASE_URL not set: using embedded Postgres in ./data/pglite");
 }
 export { pool };
@@ -92,4 +99,15 @@ export async function migrate() {
     ALTER TABLE progress ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
     ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
   `);
+  // Hosted Postgres with a public data API (Supabase): row-level security with no policies keeps
+  // that API out of every table. The server logs in as the tables' owner, which RLS doesn't limit.
+  if (!embedded) {
+    await run(`
+      ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+      ALTER TABLE refresh_tokens ENABLE ROW LEVEL SECURITY;
+      ALTER TABLE progress ENABLE ROW LEVEL SECURITY;
+      ALTER TABLE watchlist ENABLE ROW LEVEL SECURITY;
+      ALTER TABLE user_settings ENABLE ROW LEVEL SECURITY;
+    `);
+  }
 }
