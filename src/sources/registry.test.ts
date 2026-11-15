@@ -803,7 +803,7 @@ describe("health recovery, incremental resolve cache & embed hardening", () => {
     }
   });
 
-  it("decrypts KissKH AES-128-CBC .txt/.txt1 subtitles into playable data: URLs", async () => {
+  it("hands KissKH .txt/.txt1 subtitles over unfetched and decrypts them when a track is opened", async () => {
     const encKey = await crypto.subtle.importKey(
       "raw",
       new TextEncoder().encode("8056483646328763"),
@@ -876,11 +876,20 @@ describe("health recovery, incremental resolve cache & embed hardening", () => {
     expect(track.lang).toBe("en");
     expect(track.format).toBe("srt");
     expect(track.isDefault).toBe(true);
-    expect(track.url).toMatch(/^data:text\/plain;charset=utf-8;base64,/);
+    // The lookup no longer downloads the file: it returns the proxied URL right away.
+    expect(unwrapProxyUrl(track.url).url).toBe("https://cdn.kisskh.example/901/en.txt1");
+    expect(mockHttpFetch.mock.calls.some(([u]) => u === "https://cdn.kisskh.example/901/en.txt1")).toBe(false);
 
-    const fetched = await fetch(track.url).then((r) => r.text());
-    expect(fetched).toContain("Hello from Seoul!");
-    expect(fetched).toContain("Line one\nLine two");
+    // Opening the track decrypts it.
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(encryptedSrt, { status: 200 })));
+    try {
+      const { fetchAndParseSubtitle } = await import("../lib/subtitleProviders");
+      const parsed = await fetchAndParseSubtitle(track.url, { formatHint: track.format });
+      expect(parsed.raw).toContain("Hello from Seoul!");
+      expect(parsed.cues.some((c) => c.text.includes("Line one"))).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
 

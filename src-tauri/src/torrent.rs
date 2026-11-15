@@ -257,7 +257,7 @@ mod enabled {
     use std::io::SeekFrom;
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::Duration;
-    use tokio::sync::{Notify, Semaphore};
+    use tokio::sync::{watch, Semaphore};
     use tauri::Manager;
     use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -278,12 +278,48 @@ mod enabled {
     const READ_STALL: Duration = Duration::from_secs(90);
     const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
     const MAX_CONNECTIONS: usize = 24;
+    /// librqbit's blocking-reader pool. Its default (8) is smaller than our connection cap, and each
+    /// open file reader holds a permit: a burst of seeks used to exhaust it and stall piece I/O and
+    /// new torrents alike. Always keep it above the number of connections we accept.
+    const READER_PERMITS: usize = MAX_CONNECTIONS + 8;
+    /// Opening a reader (it may wait for a permit) or seeking it never hangs a request longer.
+    const OPEN_TIMEOUT: Duration = Duration::from_secs(20);
+    /// A client that stops reading (paused tab, frozen player) releases its reader after this.
+    const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+    /// A magnet whose metadata never arrives (no peers) fails instead of spinning forever.
+    const METADATA_TIMEOUT: Duration = Duration::from_secs(45);
 
-    /// Wakes every response streaming from a torrent when it is stopped.
-    fn stop_signal(id: usize) -> Arc<Notify> {
-        static MAP: OnceLock<Mutex<HashMap<usize, Arc<Notify>>>> = OnceLock::new();
-        let mut m = MAP.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner());
-        m.entry(id).or_insert_with(|| Arc::new(Notify::new())).clone()
+    fn stop_map() -> &'static Mutex<HashMap<usize, watch::Sender<bool>>> {
+        static MAP: OnceLock<Mutex<HashMap<usize, watch::Sender<bool>>>> = OnceLock::new();
+        MAP.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Level-triggered stop flag for a torrent's readers: a stop that lands while a reader is still
+    /// opening or seeking is seen as soon as it looks (Notify dropped such wakeups).
+    fn stop_signal(id: usize) -> watch::Receiver<bool> {
+        let mut m = stop_map().lock().unwrap_or_else(|e| e.into_inner());
+        m.entry(id).or_insert_with(|| watch::channel(false).0).subscribe()
+    }
+
+    fn signal_stop(id: usize) {
+        let mut m = stop_map().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(tx) = m.remove(&id) {
+            let _ = tx.send(true);
+        }
+    }
+
+    /// Resolves once the torrent is stopped (immediately if it already was).
+    async fn stopped(rx: &mut watch::Receiver<bool>) {
+        if *rx.borrow() {
+            return;
+        }
+        while rx.changed().await.is_ok() {
+            if *rx.borrow() {
+                return;
+            }
+        }
+        // Sender dropped without a stop: never resolve.
+        std::future::pending::<()>().await
     }
 
     fn app_origin() -> &'static str {
@@ -311,6 +347,11 @@ mod enabled {
                     .app_local_data_dir()
                     .map_err(|e| format!("Failed to resolve app_local_data_dir: {e}"))?
                     .join("torrents");
+                // Nothing is resumed between runs (no persistence, no fastresume), so whatever the
+                // last run left behind is dead weight: clear it before starting.
+                if data_dir.exists() {
+                    let _ = std::fs::remove_dir_all(&data_dir);
+                }
                 std::fs::create_dir_all(&data_dir)
                     .map_err(|e| format!("Failed to create torrents directory: {e}"))?;
 
@@ -323,6 +364,7 @@ mod enabled {
                     persistence: None,
                     fastresume: false,
                     concurrent_init_limit: Some(2),
+                    runtime_worker_threads: Some(READER_PERMITS),
                     ..Default::default()
                 };
 
@@ -522,7 +564,10 @@ mod enabled {
             let (status_line, start, end, content_range_hdr) = if let Some(ref r) = range_hdr {
                 match parse_http_range_header(r, total_len) {
                     Ok((s, e)) => {
-                        let e = if r.trim_end().ends_with('-') { e.min(s.saturating_add(MAX_WINDOW - 1)) } else { e };
+                        // Every partial response is one window at most, explicit ranges included
+                        // (`bytes=0-2147483647` pinned a reader for the whole file); the player
+                        // asks for the next window from Content-Range.
+                        let e = e.min(s.saturating_add(MAX_WINDOW - 1));
                         (
                         "206 Partial Content",
                         s,
@@ -547,23 +592,47 @@ mod enabled {
             };
 
             let content_len = if total_len == 0 { 0 } else { end - start + 1 };
+            let mut stop_rx = stop_signal(torrent_id);
+            if *stop_rx.borrow() {
+                write_simple_response(&mut socket, "410 Gone", "Connection: close\r\n", b"torrent stopped").await?;
+                return Ok(());
+            }
             let mut stream = if is_get && content_len > 0 {
-                match handle.stream(file_idx).await {
-                    Ok(s) => Some(s),
-                    Err(_) => {
+                let opened = tokio::select! {
+                    biased;
+                    _ = stopped(&mut stop_rx) => return Ok(()),
+                    r = tokio::time::timeout(OPEN_TIMEOUT, handle.stream(file_idx)) => r,
+                };
+                match opened {
+                    Ok(Ok(s)) => Some(s),
+                    Ok(Err(_)) => {
                         write_simple_response(&mut socket, "404 Not Found", "", b"stream unavailable").await?;
                         if close_conn {
                             return Ok(());
                         }
                         continue;
                     }
+                    Err(_) => {
+                        // Every reader is busy: tell the player to retry rather than queue forever.
+                        write_simple_response(&mut socket, "503 Service Unavailable", "Retry-After: 1\r\nConnection: close\r\n", b"busy").await?;
+                        return Ok(());
+                    }
                 }
             } else {
                 None
             };
             if let Some(stream) = stream.as_mut().filter(|_| start > 0) {
-                if let Err(err) = stream.seek(SeekFrom::Start(start)).await {
-                    let msg = format!("seek error: {err}");
+                let seeked = tokio::select! {
+                    biased;
+                    _ = stopped(&mut stop_rx) => return Ok(()),
+                    r = tokio::time::timeout(OPEN_TIMEOUT, stream.seek(SeekFrom::Start(start))) => r,
+                };
+                let seek_err = match seeked {
+                    Ok(Ok(_)) => None,
+                    Ok(Err(err)) => Some(format!("seek error: {err}")),
+                    Err(_) => Some("seek timed out".to_string()),
+                };
+                if let Some(msg) = seek_err {
                     write_simple_response(
                         &mut socket,
                         "500 Internal Server Error",
@@ -598,7 +667,6 @@ mod enabled {
             socket.write_all(head.as_bytes()).await?;
 
             if let Some(mut stream) = stream {
-                let stopped = stop_signal(torrent_id);
                 let mut remaining = content_len;
                 let mut chunk = vec![0u8; 64 * 1024];
                 let mut watch_client = true;
@@ -609,7 +677,7 @@ mod enabled {
                     // way, give the reader back now rather than when the pieces finally arrive.
                     let n = tokio::select! {
                         biased;
-                        _ = stopped.notified() => return Ok(()),
+                        _ = stopped(&mut stop_rx) => return Ok(()),
                         gone = client_gone(&socket), if watch_client => {
                             if gone {
                                 return Ok(());
@@ -626,8 +694,12 @@ mod enabled {
                         return Ok(());
                     }
                     tokio::select! {
-                        _ = stopped.notified() => return Ok(()),
-                        r = socket.write_all(&chunk[..n]) => r?,
+                        biased;
+                        _ = stopped(&mut stop_rx) => return Ok(()),
+                        r = tokio::time::timeout(WRITE_TIMEOUT, socket.write_all(&chunk[..n])) => match r {
+                            Ok(r) => r?,
+                            Err(_) => return Ok(()), // the client stopped reading
+                        },
                     }
                     remaining -= n as u64;
                 }
@@ -648,17 +720,19 @@ mod enabled {
         let magnet = parse_magnet_or_infohash(&magnet_or_hash)?;
         let rt = get_or_init_runtime(&app).await?;
 
-        let add_resp = rt
-            .session
-            .add_torrent(
+        let add_resp = tokio::time::timeout(
+            METADATA_TIMEOUT,
+            rt.session.add_torrent(
                 AddTorrent::from_url(magnet),
                 Some(AddTorrentOptions {
                     overwrite: true,
                     ..Default::default()
                 }),
-            )
-            .await
-            .map_err(|e| format!("Failed to add torrent: {e:#}"))?;
+            ),
+        )
+        .await
+        .map_err(|_| "No peers sent this torrent's metadata in time (dead or unseeded magnet)".to_string())?
+        .map_err(|e| format!("Failed to add torrent: {e:#}"))?;
 
         let (id, handle) = match add_resp {
             AddTorrentResponse::Added(id, handle)
@@ -764,7 +838,7 @@ mod enabled {
             .get()
             .ok_or_else(|| "Torrent session is not initialized".to_string())?;
         // Release any reader still serving this torrent before its files go away.
-        stop_signal(id).notify_waiters();
+        signal_stop(id);
         rt.session
             .delete(TorrentIdOrHash::Id(id), true)
             .await

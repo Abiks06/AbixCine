@@ -11,6 +11,38 @@
 
 ---
 
+## 0. Resolution Status (v1.8.0 – v1.8.1)
+
+All 21 Section 3 clusters were worked through. Items marked **Disputed** were checked against the code or live data and found not to be bugs; **Not done** items were left on purpose, with the reason.
+
+| # | Status | Notes |
+| --- | --- | --- |
+| 1 | Fixed | `abxs:` main-window only; SSRF guard on every request, redirect hop and DNS answer (link-local/metadata never; LAN only when the URL names it; no public→LAN pivots or rebinding); proxy refuses loopback. |
+| 2 | Fixed | librqbit reader permits above the connection cap; every 206 capped to the window; level-triggered stop flag; open/seek/write/metadata timeouts; stale `torrents/` swept at startup. |
+| 3 | Fixed | `abxNoWoiF` returns a fake window; header map evicts oldest; fMP4 init/fragments no longer arm early exit; verification capped (6 s each, 8 s total); cancel tombstones expire; clicker aborts on every exit path. |
+| 4 | Fixed (one item not done) | Sniffer windows and child frames restricted to the open web; new-window check uses `is_app_navigation`; test env switches debug-only. **Not done:** `.incognito(true)` — app data is already origin-isolated, and per-sniff private profiles would drop Cloudflare clearance cookies and slow capture. |
+| 5 | Fixed | Suffix ranges; buffered bodies capped (overflow served as a 206 window); playlist cache keyed by Referer/Origin, 200-only, expiry checked outside the lock; `data:`/`skd:`/`blob:` keys untouched; MPD templates in query strings and `%` round-trip fixed. **Disputed:** case-insensitive `URI=` (HLS attribute names are case-sensitive). |
+| 6 | Fixed / partly disputed | `0:V:0` mapping (cache key bumped), file cap inside folders, `unwrap_or(false)`, `CON .srt`, sample clips no longer void `Subs/`. **Disputed:** `mov_text` crash (only text codecs are ever mapped). **Not done:** forcing 5.1 AAC to stereo re-encode (turns a seconds-long remux into minutes; Chromium downmixes 5.1 correctly). |
+| 7 | Fixed / disputed | Language region tags and episode 0.5 fixed. **Disputed:** the `/-_\./g` regex is correct — OneTouchTV encodes `/` as the literal `-_.` (verified on live payloads; the suggested fix breaks every decryption). |
+| 8 | Fixed (policy kept) | Network/RPC members stripped from the worker prototype chain; GET/HEAD/POST only; routing headers dropped. Empty `allowedHosts` still means "any public site" (private/loopback always blocked); Settings now labels such plugins. |
+| 9 | Fixed | Title-page previews never add magnets (warm lookups); 3 resolutions per play; RD's disabled cache endpoint reported as "unknown"; season packs matched by filename / SxxEyy. |
+| 10 | Fixed | AnimeHeaven ranking; Hexa token mint coalesced, retry fixed; PrimeSrc/VaPlayer use `isMovieRequest`. |
+| 11 | Fixed | Direct streams never re-captured; `verify()` waiters ref-counted; per-provider probe fairness; mirror health; dub skip list completed. |
+| 12 | Fixed | enc-dec.app: 3-slot queue, 429 retry, 3-failure cooldown, outages kept out of circuit breakers, VidLink/KissKH routed through it; Jellyfin `api_key` redacted from stored health data (old data scrubbed). |
+| 13 | Fixed (library item not done) | WebGL2 probe cached; GPU timing; background-tab downgrades. **Not done:** `ClampHighlights` texture leak lives inside `anime4k-webgpu`. |
+| 14 | Fixed | Token refresh keeps subtitle/audio/pause state; HLS repair budget recovers after 15 s. **Not done:** native-HLS `onError` refresh (WebView2 always uses hls.js). |
+| 15 | Partly fixed | JASSUB kept alive across `C` and renders while paused; boundary-scheduled cue sync; OSHash file size sent; season-pack ZIP episode matching; outage reported as an error. **Not done (features):** independent dual-sub offsets, simultaneous dual HLS subtitle tracks, Shaka DASH text bridge, MKV audio track switching. **Disputed:** passing `languages` to Wyzie would drop useful fallback results. |
+| 16 | Fixed | IndexedDB retries after failure; hydration starts at load and detail pages await it (capped); epoch-guarded downloads; cour selection and offset dedup. |
+| 17 | Fixed | `isFilm` / `isMovieRequest` used everywhere a film is meant; search dedups TMDB/AniList films. |
+| 18 | Fixed (deployment items not done) | Soft-delete tombstones; subtitle memory cleared on sign-out; refresh rotation in one statement; token-version cache. **Not done:** `render.yaml` plan upgrade (cost decision); DB certificate checks are opt-in (`PGSSL_VERIFY=1`) to avoid breaking the live deployment. |
+| 19 | Fixed | Palette owns Escape (capture phase); `aria-modal` only while open; preview not `aria-hidden`; shortcuts dialog modal. |
+| 20 | Fixed | Registry counted at idle; legacy JASSUB engine removed from the build; unused Sora dependency removed. **Disputed:** font subsets (only downloaded per unicode-range; removing them degrades non-Latin titles). |
+| 21 | Fixed (one item not done) | Reduced-motion selectors; addon tile layout; preset URL normalization and failure names; interval churn; FitsTonight streams results; episode stills sized; dead CSS removed. **Not done:** `Title` progress-store re-render (only fires on sync while the page is open). |
+
+**Section 4–6 (optimizations / roadmap):** done — startup registry deferral, legacy WASM removal, lazy KissKH subtitle decryption, boundary cue timer, enc-dec concurrency. Already covered — `resolveMediaIds` coalescing (`resolveTmdbId` and `cached()` both dedupe in flight). Deliberately not done — skipping the commit-time `playCheck` for direct HLS (it catches "master OK, segments 403"). Not started — architectural rewrites (hyper gateway, IndexedDB catalog, batch sync, Player decomposition) and the Section 5 product features.
+
+---
+
 ## 1. Executive Summary & Current Verified Baseline (`v1.7.0+`)
 
 ### 1.1 Automated Workspace Verification Results

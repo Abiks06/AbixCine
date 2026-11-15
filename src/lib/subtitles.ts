@@ -1261,6 +1261,36 @@ function getCueIndexMeta(cues: readonly SubtitleCue[]): CueIndexMeta {
  * Displayed interval is `[cue.start + offsetSec, cue.end + offsetSec)`,
  * so `+0.5` makes subtitles appear 0.5s later.
  */
+/**
+ * Media time (seconds) at which the set of active cues next changes after `timeSec`: the next cue
+ * start, or the end of a cue showing now, whichever comes first. Infinity when nothing changes.
+ */
+export function nextCueBoundaryAfter(cues: readonly SubtitleCue[], timeSec: number, offsetSec = 0): number {
+  if (!cues.length || !Number.isFinite(timeSec)) return Infinity;
+  const off = Number.isFinite(offsetSec) ? offsetSec : 0;
+  const t = timeSec - off;
+  let next = Infinity;
+  const meta = getCueIndexMeta(cues);
+  if (meta.sorted) {
+    // First cue starting after t.
+    let lo = 0;
+    let hi = cues.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >>> 1;
+      if (cues[mid].start > t) {
+        next = cues[mid].start;
+        hi = mid - 1;
+      } else {
+        lo = mid + 1;
+      }
+    }
+  } else {
+    for (const c of cues) if (c.start > t && c.start < next) next = c.start;
+  }
+  for (const c of activeCuesAt(cues, timeSec, off)) if (c.end > t && c.end < next) next = c.end;
+  return next === Infinity ? Infinity : next + off;
+}
+
 export function activeCuesAt(cues: readonly SubtitleCue[], timeSec: number, offsetSec = 0): SubtitleCue[] {
   if (!cues.length || !Number.isFinite(timeSec)) return [];
   const t = timeSec - (Number.isFinite(offsetSec) ? offsetSec : 0);

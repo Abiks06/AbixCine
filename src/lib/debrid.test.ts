@@ -437,3 +437,33 @@ describe("resolution hygiene", () => {
     expect(unrestrict?.[2]?.body).toBe("link=L3");
   });
 });
+
+describe("audit fixes", () => {
+  it("picks the requested episode from a season pack without a fileIdx", async () => {
+    const files = [
+      { id: 1, path: "/Season 1/Show.S01E01.mkv", bytes: 2_000_000_000, selected: 0 },
+      { id: 2, path: "/Season 1/Show.S01E02.mkv", bytes: 1_200_000_000, selected: 0 },
+    ];
+    mockHttpFetch
+      .mockResolvedValueOnce({ status: 201, url: "x", body: JSON.stringify({ id: "T1" }) })
+      .mockResolvedValueOnce({ status: 200, url: "x", body: JSON.stringify({ id: "T1", status: "waiting_files_selection", files }) })
+      .mockResolvedValueOnce({ status: 204, url: "x", body: "" })
+      .mockResolvedValueOnce({
+        status: 200,
+        url: "x",
+        body: JSON.stringify({ id: "T1", status: "downloaded", files: files.map((f) => ({ ...f, selected: f.id === 2 ? 1 : 0 })), links: ["https://real-debrid.com/d/E2"] }),
+      })
+      .mockResolvedValueOnce({ status: 200, url: "x", body: JSON.stringify({ download: "https://s1.real-debrid.com/d/E2/Show.S01E02.mkv", filename: "Show.S01E02.mkv" }) });
+
+    // Largest-file fallback would take episode 1; the episode hint wins.
+    const out = await resolveDebridStream("realdebrid", "rd-key", HASH_A, undefined, undefined, { season: 1, episode: 2 });
+    expect(out.filename).toBe("Show.S01E02.mkv");
+    expect(mockHttpFetch).toHaveBeenNthCalledWith(3, expect.stringContaining("/torrents/selectFiles/T1"), expect.anything(), { method: "POST", body: "files=2" });
+  });
+
+  it("treats Real-Debrid's disabled cache endpoint (403) as 'unknown', not a bad key", async () => {
+    mockHttpFetch.mockResolvedValueOnce({ status: 403, url: "x", body: JSON.stringify({ error: "disabled_endpoint" }) });
+    const res = await checkDebridInstantCache("realdebrid", "rd-key", [HASH_A]);
+    expect(res[HASH_A]).toEqual({ infoHash: HASH_A, cached: false, unknown: true });
+  });
+});

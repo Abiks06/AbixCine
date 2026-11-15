@@ -5,6 +5,7 @@ import {
   fetchAndParseSubtitle,
   normalizeLangCode,
   searchOnlineSubtitles,
+  zipEntryEpisodeScore,
 } from "./subtitleProviders";
 
 const { mockInvoke, mockIsTauri } = vi.hoisted(() => ({
@@ -426,6 +427,20 @@ describe("searchOnlineSubtitles", () => {
     ctl.abort();
     const res2 = await pending;
     expect(res2).toEqual([]);
+  });
+});
+
+describe("zipEntryEpisodeScore", () => {
+  it("picks the playing episode out of a season pack before format preference", () => {
+    const ep = { season: 1, episode: 7 };
+    expect(zipEntryEpisodeScore("Show.S01E07.1080p.srt", ep)).toBe(3);
+    expect(zipEntryEpisodeScore("subs/Show.1x07.ass", ep)).toBe(3);
+    expect(zipEntryEpisodeScore("Show.S01E01.srt", ep)).toBe(-1);
+    expect(zipEntryEpisodeScore("Show.S02E07.srt", ep)).toBe(-1);
+    expect(zipEntryEpisodeScore("[Group] Show - 07 [1080p].ass", ep)).toBe(2);
+    expect(zipEntryEpisodeScore("Show Ep 08.srt", ep)).toBe(-1);
+    expect(zipEntryEpisodeScore("Fight.Club.1999.srt", ep)).toBe(0);
+    expect(zipEntryEpisodeScore("Show.S01E07.srt", undefined)).toBe(0);
   });
 });
 

@@ -1836,8 +1836,10 @@ async fn sniff_inner(app: AppHandle, target: url::Url, timeout_ms: Option<u64>, 
     if candidates.is_empty() {
         return Ok(None);
     }
+    // One slow host must not eat the whole sniff budget: each check is capped, and an unverified
+    // result (None) just moves on to the next candidate.
     Ok(select_verified_candidate(candidates, subs, |u, h| async move {
-        crate::stream::verify_playlist(&u, &h).await
+        tokio::time::timeout(VERIFY_EACH, crate::stream::verify_playlist(&u, &h)).await.ok().flatten()
     })
     .await)
 }
@@ -1936,6 +1938,10 @@ pub(crate) fn sort_candidates(candidates: &mut [Sniffed]) {
     });
 }
 
+/// Cap for one captured playlist's check, and for checking all of a page's candidates.
+const VERIFY_EACH: std::time::Duration = std::time::Duration::from_secs(6);
+const VERIFY_TOTAL: std::time::Duration = std::time::Duration::from_secs(8);
+
 async fn select_verified_candidate<F, Fut>(
     mut candidates: Vec<Sniffed>,
     subs: Vec<String>,
@@ -1951,7 +1957,12 @@ where
     sort_candidates(&mut candidates);
     let mut best_hls: Option<(bool, Sniffed)> = None;
     let mut fallback: Option<Sniffed> = None;
+    let started = std::time::Instant::now();
     for mut f in candidates {
+        // Out of time: settle for the best found so far instead of timing the whole sniff out.
+        if started.elapsed() >= VERIFY_TOTAL && (best_hls.is_some() || fallback.is_some()) {
+            break;
+        }
         let deprio = is_preview_or_ad_url(&f.url);
         if matches!(best_hls, Some((false, _))) && deprio {
             break;

@@ -47,15 +47,35 @@ export function FitsTonight({ pool, loading }: { pool: Media[]; loading?: boolea
 
   useEffect(() => {
     let live = true;
-    // One state update for the whole pool instead of a re-render per title.
-    Promise.all(pool.slice(0, 18).map((m) => getDetail(m.key).then((d) => [m.key, d.runtime] as const).catch(() => [m.key, undefined] as const))).then((all) => {
+    // Results stream in as they land (the slowest of 18 lookups used to hold the whole shelf),
+    // batched into one update per ~150 ms so it isn't a re-render per title.
+    let batch: Record<string, number> = {};
+    let flushTimer: ReturnType<typeof setTimeout> | undefined;
+    const flush = () => {
+      flushTimer = undefined;
+      if (!live || !Object.keys(batch).length) return;
+      const found = batch;
+      batch = {};
+      setRuntimes((r) => ({ ...r, ...found }));
+    };
+    const jobs = pool.slice(0, 18).map((m) =>
+      getDetail(m.key)
+        .then((d) => {
+          if (!live || !d.runtime) return;
+          batch[m.key] = d.runtime;
+          flushTimer ??= setTimeout(flush, 150);
+        })
+        .catch(() => {}),
+    );
+    void Promise.allSettled(jobs).then(() => {
       if (!live) return;
+      clearTimeout(flushTimer);
+      flush();
       setSettled(keys);
-      const found = Object.fromEntries(all.filter(([, rt]) => rt)) as Record<string, number>;
-      if (Object.keys(found).length) setRuntimes((r) => ({ ...r, ...found }));
     });
     return () => {
       live = false;
+      clearTimeout(flushTimer);
     };
   }, [keys]); // eslint-disable-line react-hooks/exhaustive-deps
 

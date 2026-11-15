@@ -4,6 +4,7 @@ import {
   DEFAULT_SUB_PREF,
   SUB_PREF_EVENT,
   activeCuesAt,
+  nextCueBoundaryAfter,
   cuesToVtt,
   decodeSubtitle,
   detectSubtitleFormat,
@@ -402,5 +403,21 @@ describe("track matching & per-media memory", () => {
     }
     expect(loadSubTrackMemory("tmdb:tv:1:s1e1")).toBeNull();
     expect(loadSubTrackMemory("item:129")).not.toBeNull();
+  });
+});
+
+describe("nextCueBoundaryAfter", () => {
+  const cue = (start: number, end: number) => ({ start, end, text: "x", align: 2 }) as unknown as Parameters<typeof activeCuesAt>[0][number];
+  const cues = [cue(1, 3), cue(5, 8), cue(6, 7)];
+  it("returns the next start, or the end of a cue showing now, whichever is sooner", () => {
+    expect(nextCueBoundaryAfter(cues, 0)).toBe(1);
+    expect(nextCueBoundaryAfter(cues, 2)).toBe(3);
+    expect(nextCueBoundaryAfter(cues, 4)).toBe(5);
+    expect(nextCueBoundaryAfter(cues, 6.5)).toBe(7);
+    expect(nextCueBoundaryAfter(cues, 9)).toBe(Infinity);
+  });
+  it("applies the subtitle offset", () => {
+    // Shifted 2 s later: the first cue starts at media time 3.
+    expect(nextCueBoundaryAfter(cues, 0, 2)).toBe(3);
   });
 });

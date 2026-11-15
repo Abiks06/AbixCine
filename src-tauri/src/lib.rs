@@ -127,6 +127,12 @@ fn sidecar_matches_stem(sub_stem: &str, video_stem: &str) -> bool {
 
 /// Collect subtitle files from a `subs`/`subtitles`/`sub` directory unless it holds video files
 /// (e.g. an anime `Sub/` folder containing episodes). Also collects 1-level video-named folders.
+fn is_sample_name(path: &Path) -> bool {
+    path.file_stem()
+        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        .is_some_and(|s| s == "sample" || s.starts_with("sample") || s.ends_with("sample") || s.contains("-sample") || s.contains(".sample"))
+}
+
 fn collect_sub_folder(sub_dir: &Path) -> (Vec<PathBuf>, Vec<(String, Vec<PathBuf>)>) {
     let Ok(entries) = std::fs::read_dir(sub_dir) else {
         return (Vec::new(), Vec::new());
@@ -142,7 +148,9 @@ fn collect_sub_folder(sub_dir: &Path) -> (Vec<PathBuf>, Vec<(String, Vec<PathBuf
             }
             continue;
         }
-        if is_video_file_entry(&path, &entry).is_some() {
+        // A folder holding real episodes (anime "Sub/" folders) is not a subtitle folder; a stray
+        // sample clip doesn't make it one, though, and used to discard every subtitle in it.
+        if is_video_file_entry(&path, &entry).is_some() && !is_sample_name(&path) {
             return (Vec::new(), Vec::new());
         }
         if ext_in(&path, SUB_EXTS) {
@@ -206,6 +214,10 @@ fn walk(dir: &Path, out: &mut Vec<LibFile>, seen: &mut HashSet<PathBuf>, depth: 
     let mut subs: Vec<PathBuf> = Vec::new();
     let mut sub_dirs: Vec<PathBuf> = Vec::new();
     for entry in entries.flatten() {
+        // The cap applies inside a folder too: one folder of 100k files used to blow straight past it.
+        if out.len() + videos.len() >= MAX_FILES {
+            break;
+        }
         let path = entry.path();
         let Ok(ft) = entry.file_type() else { continue };
         if ft.is_dir() {
@@ -446,12 +458,21 @@ fn compute_oshash_in_roots(path: &Path, allowed_roots: &[PathBuf]) -> Result<Str
     compute_oshash_from_path(&canonical)
 }
 
+#[derive(serde::Serialize)]
+struct OsHashResult {
+    hash: String,
+    /// OpenSubtitles matches on hash *and* size; the size is free here (the hash is built from it).
+    size: u64,
+}
+
 #[tauri::command]
-async fn compute_oshash(path: String) -> Result<String, String> {
+async fn compute_oshash(path: String) -> Result<OsHashResult, String> {
     let path = PathBuf::from(&path);
     tauri::async_runtime::spawn_blocking(move || {
         let canonical = ensure_in_library_roots(&path)?;
-        compute_oshash_from_path(&canonical)
+        let hash = compute_oshash_from_path(&canonical)?;
+        let size = std::fs::metadata(&canonical).map_err(|e| e.to_string())?.len();
+        Ok(OsHashResult { hash, size })
     })
     .await
     .map_err(|e| e.to_string())?
@@ -901,7 +922,7 @@ fn prepare_local_media_file(
         canonical.to_string_lossy().as_bytes(),
         &metadata.len().to_le_bytes(),
         &modified.to_le_bytes(),
-        b"abixcine-local-mp4-aac-v2",
+        b"abixcine-local-mp4-aac-v3",
     ]);
     let output = cache_dir.join(format!("{key:016x}.mp4"));
     if output.metadata().map(|m| m.len() > 0).unwrap_or(false) {
@@ -914,7 +935,8 @@ fn prepare_local_media_file(
     command
         .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i"])
         .arg(&canonical)
-        .args(["-map", "0:v:0", "-map", "0:a?"]);
+        // `V` (capital) skips attached pictures: `v:0` picked an MKV's embedded cover JPEG over the film.
+        .args(["-map", "0:V:0", "-map", "0:a?"]);
     for index in &subtitle_indices {
         command.arg("-map").arg(format!("0:{index}"));
     }
@@ -1011,7 +1033,7 @@ fn parse_ffprobe_subtitles(probe: &serde_json::Value) -> Vec<EmbeddedSubtitle> {
             s.get("codec_type")
                 .and_then(serde_json::Value::as_str)
                 .map(|t| t == "subtitle")
-                .unwrap_or(true)
+                .unwrap_or(false)
         })
         .filter_map(|s| {
             let index = s.get("index").and_then(serde_json::Value::as_u64)?;
@@ -1223,7 +1245,8 @@ fn validate_sidecar_filename(filename: &str) -> Result<String, String> {
     if name.contains("..") || name == "." || name.ends_with('.') {
         return Err("Subtitle filename contains invalid path segments".into());
     }
-    let first_label = name.split('.').next().unwrap_or("").to_ascii_uppercase();
+    // Windows ignores trailing spaces, so "CON .srt" is the CON device too.
+    let first_label = name.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
     if matches!(
         first_label.as_str(),
         "CON"

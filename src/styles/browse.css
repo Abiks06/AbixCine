@@ -221,7 +221,6 @@ p.muted.drive-note { margin: 0; max-width: 64ch; line-height: 1.6; }
 .smart-note { font-size: 13px; line-height: 1.5; color: var(--fg2); text-wrap: pretty; }
 .smart-note b { color: var(--fg); font-weight: 600; }
 .smart .btn { align-self: flex-start; }
-.smart-play { align-self: stretch !important; }
 .smart-more { align-self: flex-start; font-size: 12px; color: var(--fg2); padding: 2px; transition: color var(--fast); }
 .smart-more:hover { color: var(--fg); }
 /* section tabs: type, not boxes */

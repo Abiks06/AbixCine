@@ -23,6 +23,8 @@ pub const PROXY_BASE: &str = if cfg!(windows) { "http://abxs.localhost" } else {
 const RANGE_CHUNK: u64 = 6 * 1024 * 1024;
 /// Maximum byte offset we are willing to discard from a `200 OK` body if upstream ignores `Range`.
 const MAX_RANGE_SKIP: u64 = RANGE_CHUNK * 4;
+/// The most a single non-windowed proxied response may buffer (segments and manifests are far smaller).
+const MAX_BUFFERED_BODY: usize = (RANGE_CHUNK * 4) as usize;
 
 /// Playlists fetched while verifying a capture, kept briefly so the player's first request is
 /// answered instantly (the slow part on a new host is the connection, which is now warm too).
@@ -143,33 +145,49 @@ fn playlist_body_has_expired_token(body: &[u8], base_url: &str, now_ms: u64) -> 
     false
 }
 
-fn cached_playlist(url: &str) -> Option<(String, Vec<u8>)> {
-    cached_playlist_at(url, now_epoch_ms())
+/// A cached playlist is only reused for a request with the same Referer/Origin: hosts that bind
+/// tokens to the embedding page answer differently per page. (UA is left out: callers normalise it
+/// differently, and a miss only costs one refetch.)
+fn playlist_key(url: &str, h: &Hdrs) -> String {
+    format!(
+        "{url}\u{1}{}\u{1}{}",
+        h.referer.as_deref().unwrap_or(""),
+        h.origin.as_deref().unwrap_or("")
+    )
 }
 
-fn cached_playlist_at(url: &str, now_ms: u64) -> Option<(String, Vec<u8>)> {
-    if is_url_token_expired_at(url, now_ms) {
+fn cached_playlist(url: &str, h: &Hdrs) -> Option<(String, Vec<u8>)> {
+    cached_playlist_at(url, h, now_epoch_ms())
+}
+
+fn cached_playlist_at(url: &str, h: &Hdrs, now_ms: u64) -> Option<(String, Vec<u8>)> {
+    let key = playlist_key(url, h);
+    let forget = || {
         if let Ok(mut g) = PLAYLISTS.lock() {
             if let Some(map) = g.as_mut() {
-                map.remove(url);
+                map.remove(&key);
             }
         }
-        return None;
-    }
-    let mut g = PLAYLISTS.lock().ok()?;
-    let map = g.as_mut()?;
-    let expired = {
-        let (at, final_url, body) = map.get(url)?;
-        at.elapsed() >= PLAYLIST_TTL
-            || is_url_token_expired_at(final_url, now_ms)
-            || playlist_body_has_expired_token(body, final_url, now_ms)
     };
-    if expired {
-        map.remove(url);
+    if is_url_token_expired_at(url, now_ms) {
+        forget();
         return None;
     }
-    let (_, final_url, body) = map.get(url)?;
-    Some((final_url.clone(), body.clone()))
+    // Copy out under the lock, then scan the body for expired tokens without holding it: that
+    // scan parses every line and used to stall every other proxied request meanwhile.
+    let (at, final_url, body) = {
+        let g = PLAYLISTS.lock().ok()?;
+        let (at, final_url, body) = g.as_ref()?.get(&key)?;
+        (*at, final_url.clone(), body.clone())
+    };
+    let expired = at.elapsed() >= PLAYLIST_TTL
+        || is_url_token_expired_at(&final_url, now_ms)
+        || playlist_body_has_expired_token(&body, &final_url, now_ms);
+    if expired {
+        forget();
+        return None;
+    }
+    Some((final_url, body))
 }
 
 const MAX_PLAYLIST_CACHE: usize = 64;
@@ -219,7 +237,9 @@ fn looks_like_html_doc(text: &str) -> bool {
         || lower.contains("captcha")
 }
 
-fn cache_playlist(url: &str, final_url: &str, body: &[u8]) {
+fn cache_playlist(url: &str, h: &Hdrs, final_url: &str, body: &[u8]) {
+    let url = playlist_key(url, h);
+    let url = url.as_str();
     if let Ok(mut g) = PLAYLISTS.lock() {
         let map = g.get_or_insert_with(HashMap::new);
         map.retain(|_, (at, _, _)| at.elapsed() < PLAYLIST_TTL);
@@ -276,13 +296,17 @@ pub async fn verify_playlist(url: &str, h: &Hdrs) -> Option<u32> {
         if !res.status().is_success() {
             return None;
         }
+        // Only a plain 200 is a whole playlist worth replaying to the player.
+        let cacheable = res.status() == reqwest::StatusCode::OK;
         let final_url = res.url().to_string();
         let body = res.bytes().await.ok()?;
         let text = String::from_utf8_lossy(&body);
         if !is_valid_m3u8_body(&text) {
             return None;
         }
-        cache_playlist(url, &final_url, &body);
+        if cacheable {
+            cache_playlist(url, h, &final_url, &body);
+        }
         let top = text
             .match_indices("RESOLUTION=")
             .filter_map(|(i, _)| text[i + 11..].split(|c: char| c == ',' || c == '\n').next())
@@ -398,13 +422,61 @@ fn proxied_mpd_attr(base: &str, effective_base: &url::Url, val: &str, h: &Hdrs) 
     let Some(dollar_idx) = unescaped.find('$') else {
         return xml_escape(&proxied(base, &resolve(effective_base, &unescaped), h));
     };
-    let (base_str, tail) = match unescaped[..dollar_idx].rfind('/') {
-        Some(slash_idx) => (resolve(effective_base, &unescaped[..=slash_idx]), &unescaped[slash_idx + 1..]),
-        None => (effective_base.to_string(), unescaped.as_str()),
+    // A template inside the query (`seg?path=/a/b/$Number$.m4s`) must not be split at a `/` of the
+    // query: the base would lose its query when the proxy re-joins it. Split right at the `$` instead;
+    // the proxy then appends the tail verbatim (see `join_template`).
+    let query_idx = unescaped.find('?').filter(|&q| q < dollar_idx);
+    let (base_str, tail) = match (query_idx, unescaped[..dollar_idx].rfind('/')) {
+        (Some(_), _) => (resolve(effective_base, &unescaped[..dollar_idx]), &unescaped[dollar_idx..]),
+        (None, Some(slash_idx)) => (resolve(effective_base, &unescaped[..=slash_idx]), &unescaped[slash_idx + 1..]),
+        (None, None) => (effective_base.to_string(), unescaped.as_str()),
     };
     let hj = serde_json::to_vec(h).unwrap_or_default();
-    let tail_escaped = tail.replace('&', "%26").replace('#', "%23");
+    let tail_escaped = escape_tail(tail);
     xml_escape(&format!("{base}/p?u={}&h={}&t={tail_escaped}", B64.encode(base_str), B64.encode(hj)))
+}
+
+/// Escape a template tail for the `t=` parameter: `%` (so a literal `%26` in a token survives the
+/// round trip), `&` and `#`. Text inside `$...$` identifiers is left alone: the DASH player must
+/// still see `$Number%05d$` verbatim to substitute it.
+fn escape_tail(tail: &str) -> String {
+    let mut out = String::with_capacity(tail.len() + 8);
+    let mut in_ident = false;
+    for ch in tail.chars() {
+        match ch {
+            '$' => {
+                in_ident = !in_ident;
+                out.push(ch);
+            }
+            '%' if !in_ident => out.push_str("%25"),
+            '&' if !in_ident => out.push_str("%26"),
+            '#' if !in_ident => out.push_str("%23"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn unescape_tail(t: &str) -> String {
+    t.replace("%26", "&").replace("%23", "#").replace("%25", "%")
+}
+
+/// Rebuild a templated DASH URL: a base that carries a query gets the tail appended verbatim
+/// (joining would drop the query); otherwise the tail resolves against the base as a URL.
+fn join_template(raw_base: &str, tail: &str) -> String {
+    if raw_base.contains('?') {
+        return format!("{raw_base}{tail}");
+    }
+    url::Url::parse(raw_base)
+        .ok()
+        .map(|b| resolve(&b, tail))
+        .unwrap_or_else(|| format!("{raw_base}{tail}"))
+}
+
+/// Inline or DRM key URIs are not fetchable through the proxy: leave them as they are.
+fn is_unproxyable_uri(uri: &str) -> bool {
+    let lower = uri.trim_start().get(..6).unwrap_or(uri).to_ascii_lowercase();
+    lower.starts_with("data:") || lower.starts_with("skd:") || lower.starts_with("blob:")
 }
 
 fn resolve(base_url: &url::Url, reference: &str) -> String {
@@ -430,7 +502,11 @@ fn rewrite_playlist(text: &str, playlist_url: &str, h: &Hdrs, base: &str) -> Str
                 let after_prefix = &rest[start..];
                 if let Some(len) = after_prefix.find('"') {
                     let uri = &after_prefix[..len];
-                    if uri.is_empty() || uri.starts_with("http://abxs.localhost") || uri.starts_with("abxs://localhost") {
+                    if uri.is_empty()
+                        || uri.starts_with("http://abxs.localhost")
+                        || uri.starts_with("abxs://localhost")
+                        || is_unproxyable_uri(uri)
+                    {
                         out.push_str(uri);
                     } else {
                         let p = proxied(base, &resolve(&pu, uri), h);
@@ -696,6 +772,17 @@ fn is_video_extension(target: &str) -> bool {
         .any(|e| path.ends_with(e))
 }
 
+/// `bytes=-N`: the last N bytes (MP4 demuxers read the index at the end of a file this way).
+pub(crate) fn parse_suffix_range(header: &str) -> Option<u64> {
+    let trimmed = header.trim();
+    if !trimmed.as_bytes().get(..6).is_some_and(|b| b.eq_ignore_ascii_case(b"bytes=")) {
+        return None;
+    }
+    let spec = trimmed[6..].trim();
+    let n = spec.strip_prefix('-')?.trim().parse::<u64>().ok()?;
+    (n > 0 && !spec.contains(',')).then_some(n)
+}
+
 pub(crate) fn parse_byte_range(header: &str) -> Option<(u64, Option<u64>)> {
     let trimmed = header.trim();
     // Compared as bytes: slicing the str at 6 panicked when a multi-byte character straddled it.
@@ -891,13 +978,7 @@ pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
         return fail(StatusCode::BAD_REQUEST, &format!("missing url (len {} uri len {}: {why})", raw.len(), req.uri().to_string().len()));
     };
     let target = match q.get("t").filter(|t| !t.is_empty()) {
-        Some(t) => {
-            let unescaped = t.replace("%26", "&").replace("%23", "#");
-            url::Url::parse(&raw_target)
-                .ok()
-                .map(|b| resolve(&b, &unescaped))
-                .unwrap_or_else(|| format!("{raw_target}{unescaped}"))
-        }
+        Some(t) => join_template(&raw_target, &unescape_tail(t)),
         None => raw_target,
     };
     if let Err(e) = validate_proxy_target(&target) {
@@ -915,7 +996,7 @@ pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
 
     let looks_playlist = looks_like_hls_url(&target);
     let looks_dash = looks_like_dash_url(&target);
-    if let Some((final_url, body)) = cached_playlist(&target) {
+    if let Some((final_url, body)) = cached_playlist(&target, &h) {
         let text = String::from_utf8_lossy(&body);
         let head = &text[..floor_char_boundary(&text, MPD_SNIFF_WINDOW)];
         if looks_dash || (!is_extm3u_bytes(&body) && head.contains("<MPD")) {
@@ -959,7 +1040,8 @@ pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
     }
 
     let raw_range = req.headers().get(header::RANGE).and_then(|v| v.to_str().ok());
-    let (outbound_range, requested_range) = plan_outbound_range(raw_range, &target, looks_playlist, looks_dash);
+    let (outbound_range, mut requested_range) = plan_outbound_range(raw_range, &target, looks_playlist, looks_dash);
+    let suffix_len = raw_range.and_then(parse_suffix_range);
     let can_retry = req.method() == tauri::http::Method::GET;
 
     let mut res_opt = None;
@@ -1010,6 +1092,16 @@ pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim().to_string());
     let final_url = res.url().to_string();
+
+    // A suffix range the upstream ignored (200 with the whole file): serve the tail it asked for,
+    // which the guard below can only do when the size is known. Without this the guard answered
+    // with the start of the file, which a demuxer looking for the index can't use.
+    if let (Some(n), true, Some(total)) = (suffix_len, status == StatusCode::OK, upstream_cl) {
+        if requested_range.is_none() {
+            let start = total.saturating_sub(n);
+            requested_range = Some((start, n.min(total).min(RANGE_CHUNK)));
+        }
+    }
 
     let ctype_lower = ctype.to_ascii_lowercase();
     let is_manifest_hint = looks_playlist
@@ -1069,11 +1161,36 @@ pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
         let chunked = (has_more || start > 0) && !buf.is_empty();
         (buf, chunked, start)
     } else {
-        let bytes = match res.bytes().await {
-            Ok(b) => b,
-            Err(e) => return fail(StatusCode::BAD_GATEWAY, &e.to_string()),
-        };
-        (bytes.to_vec(), false, 0)
+        // Read against a cap: an extensionless video labelled octet-stream slips past the guard
+        // above, and buffering it whole could take gigabytes of RAM.
+        let mut buf: Vec<u8> = Vec::with_capacity(upstream_cl.map(|n| n.min(MAX_BUFFERED_BODY as u64) as usize).unwrap_or(0));
+        let mut overflow = false;
+        loop {
+            match res.chunk().await {
+                Ok(Some(c)) => {
+                    if buf.len() + c.len() > MAX_BUFFERED_BODY {
+                        let take = MAX_BUFFERED_BODY - buf.len();
+                        buf.extend_from_slice(&c[..take]);
+                        overflow = true;
+                        break;
+                    }
+                    buf.extend_from_slice(&c);
+                }
+                Ok(None) => break,
+                Err(e) => return fail(StatusCode::BAD_GATEWAY, &e.to_string()),
+            }
+        }
+        drop(res);
+        if overflow {
+            if status != StatusCode::OK || is_manifest_hint {
+                return fail(StatusCode::BAD_GATEWAY, "upstream body too large to proxy");
+            }
+            // Same contract as the guard: the first window as a 206, the player asks for the rest.
+            buf.truncate(RANGE_CHUNK as usize);
+            (buf, true, 0)
+        } else {
+            (buf, false, 0)
+        }
     };
 
     if !synthetically_chunked && status.is_success() {
@@ -1081,8 +1198,8 @@ pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
         let is_playlist = magic_m3u8 || (!looks_like_binary_media_path(&target) && (looks_playlist || ctype_lower.contains("mpegurl")));
         if is_playlist {
             let text = String::from_utf8_lossy(&body);
-            if magic_m3u8 && !looks_like_html_doc(&text) {
-                cache_playlist(&target, &final_url, &body);
+            if magic_m3u8 && status == StatusCode::OK && !looks_like_html_doc(&text) {
+                cache_playlist(&target, &h, &final_url, &body);
             }
             let out = rewrite_playlist(&text, &final_url, &h, base);
             return cors(Response::builder().status(status.as_u16()))
@@ -1103,8 +1220,8 @@ pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
                 });
         if is_dash {
             let text = String::from_utf8_lossy(&body);
-            if !looks_like_html_doc(&text) && text.contains("<MPD") {
-                cache_playlist(&target, &final_url, &body);
+            if status == StatusCode::OK && !looks_like_html_doc(&text) && text.contains("<MPD") {
+                cache_playlist(&target, &h, &final_url, &body);
             }
             let out = rewrite_mpd(&text, &final_url, &h, base);
             return cors(Response::builder().status(status.as_u16()))
@@ -1454,6 +1571,42 @@ pub async fn http_fetch_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suffix_ranges_and_templated_dash_urls_round_trip() {
+        assert_eq!(parse_suffix_range("bytes=-65536"), Some(65536));
+        assert_eq!(parse_suffix_range("bytes=0-10"), None);
+        assert_eq!(parse_suffix_range("bytes=-0"), None);
+
+        // `$Number$` inside a query: the base keeps its query and the tail is appended verbatim.
+        let h = Hdrs::default();
+        let base = url::Url::parse("https://cdn.x/dash/manifest.mpd").unwrap();
+        let attr = proxied_mpd_attr("http://abxs.localhost", &base, "seg?path=/a/b/$Number$.m4s&tok=%26x", &h);
+        let unxml = attr.replace("&amp;", "&");
+        let q: HashMap<String, String> = unxml
+            .split_once('?')
+            .unwrap()
+            .1
+            .split('&')
+            .filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+            .collect();
+        let raw_base = String::from_utf8(B64.decode(&q["u"]).unwrap()).unwrap();
+        let rebuilt = join_template(&raw_base, &unescape_tail(&q["t"]).replace("$Number$", "7"));
+        assert_eq!(rebuilt, "https://cdn.x/dash/seg?path=/a/b/7.m4s&tok=%26x");
+
+        // Path templates still resolve as before.
+        let attr = proxied_mpd_attr("http://abxs.localhost", &base, "video/$Number$.m4s", &h);
+        let unxml = attr.replace("&amp;", "&");
+        let t = unxml.split("&t=").nth(1).unwrap();
+        let u = unxml.split("u=").nth(1).unwrap().split('&').next().unwrap();
+        let raw_base = String::from_utf8(B64.decode(u).unwrap()).unwrap();
+        assert_eq!(join_template(&raw_base, &unescape_tail(t)), "https://cdn.x/dash/video/$Number$.m4s");
+
+        // Inline and DRM keys are left untouched.
+        let pl = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"data:text/plain;base64,AAAA\"\n#EXTINF:4,\nseg.ts\n";
+        let out = rewrite_playlist(pl, "https://cdn.x/a/index.m3u8", &h, "http://abxs.localhost");
+        assert!(out.contains("URI=\"data:text/plain;base64,AAAA\""));
+    }
 
     #[test]
     fn ssrf_guard_classifies_and_validates_targets() {
@@ -1806,13 +1959,17 @@ mod tests {
             "#EXTM3U\n#EXTINF:6,\nhttps://cdn.example.com/seg1.ts?exp={stale_exp}\n"
         );
 
-        cache_playlist(&fresh_url, &fresh_url, valid_body);
-        cache_playlist(&stale_url, &stale_url, valid_body);
-        cache_playlist(nested_stale_url, nested_stale_url, expired_nested_body.as_bytes());
+        let h0 = Hdrs::default();
+        cache_playlist(&fresh_url, &h0, &fresh_url, valid_body);
+        cache_playlist(&stale_url, &h0, &stale_url, valid_body);
+        cache_playlist(nested_stale_url, &h0, nested_stale_url, expired_nested_body.as_bytes());
 
-        assert!(cached_playlist_at(&fresh_url, now_ms).is_some());
-        assert!(cached_playlist_at(&stale_url, now_ms).is_none());
-        assert!(cached_playlist_at(nested_stale_url, now_ms).is_none());
+        assert!(cached_playlist_at(&fresh_url, &h0, now_ms).is_some());
+        assert!(cached_playlist_at(&stale_url, &h0, now_ms).is_none());
+        assert!(cached_playlist_at(nested_stale_url, &h0, now_ms).is_none());
+        // Another page's Referer doesn't get this page's playlist.
+        let other = Hdrs { referer: Some("https://other.example/".into()), ..Default::default() };
+        assert!(cached_playlist_at(&fresh_url, &other, now_ms).is_none());
         assert!(is_url_token_expired_at(&format!("https://cdn.example.com/exp/{stale_exp}/master.m3u8"), now_ms));
     }
 

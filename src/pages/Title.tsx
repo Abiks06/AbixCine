@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { AudioToggle } from "../components/AudioToggle";
 import { Ambient } from "../components/Ambient";
-import { Art } from "../components/Art";
+import { Art, sized } from "../components/Art";
 import { Card, CardSkeleton, kindLabel } from "../components/Card";
 import { Icon } from "../components/Icon";
 import { SmartSource } from "../components/SmartSource";
@@ -419,7 +419,8 @@ export function Title() {
                     const isCur = upNext === e.number && (matchedProgress?.season ?? season) === season;
                     const watched = !!p && p.duration > 0 && p.position / p.duration > 0.92;
                     // Episodes without their own still (often unaired ones) get the show's art, dimmed.
-                    const still = e.still ?? d.backdrop;
+                    // Tiles are ~300px wide: the full-size backdrop (up to `original`) was decoded 50 times over.
+                    const still = e.still ?? sized(d.backdrop, "w300");
                     const left = p && p.duration > 0 && !watched ? Math.max(1, Math.round((p.duration - p.position) / 60)) : null;
                     const fallback = e.airDate
                       ? new Date(`${e.airDate}T12:00:00`).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })

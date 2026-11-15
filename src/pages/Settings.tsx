@@ -955,6 +955,17 @@ export function Settings() {
                       <strong>{plugin.name}</strong>
                       <span className="muted">
                         v{plugin.version} · {plugin.mediaTypes.join(", ")}
+                        {" · "}
+                        {plugin.allowedHosts?.length ? (
+                          <span title={plugin.allowedHosts.join(", ")}>
+                            {plugin.allowedHosts.length === 1 ? plugin.allowedHosts[0] : `${plugin.allowedHosts.length} sites`}
+                          </span>
+                        ) : (
+                          // Private and loopback addresses are always blocked; this says the rest is open.
+                          <span style={{ color: "var(--warn)" }} title="This plugin declares no @allowedHosts, so it may contact any public website.">
+                            any public site
+                          </span>
+                        )}
                       </span>
                     </div>
                     <input

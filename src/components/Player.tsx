@@ -9,6 +9,7 @@ import { fetchSkipSegments, mergeSkipRanges, type SkipSegments } from "../lib/sk
 import {
   SUB_PREF_EVENT,
   activeCuesAt,
+  nextCueBoundaryAfter,
   cuesToVtt,
   decodeSubtitle,
   langBase,
@@ -480,6 +481,8 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
 
   const epSeason = season ?? episodes?.season;
   const epNumber = episode ?? episodes?.episode;
+  const epRef = useRef<{ season?: number; episode?: number }>({});
+  epRef.current = { season: epSeason ?? undefined, episode: epNumber ?? undefined };
   const subMemoryKey = useMemo(() => {
     const base =
       media?.key ||
@@ -1090,7 +1093,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     const activeUrl = activeCurUrlRef.current;
     setLoadingOnlineId(res.id);
     try {
-      const parsed = await fetchAndParseSubtitle(res.url, { formatHint: res.format, signal: ctl.signal });
+      const parsed = await fetchAndParseSubtitle(res.url, { formatHint: res.format, signal: ctl.signal, episode: epRef.current });
       if (ctl.signal.aborted || gen !== sourceGenRef.current || !mountedRef.current) return;
       const trackId = `online-${res.id}`;
       const label = res.release ? `${res.langName || res.lang} · ${res.release}` : (res.langName || res.lang);
@@ -1236,7 +1239,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
         setOnlineResults(results);
         setOnlineSearched(true);
         const top = results[0];
-        const parsed = await fetchAndParseSubtitle(top.url, { formatHint: top.format, signal: ctl.signal });
+        const parsed = await fetchAndParseSubtitle(top.url, { formatHint: top.format, signal: ctl.signal, episode: epRef.current });
         if (ctl.signal.aborted || gen !== sourceGenRef.current || !mountedRef.current || manualSub.current) return;
         const trackId = `online-${top.id}`;
         const label = top.release ? `${top.langName || top.lang} · ${top.release}` : (top.langName || top.lang);
@@ -1418,13 +1421,48 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     };
   }, [cur?.url, isEmbed, selectedSub, secondarySub, findHlsTextTrack]);
 
-  // High-precision 60ms cue sync while playing with an active subtitle track.
+  // Cue sync while playing. Tracks with parsed cues (files, online and stream subtitles) sleep
+  // until the next cue boundary instead of waking every 60 ms; HLS / native text tracks, whose cue
+  // lists grow as segments load, keep the 60 ms cadence. Seeks and speed changes resync at once.
   useEffect(() => {
-    if (isEmbed || !playing || (!selectedSub && !secondarySub)) return;
-    evaluateCues();
-    const timer = window.setInterval(evaluateCues, 60);
-    return () => window.clearInterval(timer);
-  }, [isEmbed, playing, selectedSub, secondarySub, evaluateCues]);
+    const v = video.current;
+    if (isEmbed || !playing || !v || (!selectedSub && !secondarySub)) return;
+    let timer: number | undefined;
+    let alive = true;
+    const delayMs = (): number => {
+      const list = subTracksRef.current;
+      const ids = [selectedSubRef.current, secondarySubRef.current].filter((id): id is string => !!id);
+      const t = v.currentTime || 0;
+      let boundary = Infinity;
+      for (const id of ids) {
+        const track = list.find((x) => x.id === id);
+        const cues = track ? trackDataRef.current[track.id]?.cues ?? track.cues : undefined;
+        if (!cues) return 60; // live text track: keep polling
+        boundary = Math.min(boundary, nextCueBoundaryAfter(cues, t, offsetRef.current));
+      }
+      if (!Number.isFinite(boundary)) return 250;
+      const ms = ((boundary - t) * 1000) / (v.playbackRate || 1);
+      return Math.min(250, Math.max(16, ms + 2));
+    };
+    const tick = () => {
+      if (!alive) return;
+      evaluateCuesRef.current();
+      timer = window.setTimeout(tick, delayMs());
+    };
+    const resync = () => {
+      window.clearTimeout(timer);
+      tick();
+    };
+    tick();
+    v.addEventListener("seeked", resync);
+    v.addEventListener("ratechange", resync);
+    return () => {
+      alive = false;
+      window.clearTimeout(timer);
+      v.removeEventListener("seeked", resync);
+      v.removeEventListener("ratechange", resync);
+    };
+  }, [isEmbed, playing, selectedSub, secondarySub, offset, trackData]);
 
   // Re-evaluate immediately when offset, selection, or cached parsed cues change (even while paused).
   useEffect(() => {

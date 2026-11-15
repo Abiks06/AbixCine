@@ -7,6 +7,7 @@
 
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { DEFAULT_UA, httpFetch, httpFetchBytes, unwrapProxyUrl } from "../sources/native";
+import { decryptKisskhSubtitle, isEncryptedSubCandidateUrl } from "./kisskhSubs";
 import {
   decodeSubtitle,
   langBase,
@@ -165,15 +166,19 @@ function normalizeOshash(raw?: string): string | undefined {
   return /^[0-9a-f]{16}$/.test(trimmed) ? trimmed : undefined;
 }
 
-async function resolveOshash(query: OnlineSubtitleQuery): Promise<string | undefined> {
+/** The local file's OpenSubtitles hash, plus its size (OpenSubtitles matches on both). */
+async function resolveOshash(query: OnlineSubtitleQuery): Promise<{ hash?: string; size?: number }> {
   const explicit = normalizeOshash(query.oshash);
-  if (explicit) return explicit;
-  if (!query.localPath || !isTauri()) return undefined;
+  if (explicit) return { hash: explicit, size: query.fileSize };
+  if (!query.localPath || !isTauri()) return {};
   try {
-    const hash = await invoke<string>("compute_oshash", { path: query.localPath });
-    return normalizeOshash(hash);
+    // Older builds returned the bare hash string.
+    const res = await invoke<string | { hash?: string; size?: number }>("compute_oshash", { path: query.localPath });
+    if (typeof res === "string") return { hash: normalizeOshash(res) };
+    const size = typeof res?.size === "number" && res.size > 0 ? res.size : undefined;
+    return { hash: normalizeOshash(res?.hash), size };
   } catch {
-    return undefined;
+    return {};
   }
 }
 
@@ -633,7 +638,9 @@ export async function searchOnlineSubtitles(
     .map((l) => normalizeLangCode(l))
     .filter((l) => l && l !== "und");
   const hiFilter: SubHIFilter = query.preferHearingImpaired ?? "any";
-  const oshash = await resolveOshash(query);
+  const local = await resolveOshash(query);
+  const oshash = local.hash;
+  if (local.size && query.fileSize == null) query = { ...query, fileSize: local.size };
   if (signal?.aborted) return [];
 
   const cacheKey = buildCacheKey(query, preferredLangs, hiFilter, oshash);
@@ -722,8 +729,25 @@ function isZipBuffer(buf: ArrayBuffer): boolean {
 
 const SUB_EXT_PRIORITY: Record<string, number> = { ass: 4, ssa: 3, vtt: 2, srt: 1 };
 
+/** How well a file name in a subtitle archive matches the episode being played (0 = no signal). */
+export function zipEntryEpisodeScore(name: string, ep?: { season?: number; episode?: number }): number {
+  if (ep?.episode == null) return 0;
+  const base = name.split("/").pop() ?? name;
+  const se = base.match(/\bs(\d{1,2})[ ._-]?e(\d{1,4})\b/i) ?? base.match(/\b(\d{1,2})x(\d{2,4})\b/i);
+  if (se) {
+    const sameEp = Number(se[2]) === ep.episode;
+    const sameSeason = ep.season == null || Number(se[1]) === ep.season;
+    return sameEp && sameSeason ? 3 : -1;
+  }
+  // "Show - 07.srt", "E07", "Ep 07", "[07]": an episode number without a season.
+  const lone = base.match(/(?:\b(?:ep?|episode)[ ._-]?|[ ._-]-[ ._-]|\[)(\d{1,4})(?:\]|\b)/i);
+  if (lone) return Number(lone[1]) === ep.episode ? 2 : -1;
+  return 0;
+}
+
 async function extractFirstSubtitleFromZip(
   buf: ArrayBuffer,
+  ep?: { season?: number; episode?: number },
 ): Promise<{ bytes: ArrayBuffer; formatHint?: string } | null> {
   const bytes = new Uint8Array(buf);
   const view = new DataView(buf);
@@ -775,7 +799,12 @@ async function extractFirstSubtitleFromZip(
   }
 
   if (!candidates.length) return null;
-  candidates.sort((a, b) => (SUB_EXT_PRIORITY[b.ext] ?? 0) - (SUB_EXT_PRIORITY[a.ext] ?? 0));
+  // A season pack lists every episode: the one being played wins before format preference.
+  candidates.sort(
+    (a, b) =>
+      zipEntryEpisodeScore(b.name, ep) - zipEntryEpisodeScore(a.name, ep)
+      || (SUB_EXT_PRIORITY[b.ext] ?? 0) - (SUB_EXT_PRIORITY[a.ext] ?? 0),
+  );
   const best = candidates[0];
 
   const lh = best.localHeaderOffset;
@@ -806,7 +835,13 @@ export interface FetchedSubtitle extends ParsedSubtitles {
  */
 export async function fetchAndParseSubtitle(
   url: string,
-  opts?: { formatHint?: string; headers?: Record<string, string>; signal?: AbortSignal },
+  opts?: {
+    formatHint?: string;
+    headers?: Record<string, string>;
+    signal?: AbortSignal;
+    /** The episode being played, to pick the right file out of a season-pack ZIP. */
+    episode?: { season?: number; episode?: number };
+  },
 ): Promise<FetchedSubtitle> {
   if (opts?.signal?.aborted) throw abortError();
   let hint = inferFormatHintFromUrl(url, opts?.formatHint);
@@ -829,12 +864,20 @@ export async function fetchAndParseSubtitle(
   }
 
   if (isZipBuffer(rawBytes)) {
-    const extracted = await extractFirstSubtitleFromZip(rawBytes);
+    const extracted = await extractFirstSubtitleFromZip(rawBytes, opts?.episode);
     if (!extracted) throw new Error("ZIP archive contained no supported subtitle file");
     rawBytes = extracted.bytes;
     if (extracted.formatHint) hint = extracted.formatHint;
   }
 
-  const text = decodeSubtitle(rawBytes);
+  let text = decodeSubtitle(rawBytes);
+  // KissKH serves its subtitles encrypted; they are decrypted here, when a track is opened.
+  if (isEncryptedSubCandidateUrl(unwrapProxyUrl(url).url)) {
+    const dec = await decryptKisskhSubtitle(text);
+    if (dec.decrypted) {
+      text = dec.text;
+      hint = hint && hint !== "txt" ? hint : "srt";
+    }
+  }
   return { ...parseSubtitles(text, hint), raw: text };
 }

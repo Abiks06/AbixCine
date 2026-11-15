@@ -5,8 +5,11 @@ import { langBase } from "../lib/subtitles";
 import type { MediaDetail, PlaybackRequest } from "../lib/types";
 import { isFilm } from "../lib/types";
 import { DEFAULT_UA, httpFetch, native, normalizeHeaders, proxyUrl, sniff, type StreamHeaders } from "./native";
-import { inferSubtitleMeta, isThumbnailSubtitleUrl, type SourceProvider, type StreamCandidate, type SubtitleFormat, type SubtitleTrack } from "./types";
+import { inferSubtitleMeta, isThumbnailSubtitleUrl, type SourceProvider, type StreamCandidate, type SubtitleTrack } from "./types";
 import { encDec } from "./extractors/encdec";
+import { decryptKisskhBlock, decryptKisskhSubtitle, isEncryptedSubCandidateUrl } from "../lib/kisskhSubs";
+
+export { decryptKisskhBlock, decryptKisskhSubtitle };
 
 /**
  * KissKH: Korean, Chinese, Japanese, Thai and Taiwanese dramas and films with subtitles
@@ -18,11 +21,8 @@ import { encDec } from "./extractors/encdec";
 
 const HOST = "https://kisskh.co";
 const ASIAN = new Set(["ko", "zh", "cn", "ja", "th", "tw", "tl", "id", "vi"]);
-const KISSKH_SUB_KEY = "8056483646328763";
-const KISSKH_SUB_IV = "6852612370185273";
 const SUB_FETCH_TIMEOUT_MS = 2_500;
 const DIRECT_FETCH_TIMEOUT_MS = 4_500;
-const MAX_DECRYPT_SUBS = 3;
 
 interface Hit { id: number; title: string; episodesCount: number }
 interface Drama { id: number; title: string; episodes: { id: number; number: number }[] }
@@ -30,157 +30,6 @@ interface KisskhSubItem { src?: string; label?: string; land?: string; default?:
 
 const slug = (t: string) => t.replace(/[^A-Za-z0-9]+/g, "-").replace(/^-|-$/g, "");
 
-let cachedSubKeyPromise: Promise<CryptoKey> | null = null;
-const KISSKH_IV_BYTES = new TextEncoder().encode(KISSKH_SUB_IV);
-
-function getKisskhSubKey(): Promise<CryptoKey> {
-  if (!cachedSubKeyPromise) {
-    const subtle = globalThis.crypto?.subtle;
-    if (!subtle) return Promise.reject(new Error("WebCrypto subtle API unavailable"));
-    const keyBytes = new TextEncoder().encode(KISSKH_SUB_KEY);
-    cachedSubKeyPromise = subtle.importKey("raw", keyBytes, { name: "AES-CBC" }, false, ["decrypt"]);
-  }
-  return cachedSubKeyPromise;
-}
-
-function base64ToBytes(raw: string): Uint8Array<ArrayBuffer> | null {
-  const clean = raw.trim();
-  if (!clean || clean.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(clean)) return null;
-  try {
-    const bin = atob(clean);
-    const out = new Uint8Array(new ArrayBuffer(bin.length));
-    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-    return out;
-  } catch {
-    return null;
-  }
-}
-
-function bytesToBase64(bytes: Uint8Array): string {
-  let bin = "";
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    bin += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
-  }
-  return btoa(bin);
-}
-
-/** Decrypt a single Base64-encoded AES-128-CBC KissKH subtitle block (PKCS#7 + trailing NUL trim). */
-export async function decryptKisskhBlock(b64: string): Promise<string | null> {
-  const cipher = base64ToBytes(b64);
-  if (!cipher || cipher.length < 16 || cipher.length % 16 !== 0) return null;
-  try {
-    const key = await getKisskhSubKey();
-    const plainBuf = await globalThis.crypto.subtle.decrypt(
-      { name: "AES-CBC", iv: KISSKH_IV_BYTES },
-      key,
-      cipher,
-    );
-    const bytes = new Uint8Array(plainBuf);
-    let end = bytes.length;
-    while (end > 0 && bytes[end - 1] === 0) end--;
-    return new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, end));
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Decrypt a KissKH `.txt` / `.txt1` subtitle payload.
- * Per `debakarr/kisskh-dl`, KissKH `.txt`/`.txt1` files keep SRT cue indices and timestamps in
- * plaintext while AES-128-CBC-encrypting each cue's text lines. Also handles whole-payload
- * encrypted blobs and passes through unencrypted SRT/VTT unchanged.
- */
-export async function decryptKisskhSubtitle(raw: string): Promise<{ text: string; decrypted: boolean }> {
-  const normalized = raw.replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n");
-  if (!normalized.trim()) return { text: normalized, decrypted: false };
-
-  if (!normalized.includes("-->")) {
-    const whole = await decryptKisskhBlock(normalized.replace(/\s+/g, ""));
-    if (whole && whole.trim()) {
-      return { text: whole.replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n"), decrypted: true };
-    }
-    return { text: normalized, decrypted: false };
-  }
-
-  const lines = normalized.split("\n");
-  const out: string[] = [];
-  let decryptedCount = 0;
-  let i = 0;
-
-  while (i < lines.length) {
-    const line = lines[i];
-    out.push(line);
-    i++;
-    if (!line.includes("-->")) continue;
-
-    const cueLines: string[] = [];
-    while (i < lines.length && lines[i].trim() !== "") {
-      cueLines.push(lines[i]);
-      i++;
-    }
-
-    if (cueLines.length > 0) {
-      let cueDecrypted = 0;
-      const decodedLines = await Promise.all(
-        cueLines.map(async (cl) => {
-          const dec = await decryptKisskhBlock(cl);
-          if (dec !== null) {
-            cueDecrypted++;
-            return dec;
-          }
-          return cl;
-        }),
-      );
-
-      if (cueDecrypted > 0) {
-        decryptedCount += cueDecrypted;
-        out.push(...decodedLines);
-      } else if (cueLines.length > 1) {
-        const joined = await decryptKisskhBlock(cueLines.map((l) => l.trim()).join(""));
-        if (joined !== null) {
-          decryptedCount++;
-          out.push(joined);
-        } else {
-          out.push(...cueLines);
-        }
-      } else {
-        out.push(...cueLines);
-      }
-    }
-
-    if (i < lines.length && lines[i].trim() === "") {
-      out.push(lines[i]);
-      i++;
-    }
-  }
-
-  return { text: out.join("\n"), decrypted: decryptedCount > 0 };
-}
-
-function detectDecryptedFormat(text: string): SubtitleFormat {
-  const trimmed = text.trimStart();
-  if (/^WEBVTT(?:\s|$|-)/i.test(trimmed)) return "vtt";
-  if (/^\s*\[Script Info\]/im.test(text) || /^\s*\[Events\]/im.test(text)) return "ass";
-  return "srt";
-}
-
-function toSubtitleDataUrl(text: string, format: SubtitleFormat): string {
-  const mime = format === "vtt" ? "text/vtt" : "text/plain";
-  const bytes = new TextEncoder().encode(text);
-  return `data:${mime};charset=utf-8;base64,${bytesToBase64(bytes)}`;
-}
-
-function isEncryptedSubCandidateUrl(url: string): boolean {
-  const clean = url.split(/[?#]/)[0].toLowerCase();
-  return (
-    clean.endsWith(".txt")
-    || clean.endsWith(".txt1")
-    || clean.endsWith(".txt2")
-    || clean.endsWith(".srt1")
-    || clean.endsWith(".srt2")
-  );
-}
 
 async function fetchTextWithSignal(
   url: string,
@@ -294,7 +143,7 @@ export async function resolveKisskhSubtitles(
   items: { url: string; hintLang?: string; hintLabel?: string; isDefault?: boolean }[],
   headers: StreamHeaders,
   page: string,
-  signal?: AbortSignal,
+  _signal?: AbortSignal,
   preferredLangs: string[] = [],
 ): Promise<SubtitleTrack[]> {
   const seen = new Set<string>();
@@ -306,11 +155,6 @@ export async function resolveKisskhSubtitles(
   }
   if (!unique.length) return [];
 
-  const fetchHeaders: Record<string, string> = {
-    ...(headers.referer ? { Referer: headers.referer } : { Referer: page }),
-    ...(headers.origin ? { Origin: headers.origin } : { Origin: HOST }),
-    "User-Agent": headers.ua ?? DEFAULT_UA,
-  };
   const prefBases = preferredLangs
     .map((l) => langBase(l))
     .filter((l) => l && l !== "und");
@@ -322,48 +166,23 @@ export async function resolveKisskhSubtitles(
     return { item, meta, isDefault, priority, idx };
   });
 
-  // Decrypt only the top MAX_DECRYPT_SUBS prioritized tracks in parallel; keep the rest proxied.
-  const decryptSet = new Set<number>(
-    [...annotated]
-      .sort((a, b) => (b.priority - a.priority) || (a.idx - b.idx))
-      .slice(0, MAX_DECRYPT_SUBS)
-      .map((entry) => entry.idx),
-  );
-
+  // Every track is handed over as a proxied URL: the subtitle loader decrypts KissKH's encrypted
+  // `.txt`/`.txt1` files when a track is actually opened (lib/subtitleProviders.ts). Fetching and
+  // decrypting the top three here held every lookup up by up to 2.5 s.
   const ordered = [...annotated].sort((a, b) => (b.priority - a.priority) || (a.idx - b.idx));
-  const tracks = await Promise.all(
-    ordered.map(async ({ item, meta, isDefault, idx }): Promise<SubtitleTrack> => {
-      if (decryptSet.has(idx)) {
-        const body = await fetchTextWithSignal(item.url, fetchHeaders, signal);
-        if (body) {
-          const { text, decrypted } = await decryptKisskhSubtitle(body);
-          if (decrypted || (isEncryptedSubCandidateUrl(item.url) && text.includes("-->"))) {
-            const format = detectDecryptedFormat(text);
-            return {
-              lang: meta.lang,
-              label: meta.label,
-              url: toSubtitleDataUrl(text, format),
-              format,
-              isDefault,
-              isForced: meta.isForced,
-              isHearingImpaired: meta.isHearingImpaired,
-              source: "stream",
-            };
-          }
-        }
-      }
-      return {
-        lang: meta.lang,
-        label: meta.label,
-        url: proxyUrl(item.url, headers, page),
-        ...(meta.format ? { format: meta.format } : {}),
-        isDefault,
-        isForced: meta.isForced,
-        isHearingImpaired: meta.isHearingImpaired,
-        source: "stream",
-      };
-    }),
-  );
+  const tracks = ordered.map(({ item, meta, isDefault }): SubtitleTrack => {
+    const encrypted = isEncryptedSubCandidateUrl(item.url);
+    return {
+      lang: meta.lang,
+      label: meta.label,
+      url: proxyUrl(item.url, headers, page),
+      ...(encrypted ? { format: "srt" as const } : meta.format ? { format: meta.format } : {}),
+      isDefault,
+      isForced: meta.isForced,
+      isHearingImpaired: meta.isHearingImpaired,
+      source: "stream",
+    };
+  });
 
   const labelCounts = new Map<string, number>();
   for (const t of tracks) {

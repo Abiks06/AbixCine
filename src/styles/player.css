@@ -139,9 +139,8 @@
 .chrome > * { pointer-events: auto; }
 .player.idle .chrome { opacity: 0; }
 .player.idle .chrome > * { pointer-events: none; }
-.ptop { position: absolute; left: 0; right: 0; top: 0; padding: 16px 18px; display: flex; align-items: center; gap: 14px; transition: transform var(--emph) var(--ease-out); }
+.ptop { position: absolute; left: 0; right: 0; top: 0; padding: 16px 18px; display: flex; align-items: center; gap: 14px; transition: transform var(--emph) var(--ease-out), padding-right var(--emph) var(--ease-out); }
 .pbot { transition: transform var(--emph) var(--ease-out), right var(--emph) var(--ease-out); }
-.ptop { transition: transform var(--emph) var(--ease-out), padding-right var(--emph) var(--ease-out); }
 .player.has-sheet .ptop { padding-right: calc(min(432px, 100vw - 24px) + 28px); }
 .player.idle .ptop { transform: translateY(-16px); }
 .player.idle .pbot { transform: translateY(18px); }
