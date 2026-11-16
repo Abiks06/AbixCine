@@ -1536,6 +1536,25 @@ pub fn cancel_sniff(app: AppHandle, cancel_id: String) {
     }
 }
 
+/// Destroy every background sniffer window before the app exits or launches the installer.
+pub fn close_all_sniff_windows(app: &AppHandle) {
+    if let Ok(mut m) = cancel_map().lock() {
+        for (_, entry) in m.drain() {
+            let _ = entry.tx.send(true);
+            if let Some(label) = entry.label {
+                if let Some(w) = app.get_webview_window(&label) {
+                    let _ = w.destroy();
+                }
+            }
+        }
+    }
+    for (label, w) in app.webview_windows() {
+        if label != "main" {
+            let _ = w.destroy();
+        }
+    }
+}
+
 async fn acquire_permit_or_cancel<'a>(
     semaphore: &'a tokio::sync::Semaphore,
     mut cancel_rx: Option<&mut tokio::sync::watch::Receiver<bool>>,

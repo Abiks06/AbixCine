@@ -1,5 +1,7 @@
-import { isTauri } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { useSyncExternalStore } from "react";
+
+export const RELEASES_URL = "https://github.com/Abiks06/AbixCine/releases/latest";
 
 /**
  * In-app updates. Releases are published to GitHub by the release workflow, signed with the
@@ -56,15 +58,19 @@ export async function installUpdate() {
   let got = 0;
   set({ status: "downloading", version: u.version, progress: 0 });
   try {
-    await u.downloadAndInstall((ev) => {
+    await u.download((ev) => {
       if (ev.event === "Started") total = ev.data.contentLength ?? 0;
       else if (ev.event === "Progress") {
         got += ev.data.chunkLength;
         set({ status: "downloading", version: u.version, progress: total ? got / total : 0 });
       } else if (ev.event === "Finished") set({ status: "ready", version: u.version });
     });
-    const { relaunch } = await import("@tauri-apps/plugin-process");
-    await relaunch();
+    await invoke("prepare_for_update_exit").catch(() => {});
+    await u.install();
+    if (typeof navigator !== "undefined" && !/windows/i.test(navigator.userAgent)) {
+      const { relaunch } = await import("@tauri-apps/plugin-process");
+      await relaunch();
+    }
   } catch (e: unknown) {
     set({ status: "error", message: e instanceof Error ? e.message : String(e) });
   }
@@ -72,6 +78,7 @@ export async function installUpdate() {
 
 export const dismissUpdate = () => {
   if (state.status === "available") dismissed = state.version;
+  else if (state.status === "error") state = { status: "idle" };
   listeners.forEach((l) => l());
 };
 export const isDismissed = (v: string) => dismissed === v;

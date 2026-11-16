@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { dismissUpdate, installUpdate, isDismissed, startUpdateChecks, useUpdate } from "../lib/updater";
+import { RELEASES_URL, dismissUpdate, installUpdate, isDismissed, startUpdateChecks, useUpdate } from "../lib/updater";
 
 /** Bottom-right card when a new version is out: release notes, then a one-click update. */
 export function UpdateToast() {
@@ -25,6 +25,18 @@ export function UpdateToast() {
         <div className="ut-h"><i />{u.status === "ready" ? "Installing" : "Downloading"} AbixCine {u.version}</div>
         <div className="ut-bar"><i style={{ width: `${pct}%` }} /></div>
         <p>{u.status === "ready" ? "AbixCine restarts in a moment." : `${pct}%`}</p>
+      </div>
+    );
+  }
+  if (u.status === "error") {
+    return (
+      <div className="update-toast" role="alert">
+        <div className="ut-h"><i />Update couldn't install automatically</div>
+        <p>Windows may have blocked the background installer. Download the setup file directly to update.</p>
+        <div className="ut-acts">
+          <a className="btn play sm" href={RELEASES_URL} target="_blank" rel="noreferrer">Download installer</a>
+          <button className="btn glass sm" onClick={dismissUpdate}>Dismiss</button>
+        </div>
       </div>
     );
   }

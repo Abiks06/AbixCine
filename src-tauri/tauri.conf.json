@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "AbixCine",
-  "version": "1.8.2",
+  "version": "1.8.3",
   "identifier": "app.abixcine.desktop",
   "build": {
     "beforeDevCommand": "npm run prepare:ffmpeg && npm run dev",
@@ -64,14 +64,15 @@
     ],
     "windows": {
       "webviewInstallMode": {
-        "type": "downloadBootstrapper",
-        "silent": true
+        "type": "embedBootstrapper",
+        "silent": false
       },
       "nsis": {
         "installMode": "currentUser",
         "displayLanguageSelector": false,
         "installerIcon": "icons/icon.ico",
-        "startMenuFolder": "AbixCine"
+        "startMenuFolder": "AbixCine",
+        "installerHooks": "windows/hooks.nsh"
       }
     },
     "createUpdaterArtifacts": true,

@@ -10,6 +10,7 @@ use tauri::Manager;
 
 static LIBRARY_ROOTS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
 static MEDIA_PREPARE_LOCK: Mutex<()> = Mutex::new(());
+static MEDIA_TOOL_SPAWNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[derive(Serialize)]
 struct LibFile {
@@ -390,6 +391,7 @@ fn ffprobe_tool(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 }
 
 fn background_command(program: &Path) -> std::process::Command {
+    MEDIA_TOOL_SPAWNED.store(true, std::sync::atomic::Ordering::Relaxed);
     let mut cmd = std::process::Command::new(program);
     #[cfg(windows)]
     {
@@ -1587,6 +1589,24 @@ pub(crate) fn debug_env_string(name: &str) -> Result<String, std::env::VarError>
     }
 }
 
+fn cleanup_before_exit(app: &tauri::AppHandle) {
+    shield::close_all_sniff_windows(app);
+    #[cfg(windows)]
+    if MEDIA_TOOL_SPAWNED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/IM", "ffmpeg.exe", "/IM", "ffprobe.exe"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+    }
+}
+
+#[tauri::command]
+fn prepare_for_update_exit(app: tauri::AppHandle) {
+    cleanup_before_exit(&app);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mut builder = tauri::Builder::default();
@@ -1595,12 +1615,29 @@ pub fn run() {
     if debug_env_var("ABX_SNIFF_TEST").is_none() && debug_env_var("ABX_JS_TEST").is_none() {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
                 let _ = w.unminimize();
                 let _ = w.set_focus();
+            } else {
+                app.exit(0);
             }
         }));
     }
     builder
+        .on_window_event(|window, event| {
+            if window.label() == "main"
+                && matches!(
+                    event,
+                    tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
+                )
+            {
+                let app = window.app_handle().clone();
+                cleanup_before_exit(&app);
+                if matches!(event, tauri::WindowEvent::Destroyed) {
+                    app.exit(0);
+                }
+            }
+        })
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
@@ -1740,7 +1777,8 @@ pub fn run() {
             torrent::torrent_is_supported,
             torrent::torrent_start_stream,
             torrent::torrent_status,
-            torrent::torrent_stop
+            torrent::torrent_stop,
+            prepare_for_update_exit
         ])
         .run(tauri::generate_context!())
         .expect("error while running AbixCine");

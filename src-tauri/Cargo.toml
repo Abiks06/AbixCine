@@ -1,6 +1,6 @@
 [package]
 name = "abixcine"
-version = "1.8.2"
+version = "1.8.3"
 description = "AbixCine: a desktop player for movies, series and anime"
 edition = "2021"
 
@@ -37,9 +37,9 @@ librqbit-sha1-wrapper = { version = "9.1", optional = true, default-features = f
 [profile.release]
 codegen-units = 1
 lto = true
-opt-level = "s"
+opt-level = 2
 panic = "abort"
-strip = true
+strip = false
 
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.39"

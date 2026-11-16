@@ -1397,8 +1397,27 @@ fn redirect_allowed(from: &url::Url, to: &url::Url) -> Result<(), &'static str> 
     Ok(())
 }
 
-/// DNS with the rebinding guard: a public name may only resolve to public addresses; LAN-style
-/// names may also resolve to private/loopback ones. Forbidden ranges are never returned.
+/// Virtual tunnel and CGNAT DNS ranges returned by local VPN / DNS adapters (e.g. Cloudflare WARP,
+/// Tailscale, Clash/Sing-box Fake-IP, NAT64) when resolving ordinary public domains.
+pub(crate) fn is_vpn_or_tun_addr(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            (o[0] == 100 && (o[1] & 0xc0) == 64) || (o[0] == 198 && (o[1] & 0xfe) == 18)
+        }
+        std::net::IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_vpn_or_tun_addr(std::net::IpAddr::V4(v4));
+            }
+            let segs = v6.segments();
+            (segs[0] & 0xfe00) == 0xfc00 || (segs[0] == 0x0064 && segs[1] == 0xff9b)
+        }
+    }
+}
+
+/// DNS with the rebinding guard: a public name may only resolve to public addresses (plus
+/// CGNAT/TUN/ULA addresses mapped by local VPN resolvers); LAN-style names may also resolve to
+/// private/loopback ones. Forbidden ranges are never returned.
 struct GuardedResolver;
 
 impl reqwest::dns::Resolve for GuardedResolver {
@@ -1410,7 +1429,8 @@ impl reqwest::dns::Resolve for GuardedResolver {
                 .await?
                 .filter(|a| match classify_ip(a.ip()) {
                     AddrClass::Public => true,
-                    AddrClass::Private | AddrClass::Loopback => local,
+                    AddrClass::Private => local || is_vpn_or_tun_addr(a.ip()),
+                    AddrClass::Loopback => local,
                     AddrClass::Forbidden => false,
                 })
                 .collect();
@@ -1622,6 +1642,11 @@ mod tests {
         assert_eq!(c("fe80::1"), AddrClass::Forbidden);
         assert_eq!(c("0.0.0.0"), AddrClass::Forbidden);
         assert_eq!(c("::ffff:169.254.169.254"), AddrClass::Forbidden);
+        assert!(is_vpn_or_tun_addr("100.96.0.2".parse().unwrap()));
+        assert!(is_vpn_or_tun_addr("198.18.0.5".parse().unwrap()));
+        assert!(is_vpn_or_tun_addr("fd01:5ca1:ab1e::1".parse().unwrap()));
+        assert!(!is_vpn_or_tun_addr("192.168.1.20".parse().unwrap()));
+        assert!(!is_vpn_or_tun_addr("127.0.0.1".parse().unwrap()));
 
         // Explicit local targets stay usable (self-hosted addons); forbidden ones never are.
         assert!(validate_http_url("http://192.168.1.20:7000/manifest.json").is_ok());
