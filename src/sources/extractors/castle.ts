@@ -14,10 +14,13 @@ import {
   isAnimeRequest,
   isDirectExtractorEnabled,
   isMovieRequest,
+  matchTargetFor,
   normalizeQuality,
+  pickTitleMatch,
   resolveMediaIds,
-  titleSimilarity,
+  type MatchTarget,
   type RawSubtitleInput,
+  type TitleMatch,
 } from "./common";
 
 const CASTLE_API = "https://api.hlowb.com";
@@ -215,33 +218,17 @@ function parseRowYear(row: CastleSearchRow): number | undefined {
   return m ? parseInt(m[0], 10) : undefined;
 }
 
-function pickBestCastleHit(rows: CastleSearchRow[], targets: string[], wantYear?: number): CastleSearchRow | null {
-  let best: CastleSearchRow | null = null;
-  let bestScore = -1;
-
-  for (const row of rows) {
-    if (row.id == null) continue;
-    const candidates = [row.title, row.originalTitle].filter((t): t is string => Boolean(t?.trim()));
-    if (!candidates.length) continue;
-
-    let sim = 0;
-    for (const c of candidates) {
-      for (const target of targets) {
-        sim = Math.max(sim, titleSimilarity(c, target));
-      }
-    }
-    const ry = parseRowYear(row);
-    if (wantYear && ry) {
-      if (Math.abs(ry - wantYear) <= 1) sim += 0.08;
-      else if (Math.abs(ry - wantYear) >= 3) sim -= 0.1;
-    }
-    if (sim > bestScore) {
-      bestScore = sim;
-      best = row;
-    }
-  }
-
-  return bestScore >= 0.55 ? best : null;
+/**
+ * The search row that is the wanted title (strict: equal title, year within one, no guessing
+ * between same-named rows). A similarity threshold used to accept "The Odyssey" (1997) for
+ * The Odyssey (2026): identical title, and the year only cost a few points.
+ */
+export function pickBestCastleHit(rows: CastleSearchRow[], target: MatchTarget): TitleMatch<CastleSearchRow> | null {
+  return pickTitleMatch(
+    rows.filter((row) => row.id != null),
+    target,
+    (row) => ({ titles: [row.title, row.originalTitle], year: parseRowYear(row) }),
+  );
 }
 
 function pickBestCastleTrack(tracks: CastleTrack[] | undefined): CastleTrack | undefined {
@@ -318,7 +305,9 @@ export const castleProvider: SourceProvider = {
 
       const rows: CastleSearchRow[] = [];
       const seenIds = new Set<string>();
-      let hit: CastleSearchRow | null = null;
+      let match: TitleMatch<CastleSearchRow> | null = null;
+      const baseTarget = matchTargetFor(req, { titles: targets });
+      const target: MatchTarget = { ...baseTarget, year: baseTarget.year ?? meta.year };
 
       for (const q of targets) {
         if (signal.aborted) return [];
@@ -333,11 +322,13 @@ export const castleProvider: SourceProvider = {
           seenIds.add(id);
           rows.push(row);
         }
-        hit = pickBestCastleHit(rows, targets, meta.year);
-        if (hit) break;
+        match = pickBestCastleHit(rows, target);
+        if (match) break;
       }
 
-      if (!hit || hit.id == null || signal.aborted) return [];
+      const hit = match?.item;
+      if (!match || !hit || hit.id == null || signal.aborted) return [];
+      const matched = { title: match.title, ...(match.year != null ? { year: match.year } : {}) };
       let activeMovieId = String(hit.id);
 
       const fetchDetail = (movieId: string) =>
@@ -353,6 +344,8 @@ export const castleProvider: SourceProvider = {
       const isMovie = isMovieRequest(req);
       const wantSeason = req.season ?? 1;
       const wantEpisode = req.episode ?? 1;
+      // A film request that landed on an entry with several seasons found a series of the same name.
+      if (isMovie && (detail.seasons?.length ?? 0) > 1) return [];
 
       if (!isMovie && Array.isArray(detail.seasons) && detail.seasons.length > 0) {
         const matchedSeason = detail.seasons.find((s) => Number(s?.number) === wantSeason);
@@ -456,6 +449,7 @@ export const castleProvider: SourceProvider = {
           via: "direct",
           headers: streamHeaders,
           subtitles,
+          matched,
           ...(q ? { quality: q } : {}),
           ...(anime ? { audio: "sub" as const } : {}),
         });

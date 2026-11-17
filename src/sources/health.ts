@@ -314,10 +314,25 @@ export function lastPick(req: PlaybackRequest): TitlePick | undefined {
   return undefined;
 }
 
-/** 0..1, Laplace-smoothed so a new provider starts at 0.5 instead of 0 or 1. */
+/** Old evidence counts for less: a provider unheard from for this long weighs half as much. */
+export const EVIDENCE_HALF_LIFE_MS = 3 * 86400_000;
+
+/**
+ * How much a record last updated at `last` still counts (1 → 0 over days). Counts only decayed
+ * when the provider was checked again, so one that failed a lot and then stopped being tried
+ * (ranked last, never reached) kept its bad score forever and never got a fair second chance.
+ */
+export function evidenceWeight(last: number | undefined, now = Date.now()) {
+  if (!last) return 1;
+  const age = now - last;
+  return age <= 0 ? 1 : Math.pow(0.5, age / EVIDENCE_HALF_LIFE_MS);
+}
+
+/** 0..1, Laplace-smoothed so a new provider starts at 0.5 instead of 0 or 1; drifts back to 0.5 when idle. */
 export function reliability(providerId: string) {
   const h = getHealth(providerId);
-  return (h.ok + 1) / (h.ok + h.fail + 2);
+  const w = evidenceWeight(Math.max(h.lastOk ?? 0, h.lastFail ?? 0) || undefined);
+  return (h.ok * w + 1) / ((h.ok + h.fail) * w + 2);
 }
 
 /** Decaying failure factor in [0, 1] across the 10-minute recent-failure window. */

@@ -151,6 +151,9 @@ function pickBestAnizoneCard(cards: AnizoneCard[], req: PlaybackRequest): Anizon
 
     if (year > 0 && card.year > 0) {
       const diff = Math.abs(card.year - year);
+      // A film is one release: the same name from another year is another film (series cards are
+      // left to scoring, since a later season's card carries that season's year).
+      if (isMovie && diff > 1) continue;
       if (diff === 0) sim += 0.1;
       else if (diff === 2) sim -= 0.1;
       else if (diff > 2) sim -= 0.35;

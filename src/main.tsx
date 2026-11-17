@@ -10,6 +10,8 @@ import "./styles/base.css";
 import "./styles/browse.css";
 import "./styles/player.css";
 import "./styles/frost.css";
+import "./styles/trailer.css";
+import "./styles/sources.css";
 import { installPointerLight } from "./lib/pointerLight";
 import { installGamepad } from "./lib/gamepad";
 import { kick as retryScrobbles } from "./lib/scrobble";

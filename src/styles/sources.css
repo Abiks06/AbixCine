@@ -1,0 +1,7 @@
+/* Server list additions (src/components/SourceBoard.tsx). Row layout lives in player.css and the
+   frosted material around the list in frost.css; this only marks a stream that is probably a
+   different title (its length is far off the catalog runtime). */
+.sb-row.suspect { background: color-mix(in oklab, var(--warn) 5%, transparent); box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--warn) 26%, transparent); }
+.sb-row.suspect:not(:disabled):hover { background: color-mix(in oklab, var(--warn) 9%, transparent); box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--warn) 40%, transparent); }
+.sb-row.suspect .sb-sig i { background: color-mix(in oklab, var(--warn) 55%, transparent); }
+.sb-note.warn { color: var(--warn); }

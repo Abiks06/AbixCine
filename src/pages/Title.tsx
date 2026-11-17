@@ -7,6 +7,8 @@ import { Card, CardSkeleton, kindLabel } from "../components/Card";
 import { Icon } from "../components/Icon";
 import { SmartSource } from "../components/SmartSource";
 import { TitleArt } from "../components/TitleArt";
+import { TrailerModal } from "../components/TrailerModal";
+import { isYouTubeId } from "../lib/trailer";
 import {
   clampEpisode,
   clampSeason,
@@ -125,6 +127,7 @@ export function Title() {
   useSettings(); // re-render when the audio preference changes
   const saved = useSaved(key, d?.canonicalKey, d?.key);
   const [swap, setSwap] = useState(false);
+  const [trailerOpen, setTrailerOpen] = useState(false);
   const swapTimer = useRef<number>();
   useEffect(() => () => clearTimeout(swapTimer.current), []);
   const [view, setView] = useState<EpView | null>(loadView);
@@ -303,8 +306,8 @@ export function Title() {
                 <Icon name={saved ? "check" : "bookmark"} size={17} /> {saved ? "In My List" : "My List"}
               </button>
               {audio && <AudioToggle value={audio} onChange={changeAudio} />}
-              {d.trailerYouTubeId && (
-                <a className="btn glass" href={`https://www.youtube.com/watch?v=${d.trailerYouTubeId}`} target="_blank" rel="noreferrer"><Icon name="film" size={17} /> Trailer</a>
+              {isYouTubeId(d.trailerYouTubeId) && (
+                <button type="button" className="btn glass" onClick={() => setTrailerOpen(true)} aria-haspopup="dialog"><Icon name="film" size={17} /> Trailer</button>
               )}
             </div>
             {resumePct != null && matchedProgress && (
@@ -487,6 +490,9 @@ export function Title() {
         </div>
         <div style={{ height: 96 }} />
       </div>
+      {trailerOpen && isYouTubeId(d.trailerYouTubeId) && (
+        <TrailerModal id={d.trailerYouTubeId} title={d.title} onClose={() => setTrailerOpen(false)} />
+      )}
     </div>
   );
 }

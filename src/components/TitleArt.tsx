@@ -5,6 +5,6 @@ export function TitleArt({ media, size = "lg" }: { media: Pick<Media, "title" | 
   return media.logo ? (
     <img className={`title-logo ${size}`} src={media.logo} alt={media.title} />
   ) : (
-    <h1 className={`title-type ${size} ${media.title.length > 26 ? "long" : ""}`}>{media.title}</h1>
+    <h1 className={`title-type ${size} ${media.title.length > 48 ? "xlong" : media.title.length > 26 ? "long" : ""}`}>{media.title}</h1>
   );
 }

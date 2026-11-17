@@ -5,10 +5,10 @@
      --tone       the accent (fills, progress, the active state)
      --tone-ink   the same hue, lifted until it reads as text on the canvas
      --tone-deep  the same hue, sunk into the canvas for tinted plates
-   Surfaces come in three optical tiers, so scrolling never pays for blur:
-     tier 0  solid plates (cards, rows, lists)            no backdrop-filter
-     tier 1  translucent chrome (top bar when scrolled)   gradient only
-     tier 2  floating glass (dock, palette, sheets, HUD)  the only blur on screen
+   Surfaces are glass over a lit room; frost.css (loaded last) owns the material:
+     pane    see-through plates over the blurred room     no backdrop-filter, safe in scrollers
+     smoke   floating glass over sharp content            the few real blurs on screen
+     thin    small glass controls over art                blur only where they float over art
    ========================================================= */
 @property --l1 { syntax: "<color>"; inherits: false; initial-value: #2b3410; }
 @property --l2 { syntax: "<color>"; inherits: false; initial-value: #10242a; }
@@ -27,8 +27,10 @@
   --line-3: rgb(255 255 255 / 0.24);
   /* ink */
   --fg: #f5f5f8;
-  --fg2: #b6b7c4;
-  --fg3: #8b8c9d;
+  /* secondary and tertiary ink sit a step brighter than they would on flat black: the room behind
+     them is lit by artwork now, and both still have to clear 4.5:1 over its brightest corner */
+  --fg2: #c0c1cd;
+  --fg3: #a3a4b3;
   /* brand + the tones the stage light replaces */
   --brand: oklch(0.9 0.2 128);
   --tone: var(--brand);
@@ -83,6 +85,7 @@ button:disabled { opacity: 0.4; cursor: default; }
 h1, h2, h3, h4, h5, h6, p { margin: 0; }
 img { -webkit-user-drag: none; }
 ::selection { background: color-mix(in oklab, var(--tone) 60%, transparent); color: #fff; }
+input, textarea { caret-color: var(--tone-ink); accent-color: var(--tone); }
 :focus-visible { outline: 2px solid var(--tone-ink); outline-offset: 3px; }
 kbd { font: 500 10.5px/1.5 var(--f-mono); color: var(--fg2); padding: 1px 6px; border-radius: 6px; background: rgb(255 255 255 / 0.07); box-shadow: inset 0 -1px 0 rgb(0 0 0 / 0.4), inset 0 0 0 1px var(--line); }
 .muted { color: var(--fg2); }
@@ -105,16 +108,26 @@ kbd { font: 500 10.5px/1.5 var(--f-mono); color: var(--fg2); padding: 1px 6px; b
 
 /* ---------- canvas ---------- */
 .app { position: fixed; inset: 0; background: var(--bg); }
-/* The room's light: two soft pools in the focused title's colours, with baked noise so the
-   gradients never band. Sits behind everything and only repaints when the light changes. */
-.light { position: absolute; inset: 0; z-index: 0; pointer-events: none;
+/* The room's light. Two soft pools in the focused title's colours, and over them the title's own
+   picture blurred down to a field of colour (lib/light.ts paints both). Everything translucent in
+   the app looks through to this layer, so it is what makes glass read as glass rather than grey.
+   The picture's range is squeezed before it is dimmed (contrast, then brightness): a dark frame
+   still gives the room some colour, and a white one can't lift it past the point where tertiary
+   text set straight on the room drops under 4.5:1. Fixed behind the scroller: it repaints only
+   when the light changes, never on scroll. */
+.light { position: absolute; inset: 0; z-index: 0; pointer-events: none; overflow: hidden;
   transition: --l1 var(--amb) var(--ease), --l2 var(--amb) var(--ease);
   background:
-    url("../assets/noise.png"),
-    radial-gradient(60% 55% at 12% -6%, color-mix(in oklab, var(--l1) 62%, transparent), transparent 72%),
-    radial-gradient(52% 60% at 100% 104%, color-mix(in oklab, var(--l2) 58%, transparent), transparent 72%),
+    radial-gradient(60% 55% at 12% -6%, color-mix(in oklab, var(--l1) 46%, transparent), transparent 72%),
+    radial-gradient(52% 60% at 100% 104%, color-mix(in oklab, var(--l2) 46%, transparent), transparent 72%),
     var(--bg); }
-.is-watching .light { display: none; }
+.light::before, .light::after { content: ""; position: absolute; inset: -8%; background: center / cover no-repeat; filter: blur(46px) contrast(0.58) saturate(2.3) brightness(0.5); opacity: 0; transition: opacity var(--amb) var(--ease); }
+.light::before { background-image: var(--art-a, none); }
+.light::after { background-image: var(--art-b, none); }
+.light[data-art="a"]::before, .light[data-art="b"]::after { opacity: 0.44; }
+/* Film grain over the whole room, so neither the pools nor the blurred picture ever band. */
+.app::after { content: ""; position: absolute; inset: 0; z-index: 1; pointer-events: none; background: url("../assets/noise.png"); opacity: 0.7; }
+.is-watching .light, .app.is-watching::after { display: none; }
 .main { position: absolute; inset: 0; z-index: 5; overflow-y: auto; overflow-x: hidden; scrollbar-width: none; }
 .main::-webkit-scrollbar { display: none; }
 .is-watching .main { overflow: hidden; }
@@ -146,7 +159,10 @@ kbd { font: 500 10.5px/1.5 var(--f-mono); color: var(--fg2); padding: 1px 6px; b
 /* tier 1: a gradient that arrives once the page slides underneath */
 .top::before { content: ""; position: absolute; inset: 0 0 -22px; z-index: -1; pointer-events: none; opacity: 0; transition: opacity var(--base) var(--ease);
   background: linear-gradient(180deg, rgb(7 7 10 / 0.97) 0%, rgb(7 7 10 / 0.93) 62%, rgb(7 7 10 / 0.6) 82%, transparent); }
-.top::after { content: ""; position: absolute; inset: 0 0 -40px; z-index: -2; pointer-events: none; background: linear-gradient(180deg, rgb(7 7 10 / 0.62), transparent); }
+/* At rest the bar is only a shade over the art, deep enough for the window buttons and the brand
+   to hold 3:1 over a white frame; the dock and the tools carry their own glass. */
+.top::after { content: ""; position: absolute; inset: 0 0 -40px; z-index: -2; pointer-events: none;
+  background: radial-gradient(200px 90px at 100% 0%, rgb(7 7 10 / 0.6), transparent 72%), linear-gradient(180deg, rgb(7 7 10 / 0.72) 0%, rgb(7 7 10 / 0.4) 55%, transparent); }
 .app[data-scrolled] .top::before { opacity: 1; }
 .brand { display: inline-flex; align-items: center; gap: 10px; justify-self: start; padding: 6px 8px 6px 0; border-radius: var(--r-sm); }
 .dock { position: relative; display: flex; align-items: center; gap: 2px; padding: 4px; border-radius: 999px; background: var(--glass); backdrop-filter: var(--glass-blur); box-shadow: var(--rim), 0 14px 40px -18px #000; }
@@ -156,6 +172,10 @@ kbd { font: 500 10.5px/1.5 var(--f-mono); color: var(--fg2); padding: 1px 6px; b
 .dock-link.active { color: var(--bg); }
 .dock-link svg { flex: none; }
 .top-end { display: flex; align-items: center; justify-content: flex-end; gap: 8px; min-width: 0; height: 100%; }
+/* the tools capsule: the dock's twin on the right. Its glass lives on ::before (frost.css). */
+.tools { position: relative; isolation: isolate; display: flex; align-items: center; gap: 2px; padding: 4px; border-radius: 999px; }
+.tools::before { content: ""; position: absolute; inset: 0; z-index: -1; border-radius: inherit; pointer-events: none; background: var(--glass); box-shadow: var(--rim), 0 14px 40px -18px #000; }
+.tools .menu-wrap { padding: 0 3px 0 1px; }
 .top-search { height: 36px; display: inline-flex; align-items: center; gap: 9px; padding: 0 10px 0 12px; border-radius: 999px; color: var(--fg2); font-size: 13px; background: rgb(255 255 255 / 0.06); box-shadow: inset 0 0 0 1px var(--line); transition: background var(--fast), color var(--fast), box-shadow var(--base); }
 .top-search:hover { color: var(--fg); background: rgb(255 255 255 / 0.1); box-shadow: inset 0 0 0 1px var(--line-2), 0 0 0 4px color-mix(in oklab, var(--tone) 12%, transparent); }
 .top-search .keys { display: inline-flex; gap: 3px; }
@@ -174,7 +194,9 @@ kbd { font: 500 10.5px/1.5 var(--f-mono); color: var(--fg2); padding: 1px 6px; b
 .avatar-btn { border-radius: 50%; transition: transform var(--base) var(--spring); }
 .avatar-btn:hover { transform: scale(1.08); }
 .win { display: flex; height: 100%; align-self: stretch; margin-left: 4px; }
-.win button { width: 46px; display: grid; place-items: center; color: var(--fg3); transition: background var(--fast), color var(--fast); }
+.win button { width: 46px; display: grid; place-items: center; color: var(--fg2); transition: background var(--fast), color var(--fast); }
+/* hairline glyphs over whatever art is behind them: a soft halo keeps them legible on a white frame */
+.win button svg { filter: drop-shadow(0 0 2px rgb(0 0 0 / 0.85)); }
 .win button:hover { background: rgb(255 255 255 / 0.07); color: var(--fg); }
 .win .close:hover { background: #c42b1c; color: #fff; }
 .menu-wrap { position: relative; display: grid; }
@@ -183,7 +205,8 @@ kbd { font: 500 10.5px/1.5 var(--f-mono); color: var(--fg2); padding: 1px 6px; b
   background: color-mix(in oklab, var(--s1) 90%, transparent); backdrop-filter: var(--glass-blur); box-shadow: var(--rim), var(--float); }
 .menu-head { display: flex; gap: 12px; align-items: center; padding: 10px 10px 14px; border-bottom: 1px solid var(--line); margin-bottom: 6px; }
 .menu-head div { display: flex; flex-direction: column; min-width: 0; }
-.menu-head span { color: var(--fg3); font-size: 12px; overflow: hidden; text-overflow: ellipsis; }
+.menu-head strong, .menu-head span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.menu-head span { color: var(--fg3); font-size: 12px; }
 .menu > button { width: 100%; display: flex; gap: 10px; align-items: center; padding: 10px 12px; border-radius: var(--r-sm); color: var(--fg2); transition: background var(--fast), color var(--fast); }
 .menu > button:hover { background: rgb(255 255 255 / 0.07); color: var(--fg); }
 
@@ -191,7 +214,10 @@ kbd { font: 500 10.5px/1.5 var(--f-mono); color: var(--fg2); padding: 1px 6px; b
 .btn { position: relative; height: 48px; padding: 0 24px; border-radius: 999px; display: inline-flex; align-items: center; justify-content: center; gap: 10px; font-weight: 600; font-size: 14.5px; white-space: nowrap; overflow: hidden; flex: none;
   transition: transform var(--fast) var(--ease), background var(--fast), box-shadow var(--base), color var(--fast); }
 .btn:active:not(:disabled) { transform: scale(0.965); }
-.btn:focus-visible, .pbtn:focus-visible, .chip:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--tone-ink); }
+.pbtn:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--tone-ink); }
+/* Buttons and chips ring with an outline, not a shadow: every material (play, glass, tone) paints
+   its own box-shadow, and a later or hovered one would silently wipe a shadow ring away. */
+.btn:focus-visible, .chip:focus-visible { outline: 2px solid var(--tone-ink); outline-offset: 2px; }
 .btn.sm { height: 36px; padding: 0 16px; font-size: 13px; gap: 8px; }
 .btn.wide { width: 100%; }
 .btn.icon { width: 48px; padding: 0; }
@@ -200,8 +226,8 @@ kbd { font: 500 10.5px/1.5 var(--f-mono); color: var(--fg2); padding: 1px 6px; b
 .btn.play { background: var(--fg); color: #08080b; box-shadow: 0 10px 34px -14px rgb(255 255 255 / 0.5), inset 0 -2px 0 rgb(0 0 0 / 0.1); }
 .btn.play::after { content: ""; position: absolute; inset: 0; pointer-events: none; transform: translateX(-130%);
   background: linear-gradient(105deg, transparent 30%, color-mix(in oklab, var(--tone) 55%, transparent) 50%, transparent 70%); }
-.btn.play:hover:not(:disabled)::after:not(:disabled)::after { transform: translateX(130%); transition: transform 720ms var(--ease); }
-.btn.play:hover:not(:disabled):not(:disabled) { box-shadow: 0 14px 44px -12px var(--glow), inset 0 -2px 0 rgb(0 0 0 / 0.1); transform: translateY(-1px); }
+.btn.play:hover:not(:disabled)::after { transform: translateX(130%); transition: transform 720ms var(--ease); }
+.btn.play:hover:not(:disabled) { box-shadow: 0 14px 44px -12px var(--glow), inset 0 -2px 0 rgb(0 0 0 / 0.1); transform: translateY(-1px); }
 .btn.play:active:not(:disabled) { transform: scale(0.965); }
 /* secondary: a plate that needs no blur to read */
 .btn.glass, .btn-glass { background: rgb(255 255 255 / 0.09); box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.13), inset 0 1px 0 rgb(255 255 255 / 0.08); color: var(--fg); }
@@ -226,6 +252,10 @@ button.chip:hover:not(.on):not(:disabled) { color: var(--fg); background: rgb(25
 .chip.cert { color: var(--fg); font: 600 11px var(--f-mono); letter-spacing: 0.04em; box-shadow: inset 0 0 0 1px var(--line-3); background: none; border-radius: 6px; height: 24px; padding: 0 7px; }
 .chip.muted { opacity: 0.6; height: 28px; }
 .chip small { font: 500 11px var(--f-mono); opacity: 0.6; }
+/* a folder name can be any length: the chip ends in an ellipsis (the full path is its title) */
+.chip.path { max-width: min(280px, 100%); }
+.chip.path > svg { flex: none; }
+.chip.path > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .badge { font: 600 9.5px/1 var(--f-mono); letter-spacing: 0.1em; text-transform: uppercase; padding: 4px 6px; border-radius: 5px; background: rgb(255 255 255 / 0.09); color: var(--fg2); white-space: nowrap; }
 .badge.dim { background: rgb(255 255 255 / 0.05); color: var(--fg3); }
 .badge.on { background: color-mix(in oklab, var(--ok) 16%, transparent); color: var(--ok); }
@@ -296,6 +326,8 @@ button.chip:hover:not(.on):not(:disabled) { color: var(--fg); background: rgb(25
 .title-type { font: 800 clamp(46px, 6.6vw, 108px)/0.86 var(--f-disp); font-stretch: 75%; letter-spacing: -0.012em; text-transform: uppercase; text-wrap: balance; color: #fff; max-width: 13ch; overflow-wrap: anywhere;
   text-shadow: 0 6px 40px rgb(0 0 0 / 0.5); }
 .title-type.long { font-size: clamp(38px, 4.9vw, 78px); max-width: 17ch; }
+/* a title that runs past two lines of poster type steps down again, so it can't push the copy under the top bar */
+.title-type.xlong { font-size: clamp(30px, 3.5vw, 54px); max-width: 24ch; line-height: 0.9; }
 .title-type.md { font-size: clamp(36px, 4.6vw, 70px); }
 .title-type.sm { font-size: 30px; }
 
@@ -323,7 +355,7 @@ button.chip:hover:not(.on):not(:disabled) { color: var(--fg); background: rgb(25
 .empty { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 96px 0; color: var(--fg3); text-align: center; animation: rise 0.5s var(--ease-out) both; }
 .empty p { max-width: 440px; line-height: 1.6; }
 .empty-ic { width: 72px; height: 72px; border-radius: 24px; display: grid; place-items: center; color: var(--tone-ink); background: color-mix(in oklab, var(--tone) 10%, var(--s1)); box-shadow: var(--rim); margin-bottom: 6px; }
-.empty h3 { font: 800 30px/1 var(--f-disp); font-stretch: 80%; letter-spacing: -0.02em; text-transform: uppercase; color: var(--fg); }
+.empty h3 { font: 800 30px/1 var(--f-disp); font-stretch: 80%; letter-spacing: -0.02em; text-transform: uppercase; color: var(--fg); max-width: min(720px, 100%); overflow-wrap: anywhere; text-wrap: balance; }
 .empty .btn { margin-top: 8px; }
 
 /* ---------- toasts ---------- */
@@ -343,7 +375,9 @@ button.chip:hover:not(.on):not(:disabled) { color: var(--fg); background: rgb(25
 .update-toast p { color: var(--fg2); font-size: 12.5px; line-height: 1.5; }
 .update-toast .ut-bar { height: 4px; border-radius: 2px; background: rgb(255 255 255 / 0.1); overflow: hidden; }
 .update-toast .ut-bar i { display: block; height: 100%; background: var(--tone); transition: width 300ms var(--ease); }
-.update-toast .ut-acts { display: flex; gap: 8px; }
+.update-toast .ut-acts { display: flex; gap: 8px; flex-wrap: wrap; }
+/* Below ~1290px a centred toast would slide under the update card: move the stack to the left. */
+@media (max-width: 1290px) { .app:has(.update-toast) .toasts { left: 22px; transform: none; align-items: flex-start; } }
 
 /* ---------- view transitions ---------- */
 ::view-transition-old(root), ::view-transition-new(root) { animation-duration: 280ms; animation-timing-function: var(--ease); }
@@ -358,7 +392,7 @@ button.chip:hover:not(.on):not(:disabled) { color: var(--fg); background: rgb(25
 @media (max-width: 1120px) {
   .status span, .top-search > span:not(.keys) { display: none; }
   .status { padding: 0 8px; }
-  .wordmark { display: none; }
+  .brand .wordmark { display: none; }
 }
 
 /* ---------- reduced motion ---------- */

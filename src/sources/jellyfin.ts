@@ -1,5 +1,6 @@
-import type { PlaybackRequest } from "../lib/types";
+import type { MediaDetail, PlaybackRequest } from "../lib/types";
 import { isFilm } from "../lib/types";
+import { assessTitleMatch, matchTargetFor } from "./titleMatch";
 import { inferSubtitleMeta, type SourceProvider, type StreamCandidate, type SubtitleFormat, type SubtitleTrack } from "./types";
 
 /**
@@ -27,6 +28,9 @@ interface JellyfinMediaSource {
 interface JellyfinItem {
   Id: string;
   Name: string;
+  OriginalTitle?: string;
+  /** Metadata ids, e.g. { Tmdb: "603", Imdb: "tt0133093" }. */
+  ProviderIds?: Record<string, string | undefined>;
   ProductionYear?: number;
   Height?: number;
   IndexNumber?: number;
@@ -112,15 +116,29 @@ export const jellyfinProvider: SourceProvider = {
       searchTerm: req.media.title,
       IncludeItemTypes: isMovie ? "Movie" : "Series",
       Recursive: "true",
-      Fields: "ProductionYear,MediaSources,Width,Height",
+      Fields: "ProductionYear,MediaSources,Width,Height,OriginalTitle,ProviderIds",
       Limit: "5",
     }, signal);
-    let items: JellyfinItem[] = found.Items ?? [];
-    const mediaYear = req.media.year;
-    if (mediaYear != null) {
-      const near = items.filter((i) => !i.ProductionYear || Math.abs(i.ProductionYear - mediaYear) <= 1);
-      if (near.length) items = near;
-    }
+    // Only items that are this title: the same TMDB/IMDb id when the library has one, otherwise
+    // the same name and year. (A search used to fall back to whatever it returned when no item had
+    // the right year, so a library's 1997 "The Odyssey" played for the 2026 film.)
+    const media = req.media as MediaDetail;
+    const tmdbId = media.tmdbId ?? (media.canonicalKey ?? media.key).match(/^tmdb:(?:movie|tv):(\d+)$/)?.[1];
+    const wanted = { ...matchTargetFor(req, { tmdbId, imdbId: media.imdbId }), season: undefined };
+    const items: JellyfinItem[] = (found.Items ?? [])
+      .map((item, i) => ({
+        item,
+        i,
+        a: assessTitleMatch(wanted, {
+          titles: [item.Name, item.OriginalTitle],
+          year: item.ProductionYear,
+          tmdbId: item.ProviderIds?.Tmdb,
+          imdbId: item.ProviderIds?.Imdb,
+        }),
+      }))
+      .filter((r) => r.a.ok)
+      .sort((x, y) => (y.a.ok ? y.a.score : 0) - (x.a.ok ? x.a.score : 0) || x.i - y.i)
+      .map((r) => r.item);
     const resolved = await Promise.all(
       items.slice(0, 2).map(async (item): Promise<StreamCandidate | null> => {
         try {
@@ -144,6 +162,7 @@ export const jellyfinProvider: SourceProvider = {
             quality: target.Height || undefined,
             audio: t.audio,
             subtitles: t.subtitles,
+            matched: { title: item.Name, ...(item.ProductionYear ? { year: item.ProductionYear } : {}) },
           };
         } catch {
           return null;

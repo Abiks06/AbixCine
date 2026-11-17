@@ -1,8 +1,8 @@
 /* =========================================================
    AbixCine — playback surfaces
    server board · signal (loading) screen · player HUD · sheets · subtitles
-   Over live video nothing blurs while frames are moving: plates are tinted and near-opaque,
-   and the glass only switches on when the picture is paused (.is-paused).
+   Over live video only small floating glass blurs (see the player section for the rules);
+   the big side sheet is a dense frosted plate while frames move and turns to glass when paused.
    ========================================================= */
 
 /* ---------- server board (title page, signal screen, player) ---------- */
@@ -112,9 +112,23 @@
 @media (max-width: 1100px) { .race2 { grid-template-columns: 1fr; gap: 30px; } }
 
 /* ---------- player ---------- */
-.player { position: fixed; inset: 0; background: #000; overflow: hidden; z-index: 50; cursor: default; isolation: isolate; --hud: rgb(11 11 15 / 0.84); }
+/* The HUD is frosted glass over the picture, with three rules that keep playback smooth:
+   1. Only small floating pieces blur (the top pill, the back button, the control capsule, the
+      round centre buttons, toasts, Up next, the loading and error cards). The side sheet is big,
+      so it blurs only while the picture is paused; over moving video it is a dense frosted plate.
+   2. Blur radii are constants and nothing animates them. Glass fades in by opacity and moves by
+      transform, on the glass element itself: an ancestor fading with opacity (or a mask/filter)
+      would cut the blur off from the video behind it until the fade ended.
+   3. Hidden controls are visibility: hidden once they have faded, so a resting HUD costs nothing. */
+.player { position: fixed; inset: 0; background: #000; overflow: hidden; z-index: 50; cursor: default; isolation: isolate;
+  /* fill over the blurred picture; the solid twin is for when nothing blurs behind it */
+  --hud: rgb(12 12 17 / 0.38);
+  --hud-solid: rgb(11 11 15 / 0.88);
+  --hud-blur: var(--glass-smoke, blur(28px) saturate(1.8) brightness(0.8));
+  --hud-glass: var(--frost-grain), var(--frost-light), var(--frost-sheen);
+  --sheet-w: min(432px, calc(100vw - 24px)); }
 .player.idle { cursor: none; }
-.player.is-paused { --hud: rgb(14 14 19 / 0.62); }
+.player.is-paused { --hud: rgb(14 14 19 / 0.3); }
 .screen { position: absolute; inset: 0; z-index: 1; background: #000; }
 .screen video, .enhance-canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: block; }
 /* opacity, not visibility: a hidden <video> can be throttled, which starves the upscaler */
@@ -124,42 +138,84 @@
 .screen .JASSUB { position: absolute; z-index: 2; pointer-events: none; }
 .screen iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; display: block; background: #000; transition: filter 400ms var(--ease); }
 .screen iframe.vivid { filter: contrast(1.07) saturate(1.2) brightness(1.02); }
-.pload { position: absolute; inset: 0; display: grid; place-items: center; align-content: center; gap: 16px; pointer-events: none; z-index: 2; }
-.pload-ring { width: 52px; height: 52px; border-radius: 50%; border: 2px solid rgb(255 255 255 / 0.12); border-top-color: var(--tone); animation: spin 0.9s linear infinite; }
-.pload-txt { font: 500 11.5px var(--f-mono); color: var(--fg2); letter-spacing: 0.08em; text-transform: uppercase; padding: 6px 12px; border-radius: 999px; background: rgb(0 0 0 / 0.5); }
+
+/* loading: a card naming what is loading and from where; a rebuffer is just the ring and a word */
+.pload { position: absolute; inset: 0; display: grid; place-items: center; pointer-events: none; z-index: 2; padding: 24px; transition: padding-right var(--emph) var(--ease-out); }
+.player.has-sheet .pload { padding-right: calc(var(--sheet-w) + 36px); }
+.pload-card { position: relative; isolation: isolate; display: flex; align-items: center; gap: 16px; max-width: min(560px, 100%); padding: 14px 16px; border-radius: 22px;
+  background-color: var(--hud); background-image: var(--hud-glass); backdrop-filter: var(--hud-blur); box-shadow: var(--frost-bloom, 0 0 0 transparent), 0 24px 60px -24px rgb(0 0 0 / 0.85);
+  animation: pload-in var(--base) var(--ease-out) both; }
+@keyframes pload-in { from { opacity: 0; transform: scale(0.97); } }
+.pload-ring { flex: none; width: 34px; height: 34px; border-radius: 50%; border: 2px solid rgb(255 255 255 / 0.14); border-top-color: var(--tone); animation: spin 0.8s linear infinite; }
+.pload-tx { min-width: 0; display: flex; flex-direction: column; gap: 3px; padding-right: 6px; }
+.pload-tx strong { font-weight: 650; font-size: 14px; letter-spacing: -0.005em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pload-sub { font: 500 11px var(--f-mono); letter-spacing: 0.04em; color: var(--fg2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pload-next { flex: none; pointer-events: auto; height: 32px; padding: 0 13px; border-radius: 999px; display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; font-weight: 600; color: #08080b; background: var(--fg);
+  animation: pload-in var(--base) var(--ease-out) both; transition: transform var(--fast) var(--ease), background var(--fast); }
+.pload-next:hover { background: #fff; }
+.pload-next:active { transform: scale(0.96); }
+/* A stall mid-film: a small pill, after a beat (a 100 ms hiccup shouldn't flash a spinner). */
+.pload.rebuffer .pload-card { gap: 10px; padding: 8px 14px 8px 9px; border-radius: 999px; animation-delay: 350ms; }
+.pload.rebuffer .pload-ring { width: 22px; height: 22px; }
+.pload.rebuffer .pload-tx strong { font: 500 11px var(--f-mono); letter-spacing: 0.1em; text-transform: uppercase; color: var(--fg2); }
+
+/* every pane of player glass gets the light-catching rim (frost.css paints the top pill, the capsule and the sheet) */
+.pload-card::before, .perr-card::before, .upnext::before, .ptoast::before, .pkeys::before, .scrub-tip::before { content: ""; position: absolute; inset: 0; z-index: -1; border-radius: inherit; padding: 1px; pointer-events: none;
+  background: var(--frost-edge, rgb(255 255 255 / 0.14));
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite: xor; mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0); }
+
+/* every server failed: the ways out, on screen until one is taken */
+.perr { position: absolute; inset: 0; z-index: 4; display: grid; place-items: center; padding: 24px; pointer-events: none; transition: padding-right var(--emph) var(--ease-out); }
+.player.has-sheet .perr { padding-right: calc(var(--sheet-w) + 36px); }
+.perr-card { position: relative; isolation: isolate; pointer-events: auto; width: min(460px, 100%); display: flex; flex-direction: column; align-items: flex-start; gap: 10px; padding: 22px 22px 20px; border-radius: var(--r-lg);
+  background-color: color-mix(in oklab, var(--s1) 58%, transparent); background-image: var(--hud-glass); backdrop-filter: var(--hud-blur);
+  box-shadow: var(--frost-bloom, 0 0 0 transparent), 0 40px 100px -30px rgb(0 0 0 / 0.9); animation: pop var(--emph) var(--ease-out) both; }
+.perr-ic { width: 40px; height: 40px; border-radius: 13px; display: grid; place-items: center; color: var(--warn); background: color-mix(in oklab, var(--warn) 14%, transparent); box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--warn) 30%, transparent); margin-bottom: 2px; }
+.perr-t { font: 750 21px/1.15 var(--f-disp); font-stretch: 84%; letter-spacing: -0.018em; text-wrap: balance; }
+.perr-d { margin: 0; color: var(--fg2); font-size: 13.5px; line-height: 1.5; }
+.perr-why { max-width: 100%; font: 500 10.5px var(--f-mono); color: var(--fg3); padding: 3px 8px; border-radius: 6px; background: rgb(0 0 0 / 0.25); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.perr-acts { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+
+/* Sits under the chrome but over the iframe, so moving to the top edge wakes the controls. */
 .ptop-hover-zone { position: absolute; top: 0; left: 0; right: 0; height: 96px; z-index: 2; }
 .player.is-embed .ptop-hover-zone { height: 44px; }
 
-/* chrome: vignettes for legibility, then floating pills */
-.chrome { position: absolute; inset: 0; z-index: 3; pointer-events: none; transition: opacity 420ms var(--ease); }
-.chrome::before { content: ""; position: absolute; inset: 0 0 auto 0; height: 180px; background: linear-gradient(180deg, rgb(0 0 0 / 0.7), transparent); pointer-events: none; }
-.chrome::after { content: ""; position: absolute; inset: auto 0 0 0; height: 240px; background: linear-gradient(0deg, rgb(0 0 0 / 0.72), transparent); pointer-events: none; z-index: -1; }
+/* chrome: vignettes for legibility, then floating glass. The container never fades itself (rule 2):
+   its vignettes and its pieces do, and once faded the whole layer is hidden (rule 3). */
+.chrome { position: absolute; inset: 0; z-index: 3; pointer-events: none; visibility: visible; transition: visibility 0s; }
+.chrome::before { content: ""; position: absolute; inset: 0 0 auto 0; height: 180px; background: linear-gradient(180deg, rgb(0 0 0 / 0.66), rgb(0 0 0 / 0.22) 55%, transparent); pointer-events: none; transition: opacity 180ms var(--ease); }
+.chrome::after { content: ""; position: absolute; inset: auto 0 0 0; height: 240px; background: linear-gradient(0deg, rgb(0 0 0 / 0.66), rgb(0 0 0 / 0.2) 55%, transparent); pointer-events: none; z-index: -1; transition: opacity 180ms var(--ease); }
 .player.is-embed .chrome::after { display: none; }
 .player.is-embed .chrome::before { height: 110px; }
 .chrome > * { pointer-events: auto; }
-.player.idle .chrome { opacity: 0; }
+/* Coming back is quick (it answers the mouse); going away is slow (nobody is waiting for it). */
+.ptitle, .ptop-actions { transition: opacity 180ms var(--ease); }
+.ptop > .pbtn { transition: opacity 180ms var(--ease), transform var(--fast) var(--ease), background-color var(--fast); }
+.player.idle .chrome { visibility: hidden; transition: visibility 0s linear 460ms; }
+.player.idle .chrome::before, .player.idle .chrome::after { opacity: 0; transition: opacity 460ms var(--ease); }
+.player.idle .ptitle, .player.idle .ptop-actions, .player.idle .ptop > .pbtn { opacity: 0; transition: opacity 460ms var(--ease); }
+.player.idle .pbot { opacity: 0; }
 .player.idle .chrome > * { pointer-events: none; }
 .ptop { position: absolute; left: 0; right: 0; top: 0; padding: 16px 18px; display: flex; align-items: center; gap: 14px; transition: transform var(--emph) var(--ease-out), padding-right var(--emph) var(--ease-out); }
-.pbot { transition: transform var(--emph) var(--ease-out), right var(--emph) var(--ease-out); }
-.player.has-sheet .ptop { padding-right: calc(min(432px, 100vw - 24px) + 28px); }
-.player.idle .ptop { transform: translateY(-16px); }
-.player.idle .pbot { transform: translateY(18px); }
+.player.has-sheet .ptop { padding-right: calc(var(--sheet-w) + 28px); }
+.player.idle .ptop { transform: translateY(-14px); }
 .ptitle { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .plogo { max-height: 36px; max-width: 230px; object-fit: contain; object-position: left; filter: drop-shadow(0 2px 12px rgb(0 0 0 / 0.7)); }
 .pt { font: 750 21px/1.05 var(--f-disp); font-stretch: 82%; letter-spacing: -0.015em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-shadow: 0 2px 14px rgb(0 0 0 / 0.7); }
 .ps { color: var(--fg2); font: 500 11px var(--f-mono); letter-spacing: 0.06em; text-transform: uppercase; text-shadow: 0 1px 8px rgb(0 0 0 / 0.8); }
-.ptop-actions { display: flex; align-items: center; gap: 6px; padding: 5px; border-radius: 999px; background: var(--hud); box-shadow: var(--rim), 0 16px 40px -20px #000; }
-.player.is-paused .ptop-actions, .player.is-paused .pbot, .player.is-paused .psheet { backdrop-filter: var(--glass-blur); }
+.ptop-actions { display: flex; align-items: center; gap: 6px; padding: 5px; border-radius: 999px; background-color: var(--hud); backdrop-filter: var(--hud-blur); box-shadow: var(--rim), 0 16px 40px -20px #000; }
+.player.is-paused .psheet { backdrop-filter: var(--glass-blur); }
 .pbtn { height: 38px; min-width: 38px; padding: 0 14px; border-radius: 999px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; font-size: 13px; font-weight: 600; color: #fff; white-space: nowrap;
-  background: transparent; transition: background var(--fast), transform var(--fast), color var(--fast); }
+  background: transparent; transition: background var(--fast), transform var(--fast) var(--ease), color var(--fast); }
 .pbtn:hover { background: rgb(255 255 255 / 0.14); }
-.pbtn:active { transform: scale(0.93); }
+.pbtn:active { transform: scale(0.94); }
 .pbtn.icon { padding: 0; width: 38px; }
-.pbtn.round { padding: 0; width: 44px; height: 44px; border-radius: 50%; background: var(--hud); box-shadow: var(--rim); }
-.pbtn.round:hover { background: rgb(255 255 255 / 0.2); }
+.pbtn.round { padding: 0; width: 44px; height: 44px; border-radius: 50%; background-color: var(--hud); backdrop-filter: var(--hud-blur); box-shadow: var(--rim), 0 12px 30px -16px #000; }
+.pbtn.round:hover { background-color: rgb(255 255 255 / 0.2); }
 .pbtn.big { width: 46px; height: 46px; background: var(--fg); color: #08080b; box-shadow: 0 0 34px -8px var(--glow); }
-.pbtn.big:hover { background: #fff; transform: scale(1.06); }
-.pbtn.on { background: rgb(255 255 255 / 0.2); }
+.pbtn.big:hover { background: #fff; transform: scale(1.05); }
+.pbtn.big:active { transform: scale(0.95); }
+.pbtn.on { background: rgb(255 255 255 / 0.2); box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.14); }
 .pbtn.lit { color: var(--tone-ink); }
 .pbtn.chipbtn { font: 600 12px var(--f-mono); }
 .server-pill { height: 38px; display: inline-flex; align-items: center; gap: 9px; padding: 0 5px 0 13px; border-radius: 999px; font-size: 13px; transition: background var(--fast); }
@@ -173,28 +229,49 @@
 .sp-meta:empty { display: none; }
 .sp-count { min-width: 28px; height: 28px; padding: 0 8px; border-radius: 99px; display: grid; place-items: center; font: 600 11px var(--f-mono); font-variant-numeric: tabular-nums; background: rgb(255 255 255 / 0.12); }
 .server-pill.live .sp-count, .sp-count.live { background: color-mix(in oklab, var(--ok) 20%, transparent); color: var(--ok); }
-.center-controls { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%) scale(0.9); display: flex; align-items: center; gap: 30px; opacity: 0; pointer-events: none; transition: opacity var(--emph) var(--ease), transform var(--emph) var(--ease-out); }
-.center-controls.show { opacity: 1; pointer-events: auto; transform: translate(-50%, -50%); }
+/* the paused centre: the container scales, each glass button fades itself (rule 2) */
+.center-controls { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%) scale(0.94); display: flex; align-items: center; gap: 30px; pointer-events: none; visibility: hidden;
+  transition: transform var(--emph) var(--ease-out), visibility 0s linear var(--base); }
+.center-controls.show { pointer-events: auto; visibility: visible; transform: translate(-50%, -50%); transition: transform var(--emph) var(--ease-out), visibility 0s; }
 .player.idle .center-controls.show { pointer-events: none; }
-.cc-btn { width: 60px; height: 60px; border-radius: 50%; display: grid; place-items: center; background: var(--hud); backdrop-filter: var(--glass-blur); box-shadow: var(--rim); transition: transform var(--fast), background var(--fast); }
-.cc-btn:hover { background: rgb(255 255 255 / 0.2); }
-.cc-btn:active { transform: scale(0.92); }
+.cc-btn { width: 60px; height: 60px; border-radius: 50%; display: grid; place-items: center; opacity: 0; background-color: var(--hud); backdrop-filter: var(--hud-blur); box-shadow: var(--rim), 0 18px 40px -18px #000;
+  transition: opacity var(--base) var(--ease), transform var(--fast) var(--ease), background-color var(--fast); }
+.center-controls.show .cc-btn { opacity: 1; }
+.cc-btn:hover { background-color: rgb(255 255 255 / 0.2); }
+.cc-btn:active { transform: scale(0.93); }
 .cc-btn.main { width: 92px; height: 92px; background: var(--fg); color: #08080b; box-shadow: 0 0 90px -14px var(--glow); backdrop-filter: none; }
-.cc-btn.main:hover { background: #fff; transform: scale(1.05); }
+.cc-btn.main:hover { background: #fff; transform: scale(1.04); }
+.cc-btn.main:active { transform: scale(0.96); }
 /* bottom capsule */
-.pbot { position: absolute; left: 16px; right: 16px; bottom: 16px; padding: 8px 14px 10px; display: flex; flex-direction: column; gap: 4px; border-radius: 26px; background: var(--hud); box-shadow: var(--rim), 0 24px 60px -24px #000; }
-.player.has-sheet .pbot { right: calc(min(432px, 100vw - 24px) + 24px); }
+.pbot { position: absolute; left: 16px; right: 16px; bottom: 16px; padding: 8px 14px 10px; display: flex; flex-direction: column; gap: 4px; border-radius: 26px;
+  background-color: var(--hud); backdrop-filter: var(--hud-blur); box-shadow: var(--rim), 0 24px 60px -24px #000;
+  transition: opacity 180ms var(--ease), transform var(--emph) var(--ease-out), right var(--emph) var(--ease-out); }
+.player.idle .pbot { transform: translateY(16px); transition: opacity 460ms var(--ease), transform 460ms var(--ease), right var(--emph) var(--ease-out); }
+.player.has-sheet .pbot { right: calc(var(--sheet-w) + 24px); }
 .scrub { position: relative; height: 26px; display: flex; align-items: center; cursor: pointer; touch-action: none; margin-inline: 4px; }
-.scrub .c { position: relative; flex: 1; height: 4px; border-radius: 3px; background: rgb(255 255 255 / 0.18); overflow: hidden; transition: height var(--fast) var(--ease); }
-.scrub:hover .c, .scrub.drag .c { height: 8px; }
-.scrub .c .buf { position: absolute; inset: 0 auto 0 0; background: rgb(255 255 255 / 0.22); }
-.scrub .c .ghost { position: absolute; inset: 0 auto 0 0; background: rgb(255 255 255 / 0.22); }
+.scrub .c { position: relative; flex: 1; height: 4px; border-radius: 3px; background: rgb(255 255 255 / 0.2); overflow: hidden; transition: height var(--fast) var(--ease); }
+.scrub:hover .c, .scrub.drag .c { height: 7px; }
+.scrub .c .buf { position: absolute; inset: 0 auto 0 0; background: rgb(255 255 255 / 0.24); }
+.scrub .c .ghost { position: absolute; inset: 0 auto 0 0; background: rgb(255 255 255 / 0.2); }
 .scrub .c i { position: absolute; inset: 0 auto 0 0; background: var(--tone); }
 .scrub .c .part { position: absolute; top: 0; bottom: 0; background: color-mix(in oklab, var(--gold) 80%, transparent); mix-blend-mode: screen; pointer-events: none; }
-.knob { position: absolute; top: 50%; width: 16px; height: 16px; margin: -8px 0 0 -8px; border-radius: 50%; background: #fff; box-shadow: 0 0 0 5px color-mix(in oklab, var(--tone) 34%, transparent), 0 2px 10px rgb(0 0 0 / 0.5); transform: scale(0); transition: transform var(--base) var(--spring); pointer-events: none; }
-.scrub:hover .knob, .scrub.drag .knob { transform: scale(1); }
-.scrub-tip { position: absolute; bottom: 32px; transform: translateX(-50%); display: inline-flex; align-items: center; gap: 7px; padding: 6px 10px; border-radius: 9px; background: rgb(9 9 13 / 0.94); box-shadow: var(--rim); font: 600 12px var(--f-mono); font-variant-numeric: tabular-nums; pointer-events: none; white-space: nowrap; }
+.knob { position: absolute; top: 50%; width: 15px; height: 15px; margin: -7.5px 0 0 -7.5px; border-radius: 50%; background: #fff; pointer-events: none;
+  box-shadow: 0 0 0 5px color-mix(in oklab, var(--tone) 34%, transparent), 0 2px 10px rgb(0 0 0 / 0.5);
+  opacity: 0; transform: scale(0.5); transition: transform var(--base) var(--ease-out), opacity var(--fast) var(--ease); }
+.scrub:hover .knob, .scrub.drag .knob { opacity: 1; transform: none; }
+.scrub.drag .knob { transform: scale(1.12); }
+/* The seek preview rides above the bar on a transform (no layout per pointer move). It lives in
+   the capsule, which is itself glass, so it is a dense frosted plate rather than a second blur. */
+.scrub-tip { position: absolute; left: 0; bottom: 30px; isolation: isolate; display: inline-flex; align-items: center; gap: 7px; padding: 6px 10px; border-radius: 10px; pointer-events: none; white-space: nowrap;
+  background-color: rgb(12 12 17 / 0.9); background-image: var(--frost-grain), linear-gradient(180deg, rgb(255 255 255 / 0.08), rgb(255 255 255 / 0.01) 60%);
+  box-shadow: 0 16px 36px -14px rgb(0 0 0 / 0.9); font: 600 12px var(--f-mono); font-variant-numeric: tabular-nums;
+  animation: tip-in 120ms var(--ease-out) both; }
+@keyframes tip-in { from { opacity: 0; } }
+.scrub-tip b { font-weight: 600; }
 .scrub-tip em { font: 700 9.5px var(--f-mono); font-style: normal; letter-spacing: 0.1em; text-transform: uppercase; color: var(--gold); }
+.scrub-tip.has-thumb { flex-direction: column; gap: 6px; padding: 5px 5px 7px; border-radius: 13px; }
+.scrub-tip-row { display: inline-flex; align-items: center; gap: 7px; }
+.scrub-thumb { display: block; width: 192px; height: 108px; border-radius: 9px; object-fit: cover; background: #000; box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.1); }
 .prow { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
 .pc { display: flex; align-items: center; gap: 2px; }
 .time { font: 500 12.5px var(--f-mono); color: #fff; margin-left: 6px; padding: 6px 10px; border-radius: 999px; white-space: nowrap; font-variant-numeric: tabular-nums; transition: background var(--fast); }
@@ -213,11 +290,11 @@
 .sub-pill-badge.dual { background: var(--tone); color: var(--on-tone); }
 
 /* side sheet */
-.psheet { position: absolute; top: 12px; right: 12px; bottom: 12px; width: min(432px, calc(100vw - 24px)); z-index: 5; display: flex; flex-direction: column; border-radius: var(--r-lg);
+.psheet { position: absolute; top: 12px; right: 12px; bottom: 12px; width: var(--sheet-w); z-index: 5; display: flex; flex-direction: column; border-radius: var(--r-lg);
   background: rgb(12 12 17 / 0.93); box-shadow: var(--rim), 0 30px 90px rgb(0 0 0 / 0.6);
   transform: translateX(calc(100% + 24px)); opacity: 0; visibility: hidden; pointer-events: none; transition: transform var(--emph) var(--ease-out), opacity var(--base) var(--ease), visibility 0s linear var(--emph); }
 .psheet.open { transform: none; opacity: 1; visibility: visible; pointer-events: auto; transition-delay: 0s; }
-.player.is-paused .psheet { background: rgb(14 14 19 / 0.8); }
+.player.is-paused .psheet { background: rgb(14 14 19 / 0.78); }
 .ps-head { display: flex; align-items: center; gap: 8px; padding: 12px 12px 10px; border-bottom: 1px solid var(--line); }
 .ps-tabs { flex: 1; min-width: 0; display: flex; gap: 2px; padding: 3px; border-radius: 999px; background: rgb(255 255 255 / 0.06); }
 .ps-tabs button { flex: 1; min-width: 0; height: 32px; padding: 0 6px; border-radius: 999px; font-size: 12px; font-weight: 600; color: var(--fg2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; transition: background var(--base) var(--ease), color var(--base) var(--ease); }
@@ -265,39 +342,53 @@
 .srv-act.busy { box-shadow: inset 0 0 0 1px var(--tone-ink); color: #fff; }
 /* floating prompts step aside when the sheet is open, so nothing is ever covered */
 .skip-btn { position: absolute; right: 28px; bottom: 132px; z-index: 4; height: 46px; padding: 0 18px 0 22px; border-radius: 999px; display: inline-flex; align-items: center; gap: 10px;
-  font-weight: 700; font-size: 14px; color: #08080b; background: var(--fg); box-shadow: 0 16px 40px -12px rgb(0 0 0 / 0.7), 0 0 44px -12px var(--glow); animation: pop var(--emph) var(--ease-out) both; transition: transform var(--fast), bottom var(--emph) var(--ease-out), right var(--emph) var(--ease-out); }
+  font-weight: 700; font-size: 14px; color: #08080b; background: var(--fg); box-shadow: 0 16px 40px -12px rgb(0 0 0 / 0.7), 0 0 44px -12px var(--glow); animation: pop var(--emph) var(--ease-out) both; transition: transform var(--fast) var(--ease), bottom var(--emph) var(--ease-out), right var(--emph) var(--ease-out); }
 .skip-btn:hover { transform: translateY(-1px); }
+.skip-btn:active { transform: scale(0.96); }
 .player.idle .skip-btn { bottom: 40px; }
-.player.has-sheet .skip-btn, .player.has-sheet .upnext { right: calc(min(432px, 100vw - 24px) + 36px); }
-.upnext { position: absolute; right: 28px; bottom: 132px; z-index: 4; display: flex; gap: 14px; padding: 12px; width: 430px; max-width: calc(100vw - 56px); border-radius: var(--r-lg);
-  background: rgb(12 12 17 / 0.92); box-shadow: var(--rim), 0 30px 80px rgb(0 0 0 / 0.6); animation: pop var(--emph) var(--ease-out) both; transition: right var(--emph) var(--ease-out), bottom var(--emph) var(--ease-out); }
+.player.has-sheet .skip-btn, .player.has-sheet .upnext { right: calc(var(--sheet-w) + 36px); }
+.upnext { position: absolute; right: 28px; bottom: 132px; z-index: 4; isolation: isolate; display: flex; gap: 14px; padding: 12px; width: 430px; max-width: calc(100vw - 56px); border-radius: var(--r-lg);
+  background-color: var(--hud); background-image: var(--hud-glass); backdrop-filter: var(--hud-blur); box-shadow: var(--frost-bloom, 0 0 0 transparent), 0 30px 80px -20px rgb(0 0 0 / 0.8);
+  animation: pop var(--emph) var(--ease-out) both; transition: right var(--emph) var(--ease-out), bottom var(--emph) var(--ease-out); }
 .player.idle .upnext { bottom: 36px; }
 .player.is-embed .upnext { bottom: 90px; }
-.un-th { width: 150px; aspect-ratio: 16 / 9; border-radius: var(--r-sm); background: #111 center/cover; flex: none; display: grid; place-items: center; position: relative; overflow: hidden; }
+.un-th { width: 150px; aspect-ratio: 16 / 9; border-radius: var(--r-sm); background: #111 center/cover; flex: none; display: grid; place-items: center; position: relative; overflow: hidden; box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.08); }
 .un-th::after { content: ""; position: absolute; inset: 0; background: rgb(0 0 0 / 0.35); }
-.un-play { position: relative; z-index: 1; width: 46px; height: 46px; border-radius: 50%; display: grid; place-items: center; background: var(--fg); color: #08080b; }
+.un-play { position: relative; z-index: 1; width: 46px; height: 46px; border-radius: 50%; display: grid; place-items: center; background: var(--fg); color: #08080b; transition: transform var(--fast) var(--ease); }
+.un-play:active { transform: scale(0.94); }
 .un-ring { position: absolute; inset: -5px; width: 56px; height: 56px; transform: rotate(-90deg); }
 .un-ring circle { fill: none; stroke: var(--tone); stroke-width: 2.5; stroke-dasharray: 100.5; stroke-dashoffset: calc(100.5 * (1 - var(--p))); transition: stroke-dashoffset 1s linear; }
 .un-tx { min-width: 0; display: flex; flex-direction: column; gap: 3px; justify-content: center; }
 .un-tx small { font: 500 10px var(--f-mono); letter-spacing: 0.14em; text-transform: uppercase; color: var(--tone-ink); }
 .un-tx strong { font: 700 16px/1.1 var(--f-disp); font-stretch: 84%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .un-acts { display: flex; gap: 6px; margin-top: 7px; }
-.ptoast { position: absolute; left: 50%; top: 84px; transform: translateX(-50%); z-index: 6; padding: 10px 16px; border-radius: 999px; display: flex; align-items: center; gap: 10px; font-size: 13px; white-space: nowrap; pointer-events: none;
-  background: rgb(12 12 17 / 0.92); box-shadow: var(--rim); animation: toast 2.6s var(--ease) both; }
-.ptoast .dot { background: var(--tone); box-shadow: 0 0 0 3px color-mix(in oklab, var(--tone) 24%, transparent); }
-@keyframes toast { 0% { opacity: 0; transform: translate(-50%, -14px); } 10%, 85% { opacity: 1; transform: translate(-50%, 0); } 100% { opacity: 0; transform: translate(-50%, -8px); } }
+/* One toast: a new message swaps the text in place; .out plays the exit before it goes. */
+.ptoast { position: absolute; left: 50%; top: 84px; z-index: 6; isolation: isolate; padding: 10px 16px; border-radius: 999px; display: flex; align-items: center; gap: 10px; font-size: 13px; font-weight: 500; white-space: nowrap; pointer-events: none;
+  max-width: calc(100vw - 48px); overflow: hidden;
+  background-color: var(--hud); background-image: var(--hud-glass); backdrop-filter: var(--hud-blur); box-shadow: 0 16px 40px -18px rgb(0 0 0 / 0.9);
+  transform: translateX(-50%); animation: ptoast-in 240ms var(--ease-out) both; }
+.ptoast.out { animation: ptoast-out 200ms var(--ease) forwards; }
+.ptoast .dot { flex: none; background: var(--tone); box-shadow: 0 0 0 3px color-mix(in oklab, var(--tone) 24%, transparent); }
+@keyframes ptoast-in { from { opacity: 0; transform: translate(-50%, -10px) scale(0.98); } }
+@keyframes ptoast-out { to { opacity: 0; transform: translate(-50%, -6px); } }
 .seek-bump { position: absolute; top: 50%; z-index: 4; display: flex; flex-direction: column; align-items: center; gap: 6px; width: 96px; height: 96px; margin-top: -48px; justify-content: center; border-radius: 50%; color: #fff; pointer-events: none;
   background: rgb(10 10 14 / 0.7); box-shadow: var(--rim); font: 600 13px var(--f-mono); animation: bump 750ms var(--ease) both; }
 .seek-bump.back { left: 16%; }
 .seek-bump.fwd { right: 16%; }
 .player.has-sheet .seek-bump.fwd { right: calc(16% + 432px); }
 @keyframes bump { 0% { opacity: 0; transform: scale(0.8); } 18% { opacity: 1; transform: scale(1.04); } 30% { transform: none; } 75% { opacity: 1; } 100% { opacity: 0; } }
-.pkeys-scrim { position: absolute; inset: 0; z-index: 7; display: grid; place-items: center; background: rgb(0 0 0 / 0.66); animation: fade var(--base) var(--ease); }
-.pkeys { width: min(620px, calc(100vw - 40px)); max-height: calc(100vh - 80px); overflow-y: auto; padding: 20px 22px 22px; border-radius: var(--r-lg); background: rgb(14 14 19 / 0.96); box-shadow: var(--rim), 0 40px 120px rgb(0 0 0 / 0.7); animation: pop var(--emph) var(--ease-out) both; scrollbar-width: thin; }
+/* The shortcuts card. The scrim's dimming fades on its own layer, never on the card's ancestor (rule 2). */
+.pkeys-scrim { position: absolute; inset: 0; z-index: 7; display: grid; place-items: center; }
+.pkeys-scrim::before { content: ""; position: absolute; inset: 0; background: radial-gradient(90% 80% at 50% 45%, rgb(4 4 7 / 0.42), rgb(4 4 7 / 0.72)); animation: fade var(--base) var(--ease); }
+.pkeys { position: relative; isolation: isolate; width: min(640px, calc(100vw - 40px)); max-height: calc(100vh - 80px); overflow-y: auto; padding: 20px 22px 22px; border-radius: var(--r-lg);
+  background-color: color-mix(in oklab, var(--s1) 62%, transparent); background-image: var(--hud-glass); backdrop-filter: var(--hud-blur);
+  box-shadow: var(--frost-bloom, 0 0 0 transparent), 0 40px 120px rgb(0 0 0 / 0.7); animation: pop var(--emph) var(--ease-out) both; scrollbar-width: thin; }
 .pkeys-h { display: flex; align-items: center; justify-content: space-between; font: 750 22px var(--f-disp); font-stretch: 82%; letter-spacing: -0.02em; margin-bottom: 12px; }
-.pkeys dl { margin: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 0 26px; }
-.pkeys dl > div { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; padding: 9px 0; border-top: 1px solid var(--line); }
-.pkeys dt { font: 600 11.5px var(--f-mono); color: #fff; white-space: nowrap; }
+.pkeys dl { margin: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 0 26px; }
+.pkeys dl > div { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 8px 0; border-top: 1px solid var(--line); }
+.pkeys dt { display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap; white-space: nowrap; }
+.pkeys dt kbd { min-width: 22px; text-align: center; color: #fff; font-weight: 600; font-size: 11px; }
+.pkeys dt i { font-style: normal; font-size: 10px; color: var(--fg3); }
 .pkeys dd { margin: 0; font-size: 12.5px; color: var(--fg2); text-align: right; }
 .drop-sub-overlay { position: absolute; inset: 16px; z-index: 8; border-radius: var(--r-lg); display: grid; place-items: center; pointer-events: none;
   background: rgb(8 8 12 / 0.86); border: 2px dashed var(--tone-ink); animation: fade var(--fast) var(--ease); }
@@ -309,6 +400,23 @@
   .ptop .pbtn span { display: none; }
   .ptop .pbtn:not(.icon):not(.round) { padding: 0; width: 38px; }
   .sp-meta { display: none; }
+}
+/* Low-power and accessibility paths for the player's glass. Reduce motion is also the app's
+   "cheap" path (base.css drops the HUD blur there): without a blur behind them, translucent fills
+   would show sharp video through the text, so they go nearly solid. */
+:root.reduce-motion .player { --hud: var(--hud-solid); }
+:root.reduce-motion .player .pbtn.round, :root.reduce-motion .player .cc-btn, :root.reduce-motion .pload-card, :root.reduce-motion .perr-card,
+:root.reduce-motion .upnext, :root.reduce-motion .ptoast, :root.reduce-motion .pkeys { backdrop-filter: none; }
+:root.reduce-motion .perr-card, :root.reduce-motion .pkeys { background-color: rgb(13 13 19 / 0.96); }
+@media (prefers-reduced-motion: reduce) {
+  .player, .player.is-paused { --hud: var(--hud-solid); }
+  .player .pbtn.round, .player .cc-btn, .pload-card, .perr-card, .upnext, .ptoast, .pkeys { backdrop-filter: none; }
+  .perr-card, .pkeys { background-color: rgb(13 13 19 / 0.96); }
+}
+@media (prefers-reduced-transparency: reduce) {
+  .player, .player.is-paused { --hud: var(--pane-solid, #15151c); --hud-solid: var(--pane-solid, #15151c); }
+  .pload-card, .perr-card, .upnext, .ptoast, .pkeys, .scrub-tip { background-color: var(--pane-solid, #15151c); background-image: none; backdrop-filter: none !important; }
+  .player .pbtn.round, .player .cc-btn:not(.main) { backdrop-filter: none !important; }
 }
 
 /* ---------- subtitles on screen ---------- */
@@ -447,7 +555,3 @@
 .transcript-list li:hover .transcript-sync, .transcript-sync:focus-visible { opacity: 1; }
 .transcript-sync:hover { background: rgb(255 255 255 / 0.1); color: var(--fg); }
 
-/* scrub preview frame above the time */
-.scrub-tip.has-thumb { flex-direction: column; gap: 6px; padding: 5px 5px 7px; border-radius: 12px; }
-.scrub-tip-row { display: inline-flex; align-items: center; gap: 7px; }
-.scrub-thumb { display: block; width: 192px; height: 108px; border-radius: 8px; object-fit: cover; background: #000; box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.1); }

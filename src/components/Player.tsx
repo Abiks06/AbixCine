@@ -10,7 +10,25 @@ import { createHlsSideLoader } from "../lib/hlsSideSubs";
 import { TrickplayEngine } from "../lib/trickplay";
 import { TranscriptSheet } from "./TranscriptSheet";
 import { hasAudioFx, loadAudioFx, releaseAudioFx, resumeAudioFx, saveAudioFx, setAudioFx, type AudioFx } from "../lib/audioFx";
-import { createPlayhead, Scrubber, TimeReadout, usePlayhead } from "./Playhead";
+import { createHoverStore, createPlayhead, Scrubber, TimeReadout, useHover, usePlayhead } from "./Playhead";
+import {
+  EMBED_KEYS,
+  NAV_KEYS,
+  UP_NEXT_AT,
+  classifyKeyTarget,
+  friendlyFailure,
+  inUpNextWindow,
+  isKeyboardFocused,
+  loadSessionMute,
+  loadingStage,
+  nextSpeed,
+  saveSessionMute,
+  scrubPoint,
+  showsSpinner,
+  upNextVisible,
+  wheelVolumeSteps,
+  type WheelState,
+} from "../lib/playerControls";
 import { DashCueCollector } from "../lib/dashCues";
 import {
   SUB_PREF_EVENT,
@@ -46,6 +64,7 @@ import type { SessionSnapshot, SourceSession } from "../sources/session";
 import { SourceBoard } from "./SourceBoard";
 import { AudioToggle } from "./AudioToggle";
 import { Icon } from "./Icon";
+import { loadShowSpeed, saveShowSpeed, showKeyFor } from "../lib/showSpeed";
 import { SubtitleOverlay } from "./SubtitleOverlay";
 import { SubtitleSheet, type UnifiedSubTrack } from "./SubtitleSheet";
 
@@ -89,6 +108,8 @@ interface Props {
   episode?: number;
   media?: {
     key?: string;
+    /** Franchise key when one anime series spans several catalog entries. */
+    canonicalKey?: string;
     tmdbId?: number;
     imdbId?: string;
     malId?: number;
@@ -121,8 +142,11 @@ type Sheet = "servers" | "episodes" | "subtitles" | "transcript" | "audio" | "pi
 
 const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2];
 const MAX_VOL = 2; // Up to 200% pre-amp boost via Web Audio + brickwall safety limiter
-const UP_NEXT_AT = 25; // seconds before the end
 const TIME_LEFT_KEY = "abx.timeLeft";
+/** Controls fade this long after the last pointer move or key press (while playing). */
+const IDLE_MS = 2800;
+/** A connect or rebuffer that runs this long offers the next server instead of only spinning. */
+const SLOW_MS = 8000;
 const SHORTCUTS: [string, string][] = [
   ["Space / K", "Play or pause"],
   ["← / →", "Back or forward 5s (Shift: 30s)"],
@@ -136,9 +160,13 @@ const SHORTCUTS: [string, string][] = [
   ["[ / ]", "Subtitle timing ±0.5s (Shift: ±0.1s)"],
   ["S · E", "Servers · Episodes"],
   ["N", "Next episode"],
-  ["F · P", "Fullscreen · Picture-in-picture"],
+  ["F · double-click", "Fullscreen (F11 too)"],
+  ["P", "Picture-in-picture"],
+  ["?", "This list"],
   ["Esc", "Close panel, leave fullscreen, go back"],
 ];
+/** Pointer over these keeps the controls up: they don't fade from under a resting cursor. */
+const HOLD_CHROME = ".ptop-actions, .ptop > .pbtn, .pbot, .upnext, .skip-btn, .psheet, .perr-card, .pload-next";
 const ENHANCE_KEY = "abx.enhance.v1";
 const SUB_FILE_EXT_RX = /\.(srt|vtt|ass|ssa)$/i;
 const SUB_LANG_HINT_RX = /(?:^|[._ -])(en|eng|english|ja|jpn|japanese|fr|fra|fre|french|es|spa|spanish|de|deu|ger|german|pt|pt-br|por|portuguese|it|ita|italian|ar|ara|arabic|ko|kor|korean|zh|chi|zho|chinese|ru|rus|russian|hi|hin|tr|tur|pl|pol|nl|nld)(?:[._ -]|$)/i;
@@ -309,13 +337,30 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     }
     return Number.isFinite(v) && v >= 0.15 ? Math.min(MAX_VOL, v) : 1;
   });
-  const [muted, setMuted] = useState(false);
+  // Muting carries over to the next episode (the player is rebuilt for each), not to the next launch.
+  const [muted, setMuted] = useState(loadSessionMute);
   const volRef = useRef(vol);
   volRef.current = vol;
-  const wheelAccumRef = useRef(0);
-  const wheelStampRef = useRef(0);
-  const [speed, setSpeed] = useState(1);
+  /** The last volume you could hear, for unmuting a slider that was dragged to zero. */
+  const lastAudibleVolRef = useRef(vol > 0.001 ? vol : 1);
+  const wheelRef = useRef<WheelState>({ acc: 0, at: 0 });
+  // Speed carries over between episodes of the same show, never to other shows or films.
+  const showKey = showKeyFor(media, episode);
+  const [speed, setSpeed] = useState(() => loadShowSpeed(showKey));
+  const speedRef = useRef(speed);
+  speedRef.current = speed;
+  useEffect(() => {
+    // Only write when the viewer changed it, so opening an episode never rewrites the entry.
+    if (speed !== loadShowSpeed(showKey)) saveShowSpeed(showKey, speed);
+  }, [speed, showKey]);
   const [waiting, setWaiting] = useState(true);
+  /** The stream died and the session is looking for another one. */
+  const [recovering, setRecovering] = useState(false);
+  /** Every server failed: what went wrong, shown with the ways out. */
+  const [fatal, setFatal] = useState<{ why: string; server?: string } | null>(null);
+  /** The video reached its end (Up next stays up then, with autoplay off). */
+  const [ended, setEnded] = useState(false);
+  const [pipOn, setPipOn] = useState(false);
   const [preparingLocal, setPreparingLocal] = useState(false);
   const [preparingTorrent, setPreparingTorrent] = useState(false);
   const [idle, setIdle] = useState(false);
@@ -329,17 +374,25 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     }
   }, []);
   const [sheet, setSheet] = useState<Sheet | null>(null);
-  const [toast, setToast] = useState<string | null>(null);
+  /**
+   * One toast at a time. A new message while one is up swaps the text in place (keeping its id, so
+   * it doesn't re-enter on every wheel notch); `out` plays the exit before it unmounts. Keyed on the
+   * text it used to re-run nothing when the same message came twice, and went silent.
+   */
+  const [toast, setToast] = useState<{ msg: string; id: number; out: boolean } | null>(null);
   const [isFull, setIsFull] = useState(false);
+  const isFullRef = useRef(false);
+  isFullRef.current = isFull;
   const [levels, setLevels] = useState<{ height: number }[]>([]);
   const [level, setLevel] = useState(-1);
   const [activeLevel, setActiveLevel] = useState(-1);
   const [videoHeight, setVideoHeight] = useState<number | undefined>(undefined);
-  const [hover, setHover] = useState<{ x: number; t: number; w: number } | null>(null);
+  // The seek-bar hover point is a store too (components/Playhead.tsx): only the scrubber follows it.
+  const hoverStore = useMemo(() => createHoverStore(), []);
   // Scrub previews (lib/trickplay): the engine opens on the first hover of a stream.
   const trickRef = useRef<TrickplayEngine | null>(null);
   const [thumb, setThumb] = useState<string | null>(null);
-  const hoverBucket = hover ? Math.floor(hover.t / 5) : -1;
+  const hoverBucket = useHover(hoverStore, (p) => (p ? Math.floor(p.t / 5) : -1));
   /** The ±seconds badge that appears on the side you skipped towards; repeated presses add up. */
   const [bump, setBump] = useState<{ total: number; n: number } | null>(null);
   const bumpTimer = useRef<number>();
@@ -378,9 +431,12 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
   const failedSessionRef = useRef(-1);
   const flash = (msg: string) => {
     if (!mountedRef.current) return;
-    setToast(msg);
+    setToast((prev) => ({ msg, id: prev && !prev.out ? prev.id : (prev?.id ?? 0) + 1, out: false }));
     clearTimeout(toastTimer.current);
-    toastTimer.current = window.setTimeout(() => setToast(null), 2600);
+    toastTimer.current = window.setTimeout(() => {
+      setToast((prev) => (prev ? { ...prev, out: true } : prev));
+      toastTimer.current = window.setTimeout(() => setToast(null), 220);
+    }, 2400);
   };
   useEffect(() => {
     mountedRef.current = true;
@@ -447,11 +503,16 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     verifyCtlRef.current = ctl;
     const gen = ++verifyGenRef.current;
     setWaiting(true);
+    setRecovering(true);
+    setFatal(null);
+    const deadName = curRef.current?.providerName;
     const backupReady = session.getSnapshot().candidates.some((c) => candKey(c) !== deadId && c.probe?.ok && c.kind !== "embed");
     if (!backupReady) flash(`Checking backup servers (${why})…`);
-    void session.failover(deadId, ctl.signal).then((next) => {
+    // A rejected search counts as "nothing found": it must not leave the spinner up for good.
+    void session.failover(deadId, ctl.signal).catch(() => null).then((next) => {
       if (!mountedRef.current || ctl.signal.aborted || gen !== verifyGenRef.current) return;
       if (verifyCtlRef.current === ctl) verifyCtlRef.current = null;
+      setRecovering(false);
       if (next) {
         const nextId = candKey(next);
         activeIdRef.current = nextId;
@@ -459,9 +520,10 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
         flash(`Switched to ${next.providerName} (${why})`);
         return;
       }
+      // Nothing else would play: say so on screen with the ways out, instead of a toast that
+      // fades and leaves a black screen behind it.
       setWaiting(false);
-      flash(`Playback failed: ${why}`);
-      setSheet("servers");
+      setFatal({ why, server: deadName });
     });
   }, [clearStall, session]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -471,11 +533,14 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     if (!c) return;
     const key = candKey(c);
     setLiveStreamId(key);
+    setFatal(null);
     if (reported.current.has(key)) return;
     reported.current.add(key);
     session.report(key, true, {
       latencyMs: Math.max(1, Math.round(performance.now() - attachStartRef.current)),
       quality: video.current?.videoHeight || videoHeightRef.current,
+      // The element's own length is the strongest evidence of which title is really playing.
+      durationSec: video.current?.duration,
     });
   }, [session]);
 
@@ -1639,6 +1704,21 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     dashHeightsRef.current = [];
     if (sp) void sp.destroy().catch(() => {});
   };
+  /**
+   * Leaving the player (or moving to a web player, which drops the <video>): stop the element's own
+   * download too. A detached video with a plain file or torrent URL keeps fetching until it is
+   * garbage-collected. A switch between our own streams skips this: the next attach resets it.
+   */
+  const releaseMediaIfUnmounted = (v: HTMLVideoElement) => {
+    if (mountedRef.current && v.isConnected) return;
+    try {
+      v.pause();
+      v.removeAttribute("src");
+      v.load();
+    } catch {
+      /* already gone */
+    }
+  };
 
   /** On a dual-audio stream, play the track that matches sub (Japanese) or dub (English). */
   const pickAudioTrack = () => {
@@ -1845,6 +1925,9 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     setHasStarted(false);
     setPlaying(false);
     setLiveStreamId(null);
+    setRecovering(false);
+    setFatal(null);
+    setEnded(false);
     setPreparingLocal(false);
     setPreparingTorrent(false);
     stopActiveTorrent();
@@ -2345,6 +2428,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
         if (v.currentTime > 1) resumeAt.current = v.currentTime;
         stopActiveTorrent();
         destroyAttachedPlayers();
+        releaseMediaIfUnmounted(v);
       };
     }
     attachStream(c);
@@ -2356,6 +2440,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
       if (v.currentTime > 1) resumeAt.current = v.currentTime;
       stopActiveTorrent();
       destroyAttachedPlayers();
+      releaseMediaIfUnmounted(v);
     };
   }, [cur?.url, cur?.kind, cur?.localPath, retrySeq, failover, clearStall, stopActiveTorrent]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -2387,7 +2472,9 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
       if (m.ended) {
         const p = embedPos.current;
         if (p.duration) onProgress?.(p.duration, p.duration);
-        onEnded?.();
+        setEnded(true);
+        // "Keep watching" means stay, here as for our own video.
+        if (!upNextDismissedRef.current) onEnded?.();
       }
     };
     window.addEventListener("message", onMsg);
@@ -2399,15 +2486,15 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
   const [enhance, setEnhance] = useState<EnhanceMode>(loadEnhance);
   const [enhancing, setEnhancing] = useState<"idle" | "starting" | "on" | "error">("idle");
   const toggleAudioFx = (k: keyof AudioFx) => {
-    setAudioFxState((prev) => {
-      const next = { ...prev, [k]: !prev[k] };
-      saveAudioFx(next);
-      const v = video.current;
-      const boost = muted ? 1 : Math.max(1, volRef.current);
-      // Applied inside the click (a user gesture), so a new AudioContext starts running.
-      if (v && !isEmbed && !setAudioFx(v, { ...next, boost })) flash("Sound effects aren't available in this player");
-      return next;
-    });
+    // Worked out here, not inside the state updater: updaters must be pure (StrictMode runs them
+    // twice, which rebuilt the audio graph and fired the toast twice).
+    const next = { ...audioFx, [k]: !audioFx[k] };
+    setAudioFxState(next);
+    saveAudioFx(next);
+    const v = video.current;
+    const boost = muted ? 1 : Math.max(1, volRef.current);
+    // Applied inside the click (a user gesture), so a new AudioContext starts running.
+    if (v && !isEmbed && !setAudioFx(v, { ...next, boost })) flash("Sound effects aren't available in this player");
   };
   /**
    * Before/after: the upscaled canvas sits exactly over the video, so clipping it shows the original
@@ -2507,6 +2594,10 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     if (!v) return;
     v.volume = Math.max(0, Math.min(1, vol));
     v.muted = muted;
+    // The default rate too: every new source (hls.js / Shaka attaching, a retry, a refreshed link)
+    // runs the media load algorithm, which resets playbackRate to defaultPlaybackRate. With only
+    // playbackRate set, a server switch at 1.5× quietly played at 1× while the chip still said 1.5×.
+    v.defaultPlaybackRate = speed;
     v.playbackRate = speed;
     if (!isEmbed) {
       const boost = muted ? 1 : Math.max(1, vol);
@@ -2515,7 +2606,8 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
       }
     }
     try { localStorage.setItem("abx.vol", String(vol)); } catch { /* ignore */ }
-  }, [vol, muted, speed, isEmbed, audioFx, cur?.url]);
+  }, [vol, muted, speed, isEmbed, audioFx, cur?.url, retrySeq]);
+  useEffect(() => saveSessionMute(muted), [muted]);
 
   // Report progress every 5s (video element or the embed's last report).
   useEffect(() => {
@@ -2529,17 +2621,43 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     return () => clearInterval(t);
   }, [onProgress]);
 
-  // Auto-hide controls.
+  // Auto-hide controls. They stay up while the pointer rests on them or one of them has keyboard
+  // focus: nothing fades out from under a still cursor or from under the Tab key.
   const idleTimer = useRef<number>();
+  const overChromeRef = useRef(false);
+  const lastPointerRef = useRef({ x: Number.NaN, y: Number.NaN });
   const poke = () => {
     setIdle(false);
     clearTimeout(idleTimer.current);
-    idleTimer.current = window.setTimeout(() => setIdle(true), 2800);
+    const later = () => {
+      const a = document.activeElement;
+      const keyboardOnControls = !!a && !!wrap.current?.contains(a) && !!a.closest?.(HOLD_CHROME) && isKeyboardFocused(a);
+      if (overChromeRef.current || keyboardOnControls) {
+        idleTimer.current = window.setTimeout(later, IDLE_MS);
+        return;
+      }
+      setIdle(true);
+    };
+    idleTimer.current = window.setTimeout(later, IDLE_MS);
   };
+  /**
+   * Pointer activity over the player. Chromium also sends mousemoves without any movement (when
+   * the layout changes under a still cursor, e.g. as the controls fade): those must not count, or
+   * the controls could keep waking themselves up.
+   */
+  const onPointerActivity = (e: React.MouseEvent) => {
+    overChromeRef.current = !!(e.target as Element | null)?.closest?.(HOLD_CHROME);
+    const last = lastPointerRef.current;
+    if (e.clientX === last.x && e.clientY === last.y) return;
+    lastPointerRef.current = { x: e.clientX, y: e.clientY };
+    poke();
+  };
+  useEffect(() => () => clearTimeout(idleTimer.current), []);
+  // Starting or resuming playback shows the controls for a moment before they fade (they used to
+  // vanish the instant a slow stream finally started, if the mouse had been still meanwhile).
   useEffect(() => {
     poke();
-    return () => clearTimeout(idleTimer.current);
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [playing]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const toggle = () => {
     const v = video.current;
@@ -2564,6 +2682,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
   const setVolumeLevel = (target: number) => {
     const n = Math.max(0, Math.min(MAX_VOL, +target.toFixed(2)));
     volRef.current = n;
+    if (n > 0.001) lastAudibleVolRef.current = n;
     setMuted(false);
     setVol(n);
     const v = video.current;
@@ -2578,11 +2697,32 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     const n = setVolumeLevel(volRef.current + d);
     flash(`Volume ${Math.round(n * 100)}%${n > 1.001 ? " (Boost)" : ""}`);
   };
+  /**
+   * Mute / unmute. Unmuting a slider that was dragged all the way down brings back the last level
+   * you could hear: it used to flip the mute flag and stay silent, with no way to tell why.
+   */
+  const toggleMute = (announce = false) => {
+    const audible = volRef.current > 0.001;
+    if (muted || !audible) {
+      const n = audible ? volRef.current : setVolumeLevel(lastAudibleVolRef.current || 1);
+      setMuted(false);
+      if (announce) flash(`Sound on · ${Math.round(n * 100)}%`);
+    } else {
+      setMuted(true);
+      if (announce) flash("Muted");
+    }
+  };
   const changeSpeed = (dir: 1 | -1) => {
-    const i = SPEEDS.indexOf(speed);
-    const n = SPEEDS[Math.max(0, Math.min(SPEEDS.length - 1, (i < 0 ? SPEEDS.indexOf(1) : i) + dir))];
+    const n = nextSpeed(SPEEDS, speed, dir);
     setSpeed(n);
     flash(n === 1 ? "Normal speed" : `Speed ${n}×`);
+  };
+  // Volume from the mouse wheel, over the picture or the volume control.
+  const onWheelVolume = (e: React.WheelEvent) => {
+    if (isEmbed || sheet || !e.deltaY) return;
+    poke();
+    const steps = wheelVolumeSteps(wheelRef.current, e.deltaY, e.deltaMode, performance.now());
+    if (steps) changeVol(steps * 0.05);
   };
   const pipOk = typeof document !== "undefined" && document.pictureInPictureEnabled;
   const togglePip = async () => {
@@ -2602,15 +2742,18 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
   const setFull = async (on: boolean) => {
     try {
       if (win) {
+        // Noted before the await, so a quick second press (F, then F again) toggles back instead of
+        // repeating the same request off the not-yet-updated state.
+        isFullRef.current = on;
         await win.setFullscreen(on);
         setIsFull(on);
       } else if (on) await wrap.current?.requestFullscreen();
       else if (document.fullscreenElement) await document.exitFullscreen();
     } catch {
-      /* ignore */
+      if (win) void win.isFullscreen().then((f) => mountedRef.current && setIsFull(f)).catch(() => {});
     }
   };
-  const toggleFull = () => setFull(!isFull);
+  const toggleFull = () => void setFull(!isFullRef.current);
   useEffect(() => {
     if (win) return;
     const f = () => setIsFull(!!document.fullscreenElement);
@@ -2642,6 +2785,22 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     },
     [],
   );
+  // The PiP button shows whether the picture is popped out (closing the PiP window counts too).
+  useEffect(() => {
+    const v = video.current;
+    if (!v || isEmbed) {
+      setPipOn(false);
+      return;
+    }
+    const sync = () => setPipOn(document.pictureInPictureElement === v);
+    sync();
+    v.addEventListener("enterpictureinpicture", sync);
+    v.addEventListener("leavepictureinpicture", sync);
+    return () => {
+      v.removeEventListener("enterpictureinpicture", sync);
+      v.removeEventListener("leavepictureinpicture", sync);
+    };
+  }, [isEmbed]);
   const leave = () => {
     // The 5-second progress timer may not have fired yet: save where you actually stopped.
     saveNow();
@@ -2700,6 +2859,8 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     setHasStarted(false);
     setPlaying(false);
     setLiveStreamId(null);
+    setFatal(null);
+    setRecovering(false);
 
     if (id === activeIdRef.current) {
       setRetrySeq((n) => n + 1);
@@ -2745,6 +2906,12 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
   const [upNextDismissed, setUpNextDismissed] = useState(false);
   const upNextDismissedRef = useRef(false);
   upNextDismissedRef.current = upNextDismissed;
+  // "Keep watching" holds for this run to the end. Seek back out of the last stretch and the card
+  // (and autoplay at the end) come back, instead of being gone for the rest of the episode.
+  const inUpNext = inUpNextWindow(remaining, ended);
+  useEffect(() => {
+    if (!inUpNext) setUpNextDismissed(false);
+  }, [inUpNext]);
   /** Every way of moving to the next episode saves the playhead first (it used to lose up to 5 s). */
   const goNext = () => {
     if (!onNext) return;
@@ -2757,18 +2924,24 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
   // click also paused and resumed, which stutters the picture.
   const clickTimer = useRef<number>();
   useEffect(() => () => clearTimeout(clickTimer.current), []);
-  const showUpNext = !!onNext && !upNextDismissed && remaining <= UP_NEXT_AT && remaining > 0.5 && clock.duration > 120;
+  // With autoplay off the card used to vanish exactly at the end (0.5 s left), when it's needed most.
+  const showUpNext = upNextVisible({ hasNext: !!onNext, dismissed: upNextDismissed, remaining, duration: clock.duration, ended });
 
   // Keyboard shortcuts (bound once via ref so timeupdate ticks don't re-bind the window listener).
   const onKeyRef = useRef<(e: KeyboardEvent) => void>();
   onKeyRef.current = (e: KeyboardEvent) => {
     const el = e.target as HTMLElement | null;
-    if (
-      el?.tagName === "INPUT" ||
-      el?.tagName === "TEXTAREA" ||
-      el?.tagName === "SELECT" ||
-      el?.isContentEditable
-    ) return;
+    const target = classifyKeyTarget(el);
+    // Typing belongs to the field. Escape still closes the panel the field is in, instead of
+    // trapping you in the subtitle search box.
+    if (target === "text") {
+      if (e.key === "Escape" && sheet && el?.closest?.(".psheet")) {
+        e.preventDefault();
+        el.blur();
+        setSheet(null);
+      }
+      return;
+    }
     // Ctrl+K and friends belong to the app, not the player (Ctrl+K used to pause as well).
     if (e.ctrlKey || e.metaKey || e.altKey) return;
     // A modal on top (the command palette) owns the keyboard until it closes. The player's own
@@ -2776,6 +2949,13 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     if (document.querySelector('[aria-modal="true"]:not(.pkeys)')) return;
     // Letters work with Caps Lock on.
     const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+    // Holding a key repeats seeks and volume steps, never a toggle: a held F used to flick in and
+    // out of fullscreen, a held N skipped several episodes.
+    const repeatable = k === "ArrowLeft" || k === "ArrowRight" || k === "ArrowUp" || k === "ArrowDown" || k === "j" || k === "l" || k === "," || k === "." || k === "[" || k === "]" || k === "{" || k === "}";
+    if (e.repeat && !repeatable) {
+      if (k === " " && target !== "control") e.preventDefault();
+      return;
+    }
     // The shortcuts card is modal too: Escape or ? closes it, and nothing else leaks through to
     // the video underneath (closing it with Space used to pause as well).
     if (keysOpen) {
@@ -2783,10 +2963,19 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
       if (k === "Escape" || k === "?") setKeysOpen(false);
       return;
     }
-    // A focused control keeps its own Space/Enter: pressing Space on "Next server" must press that
-    // button, not pause the film.
-    const onControl = !!el?.closest?.('button, a[href], [role="tab"], [role="slider"], [role="radio"], [role="option"]');
-    if (onControl && (k === " " || k === "Enter")) return;
+    // A slider keeps its arrows (the volume slider: our handler on top doubled every step), and so
+    // does the side panel, whose lists and tabs move and scroll with them.
+    if (NAV_KEYS.has(k) && (target === "range" || el?.closest?.(".psheet"))) return;
+    // A control reached from the keyboard keeps its own Space/Enter: Space on a focused "Next
+    // server" presses that button. One that was only clicked keeps focus too; then Space is the
+    // film's again (it used to toggle fullscreen again after a click on Fullscreen).
+    if (target === "control" && (k === " " || k === "Enter")) {
+      if (k === "Enter" || isKeyboardFocused(el)) return;
+      e.preventDefault();
+      el?.blur();
+    }
+    // A web player plays in a sealed frame: only the keys that drive our own chrome apply.
+    if (isEmbed && !EMBED_KEYS.has(k)) return;
     poke();
     // Speed: Shift+comma / Shift+period by physical key, so it works on layouts where < and > live elsewhere.
     if (e.shiftKey && (e.code === "Comma" || e.code === "Period")) {
@@ -2800,13 +2989,13 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     }
     switch (k) {
       case " ": case "k": e.preventDefault(); toggle(); break;
-      case "ArrowLeft": seek(e.shiftKey ? -30 : -5); break;
-      case "ArrowRight": seek(e.shiftKey ? 30 : 5); break;
+      case "ArrowLeft": e.preventDefault(); seek(e.shiftKey ? -30 : -5); break;
+      case "ArrowRight": e.preventDefault(); seek(e.shiftKey ? 30 : 5); break;
       case "j": seek(-10); break;
       case "l": seek(10); break;
       case "ArrowUp": e.preventDefault(); changeVol(0.1); break;
       case "ArrowDown": e.preventDefault(); changeVol(-0.1); break;
-      case "m": setMuted((x) => !x); break;
+      case "m": toggleMute(true); break;
       case "c":
         if (e.shiftKey) cycleSub();
         else toggleSub();
@@ -2828,6 +3017,8 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
         break;
       }
       case "f": toggleFull(); break;
+      // The Windows fullscreen key, for people who reach for it out of habit.
+      case "F11": e.preventDefault(); toggleFull(); break;
       case "p": void togglePip(); break;
       case "n": goNext(); break;
       case "?": setKeysOpen((x) => !x); break;
@@ -2889,30 +3080,49 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
 
   const scrubRef = useRef<HTMLDivElement>(null);
   const [dragging, setDragging] = useState(false);
-  const atX = (clientX: number) => {
-    const r = scrubRef.current?.getBoundingClientRect();
-    if (!r || r.width <= 0) return { x: 0, t: 0, w: 0 };
-    const f = Math.max(0, Math.min(1, (clientX - r.left) / r.width));
-    return { x: f * r.width, t: f * dur, w: r.width };
-  };
+  // Read by the pointer and timeupdate handlers, which must not see a render-old value.
+  const draggingRef = useRef(false);
+  const atX = (clientX: number) => scrubPoint(clientX, scrubRef.current?.getBoundingClientRect(), dur);
   const onScrubDown = (e: React.PointerEvent) => {
-    if (!dur) return;
+    if (!dur || e.button !== 0 || draggingRef.current) return;
     e.currentTarget.setPointerCapture(e.pointerId);
+    draggingRef.current = true;
     setDragging(true);
     const p = atX(e.clientX);
     setTime(p.t);
-    setHover(p);
+    hoverStore.set(p);
   };
   const onScrubMove = (e: React.PointerEvent) => {
     if (!dur) return;
     const p = atX(e.clientX);
-    setHover(p);
-    if (dragging) setTime(p.t);
+    hoverStore.set(p);
+    if (draggingRef.current) setTime(p.t);
   };
   const onScrubUp = (e: React.PointerEvent) => {
-    if (!dragging) return;
+    if (!draggingRef.current) return;
+    draggingRef.current = false;
     setDragging(false);
     seekTo(atX(e.clientX).t);
+    // Released outside the bar: the preview goes too (pointerleave already fired during capture).
+    const r = scrubRef.current?.getBoundingClientRect();
+    if (r && (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top - 8 || e.clientY > r.bottom + 8)) hoverStore.set(null);
+  };
+  /**
+   * The drag ended without a release: capture lost to Alt+Tab, a system dialog or a cancelled touch.
+   * It used to leave `dragging` stuck on, freezing the playhead on screen (timeupdate skips while
+   * dragging) and keeping the controls up for good. Nothing is committed: the bar goes back to
+   * where the video really is.
+   */
+  const onScrubCancel = () => {
+    if (!draggingRef.current) return;
+    draggingRef.current = false;
+    setDragging(false);
+    hoverStore.set(null);
+    const v = video.current;
+    if (v) setTime(v.currentTime);
+  };
+  const onScrubLeave = () => {
+    if (!draggingRef.current) hoverStore.set(null);
   };
   const toggleTimeLeft = useCallback(
     () =>
@@ -2929,8 +3139,8 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
   /** What the scrubber tooltip calls the stretch you're pointing at. */
   const partAt = (t: number) => (sk?.intro && t >= sk.intro[0] && t < sk.intro[1] ? "Intro" : sk?.outro && t >= sk.outro[0] && t < sk.outro[1] ? "Credits" : null);
 
-  const hide = idle && playing && !sheet && !showUpNext && !dragging;
-  const embedHide = isEmbed && idle && !sheet;
+  const hide = idle && playing && !sheet && !showUpNext && !dragging && !keysOpen;
+  const embedHide = isEmbed && idle && !sheet && !keysOpen;
   const q = cur?.probe?.quality ?? cur?.quality;
   const curLevel = level >= 0 ? levels[level]?.height : activeLevel >= 0 ? levels[activeLevel]?.height : undefined;
   const shownQ = curLevel ?? videoHeight ?? q;
@@ -3013,11 +3223,29 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
   const enhMode = ENHANCE_MODES.find((m) => m.id === enhance) ?? ENHANCE_MODES[0];
   const openSheet = (s: Sheet) => setSheet((x) => (x === s ? null : s));
 
+  const preparing = preparingLocal || preparingTorrent;
+  const spinner = showsSpinner({ waiting, failed: !!fatal, isEmbed, hasStarted, playing, preparing });
+  const paused = !isEmbed && !playing && !spinner;
+  const hasOtherServer = candidates.some((c) => candKey(c) !== activeKey);
+  const stage = loadingStage({ recovering, preparingTorrent, preparingLocal, hasStarted, server: cur?.providerName });
+  // A connect or rebuffer that drags on offers the next server, rather than leaving you to watch a
+  // spinner until the 15-20 s watchdog gives up on its own.
+  const [slow, setSlow] = useState(false);
+  useEffect(() => {
+    setSlow(false);
+    if (!spinner) return;
+    const t = window.setTimeout(() => setSlow(true), SLOW_MS);
+    return () => clearTimeout(t);
+  }, [spinner, activeKey, hasStarted]);
+
   return (
     <div
       ref={wrap}
-      className={`player ${isEmbed ? "is-embed" : ""} ${hide || embedHide ? "idle" : ""} ${isFull ? "is-full" : ""} ${sheet ? "has-sheet" : ""} ${!isEmbed && !playing && !waiting ? "is-paused" : ""}`}
-      onMouseMove={poke}
+      className={`player ${isEmbed ? "is-embed" : ""} ${hide || embedHide ? "idle" : ""} ${isFull ? "is-full" : ""} ${sheet ? "has-sheet" : ""} ${paused ? "is-paused" : ""}`}
+      onMouseMove={onPointerActivity}
+      onMouseLeave={() => {
+        overChromeRef.current = false;
+      }}
       onDragEnter={(e) => {
         if (isEmbed || !e.dataTransfer?.types?.includes("Files")) return;
         dragDepthRef.current += 1;
@@ -3057,24 +3285,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
           clearTimeout(clickTimer.current);
           toggleFull();
         }}
-        onWheel={(e) => {
-          if (isEmbed || sheet || !e.deltaY) return;
-          poke();
-          if (e.deltaMode === 1) {
-            changeVol(e.deltaY < 0 ? 0.05 : -0.05);
-            return;
-          }
-          const now = performance.now();
-          if (now - wheelStampRef.current > 250) wheelAccumRef.current = 0;
-          wheelStampRef.current = now;
-          wheelAccumRef.current += e.deltaY;
-          const stepPx = 60;
-          if (Math.abs(wheelAccumRef.current) >= stepPx) {
-            const steps = Math.trunc(wheelAccumRef.current / stepPx);
-            wheelAccumRef.current -= steps * stepPx;
-            changeVol(-steps * 0.05);
-          }
-        }}
+        onWheel={onWheelVolume}
       >
         {isEmbed ? (
           <iframe
@@ -3101,6 +3312,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
               className={enhancing === "on" ? "under" : ""}
               onPlay={() => {
                 setPlaying(true);
+                setEnded(false);
                 resumeAudioFx();
               }}
               onPause={() => {
@@ -3112,11 +3324,15 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
                 setWaiting(true);
                 armStall();
               }}
-              onPlaying={() => {
+              onPlaying={(e) => {
                 setWaiting(false);
                 clearStall();
                 started.current = true;
                 setHasStarted(true);
+                // Belt and braces for the chosen speed: a player library may have reset the rate
+                // while attaching (0 is Shaka holding playback for a rebuffer: leave that alone).
+                const v = e.currentTarget;
+                if (v.playbackRate !== 0 && v.playbackRate !== speedRef.current) v.playbackRate = speedRef.current;
                 onPlaying();
               }}
               onCanPlay={() => {
@@ -3125,7 +3341,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
               }}
               onTimeUpdate={(e) => {
                 const v = e.currentTarget;
-                if (!dragging) setTime(v.currentTime);
+                if (!draggingRef.current) setTime(v.currentTime);
                 setBuffered(bufferedAhead(v));
               }}
               onLoadedMetadata={(e) => {
@@ -3140,9 +3356,11 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
               }}
               onProgress={(e) => setBuffered(bufferedAhead(e.currentTarget))}
               onDurationChange={(e) => setDur(e.currentTarget.duration)}
+              onSeeking={() => setEnded(false)}
               onEnded={() => {
                 const v = video.current;
                 if (v) onProgress?.(v.duration, v.duration);
+                setEnded(true);
                 // "Keep watching" means stay here: don't auto-advance behind the viewer's back.
                 if (!upNextDismissedRef.current) onEnded?.();
               }}
@@ -3198,24 +3416,37 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
             />
           </>
         )}
-        {waiting && (
-          <div className="pload" aria-label="Loading">
-            <span className="pload-ring" />
-            <span className="pload-txt">
-              {preparingTorrent
-                ? "Starting torrent stream"
-                : preparingLocal
-                  ? "Preparing local audio"
-                  : hasStarted
-                    ? "Buffering"
-                    : `Connecting to ${cur?.providerName ?? "server"}`}
-            </span>
+        {spinner && (
+          // Before the first frame: a card that says what is loading and from where. A rebuffer
+          // mid-film: only the ring and a word, shown after a beat so short stalls don't flash.
+          <div className={`pload ${hasStarted && !recovering && !preparing ? "rebuffer" : ""}`} role="status" aria-live="polite">
+            <div className="pload-card">
+              <span className="pload-ring" aria-hidden />
+              <span className="pload-tx">
+                <strong>{stage}</strong>
+                {!hasStarted && <span className="pload-sub">{[title, subtitle].filter(Boolean).join(" · ")}</span>}
+              </span>
+              {slow && hasOtherServer && !recovering && (
+                <button
+                  type="button"
+                  className="pload-next"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    nextServer();
+                  }}
+                  onDoubleClick={(e) => e.stopPropagation()}
+                >
+                  <Icon name="refresh" size={14} />
+                  Try next server
+                </button>
+              )}
+            </div>
           </div>
         )}
       </div>
 
       {/* Sits under the chrome but over the iframe, so moving to the top edge wakes the controls. */}
-      <div className="ptop-hover-zone" onMouseEnter={poke} onMouseMove={poke} />
+      <div className="ptop-hover-zone" aria-hidden />
 
       <div className="chrome">
         <header className="ptop">
@@ -3253,7 +3484,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
         </header>
 
         {!isEmbed && (
-          <div className={`center-controls ${!playing && !waiting ? "show" : ""}`} onClick={(e) => e.stopPropagation()}>
+          <div className={`center-controls ${paused && !fatal ? "show" : ""}`} onClick={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()}>
             <button className="cc-btn" onClick={() => seek(-10)} aria-label="Back 10 seconds"><Icon name="replay10" size={26} /></button>
             <button className="cc-btn main" onClick={toggle} aria-label={playing ? "Pause" : "Play"}><Icon name={playing ? "pause" : "play"} size={34} /></button>
             <button className="cc-btn" onClick={() => seek(10)} aria-label="Forward 10 seconds"><Icon name="fwd10" size={26} /></button>
@@ -3261,13 +3492,13 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
         )}
 
         {!isEmbed && (
-          <footer className="pbot" onClick={(e) => e.stopPropagation()} onMouseMove={poke}>
+          <footer className="pbot" onClick={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()}>
             <Scrubber
               ph={playhead}
               dur={dur}
-              thumb={hover ? thumb : null}
+              thumb={thumb}
               dragging={dragging}
-              hover={hover}
+              hoverStore={hoverStore}
               intro={sk?.intro}
               outro={sk?.outro}
               scrubRef={scrubRef}
@@ -3275,7 +3506,8 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
               onPointerDown={onScrubDown}
               onPointerMove={onScrubMove}
               onPointerUp={onScrubUp}
-              onPointerLeave={() => !dragging && setHover(null)}
+              onPointerCancel={onScrubCancel}
+              onPointerLeave={onScrubLeave}
             />
             <div className="prow">
               <div className="pc">
@@ -3283,8 +3515,8 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
                 <button className="pbtn icon" onClick={() => seek(-10)} aria-label="Back 10 seconds"><Icon name="replay10" size={20} /></button>
                 <button className="pbtn icon" onClick={() => seek(10)} aria-label="Forward 10 seconds"><Icon name="fwd10" size={20} /></button>
                 {onNext && <button className="pbtn icon" onClick={goNext} aria-label="Next episode" title="Next episode (N)"><Icon name="next" size={20} /></button>}
-                <div className="vol">
-                  <button className="pbtn icon" onClick={() => setMuted((m) => !m)} aria-label="Mute"><Icon name={muted || vol === 0 ? "mute" : "vol"} size={20} /></button>
+                <div className="vol" onWheel={onWheelVolume}>
+                  <button className="pbtn icon" onClick={() => toggleMute()} aria-label={muted || vol === 0 ? "Unmute" : "Mute"} title={muted || vol === 0 ? "Unmute (M)" : "Mute (M)"}><Icon name={muted || vol === 0 ? "mute" : "vol"} size={20} /></button>
                   <input
                     type="range"
                     min={0}
@@ -3323,7 +3555,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
                     {speed !== 1 ? ` · ${speed}×` : ""}
                   </span>
                 </button>
-                {pipOk && <button className="pbtn icon" onClick={() => void togglePip()} aria-label="Picture-in-picture" title="Picture-in-picture (P)"><Icon name="pip" size={20} /></button>}
+                {pipOk && <button className={`pbtn icon ${pipOn ? "on" : ""}`} onClick={() => void togglePip()} aria-label="Picture-in-picture" aria-pressed={pipOn} title="Picture-in-picture (P)"><Icon name="pip" size={20} /></button>}
                 <button className="pbtn icon" onClick={toggleFull} aria-label="Fullscreen" title="Fullscreen (F)"><Icon name={isFull ? "unfull" : "full"} size={20} /></button>
               </div>
             </div>
@@ -3357,15 +3589,43 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
         <UpNext
           label={episodes?.nextLabel ?? nextLabel ?? "Next episode"}
           still={media?.backdrop}
-          seconds={Math.ceil(remaining)}
+          seconds={ended || !Number.isFinite(remaining) ? 0 : Math.ceil(remaining)}
           auto={!!autoNext}
           onPlay={goNext}
           onDismiss={() => setUpNextDismissed(true)}
         />
       )}
 
+      {fatal && (
+        // Every server failed. The toast this used to be faded after 2.6 s and left a black screen:
+        // now the ways out stay on screen until one is taken.
+        <div className="perr" onClick={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()}>
+          <div className="perr-card" role="alert">
+            <span className="perr-ic" aria-hidden><Icon name="info" size={22} /></span>
+            <strong className="perr-t">{fatal.server ? `${fatal.server} couldn't play this` : "This stream couldn't play"}</strong>
+            <p className="perr-d">{friendlyFailure(fatal.why)} {hasOtherServer ? "Another server may have it." : onRetry ? "Looking again may find a server that has it." : ""}</p>
+            <code className="perr-why">{fatal.why}</code>
+            <div className="perr-acts">
+              {hasOtherServer && (
+                <button type="button" className="btn play sm" onClick={nextServer} autoFocus>
+                  <Icon name="refresh" size={15} /> Try next server
+                </button>
+              )}
+              {onRetry && (
+                <button type="button" className={`btn ${hasOtherServer ? "glass" : "play"} sm`} onClick={refreshServerList} autoFocus={!hasOtherServer}>
+                  <Icon name="search" size={15} /> Look again
+                </button>
+              )}
+              <button type="button" className="btn glass sm" onClick={() => setSheet("servers")}>
+                <Icon name="layers" size={15} /> All servers
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* inert while closed: off-screen controls must not take focus or be read out. */}
-      <aside className={`psheet ${sheet ? "open" : ""}`} aria-hidden={!sheet} {...(sheet ? {} : { inert: "" })} onMouseMove={poke}>
+      <aside className={`psheet ${sheet ? "open" : ""}`} aria-hidden={!sheet} {...(sheet ? {} : { inert: "" })}>
         <div className="ps-head">
           <div className="ps-tabs" role="tablist">
             <button role="tab" className={sheet === "servers" ? "on" : ""} onClick={() => setSheet("servers")}>Servers</button>
@@ -3644,10 +3904,15 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
       {keysOpen && (
         <div className="pkeys-scrim" onClick={() => setKeysOpen(false)}>
           <div className="pkeys" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts" onClick={(e) => e.stopPropagation()}>
-            <div className="pkeys-h">Keyboard shortcuts <button className="pbtn icon" onClick={() => setKeysOpen(false)} aria-label="Close"><Icon name="x" size={16} /></button></div>
+            {/* Focus moves into the card (it's modal), and lands back on the page when it closes. */}
+            <div className="pkeys-h">Keyboard shortcuts <button className="pbtn icon" onClick={() => setKeysOpen(false)} aria-label="Close" autoFocus><Icon name="x" size={16} /></button></div>
             <dl>
               {SHORTCUTS.map(([k, what]) => (
-                <div key={k}><dt>{k}</dt><dd>{what}</dd></div>
+                <div key={k}>
+                  {/* "C · Shift+C" -> keycaps, with the separators kept ("/" = either, "·" = and) */}
+                  <dt>{k.split(/\s+([/·])\s+/).map((part, i) => (i % 2 ? <i key={i}>{part}</i> : <kbd key={i}>{part}</kbd>))}</dt>
+                  <dd>{what}</dd>
+                </div>
               ))}
             </dl>
           </div>
@@ -3664,7 +3929,12 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
         </div>
       )}
 
-      {toast && <div className="ptoast" key={toast}><i className="dot" />{toast}</div>}
+      {toast && (
+        <div className={`ptoast ${toast.out ? "out" : ""}`} key={toast.id} role="status" aria-live="polite">
+          <i className="dot" />
+          {toast.msg}
+        </div>
+      )}
     </div>
   );
 }

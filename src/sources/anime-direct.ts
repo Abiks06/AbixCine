@@ -104,7 +104,11 @@ export async function malIdFor(req: PlaybackRequest, signal?: AbortSignal): Prom
       const pool = filtered.length ? filtered : list.filter((m) => Boolean(m.idMal) && m.format !== "MUSIC");
       const mediaYear = req.media.year;
       const byYear = season === 1 && mediaYear != null ? pool.find((m) => m.seasonYear && Math.abs(m.seasonYear - mediaYear) <= 1) : undefined;
-      const idMal = (byYear ?? pool[0])?.idMal ?? null;
+      // The top search hit is only a fallback when nothing says it is another release: one with a
+      // known, different year is a remake or another entry of the same name, not this title.
+      const top = pool[0];
+      const topIsOther = season === 1 && mediaYear != null && !!top?.seasonYear && Math.abs(top.seasonYear - mediaYear) > 1;
+      const idMal = (byYear ?? (topIsOther ? undefined : top))?.idMal ?? null;
       if (!idMal) throw new Error("no MAL match");
       return idMal;
     });

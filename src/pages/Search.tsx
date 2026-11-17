@@ -4,6 +4,7 @@ import { encodeKey } from "../lib/catalog";
 import { peekSearch, searchAll } from "../lib/search";
 import { clearHistory, forgetQuery, rememberQuery, rememberTitle, useSearchHistory } from "../lib/history";
 import type { Media } from "../lib/types";
+import { Ambient } from "../components/Ambient";
 import { Art } from "../components/Art";
 import { Card, CardSkeleton, kindLabel, seedState, tagForMorph } from "../components/Card";
 import { Icon } from "../components/Icon";
@@ -18,6 +19,11 @@ type Tab = (typeof TABS)[number]["id"];
 
 export function Search() {
   const [params, setParams] = useSearchParams();
+  // setSearchParams gets a new identity on every navigation. The search effect below must not
+  // re-run because of that: it would write the old query back over a ?q= that just arrived from
+  // outside (the palette's "See all results"), and the two would overwrite each other forever.
+  const writeParams = useRef(setParams);
+  writeParams.current = setParams;
   const urlQ = params.get("q") ?? "";
   const [q, setQ] = useState(urlQ);
   const [tab, setTab] = useState<Tab>("all");
@@ -39,7 +45,7 @@ export function Search() {
   // Debounced search across both catalogs; the latest query wins.
   useEffect(() => {
     const term = q.trim();
-    setParams(term ? { q: term } : {}, { replace: true });
+    writeParams.current(term ? { q: term } : {}, { replace: true });
     if (term.length < 2) {
       setBusy(false);
       return setResults(null);
@@ -68,7 +74,7 @@ export function Search() {
       live = false;
       clearTimeout(t);
     };
-  }, [q, setParams]);
+  }, [q]);
 
   const count = (t: Tab) => (t === "all" ? results?.length ?? 0 : results?.filter((m) => m.kind === t).length ?? 0);
   // A filter with nothing in it for this query falls back to All.
@@ -84,6 +90,8 @@ export function Search() {
 
   return (
     <div className="page">
+      {/* The room behind the glass takes its colour from the best match. */}
+      {top?.backdrop && <Ambient media={top} />}
       <div className="search-box">
         <Icon name="search" size={30} />
         <input
@@ -126,7 +134,7 @@ export function Search() {
                 <div className="history-chips">
                   {history.queries.map((h) => (
                     <span key={h.q} className="history-chip">
-                      <button onClick={() => setQ(h.q)}><Icon name="clock" size={13} /> {h.q}</button>
+                      <button onClick={() => setQ(h.q)} title={h.q}><Icon name="clock" size={13} /> <span>{h.q}</span></button>
                       <button className="x" aria-label={`Forget ${h.q}`} onClick={() => forgetQuery(h.q)}><Icon name="x" size={12} /></button>
                     </span>
                   ))}

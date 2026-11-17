@@ -3,6 +3,7 @@ import { animeDirectProvider } from "./anime-direct";
 import { jellyfinProvider } from "./jellyfin";
 import {
   badUrl,
+  evidenceWeight,
   getHealth,
   isCircuitOpen,
   lastPick,
@@ -90,7 +91,8 @@ const HEDGE_DELAY_MS = 2500;
  * in this learned order, so the ones that keep delivering are checked first and the race ends sooner.
  */
 const WINS_KEY = "abx.serverWins.v1";
-type Wins = Record<string, { ok: number; n: number; last?: number }>;
+/** `last`: last success; `at`: last result of any kind (for fading old history). */
+type Wins = Record<string, { ok: number; n: number; last?: number; at?: number }>;
 let wins: Wins = (() => {
   try {
     return JSON.parse(localStorage.getItem(WINS_KEY) ?? "{}");
@@ -102,7 +104,8 @@ export function recordWin(providerId: string, kind: string, ok: boolean) {
   const k = `${providerId}:${kind}`;
   const w = wins[k] ?? { ok: 0, n: 0 };
   // Decay old history so a server that recovers (or breaks) moves quickly.
-  wins = { ...wins, [k]: { ok: w.ok * 0.85 + (ok ? 1 : 0), n: w.n * 0.85 + 1, last: ok ? Date.now() : w.last } };
+  const now = Date.now();
+  wins = { ...wins, [k]: { ok: w.ok * 0.85 + (ok ? 1 : 0), n: w.n * 0.85 + 1, last: ok ? now : w.last, at: now } };
   try {
     localStorage.setItem(WINS_KEY, JSON.stringify(wins));
   } catch {
@@ -114,7 +117,10 @@ export function learnedRank(providerId: string, kind: string, base: number) {
   const healthBase = serverHealthScore(providerId, base);
   const w = wins[`${providerId}:${kind}`];
   if (!w) return healthBase;
-  const rate = (w.ok + 1) / (w.n + 2);
+  // A record nobody has added to for days fades back toward neutral, so a server that was bad
+  // once and then never reached again (it ranked last) gets tried again eventually.
+  const fade = evidenceWeight(w.at ?? w.last);
+  const rate = (w.ok * fade + 1) / (w.n * fade + 2);
   const recent = w.last && Date.now() - w.last < 3 * 86400_000 && !recentlyFailed(providerId) && !isCircuitOpen(providerId) ? 3 : 0;
   return healthBase + rate * 12 - 6 + recent;
 }
@@ -685,7 +691,11 @@ export function score(c: StreamCandidate, preferred: number, priority: number, r
   const audioMiss = req.audio && c.audio === "unknown" ? 18 : 0;
   // This exact URL failed to play or has an expired token.
   const broken = badUrl(c.url) || isUrlTokenExpired(c.url) ? 40 : 0;
+  // Plays, but nowhere near the catalog runtime: probably another title (or a trailer). Below every
+  // stream that isn't, whatever its quality or record.
+  const otherTitle = c.identity?.status === "mismatch" ? 120 : 0;
   const why: string[] = [];
+  if (otherTitle) why.push("might be a different title");
   if (own && c.via !== "direct") why.push("ad-free");
   if (c.via === "direct") why.push("direct stream");
   if (req.audio && (c.audio === req.audio || c.audio === "dual")) why.push(req.audio === "dub" ? "English dub" : "subtitled");
@@ -697,7 +707,7 @@ export function score(c: StreamCandidate, preferred: number, priority: number, r
   return {
     ...c,
     why,
-    score: own + qScore * 40 - latency * 20 + (rel - 0.5) * 20 + memory - shaky - tripped - languageMiss - audioMiss - broken + priority * 0.5,
+    score: own + qScore * 40 - latency * 20 + (rel - 0.5) * 20 + memory - shaky - tripped - languageMiss - audioMiss - broken - otherTitle + priority * 0.5,
   };
 }
 
@@ -734,14 +744,35 @@ export function displayScore(c: StreamCandidate) {
   return Math.max(1, Math.min(99, Math.round((c.score / 90) * 100)));
 }
 
+/** Check failures in words a viewer can act on; plain HTTP codes stay as they are. */
+const FAILURE_LINES: [RegExp, string | ((m: RegExpMatchArray) => string)][] = [
+  [/^(?:no stream|not found)$/i, "no stream found"],
+  [/^timeout$/i, "timed out"],
+  [/^AbortError$/i, "check was stopped"],
+  [/^(?:token expired|expired stream)$/i, "link expired"],
+  [/^HTML or captcha response$/i, "blocked by a browser check"],
+  [/^refused$/i, "stream refused to load"],
+  [/^won't play$/i, "wouldn't play"],
+  [/^(?:segments aren't video|not a video file)$/i, "not a real video stream"],
+  [/^(?:not a playlist|empty playlist|no segments|manifest error tag|invalid (?:variant playlist|DASH manifest|URI in playlist)|empty DASH manifest|no DASH segments|error segment in playlist)$/i, "broken playlist"],
+  [/^(?:variant|segment) HTTP (\d{3})$/i, (m) => `stream parts refused (HTTP ${m[1]})`],
+  [/^API error response$/i, "server sent an error"],
+  [/^(?:check failed|failed)$/i, "couldn't be checked"],
+];
+
+function failureLine(error?: string) {
+  if (!error) return "couldn't verify";
+  for (const [rx, line] of FAILURE_LINES) {
+    const m = error.match(rx);
+    if (m) return typeof line === "string" ? line : line(m);
+  }
+  return error.slice(0, 72);
+}
+
 /** "1080p · 2.1 s" style line for a candidate. */
 export function candLine(c: StreamCandidate) {
   if (!c.probe) return "not verified";
-  if (!c.probe.ok) {
-    if (c.probe.error === "no stream" || c.probe.error === "not found") return "no stream found";
-    if (c.probe.error === "timeout") return "timed out";
-    return c.probe.error?.slice(0, 72) ?? "couldn't verify";
-  }
+  if (!c.probe.ok) return failureLine(c.probe.error);
   const q = c.probe.quality ?? c.quality;
   const ms = c.probe.latencyMs;
   return [q ? `${q}p` : null, ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${ms} ms`].filter(Boolean).join(" · ");

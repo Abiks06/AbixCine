@@ -56,6 +56,8 @@ export function SmartSource({ req, what, onPlay }: { req: PlaybackRequest; what:
               `Finding ${what}…`
             ) : snap.waiting > 0 ? (
               <><b>{snap.waiting}</b> {snap.waiting === 1 ? "server is" : "servers are"} on standby for {what}. Pick one to check it.</>
+            ) : snap.suspect > 0 ? (
+              <>{snap.suspect === 1 ? "One server has" : `${snap.suspect} servers have`} a stream, but it <b>might be a different title</b>: its length doesn't match {what}.</>
             ) : (
               `No server has ${what} right now.`
             )}

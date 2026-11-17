@@ -655,6 +655,26 @@ export interface StreamCandidate {
   score?: number;
   /** Short reasons the ranker liked it: "played last time", "fastest", "best quality". */
   why?: string[];
+  /**
+   * Providers that find a title by searching their catalog by name: the entry they settled on, so
+   * the server list can show what a server actually found.
+   */
+  matched?: { title: string; year?: number };
+  /**
+   * Is the stream really this title? Its length compared with the catalog runtime (filled in by
+   * the session). "mismatch": far too short or too long, probably a different title or a trailer.
+   */
+  identity?: StreamIdentity;
+}
+
+export interface StreamIdentity {
+  status: "match" | "mismatch" | "unknown";
+  /** Measured stream length, seconds. */
+  durationSec?: number;
+  /** What the catalog says it should run, seconds. */
+  expectedSec?: number;
+  /** Mismatch only: which way it is off. */
+  off?: "short" | "long";
 }
 
 /**

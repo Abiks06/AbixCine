@@ -11,7 +11,8 @@ import {
   recordPlayback,
   recordProbe,
 } from "./health";
-import { isUrlTokenExpired, native } from "./native";
+import { checkStreamIdentity, expectedRuntime, identityApplies, judgeRuntime, type RuntimeExpectation } from "./identity";
+import { isUrlTokenExpired, native, unwrapProxyUrl } from "./native";
 import {
   candKey,
   isAbortedProbe,
@@ -27,7 +28,7 @@ import {
   verifyEmbed,
   withTimeout,
 } from "./registry";
-import type { SourceProvider, StreamCandidate } from "./types";
+import type { SourceProvider, StreamCandidate, StreamIdentity } from "./types";
 
 /**
  * One source session per thing-to-play. The title page, the loading screen and the player all
@@ -71,10 +72,15 @@ export interface SessionSnapshot {
   candidates: StreamCandidate[];
   /** Keys (candKey) with a check in flight. */
   checking: ReadonlySet<string>;
+  /** Ready streams whose length is being compared with the catalog runtime. */
+  verifying: ReadonlySet<string>;
   lanes: Lane[];
   /** The stream the session committed to. Stable until it fails. */
   pick?: StreamCandidate;
+  /** Ready streams that are this title as far as anyone can tell (probable mismatches excluded). */
   ready: number;
+  /** Streams that play but are probably a different title (far off the catalog runtime). Never auto-picked. */
+  suspect: number;
   /** Found but not checked yet. */
   waiting: number;
   failed: number;
@@ -95,6 +101,11 @@ export interface SessionDeps {
   confirm: (c: StreamCandidate, signal: AbortSignal) => Promise<{ ok: boolean; quality?: number; error?: string }>;
   /** Re-capture an embed page (stream links expire). */
   capture: (c: StreamCandidate, signal: AbortSignal) => Promise<StreamCandidate>;
+  /**
+   * Is a ready stream really this title (its length against the catalog runtime)? Null: nothing to
+   * compare. Defaults to the playlist-duration check when the request's runtime can be known.
+   */
+  identity?: (c: StreamCandidate, signal: AbortSignal) => Promise<StreamIdentity | null>;
 }
 
 /** Direct checks are plain HTTP: several at once is fine. */
@@ -126,12 +137,26 @@ const CONFIRM_MS = 3500;
 const SESSION_FRESH_MS = 4 * 60_000;
 /** Nobody watching: stop background captures after this, keep the results. */
 const IDLE_STOP_MS = 1500;
+/** How long the would-be pick's runtime check may hold the pick up; past it, "unknown". */
+const IDENTITY_MS = 3000;
+/**
+ * Hard ceilings for one check. Every check has its own timeouts; these only make sure a check that
+ * somehow never settles can't leave a server "Checking…" (and the session busy) forever.
+ */
+const DIRECT_CHECK_CAP_MS = 20_000;
+const CAPTURE_CHECK_CAP_MS = 35_000;
 
 /** Errors that mean "we stopped asking", not "the stream is broken". */
 const SOFT_CONFIRM_ERRORS = /^(?:timeout|AbortError)$/i;
 
 const isEmbed = (c: StreamCandidate) => c.kind === "embed";
 const isMagnet = (c: StreamCandidate) => /^magnet:/i.test(c.url);
+/** Probably a different title: plays, but nowhere near the catalog runtime. */
+const isSuspect = (c: StreamCandidate) => c.identity?.status === "mismatch";
+/** Ready, and nothing says it is another title. */
+const isUsable = (c: StreamCandidate) => !!c.probe?.ok && !isSuspect(c);
+/** The stream behind the proxy: two servers capturing the same CDN playlist are one stream. */
+const streamOf = (c: StreamCandidate) => (c.kind === "embed" ? c.pageUrl ?? c.url : unwrapProxyUrl(c.url).url);
 const isAbxsProxied = (url: string) => /^(?:https?:\/\/abxs\.localhost(?:[/:?]|$)|abxs:\/\/)/i.test(url);
 
 const ANIME_ONLY_DIRECT_IDS = new Set(["hianime", "megaplay", "anizone", "kickassanime", "anikoto", "animeheaven"]);
@@ -188,6 +213,12 @@ export class SourceSession {
   private recorded = new Set<string>();
   /** Keys the viewer chose by hand, so a successful play is remembered as their choice. */
   private manual = new Set<string>();
+  /** Runtime checks in flight, by candKey. */
+  private identityInflight = new Map<string, AbortController>();
+  private readonly identityCheck?: (c: StreamCandidate, signal: AbortSignal) => Promise<StreamIdentity | null>;
+  private expected?: Promise<RuntimeExpectation | null>;
+  /** "Play now": take the best ready stream as it is, without waiting on its runtime check. */
+  private pickAny = false;
 
   private started = false;
   private disposed = false;
@@ -222,7 +253,11 @@ export class SourceSession {
       probe: deps.probe ?? probeCandidate,
       confirm: deps.confirm ?? playCheck,
       capture: deps.capture ?? verifyEmbed,
+      identity: deps.identity,
     };
+    // Without a runtime to compare with there is nothing to check, and the session runs as before.
+    this.identityCheck =
+      deps.identity ?? (identityApplies(req) ? (c, signal) => this.expectation().then((exp) => checkStreamIdentity(c, exp, signal)) : undefined);
     this.providers = this.deps.providers.filter((p) => p.isEnabled(this.s));
     this.prio = Object.fromEntries(this.deps.providers.map((p) => [p.id, p.priority]));
     for (const p of this.providers) {
@@ -264,16 +299,20 @@ export class SourceSession {
       c.probe?.ok ? (candKey(c) === this.pickKey ? 0 : 1) : checking.has(candKey(c)) ? 2 : !c.probe ? 3 : 4;
     const rank = (c: StreamCandidate) => (c.probe?.ok ? (c.score ?? 0) : this.rankOf(c));
     const candidates = all.sort((a, b) => group(a) - group(b) || rank(b) - rank(a));
-    const ready = all.filter((c) => c.probe?.ok).length;
+    const ready = all.filter(isUsable).length;
     const busy = this.isBusy();
     this.snap = {
       req: this.req,
+      // Streams that are probably another title don't count: with nothing else, there is no stream
+      // for this title (they stay listed, with a warning, for the viewer to choose deliberately).
       phase: pick?.probe?.ok ? "picked" : !busy && ready === 0 && this.started ? "empty" : "racing",
       candidates,
       checking,
+      verifying: new Set(this.identityInflight.keys()),
       lanes: [...this.lanes.values()],
       pick: pick?.probe?.ok ? pick : undefined,
       ready,
+      suspect: all.filter((c) => c.probe?.ok && isSuspect(c)).length,
       waiting: all.filter((c) => !c.probe && !checking.has(candKey(c))).length,
       failed: all.filter((c) => c.probe && !c.probe.ok).length,
       busy,
@@ -285,7 +324,7 @@ export class SourceSession {
   /** Is anything running, or about to be started by the scheduler? */
   private isBusy() {
     if (!this.started) return true;
-    if (this.lookupsPending > 0 || this.inflight.size > 0 || this.confirming) return true;
+    if (this.lookupsPending > 0 || this.inflight.size > 0 || this.confirming || this.identityInflight.size > 0) return true;
     if (this.backgroundStopped) return false;
     if (this.directQueue.length > 0 && this.autoDirect < AUTO_DIRECT_CHECKS && this.readyCount() < Math.max(this.target, 1)) return true;
     return this.captureQueue.length > 0 && this.readyCount() < this.target && !this.backupsHeld;
@@ -348,6 +387,7 @@ export class SourceSession {
     this.root.abort();
     for (const t of [this.holdTimer, this.graceTimer, this.hedgeTimer, this.backupTimer, this.idleTimer]) clearTimeout(t);
     this.inflight.clear();
+    this.identityInflight.clear();
     this.listeners.clear();
   }
 
@@ -516,9 +556,10 @@ export class SourceSession {
 
   /* ----------------------------------------------------------- scheduler */
 
+  /** Ready streams that count: a probable different title is neither a pick nor a backup. */
   private readyCount() {
     let n = 0;
-    for (const c of this.cands.values()) if (c.probe?.ok) n++;
+    for (const c of this.cands.values()) if (isUsable(c)) n++;
     return n;
   }
 
@@ -622,14 +663,28 @@ export class SourceSession {
     const capture = isEmbed(c) || recapture;
     const { ctl, cleanup } = linkSignal(this.root.signal);
     const run = recapture ? this.deps.capture(c, ctl.signal) : this.deps.probe(c, ctl.signal);
-    const promise = run
-      .catch((e: unknown): StreamCandidate => ({ ...c, probe: { ok: false, latencyMs: 0, error: e instanceof Error ? e.message : "check failed" } }))
+    // A check that never settles (a hung native call) is a timed-out check, not one to retry.
+    let timedOut = false;
+    let capTimer: ReturnType<typeof setTimeout> | undefined;
+    const capMs = capture ? CAPTURE_CHECK_CAP_MS : DIRECT_CHECK_CAP_MS;
+    const capped = new Promise<StreamCandidate>((resolve) => {
+      capTimer = setTimeout(() => {
+        timedOut = true;
+        ctl.abort();
+        resolve({ ...c, probe: { ok: false, latencyMs: capMs, error: "timeout" } });
+      }, capMs);
+    });
+    const promise = Promise.race([
+      run.catch((e: unknown): StreamCandidate => ({ ...c, probe: { ok: false, latencyMs: 0, error: e instanceof Error ? e.message : "check failed" } })),
+      capped,
+    ])
       .then((r) => {
+        clearTimeout(capTimer);
         cleanup();
         const mine = this.inflight.get(key);
         if (mine?.promise === promise) this.inflight.delete(key);
         if (this.disposed) return r;
-        const cancelled = ctl.signal.aborted && !r.probe?.ok;
+        const cancelled = ctl.signal.aborted && !r.probe?.ok && !timedOut;
         if (cancelled) {
           // Stopped because enough streams were ready: it goes back to waiting, not to failed.
           const back = this.cands.get(key);
@@ -638,6 +693,7 @@ export class SourceSession {
         } else {
           this.learn(r);
           this.put({ ...r, lookupMs: r.lookupMs ?? c.lookupMs });
+          if (r.probe?.ok) this.startIdentity(key);
           // Only once a pick exists: before that, a capture still running may be the better stream.
           if (r.probe?.ok && this.pickKey && this.readyCount() >= this.target) this.cancelSurplus();
         }
@@ -682,12 +738,60 @@ export class SourceSession {
     return scored;
   }
 
+  /* ------------------------------------------------------ is it this title? */
+
+  private expectation() {
+    return (this.expected ??= expectedRuntime(this.req).catch(() => null));
+  }
+
+  private wantsIdentity(c: StreamCandidate) {
+    return (
+      !!this.identityCheck &&
+      !!c.probe?.ok &&
+      !c.identity &&
+      (c.kind === "hls" || c.kind === "dash") &&
+      c.providerId !== "local" &&
+      c.providerId !== "manual" &&
+      !isMagnet(c)
+    );
+  }
+
+  /**
+   * A stream is ready: compare its length with the catalog runtime. A probable mismatch is demoted,
+   * never auto-picked and never used as a backup; the viewer can still choose it from the list.
+   */
+  private startIdentity(key: string) {
+    const c = this.cands.get(key);
+    if (!c || this.disposed || this.identityInflight.has(key) || !this.wantsIdentity(c)) return;
+    const { ctl, cleanup } = linkSignal(this.root.signal);
+    this.identityInflight.set(key, ctl);
+    const timer = setTimeout(() => ctl.abort(), IDENTITY_MS);
+    const url = c.url;
+    void this.identityCheck!(c, ctl.signal)
+      .catch(() => null)
+      .then((verdict) => {
+        clearTimeout(timer);
+        cleanup();
+        if (this.identityInflight.get(key) === ctl) this.identityInflight.delete(key);
+        if (this.disposed) return;
+        const cur = this.cands.get(key);
+        // Nothing to compare, or a check cut short: "unknown", which never holds anything up again.
+        if (cur && cur.url === url && !cur.identity) this.put({ ...cur, identity: verdict ?? { status: "unknown" } });
+        this.evaluate();
+        this.pump();
+        this.changed();
+      });
+    this.changed();
+  }
+
   /* ------------------------------------------------------------- picking */
 
-  private bestReady(except?: string) {
+  /** Best ready stream. A probable different title only with `any` (the viewer said "play now"). */
+  private bestReady(except?: string, any = false) {
     let best: StreamCandidate | undefined;
     for (const c of this.cands.values()) {
       if (!c.probe?.ok || candKey(c) === except) continue;
+      if (!any && isSuspect(c)) continue;
       if (!best || (c.score ?? 0) > (best.score ?? 0)) best = c;
     }
     return best;
@@ -735,6 +839,7 @@ export class SourceSession {
     clearTimeout(this.graceTimer);
     this.graceTimer = undefined;
     this.firstReadyAt = -Infinity;
+    this.pickAny = true;
     this.commit();
   }
 
@@ -776,10 +881,15 @@ export class SourceSession {
 
   private commit() {
     if (this.disposed || this.pickKey || this.confirming) return;
-    const best = this.bestReady();
+    const best = this.bestReady(undefined, this.pickAny);
     if (!best) return;
     const key = candKey(best);
-    if (!this.needsConfirm(best)) return this.setPick(key);
+    // Its runtime check finishing (or giving up) re-evaluates, and commits then.
+    const identityPending = () => !this.pickAny && this.identityInflight.has(key);
+    if (!this.needsConfirm(best)) {
+      if (identityPending()) return;
+      return this.setPick(key);
+    }
 
     clearTimeout(this.graceTimer);
     this.graceTimer = undefined;
@@ -801,10 +911,14 @@ export class SourceSession {
         this.confirmed.add(key);
         if (this.pickKey) return;
         const cur = this.cands.get(key);
-        if (!cur?.probe?.ok) return this.evaluate();
+        if (!cur?.probe?.ok || (isSuspect(cur) && !this.pickAny)) return this.evaluate();
         // Too slow to say is not a no: the player's own watchdog is the last word.
         if (res.ok || SOFT_CONFIRM_ERRORS.test(res.error ?? "") || ctl.signal.aborted) {
           if (res.ok && res.quality && !cur.probe.quality) this.put({ ...cur, quality: res.quality, probe: { ...cur.probe, quality: res.quality } });
+          if (identityPending()) {
+            this.changed();
+            return;
+          }
           return this.setPick(key);
         }
         const dead = { ...cur, probe: { ok: false, latencyMs: cur.probe.latencyMs, error: res.error ?? "won't play" } };
@@ -820,6 +934,7 @@ export class SourceSession {
   private setPick(key: string) {
     if (this.disposed || this.pickKey === key) return;
     this.pickKey = key;
+    this.pickAny = false;
     this.pickMs ??= Math.round(performance.now() - this.t0);
     clearTimeout(this.graceTimer);
     this.graceTimer = undefined;
@@ -964,13 +1079,23 @@ export class SourceSession {
    * What the player saw: the strongest signal there is. A stream that started is ready whatever
    * its check said; one that died is failed, and the pick moves on.
    */
-  report(key: string, ok: boolean, info: { latencyMs?: number; quality?: number; error?: string } = {}) {
+  report(key: string, ok: boolean, info: { latencyMs?: number; quality?: number; error?: string; durationSec?: number } = {}) {
     const c = this.cands.get(key);
     if (!c) return;
     if (ok) {
       const quality = c.probe?.quality ?? info.quality ?? c.quality;
       const latencyMs = c.probe?.ok && c.probe.latencyMs > 0 ? c.probe.latencyMs : (info.latencyMs ?? 0);
       const live = this.put({ ...c, quality, probe: { ok: true, latencyMs, quality } });
+      // The player's own duration is the best evidence of what is really playing.
+      if (this.identityCheck && info.durationSec && Number.isFinite(info.durationSec) && info.durationSec > 0) {
+        const durationSec = info.durationSec;
+        void this.expectation().then((exp) => {
+          const cur = this.cands.get(key);
+          if (!exp || !cur || this.disposed) return;
+          this.put({ ...cur, identity: judgeRuntime(durationSec, exp) });
+          this.changed();
+        });
+      }
       this.confirmed.add(key);
       if (!this.pickKey) {
         this.cancelPendingCommit();
@@ -1000,9 +1125,12 @@ export class SourceSession {
   async failover(deadKey: string, signal?: AbortSignal): Promise<StreamCandidate | null> {
     if (this.disposed || signal?.aborted) return null;
     const token = ++this.failoverToken;
+    // Two servers often capture the very same CDN playlist: when it dies, its twin is no backup.
+    const dead = this.cands.get(deadKey);
+    const deadStream = dead && !isEmbed(dead) ? streamOf(dead) : undefined;
     const usable = () =>
       [...this.cands.values()]
-        .filter((c) => candKey(c) !== deadKey && c.probe?.ok && !isEmbed(c))
+        .filter((c) => candKey(c) !== deadKey && isUsable(c) && !isEmbed(c) && (!deadStream || streamOf(c) !== deadStream))
         .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))[0];
     const accept = (winner: StreamCandidate) => {
       this.cancelPendingCommit();

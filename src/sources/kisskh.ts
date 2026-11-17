@@ -1,10 +1,10 @@
 import { cached } from "../lib/cache";
-import { normTitle } from "../lib/format";
 import type { Settings } from "../lib/settings";
 import { langBase } from "../lib/subtitles";
 import type { MediaDetail, PlaybackRequest } from "../lib/types";
 import { isFilm } from "../lib/types";
 import { DEFAULT_UA, httpFetch, native, normalizeHeaders, proxyUrl, sniff, type StreamHeaders } from "./native";
+import { matchTargetFor, normalizeMatchTitle, pickTitleMatch } from "./titleMatch";
 import { inferSubtitleMeta, isThumbnailSubtitleUrl, type SourceProvider, type StreamCandidate, type SubtitleTrack } from "./types";
 import { encDec } from "./extractors/encdec";
 import { decryptKisskhBlock, decryptKisskhSubtitle, isEncryptedSubCandidateUrl } from "../lib/kisskhSubs";
@@ -240,7 +240,6 @@ export const kisskhProvider: SourceProvider = {
     // "zh-CN", "ZH" and "zh" are all Chinese.
     const lang = (req.media as MediaDetail).originalLanguage?.toLowerCase().split(/[-_]/)[0];
     if (!lang || !ASIAN.has(lang) || req.media.kind === "anime" || signal.aborted) return [];
-    const want = normTitle(req.media.title);
     const season = req.season ?? 1;
     const q = season > 1 ? `${req.media.title} ${season}` : req.media.title;
     const [primaryHits, altHits] = await Promise.all([
@@ -249,12 +248,18 @@ export const kisskhProvider: SourceProvider = {
     ]);
     if (signal.aborted) return [];
     const hits = primaryHits.concat(altHits);
-    const seasonForms = season > 1 ? [`${want} ${season}`, `${want}${season}`, `${want} season ${season}`] : [want];
-    // No blind fallback to the first hit: a show that isn't on KissKH must come back empty, not
-    // as whatever the search happened to list first.
-    const hit =
-      hits.find((h) => seasonForms.includes(normTitle(h.title))) ??
-      (season > 1 ? undefined : hits.find((h) => normTitle(h.title).startsWith(want)));
+    // No blind fallback to the first hit, and no "starts with" either: that took "Alchemy of
+    // Souls: Light and Shadow" for "Alchemy of Souls", or a same-named title from another year.
+    // KissKH titles carry the year only as a "(2024)" suffix, which the matcher reads.
+    let hit: Hit | undefined;
+    if (season > 1 && !isFilm(req.media)) {
+      const want = normalizeMatchTitle(req.media.title);
+      const seasonForms = [`${want} ${season}`, `${want}${season}`, `${want} season ${season}`];
+      hit = hits.find((h) => seasonForms.includes(normalizeMatchTitle(h.title)));
+    } else {
+      // Season 1 (or a film): a hit titled "… Season 2" ranks below the plain title.
+      hit = pickTitleMatch(hits, { ...matchTargetFor(req), season: isFilm(req.media) ? undefined : 1, yearRange: undefined }, (h) => ({ titles: [h.title] }))?.item;
+    }
     if (!hit) return [];
     const d = await drama(hit.id);
     const epNo = isFilm(req.media) ? 1 : req.episode ?? 1;
@@ -294,6 +299,7 @@ export const kisskhProvider: SourceProvider = {
           via: "direct",
           headers,
           subtitles,
+          matched: { title: d.title },
           lookupMs: Math.round(performance.now() - t0),
         },
       ];
@@ -329,6 +335,7 @@ export const kisskhProvider: SourceProvider = {
         pageUrl: page,
         headers,
         subtitles,
+        matched: { title: d.title },
         ...(got.verified === true
           ? { probe: { ok: true, latencyMs: Math.round(performance.now() - t0), quality: got.quality ?? undefined } }
           : {}),

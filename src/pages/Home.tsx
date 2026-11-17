@@ -38,10 +38,12 @@ export function Home() {
   // A stable array, so the hero doesn't restart its slide every time an unrelated store updates.
   const stage = useMemo(() => (d?.[0]?.length ? d[0] : (animeTrending.data ?? []).filter((m) => m.backdrop)), [d, animeTrending.data]);
   const catalog = hasTmdb();
+  // The stage waits for whichever feed can fill it; once both have settled empty, it steps aside.
+  const staging = (feeds.loading && !d) || (!d?.[0]?.length && animeTrending.loading && !animeTrending.data);
 
   return (
     <div className="page-flush">
-      <Hero items={stage} label="Tonight" />
+      <Hero items={stage} label="Tonight" loading={staging} />
       <div className="shelves pad">
         {!catalog && (
           <Link to="/settings#catalog" className="notice" viewTransition>

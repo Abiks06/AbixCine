@@ -1,5 +1,6 @@
 import { memo, useSyncExternalStore, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
 import { fmtTime } from "../lib/format";
+import { clampTip } from "../lib/playerControls";
 
 /**
  * The playhead (current time and buffered end) lives outside React state. `timeupdate` fires
@@ -49,12 +50,51 @@ export function usePlayhead<T extends string | number | boolean | null>(ph: Play
 }
 
 
+/** Where the pointer is on the seek bar: pixels from the bar's left edge, the time there, the bar's width. */
+export interface HoverPoint {
+  x: number;
+  t: number;
+  w: number;
+}
+
+/**
+ * The seek-bar hover point, also outside React state: pointer moves arrive at the display's rate,
+ * and as Player state each one re-rendered the whole player. Only the scrubber follows it.
+ */
+export interface HoverStore {
+  get(): HoverPoint | null;
+  set(p: HoverPoint | null): void;
+  subscribe(cb: () => void): () => void;
+}
+
+export function createHoverStore(): HoverStore {
+  let point: HoverPoint | null = null;
+  const subs = new Set<() => void>();
+  return {
+    get: () => point,
+    set(p) {
+      if (p === point || (p && point && p.x === point.x && p.t === point.t && p.w === point.w)) return;
+      point = p;
+      subs.forEach((f) => f());
+    },
+    subscribe(cb) {
+      subs.add(cb);
+      return () => subs.delete(cb);
+    },
+  };
+}
+
+/** Subscribe to a value derived from the hover point (a primitive, so renders stay rare). */
+export function useHover<T extends string | number | boolean | null>(hs: HoverStore, select: (p: HoverPoint | null) => T): T {
+  return useSyncExternalStore(hs.subscribe, () => select(hs.get()));
+}
+
 export const Scrubber = memo(function Scrubber({
   ph,
   dur,
   thumb,
   dragging,
-  hover,
+  hoverStore,
   intro,
   outro,
   scrubRef,
@@ -62,6 +102,7 @@ export const Scrubber = memo(function Scrubber({
   onPointerDown,
   onPointerMove,
   onPointerUp,
+  onPointerCancel,
   onPointerLeave,
 }: {
   ph: PlayheadStore;
@@ -69,7 +110,7 @@ export const Scrubber = memo(function Scrubber({
   /** Preview frame for the hovered point (lib/trickplay), when one is ready. */
   thumb?: string | null;
   dragging: boolean;
-  hover: { x: number; t: number; w: number } | null;
+  hoverStore: HoverStore;
   intro?: [number, number];
   outro?: [number, number];
   scrubRef: RefObject<HTMLDivElement>;
@@ -77,12 +118,17 @@ export const Scrubber = memo(function Scrubber({
   onPointerDown: (e: ReactPointerEvent) => void;
   onPointerMove: (e: ReactPointerEvent) => void;
   onPointerUp: (e: ReactPointerEvent) => void;
+  /** The drag ended without a release (capture lost: Alt+Tab, a system dialog, a cancelled touch). */
+  onPointerCancel: (e: ReactPointerEvent) => void;
   onPointerLeave: () => void;
 }) {
   // Whole seconds for the slider's accessible value; the bar itself follows every update.
   const time = usePlayhead(ph, (t) => t);
   const buffered = usePlayhead(ph, (_, b) => b);
-  const pct = dur ? (time / dur) * 100 : 0;
+  const hover = useSyncExternalStore(hoverStore.subscribe, hoverStore.get);
+  const pct = dur ? Math.max(0, Math.min(100, (time / dur) * 100)) : 0;
+  const part = hover && dur > 0 ? partAt(hover.t) : null;
+  const tipHalf = thumb ? 101 : 34;
   return (
     <div
       ref={scrubRef}
@@ -96,26 +142,29 @@ export const Scrubber = memo(function Scrubber({
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
+      onPointerCancel={onPointerCancel}
+      onLostPointerCapture={onPointerCancel}
       onPointerLeave={onPointerLeave}
     >
       <div className="c">
-        <span className="buf" style={{ width: `${dur ? (buffered / dur) * 100 : 0}%` }} />
+        <span className="buf" style={{ width: `${dur ? Math.min(100, (buffered / dur) * 100) : 0}%` }} />
         {hover && <span className="ghost" style={{ width: hover.x }} />}
         <i style={{ width: `${pct}%` }} />
         {dur > 0 && intro && intro[0] < dur && (
           <span className="part" style={{ left: `${(intro[0] / dur) * 100}%`, width: `${((Math.min(dur, intro[1]) - intro[0]) / dur) * 100}%` }} />
         )}
-        {dur > 0 && outro && (
+        {dur > 0 && outro && outro[0] < dur && (
           <span className="part" style={{ left: `${(outro[0] / dur) * 100}%`, width: `${((Math.min(dur, outro[1]) - outro[0]) / dur) * 100}%` }} />
         )}
       </div>
       <span className="knob" style={{ left: `${pct}%` }} />
       {hover && dur > 0 && (
-        <span className={`scrub-tip ${thumb ? "has-thumb" : ""}`} style={{ left: Math.max(thumb ? 104 : 34, Math.min(hover.w - (thumb ? 104 : 34), hover.x)) }}>
-          {thumb && <img className="scrub-thumb" src={thumb} alt="" />}
+        // Positioned with a transform (no layout per pointer move), centred and kept inside the bar.
+        <span className={`scrub-tip ${thumb ? "has-thumb" : ""}`} style={{ transform: `translateX(${clampTip(hover.x, hover.w, tipHalf)}px) translateX(-50%)` }}>
+          {thumb && <img className="scrub-thumb" src={thumb} alt="" draggable={false} />}
           <span className="scrub-tip-row">
-            {partAt(hover.t) && <em>{partAt(hover.t)}</em>}
-            {fmtTime(hover.t)}
+            {part && <em>{part}</em>}
+            <b>{fmtTime(hover.t)}</b>
           </span>
         </span>
       )}

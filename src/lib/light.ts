@@ -156,10 +156,92 @@ function paintLight(t: Tones | undefined) {
   });
 }
 
+/**
+ * The room also carries the focused title's own picture, blurred until only its colour is left
+ * (.light::before / ::after in styles/base.css). That soft colour field is what every pane of
+ * glass in the app looks through: translucent plates over it read as frosted with no blur of
+ * their own. Two layers take turns, so a new picture cross-fades over the old one, and nothing
+ * shows until the image has loaded.
+ */
+let artSrc: string | undefined;
+let artToken = 0;
+let artFlip = false;
+/** A few hundred pixels are plenty for something that is blurred to a glow. */
+function artOf(m: Media | undefined) {
+  const raw = m?.backdrop ?? m?.poster;
+  return raw ? sized(raw, m?.backdrop ? "w300" : "w185") ?? raw : undefined;
+}
+function paintArt(src: string | undefined) {
+  if (typeof document === "undefined") return;
+  if (src === artSrc) return;
+  artSrc = src;
+  const t = ++artToken;
+  const show = (url?: string) => {
+    if (t !== artToken) return;
+    if (url) artFlip = !artFlip;
+    lightEls().forEach((el) => {
+      if (url) el.style.setProperty(artFlip ? "--art-a" : "--art-b", `url(${JSON.stringify(url)})`);
+      el.dataset.art = url ? (artFlip ? "a" : "b") : "";
+    });
+  };
+  if (!src) return show();
+  const img = new Image();
+  img.decoding = "async";
+  img.onload = () => show(src);
+  img.onerror = () => show();
+  img.src = src;
+}
+
+/**
+ * The last room is remembered, so a cold start (or a page with no title of its own, opened
+ * first) is lit straight away by the film you last looked at instead of an empty black room.
+ */
+const ROOM_KEY = "abx.room";
+let restored: { src?: string; tones: Tones } | undefined;
+function remember(src: string | undefined, tones: Tones) {
+  try {
+    localStorage.setItem(ROOM_KEY, JSON.stringify({ src, tones }));
+  } catch {
+    /* storage full or blocked: the room just starts dark next time */
+  }
+}
+function setRootTones(t: Tones) {
+  const r = document.documentElement.style;
+  r.setProperty("--tone", t.tone);
+  r.setProperty("--tone-ink", t.ink);
+  r.setProperty("--tone-deep", t.deep);
+}
+function restoreRoom() {
+  if (typeof window === "undefined") return;
+  try {
+    const saved = JSON.parse(localStorage.getItem(ROOM_KEY) || "null") as typeof restored | null;
+    const t = saved?.tones;
+    if (!t || ![t.tone, t.ink, t.deep, t.l1, t.l2].every((v) => typeof v === "string" && v.startsWith("oklch("))) return;
+    restored = saved;
+  } catch {
+    return;
+  }
+  setRootTones(restored.tones);
+  // The room element mounts with the app; wait a few frames for it, unless a page lit it first.
+  let tries = 0;
+  const paint = () => {
+    if (base) return;
+    if (!document.querySelector(".light")) {
+      if (++tries < 120) requestAnimationFrame(paint);
+      return;
+    }
+    paintLight(restored!.tones);
+    paintArt(restored!.src);
+  };
+  requestAnimationFrame(paint);
+}
+restoreRoom();
+
 let previewToken = 0;
 function clearPreview() {
   previewToken++;
-  paintLight(baseTones);
+  paintLight(baseTones ?? restored?.tones);
+  paintArt(base ? artOf(base) : restored?.src);
 }
 
 /** The title a page is "about" (hero slide, title page, player). Sets the app-wide tones. */
@@ -170,15 +252,15 @@ export function setStageLight(m: Media | undefined) {
   // A card you clicked never gets its mouse-leave: don't let its preview outlive the page.
   clearTimeout(hoverTimer);
   previewToken++;
+  const src = artOf(m);
+  paintArt(src);
   if (!m) return;
   tonesFor(m).then((tones) => {
     if (t !== token) return;
     baseTones = tones;
-    const r = document.documentElement.style;
-    r.setProperty("--tone", tones.tone);
-    r.setProperty("--tone-ink", tones.ink);
-    r.setProperty("--tone-deep", tones.deep);
+    setRootTones(tones);
     paintLight(tones);
+    remember(src, tones);
   });
 }
 
@@ -196,6 +278,8 @@ export function previewLight(m: Media | null) {
       tonesFor(m).then((tones) => {
         if (t === previewToken) paintLight(tones);
       });
+      // The picture follows too, unless the connection asked to save data (it is one more image).
+      if (!(navigator as { connection?: { saveData?: boolean } }).connection?.saveData) paintArt(artOf(m));
     },
     m ? 160 : 80,
   );

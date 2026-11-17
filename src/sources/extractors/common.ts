@@ -6,6 +6,19 @@ import { resolveTmdbId } from "../embeds";
 import { DEFAULT_UA, httpFetch, httpFetchBytes, native, normalizeHeaders, proxyUrl, type FetchResult, type StreamHeaders } from "../native";
 import { inferSubtitleMeta, isThumbnailSubtitleUrl, type StreamKind, type SubtitleTrack } from "../types";
 
+/** The strict "is this catalog entry the title being played?" matcher every title search uses. */
+export {
+  assessTitleMatch,
+  matchTargetFor,
+  normalizeMatchTitle,
+  parseYear,
+  pickTitleMatch,
+  splitSeasonSuffix,
+  type MatchCandidate,
+  type MatchTarget,
+  type TitleMatch,
+} from "../titleMatch";
+
 export const DEFAULT_TIMEOUT_MS = 10_000;
 
 export const ASIAN_DRAMA_LANGS = new Set(["ko", "zh", "cn", "ja", "th", "tw", "tl", "id", "vi"]);

@@ -2,6 +2,7 @@ import { searchTmdb } from "../lib/tmdb";
 import type { Settings } from "../lib/settings";
 import { isFilm, type PlaybackRequest } from "../lib/types";
 import { DEFAULT_UA, normalizeHeaders, type StreamHeaders } from "./native";
+import { matchTargetFor, pickTitleMatch, type MatchTarget } from "./titleMatch";
 import type { SourceProvider, StreamCandidate, VideoSource } from "./types";
 
 const serverHeaders = (origin: string): StreamHeaders => ({
@@ -178,6 +179,8 @@ interface TmdbLookupEntry {
   callers: number;
   settled: boolean;
   aborted: boolean;
+  /** The search result the id came from. */
+  match?: { title: string; year?: number };
 }
 
 const MAX_TMDB_CACHE = 200;
@@ -191,38 +194,36 @@ export function buildEmbedUrl(template?: string, id?: string, season?: number, e
     .replaceAll("{episode}", String(episode ?? 1));
 }
 
-function pickBestTmdbMatch(
-  results: { key: string; kind: string; title: string; originalTitle?: string; year?: number }[],
-  req: PlaybackRequest,
-  isMovie: boolean,
-) {
-  if (!results.length) return undefined;
-  const kindFiltered = results.filter((item) => (isMovie ? item.kind === "movie" : item.kind !== "movie"));
-  const pool = kindFiltered.length > 0 ? kindFiltered : results;
-  const norm = (s?: string) => (s ?? "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-  const targetTitles = new Set([norm(req.media.title), norm(req.media.originalTitle)].filter(Boolean));
-  const targetYear = req.media.year;
+type TmdbSearchHit = { key: string; kind: string; title: string; originalTitle?: string; year?: number };
 
-  let best = pool[0];
-  let bestScore = -Infinity;
-  for (let i = 0; i < pool.length; i++) {
-    const item = pool[i];
-    let s = -i;
-    if (targetTitles.has(norm(item.title)) || (item.originalTitle && targetTitles.has(norm(item.originalTitle)))) {
-      s += 20;
-    }
-    if (targetYear && item.year) {
-      const diff = Math.abs(item.year - targetYear);
-      if (diff === 0) s += 30;
-      else if (diff === 1) s += 15;
-      else if (diff > 2) s -= 15;
-    }
-    if (s > bestScore) {
-      bestScore = s;
-      best = item;
-    }
-  }
-  return best;
+/**
+ * The TMDB search result that *is* this title, or undefined. Never "the closest one": the old
+ * fuzzy pick fell back to the first result, so a search for The Odyssey (2026) could hand every
+ * TMDB-keyed server the id of the 1997 miniseries. Movie vs series must agree, the title (or
+ * original title) must be equal once normalized, the year within one when both are known, and
+ * several equally-named results the year can't separate mean no match.
+ */
+export function pickBestTmdbMatch(results: TmdbSearchHit[], req: PlaybackRequest, isMovie: boolean, extraTitles: string[] = []) {
+  if (!results.length) return undefined;
+  const pool = results.filter((item) => (isMovie ? item.kind === "movie" : item.kind !== "movie"));
+  const base = matchTargetFor(req, { titles: extraTitles });
+  // An AniList entry for a later season carries that season's year, while TMDB files the whole
+  // show under its first year: the show must simply have started by then.
+  const target: MatchTarget =
+    !isMovie && isAnimeReq(req) && req.media.year != null
+      ? { ...base, kind: undefined, year: undefined, yearRange: { max: req.media.year + 1 }, season: undefined }
+      : { ...base, kind: undefined, season: undefined };
+  return pickTitleMatch(pool, target, (item) => ({ titles: [item.title, item.originalTitle], year: item.year }))?.item;
+}
+
+/**
+ * For a title that had to be looked up on TMDB by name: what the search settled on, so a server's
+ * row can say what it is really playing. Undefined for titles keyed by a TMDB id (nothing guessed).
+ */
+export function searchedTmdbMatch(req: PlaybackRequest): { title: string; year?: number } | undefined {
+  const key = (req.media as { canonicalKey?: string }).canonicalKey ?? req.media.key;
+  const entry = tmdbResolutionMap.get(key);
+  return entry?.settled ? entry.match : undefined;
 }
 
 function attachTmdbSignal(key: string, entry: TmdbLookupEntry, signal?: AbortSignal): Promise<string | null> {
@@ -300,18 +301,23 @@ export function resolveTmdbId(req: PlaybackRequest, signal?: AbortSignal): Promi
         match = pickBestTmdbMatch(results, req, isMovie);
       }
 
-      // If still not matched, strip secondary titles/brackets (common in anime entries)
+      // If still not matched, strip secondary titles/brackets. Only anime entries ("Frieren: Beyond
+      // Journey's End") may then match on the shortened name; for anything else the shorter search
+      // just widens the net and the full title must still match exactly.
       if (!match && /[:\-(\[]/.test(q)) {
         const cleaned = q.split(/[:\-(\[]/)[0].trim();
         if (cleaned.length > 2) {
           results = await searchTmdb(cleaned);
-          match = pickBestTmdbMatch(results, req, isMovie);
+          match = pickBestTmdbMatch(results, req, isMovie, isAnimeReq(req) ? [cleaned] : []);
         }
       }
 
       if (match?.key) {
         const matchId = match.key.match(/^tmdb:(movie|tv):(\d+)$/);
-        if (matchId) return matchId[2];
+        if (matchId) {
+          entry.match = { title: match.title, ...(match.year != null ? { year: match.year } : {}) };
+          return matchId[2];
+        }
       }
     } catch {
       /* ignore lookup failures */
@@ -406,6 +412,7 @@ export function createEmbedProvider(src: VideoSource, index: number): SourceProv
       const template = isMovie ? src.urls?.movie : src.urls?.tv;
       const url = buildEmbedUrl(template, tmdbId, req.season, req.episode);
       if (!url) return [];
+      const matched = searchedTmdbMatch(req);
       return [
         {
           ...base,
@@ -414,6 +421,7 @@ export function createEmbedProvider(src: VideoSource, index: number): SourceProv
           headers: normalizeHeaders(src.headers, url),
           audio: anime ? "unknown" : undefined,
           label: `${src.name}${src.isFrench ? " · French" : ""}${anime ? " · audio not guaranteed" : ""}`,
+          ...(matched ? { matched } : {}),
         },
       ];
     },

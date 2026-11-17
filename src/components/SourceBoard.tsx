@@ -1,5 +1,7 @@
+import type { KeyboardEvent } from "react";
+import { fmtRuntime } from "../sources/identity";
 import { candKey, candLine } from "../sources/registry";
-import type { SessionSnapshot } from "../sources/session";
+import type { Lane, SessionSnapshot } from "../sources/session";
 import type { StreamCandidate } from "../sources/types";
 import { Icon } from "./Icon";
 
@@ -17,6 +19,8 @@ export interface BoardRow {
   /** Missing for a provider that is still searching or never answered. */
   c?: StreamCandidate;
   note: string;
+  /** Plays, but probably isn't this title (far off the catalog runtime). Never picked automatically. */
+  suspect?: boolean;
 }
 
 const fmtMs = (ms?: number) => (ms == null || ms <= 0 ? null : ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${ms} ms`);
@@ -39,6 +43,32 @@ export const qualityLabel = (c: StreamCandidate) => {
 export const audioLabel = (c: StreamCandidate) =>
   c.audio === "dub" ? "DUB" : c.audio === "sub" ? "SUB" : c.audio === "dual" ? "DUAL" : c.audio === "unknown" ? "JP?" : null;
 
+/** Plays, but its length is far off the catalog runtime: probably another title, or a trailer. */
+export const isSuspect = (c: StreamCandidate) => !!c.probe?.ok && c.identity?.status === "mismatch";
+
+/** What a search-based server found: “The Odyssey” (2026). */
+export const foundLabel = (c: StreamCandidate) =>
+  c.matched?.title ? `“${c.matched.title}”${c.matched.year ? ` (${c.matched.year})` : ""}` : null;
+
+/** "Might be a different title · runs 1 h 32 min, should be 2 h 30 min". */
+export function suspectNote(c: StreamCandidate) {
+  const id = c.identity;
+  const runs = fmtRuntime(id?.durationSec);
+  const should = fmtRuntime(id?.expectedSec);
+  const detail = runs && should ? `runs ${runs}, should be ${should}` : id?.off === "short" ? "much too short" : "much too long";
+  return `Might be a different title · ${detail}`;
+}
+
+/** Why a provider that returned nothing is listed as unavailable, in words. */
+function laneNote(lane: Lane) {
+  if (lane.status === "timeout") return "Didn't answer in time";
+  const e = lane.error ?? "";
+  if (/enc-dec\.app unavailable/i.test(e)) return "Its decoding service is down";
+  if (/\b(?:401|403)\b/.test(e)) return "Refused the request";
+  if (/\btime(?:d)? ?out\b/i.test(e)) return "Didn't answer in time";
+  return "Couldn't be reached";
+}
+
 /** 0-3 bars from how quickly the stream answered. An unmeasured stream gets two, not a full house it didn't earn. */
 const bars = (c: StreamCandidate) => {
   const ms = c.probe?.latencyMs;
@@ -60,11 +90,19 @@ export function boardRows(snap: SessionSnapshot, playingKey?: string): BoardRow[
     const checking = snap.checking.has(key);
     const state: RowState = key === playingKey && c.probe?.ok ? "playing" : c.probe?.ok ? "ready" : checking ? "checking" : !c.probe ? "waiting" : "failed";
     const many = (perProvider.get(c.providerId) ?? 0) > 1 && c.label && c.label !== c.providerName;
-    const note =
+    const suspect = isSuspect(c);
+    const why = c.why?.filter((w) => w !== "might be a different title");
+    let note =
       state === "playing"
         ? ["Playing now", fmtMs(c.probe?.latencyMs)].filter(Boolean).join(" · ")
         : state === "ready"
-          ? (c.why?.length ? c.why.slice(0, 2).join(" · ") : (fmtMs(c.probe?.latencyMs) ?? "ready"))
+          ? suspect
+            ? suspectNote(c)
+            : snap.verifying?.has(key)
+              ? "Checking it's the right title…"
+              : why?.length
+                ? why.slice(0, 2).join(" · ")
+                : (fmtMs(c.probe?.latencyMs) ?? "ready")
           : state === "checking"
             ? c.kind === "embed"
               ? "Capturing the stream…"
@@ -72,13 +110,17 @@ export function boardRows(snap: SessionSnapshot, playingKey?: string): BoardRow[
             : state === "waiting"
               ? "On standby"
               : candLine(c);
-    rows.push({ id: key, name: many ? c.label : c.providerName, state, c, note });
+    // A server that found the title by searching its catalog by name says what it found.
+    const found = foundLabel(c);
+    if (found && suspect) note = `${note} · found ${found}`;
+    else if (found && state !== "checking") note = `${found} · ${note}`;
+    rows.push({ id: key, name: many ? c.label : c.providerName, state, c, note, ...(suspect ? { suspect } : {}) });
   }
   for (const lane of snap.lanes) {
     if (listed.has(lane.providerId)) continue;
     if (lane.status === "searching") rows.push({ id: `lane:${lane.providerId}`, name: lane.name, state: "searching", note: "Looking…" });
     else if (lane.status === "timeout" || lane.status === "error")
-      rows.push({ id: `lane:${lane.providerId}`, name: lane.name, state: "failed", note: lane.status === "timeout" ? "Didn't answer in time" : "Couldn't be reached" });
+      rows.push({ id: `lane:${lane.providerId}`, name: lane.name, state: "failed", note: laneNote(lane) });
   }
   return rows;
 }
@@ -107,6 +149,19 @@ interface Props {
   rows?: BoardRow[];
 }
 
+/** Arrow keys, Home and End move between the servers that can be picked. */
+function moveFocus(e: KeyboardEvent<HTMLDivElement>) {
+  if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) return;
+  const rows = [...e.currentTarget.querySelectorAll<HTMLButtonElement>("button.sb-row:not(:disabled)")];
+  if (!rows.length) return;
+  const at = rows.indexOf(document.activeElement as HTMLButtonElement);
+  const last = rows.length - 1;
+  const next =
+    e.key === "Home" ? 0 : e.key === "End" ? last : e.key === "ArrowDown" ? (at < 0 ? 0 : Math.min(last, at + 1)) : at < 0 ? last : Math.max(0, at - 1);
+  e.preventDefault();
+  rows[next].focus();
+}
+
 export function SourceBoard({ snap, playingKey, busyKey, busyNote = "Checking…", onPick, limit, grouped = true, rows: given }: Props) {
   const all = given ?? boardRows(snap, playingKey);
   const pickKey = snap.pick ? candKey(snap.pick) : undefined;
@@ -123,17 +178,21 @@ export function SourceBoard({ snap, playingKey, busyKey, busyNote = "Checking…
       !c
         ? r.note
         : r.state === "playing"
-          ? "Playing now"
-          : r.state === "ready"
-            ? `Play from ${r.name}`
-            : r.state === "failed"
-              ? `Try ${r.name} again`
-              : `Check ${r.name} and play`;
+          ? r.suspect
+            ? `Playing now. ${r.note}`
+            : "Playing now"
+          : r.suspect
+            ? `${r.note}. Probably another title or a trailer: play it anyway?`
+            : r.state === "ready"
+              ? `Play from ${r.name}`
+              : r.state === "failed"
+                ? `Try ${r.name} again`
+                : `Check ${r.name} and play`;
     return (
       <button
         key={r.id}
         type="button"
-        className={`sb-row ${r.state} ${c && candKey(c) === pickKey ? "pick" : ""}`}
+        className={`sb-row ${r.state}${r.suspect ? " suspect" : ""} ${c && candKey(c) === pickKey ? "pick" : ""}`}
         disabled={!c || busy || r.state === "playing"}
         onClick={() => c && onPick(c)}
         style={{ ["--i" as string]: Math.min(i, 14) }}
@@ -145,12 +204,16 @@ export function SourceBoard({ snap, playingKey, busyKey, busyNote = "Checking…
             <span className="sb-name-tx">{r.name}</span>
             {c && candKey(c) === pickKey && r.state !== "playing" && <em className="sb-auto">AUTO</em>}
           </span>
-          <span className="sb-note">{busyKey === r.id ? busyNote : r.note}</span>
+          <span className={`sb-note${r.suspect ? " warn" : ""}`}>{busyKey === r.id ? busyNote : r.note}</span>
         </span>
         <span className="sb-tags">
           {q && <b>{q}</b>}
           {audio && <b className={audio === "JP?" ? "warn" : ""} title={audio === "JP?" ? "This server can't switch audio" : undefined}>{audio}</b>}
-          {c && (r.state === "ready" || r.state === "playing") && <b className="via">{viaLabel(c)}</b>}
+          {r.suspect ? (
+            <b className="warn">Other title?</b>
+          ) : (
+            c && (r.state === "ready" || r.state === "playing") && <b className="via">{viaLabel(c)}</b>
+          )}
         </span>
         <span className="sb-act">
           {busy ? (
@@ -167,10 +230,10 @@ export function SourceBoard({ snap, playingKey, busyKey, busyNote = "Checking…
     );
   };
 
-  if (!grouped) return <div className="sb">{rows.map(row)}</div>;
+  if (!grouped) return <div className="sb" role="group" aria-label="Servers" onKeyDown={moveFocus}>{rows.map(row)}</div>;
   let n = 0;
   return (
-    <div className="sb">
+    <div className="sb" role="group" aria-label="Servers" onKeyDown={moveFocus}>
       {GROUPS.map(([states, label]) => {
         const mine = rows.filter((r) => states.includes(r.state));
         if (!mine.length) return null;

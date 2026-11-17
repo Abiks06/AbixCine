@@ -13,6 +13,8 @@ import { Art } from "./Art";
 import { kindLabel, seedState } from "./Card";
 import { Icon } from "./Icon";
 import { TitleArt } from "./TitleArt";
+import { TrailerModal } from "./TrailerModal";
+import { isYouTubeId } from "../lib/trailer";
 
 const SLIDE_MS = 9000;
 const pad2 = (n: number) => String(n).padStart(2, "0");
@@ -30,10 +32,11 @@ const length = (m: Featured) =>
  * The living stage: a rotating spotlight with the title's own art, a ruled line of facts, the
  * actions, a timeline of slides, and the whole programme listed down the right-hand side.
  */
-export function Hero({ items, label, onActive }: { items: Media[]; label: string; onActive?: (m: Media) => void }) {
+export function Hero({ items, label, onActive, loading = true }: { items: Media[]; label: string; onActive?: (m: Media) => void; loading?: boolean }) {
   const picks = useFeatured(items.filter((m) => m.backdrop || m.hue != null).slice(0, 6));
   const [i, setI] = useState(0);
   const [paused, setPaused] = useState(false);
+  const [trailer, setTrailer] = useState<{ id: string; title: string } | null>(null);
   const nav = useNavigate();
   const n = picks.length;
   const cur = n ? i % n : 0;
@@ -60,7 +63,7 @@ export function Hero({ items, label, onActive }: { items: Media[]; label: string
       document.removeEventListener("visibilitychange", sync);
     };
   }, [ready]);
-  const hold = paused || away;
+  const hold = paused || away || !!trailer;
 
   // The slide advances when its timeline tick finishes (onAnimationEnd below), so pausing on hover,
   // focus or visibility keeps tick and slide in step. Reduced motion: no autoplay at all (WCAG 2.2.2).
@@ -80,10 +83,13 @@ export function Hero({ items, label, onActive }: { items: Media[]; label: string
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [m?.key, m?.backdrop]);
 
-  if (!m) return <section className="hero hero-skeleton" ref={root} aria-busy />;
+  // Nothing to feature once the feeds have settled (offline, no catalog): no stage at all, rather
+  // than a placeholder that shimmers forever. The shelves below then start under the top bar.
+  if (!m) return loading ? <section className="hero hero-skeleton" ref={root} aria-busy aria-label={`Featured ${label}`} /> : null;
   const len = length(m);
 
   return (
+    <>
     <section
       className="hero"
       ref={root}
@@ -132,6 +138,11 @@ export function Hero({ items, label, onActive }: { items: Media[]; label: string
             <Link className="btn glass" to={`/title/${encodeKey(m.key)}`} state={seedState(m)} viewTransition>
               <Icon name="info" size={18} /> Details
             </Link>
+            {isYouTubeId(m.trailerYouTubeId) && (
+              <button type="button" className="btn glass icon" onClick={() => setTrailer({ id: m.trailerYouTubeId!, title: m.title })} aria-label={`Watch the ${m.title} trailer`} aria-haspopup="dialog" title="Trailer">
+                <Icon name="film" size={18} />
+              </button>
+            )}
             <button className={`btn glass icon ${saved ? "on" : ""}`} onClick={() => toggleList(m)} aria-label={saved ? "Remove from My List" : "Add to My List"} aria-pressed={saved} title={saved ? "In My List" : "Add to My List"}>
               <Icon name={saved ? "check" : "plus"} size={20} />
             </button>
@@ -168,5 +179,7 @@ export function Hero({ items, label, onActive }: { items: Media[]; label: string
         </div>
       )}
     </section>
+    {trailer && <TrailerModal id={trailer.id} title={trailer.title} onClose={() => setTrailer(null)} />}
+    </>
   );
 }

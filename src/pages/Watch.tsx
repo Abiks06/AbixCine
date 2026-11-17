@@ -299,7 +299,11 @@ export function Watch() {
   const total = snap?.lanes.length ?? 0;
   const answered = snap?.lanes.filter((l) => l.status !== "searching").length ?? 0;
   const pick = snap?.pick;
-  const best = snap?.candidates.find((c) => c.probe?.ok);
+  // Offer a verified stream first; one whose length says it's probably another title only as a last resort.
+  const best =
+    snap?.candidates.find((c) => c.probe?.ok && c.identity?.status !== "mismatch") ??
+    snap?.candidates.find((c) => c.probe?.ok);
+  const bestSuspect = best?.identity?.status === "mismatch";
   const empty = snap?.phase === "empty";
   const awaiting = snap?.awaitingChoice ? snap.lanes.find((l) => l.providerId === snap.awaitingChoice)?.name : undefined;
   const webPlayers = snap?.candidates.filter((c) => c.pageUrl && !c.probe?.ok).length ?? 0;
@@ -367,7 +371,7 @@ export function Watch() {
               <div className="race-acts">
                 {pick && <button className="btn play" onClick={() => setStart(candKey(pick))}><Icon name="play" size={16} /> Play now</button>}
                 {!pick && best && (
-                  <button className="btn play" onClick={() => session?.pickNow()}><Icon name="play" size={16} /> Play from {best.providerName} now</button>
+                  <button className="btn play" onClick={() => session?.pickNow()}><Icon name="play" size={16} /> {bestSuspect ? `Try ${best.providerName} anyway (might be a different title)` : `Play from ${best.providerName} now`}</button>
                 )}
               </div>
             </>

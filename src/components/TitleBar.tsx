@@ -61,10 +61,27 @@ function useServerCount(s: Settings) {
   return exact ?? quick;
 }
 
+const appWindow = () => (isTauri() ? getCurrentWindow() : null);
+// The dev design preview draws the window buttons too, so it lays out exactly like the desktop app.
+const showWindowButtons = () => isTauri() || (import.meta.env.DEV && location.search.includes("preview"));
+
+/** Minimise / maximise / close for the borderless window. Shared by the title bar and sign-in. */
+export function WindowButtons() {
+  const w = useMemo(appWindow, []);
+  if (!showWindowButtons()) return null;
+  return (
+    <div className="win">
+      <button aria-label="Minimize" onClick={() => w?.minimize()}><Icon name="min" size={14} /></button>
+      <button aria-label="Maximize" onClick={() => w?.toggleMaximize()}><Icon name="max" size={12} /></button>
+      <button aria-label="Close" className="close" onClick={() => w?.close()}><Icon name="x" size={14} /></button>
+    </div>
+  );
+}
+
 /**
  * One bar for the whole shell: brand, a floating dock whose lit pill slides to the current
- * section, search, live server status, the account and the window buttons. Empty stretches of
- * the bar drag the (borderless) window.
+ * section, a second glass capsule with search, live server status and the account, then the
+ * window buttons. Empty stretches of the bar drag the (borderless) window.
  */
 export function TitleBar({ onOpenPalette }: { onOpenPalette: () => void }) {
   const nav = useNavigate();
@@ -72,9 +89,8 @@ export function TitleBar({ onOpenPalette }: { onOpenPalette: () => void }) {
   const { user } = useAuth();
   const s = useSettings();
   const [menu, setMenu] = useState(false);
-  const w = useMemo(() => (isTauri() ? getCurrentWindow() : null), []);
-  // The dev design preview draws the window buttons too, so it lays out exactly like the desktop app.
-  const showWin = !!w || (import.meta.env.DEV && location.search.includes("preview"));
+  const w = useMemo(appWindow, []);
+  const showWin = showWindowButtons();
 
   // The pill: measured from the active link, re-measured when the dock reflows (labels collapse on narrow windows).
   const dock = useRef<HTMLElement>(null);
@@ -130,53 +146,49 @@ export function TitleBar({ onOpenPalette }: { onOpenPalette: () => void }) {
       </nav>
 
       <div className="top-end" data-tauri-drag-region>
-        <button className="top-search" onClick={onOpenPalette} aria-label="Search and commands">
-          <Icon name="search" size={15} />
-          <span>Search</span>
-          <span className="keys"><kbd>Ctrl</kbd><kbd>K</kbd></span>
-        </button>
-        <Link to="/settings#sources" className={`status ${ready ? "" : "off"}`} title={ready ? "Servers that answer when you press play" : "Every server is switched off"} viewTransition>
-          <i className="dot" />
-          <span>{status}</span>
-        </Link>
-        <NavLink to="/settings" className="top-icon" aria-label="Settings" title="Settings" viewTransition>
-          <Icon name="gear" size={17} />
-        </NavLink>
-        {user ? (
-          <div className="menu-wrap">
-            <button className="avatar-btn" onClick={() => setMenu((m) => !m)} aria-label="Account" aria-haspopup="menu" aria-expanded={menu}>
-              <Avatar user={user} size={30} />
-            </button>
-            {menu && (
-              <>
-                <div className="menu-scrim" onClick={() => setMenu(false)} />
-                <div className="menu" role="menu">
-                  <div className="menu-head">
-                    <Avatar user={user} size={40} />
-                    <div>
-                      <strong>{user.name}</strong>
-                      <span>{user.email}</span>
+        {/* The glass is painted by ::before, so this capsule never becomes the containing block of
+            the menu's fixed scrim, nor a backdrop root that would stop the menu's own blur. */}
+        <div className="tools">
+          <button className="top-search" onClick={onOpenPalette} aria-label="Search and commands">
+            <Icon name="search" size={15} />
+            <span>Search</span>
+            <span className="keys"><kbd>Ctrl</kbd><kbd>K</kbd></span>
+          </button>
+          <Link to="/settings#sources" className={`status ${ready ? "" : "off"}`} title={ready ? "Servers that answer when you press play" : "Every server is switched off"} viewTransition>
+            <i className="dot" />
+            <span>{status}</span>
+          </Link>
+          <NavLink to="/settings" className="top-icon" aria-label="Settings" title="Settings" viewTransition>
+            <Icon name="gear" size={17} />
+          </NavLink>
+          {user ? (
+            <div className="menu-wrap">
+              <button className="avatar-btn" onClick={() => setMenu((m) => !m)} aria-label="Account" aria-haspopup="menu" aria-expanded={menu}>
+                <Avatar user={user} size={30} />
+              </button>
+              {menu && (
+                <>
+                  <div className="menu-scrim" onClick={() => setMenu(false)} />
+                  <div className="menu" role="menu">
+                    <div className="menu-head">
+                      <Avatar user={user} size={40} />
+                      <div>
+                        <strong>{user.name}</strong>
+                        <span>{user.email}</span>
+                      </div>
                     </div>
+                    <button role="menuitem" onClick={() => go("/list")}><Icon name="bookmark" size={16} /> My List</button>
+                    <button role="menuitem" onClick={() => go("/settings")}><Icon name="gear" size={16} /> Settings</button>
+                    <button role="menuitem" onClick={() => { setMenu(false); void signOut(); }}><Icon name="logout" size={16} /> Sign out</button>
                   </div>
-                  <button role="menuitem" onClick={() => go("/list")}><Icon name="bookmark" size={16} /> My List</button>
-                  <button role="menuitem" onClick={() => go("/settings")}><Icon name="gear" size={16} /> Settings</button>
-                  <button role="menuitem" onClick={() => { setMenu(false); void signOut(); }}><Icon name="logout" size={16} /> Sign out</button>
-                </div>
-              </>
-            )}
-          </div>
-        ) : (
-          <button className="btn glass sm" onClick={leaveGuest}>Sign in</button>
-        )}
-        {showWin ? (
-          <div className="win">
-            <button aria-label="Minimize" onClick={() => w?.minimize()}><Icon name="min" size={14} /></button>
-            <button aria-label="Maximize" onClick={() => w?.toggleMaximize()}><Icon name="max" size={12} /></button>
-            <button aria-label="Close" className="close" onClick={() => w?.close()}><Icon name="x" size={14} /></button>
-          </div>
-        ) : (
-          <span style={{ width: 14 }} />
-        )}
+                </>
+              )}
+            </div>
+          ) : (
+            <button className="btn glass sm" onClick={leaveGuest}>Sign in</button>
+          )}
+        </div>
+        {showWin ? <WindowButtons /> : <span style={{ width: 14 }} />}
       </div>
     </header>
   );

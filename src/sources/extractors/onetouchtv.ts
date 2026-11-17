@@ -1,4 +1,3 @@
-import { normTitle } from "../../lib/format";
 import type { Settings } from "../../lib/settings";
 import type { MediaDetail, PlaybackRequest } from "../../lib/types";
 import { DEFAULT_UA, proxyUrl } from "../native";
@@ -14,9 +13,12 @@ import {
   isAbortError,
   isAnimeRequest,
   isDirectExtractorEnabled,
+  matchTargetFor,
   normalizeQuality,
-  titleSimilarity,
+  pickTitleMatch,
   isMovieRequest,
+  type MatchTarget,
+  type TitleMatch,
 } from "./common";
 
 const MAIN_URL = "https://api3.devcorp.me";
@@ -110,51 +112,15 @@ function isTypeCompatible(isMovie: boolean, rawType?: string): boolean {
   return ALLOWED_SERIES_TYPES.has(t);
 }
 
-function pickBestOttMatch(
-  results: OttSearchItem[],
-  queries: string[],
-  year: number | undefined,
-  isMovie: boolean,
-  season: number,
-): OttSearchItem | null {
+/**
+ * The search result that is the wanted title: right type, equal title (a "Season N" suffix must
+ * name the wanted season, since OneTouchTV lists each season separately), year within one.
+ * Similarity scoring used to accept same-named titles from other years.
+ */
+export function pickBestOttMatch(results: OttSearchItem[], target: MatchTarget, isMovie: boolean): TitleMatch<OttSearchItem> | null {
   const compatible = results.filter((r) => r?.id != null && r?.title && isTypeCompatible(isMovie, r.type));
   if (compatible.length === 0) return null;
-
-  const normQueries = queries.map((q) => normTitle(q)).filter(Boolean);
-  let best: OttSearchItem | null = null;
-  let bestScore = -1;
-
-  for (const item of compatible) {
-    const title = String(item.title ?? "");
-    const itemNorm = normTitle(title);
-    let score = 0;
-
-    for (const nq of normQueries) {
-      if (itemNorm === nq) score = Math.max(score, 1.0);
-      else score = Math.max(score, titleSimilarity(title, nq));
-    }
-
-    const itemYear = parseInt(String(item.year ?? ""), 10);
-    if (year && Number.isFinite(itemYear)) {
-      const diff = Math.abs(itemYear - year);
-      if (diff === 0) score += 0.15;
-      else if (diff > 2) score -= 0.25;
-    }
-
-    const seasonMatch = title.match(/\bseason\s+(\d+)\b/i);
-    if (!isMovie && season > 1 && seasonMatch) {
-      const foundSeason = parseInt(seasonMatch[1], 10);
-      if (foundSeason === season) score += 0.2;
-      else score -= 0.5;
-    }
-
-    if (score > bestScore) {
-      bestScore = score;
-      best = item;
-    }
-  }
-
-  return bestScore >= 0.45 ? best : null;
+  return pickTitleMatch(compatible, { ...target, strictSeason: !isMovie }, (item) => ({ titles: [String(item.title ?? "")], year: item.year }));
 }
 
 /**
@@ -187,16 +153,19 @@ export const onetouchtvProvider: SourceProvider = {
         keywords.push(req.media.originalTitle);
       }
 
-      let matched: OttSearchItem | null = null;
+      const target = matchTargetFor(req);
+      let hit: TitleMatch<OttSearchItem> | null = null;
       for (const kw of keywords) {
         if (signal.aborted) return [];
         const list = await fetchOttEncrypted<OttSearchItem[]>(`/vod/search?keyword=${encodeURIComponent(kw)}`, signal);
         if (Array.isArray(list) && list.length > 0) {
-          matched = pickBestOttMatch(list, [kw, baseTitle], req.media.year, isMovie, season);
-          if (matched) break;
+          hit = pickBestOttMatch(list, target, isMovie);
+          if (hit) break;
         }
       }
-      if (!matched || matched.id == null || signal.aborted) return [];
+      const matched = hit?.item;
+      if (!hit || !matched || matched.id == null || signal.aborted) return [];
+      const found = { title: hit.title, ...(hit.year != null ? { year: hit.year } : {}) };
 
       const detail = await fetchOttEncrypted<OttDetail>(`/vod/${matched.id}/detail`, signal);
       if (signal.aborted || !detail?.episodes?.length) return [];
@@ -243,6 +212,7 @@ export const onetouchtvProvider: SourceProvider = {
           via: "direct",
           headers: streamHeaders,
           subtitles,
+          matched: found,
           ...(q ? { quality: q } : {}),
         });
       }

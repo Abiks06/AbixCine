@@ -18,7 +18,7 @@ export function Library() {
         </div>
         <div className="grow" />
         {s.libraryPaths.map((p) => (
-          <span key={p} className="chip" title={p}><Icon name="folder" size={14} /> {folderLabel(p)}</span>
+          <span key={p} className="chip path" title={p}><Icon name="folder" size={14} /> <span>{folderLabel(p)}</span></span>
         ))}
         {s.libraryPaths.length > 0 && (
           <>

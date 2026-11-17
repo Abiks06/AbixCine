@@ -692,6 +692,21 @@ pub(crate) fn build_player_hook_script(referer_hint: Option<&str>) -> String {
     )
 }
 
+/// Referer the main window's trailer iframe falls back to (its own origin in a release build).
+pub(crate) const APP_EMBED_REFERER: &str = "http://tauri.localhost/";
+
+/// A YouTube embed-player document (`youtube.com` / `youtube-nocookie.com` `/embed/...`).
+pub(crate) fn is_youtube_embed_url(uri: &str) -> bool {
+    let Ok(u) = url::Url::parse(uri) else { return false };
+    if u.scheme() != "https" || !u.path().starts_with("/embed/") {
+        return false;
+    }
+    matches!(
+        u.host_str(),
+        Some("www.youtube.com" | "youtube.com" | "www.youtube-nocookie.com" | "youtube-nocookie.com")
+    )
+}
+
 pub(crate) fn is_opaque_header_value(val: Option<&str>) -> bool {
     val.map(str::trim).is_none_or(|v| {
         v.is_empty() || v.eq_ignore_ascii_case("null") || v.eq_ignore_ascii_case("about:blank")
@@ -1164,6 +1179,16 @@ mod win {
                                     let _ = hdrs.SetHeader(&HSTRING::from("Referer"), &HSTRING::from(ref_val.as_str()));
                                 }
                             }
+                        } else if main && is_youtube_embed_url(&uri) {
+                            // YouTube's embed player refuses to start without a Referer ("Error
+                            // 153"). The trailer iframe normally sends `http://tauri.localhost/`;
+                            // if the WebView dropped it, supply the app origin ourselves.
+                            let existing_ref = req_header(&req, "Referer");
+                            if is_opaque_header_value(existing_ref.as_deref()) {
+                                if let Ok(hdrs) = req.Headers() {
+                                    let _ = hdrs.SetHeader(&HSTRING::from("Referer"), &HSTRING::from(APP_EMBED_REFERER));
+                                }
+                            }
                         }
                     }
                     let req_type = map_resource_context(ctx);
@@ -1272,9 +1297,9 @@ mod win {
                         let mut uri = PWSTR::null();
                         args.Uri(&mut uri)?;
                         let uri = take_pwstr(uri);
-                        if uri.starts_with("https://") || uri.starts_with("http://") {
-                            let _ = std::process::Command::new("explorer").arg(&uri).spawn();
-                        }
+                        // Never `explorer.exe <url>`: Explorer is not a URL launcher and opens a
+                        // File Explorer window for many URLs (e.g. with a `?v=` query).
+                        let _ = open_in_browser(&uri);
                     } else {
                         BLOCKED.fetch_add(1, Ordering::Relaxed);
                     }
@@ -1423,6 +1448,50 @@ mod win {
 
 #[cfg(windows)]
 pub use win::{cdp, install, install_with_options, navigate_with_referer};
+
+/// Only plain web links may leave the app: `http(s)` with a host, re-serialized by the URL parser
+/// so nothing odd (spaces, quotes, `file:`, custom OS handlers) reaches the shell.
+pub(crate) fn external_web_url(raw: &str) -> Option<String> {
+    let u = url::Url::parse(raw.trim()).ok()?;
+    if !matches!(u.scheme(), "http" | "https") || u.host_str().is_none_or(|h| h.is_empty()) {
+        return None;
+    }
+    if !u.username().is_empty() || u.password().is_some() {
+        return None;
+    }
+    Some(u.to_string())
+}
+
+/// Open a web link in the user's default browser (ShellExecuteW "open", the same call the shell
+/// uses for a double-clicked .url file).
+pub(crate) fn open_in_browser(raw: &str) -> Result<(), String> {
+    let url = external_web_url(raw).ok_or_else(|| "Only http(s) links can be opened".to_string())?;
+    #[cfg(windows)]
+    {
+        use windows::core::{w, HSTRING, PCWSTR};
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        let file = HSTRING::from(url.as_str());
+        let h = unsafe { ShellExecuteW(None, w!("open"), &file, PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL) };
+        // Per the docs, a value greater than 32 means success.
+        if (h.0 as isize) > 32 {
+            Ok(())
+        } else {
+            Err(format!("Couldn't open the browser (code {})", h.0 as isize))
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let cmd = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        std::process::Command::new(cmd).arg(&url).spawn().map(|_| ()).map_err(|e| e.to_string())
+    }
+}
+
+/// Frontend entry point for "Open on YouTube" and other deliberate external links.
+#[tauri::command]
+pub fn open_external(url: String) -> Result<(), String> {
+    open_in_browser(&url)
+}
 
 #[cfg(not(windows))]
 pub fn cdp(_pw: &tauri::webview::PlatformWebview, _method: &str, _params: &str) {}
@@ -2439,5 +2508,31 @@ mod navigation_tests {
         for bad in ["javascript:alert(1)", "data:text/html,hi", "file:///C:/Windows/win.ini", "http://abxs.localhost/p?u=x", "https://example.com/", "ms-settings:privacy"] {
             assert!(!is_app_navigation(bad), "{bad} must be blocked");
         }
+    }
+}
+
+#[cfg(test)]
+mod external_link_tests {
+    use super::{external_web_url, is_youtube_embed_url};
+
+    #[test]
+    fn only_plain_web_links_leave_the_app() {
+        assert_eq!(
+            external_web_url("https://www.youtube.com/watch?v=abc123").as_deref(),
+            Some("https://www.youtube.com/watch?v=abc123")
+        );
+        assert!(external_web_url(" https://www.imdb.com/title/tt0111161/ ").is_some());
+        for bad in ["file:///C:/Windows", r"C:\Windows", "ms-settings:privacy", "javascript:alert(1)", "shell:startup", "https://user:pw@example.com/", ""] {
+            assert!(external_web_url(bad).is_none(), "{bad} must not be opened");
+        }
+    }
+
+    #[test]
+    fn recognises_youtube_embeds() {
+        assert!(is_youtube_embed_url("https://www.youtube-nocookie.com/embed/abc?autoplay=1"));
+        assert!(is_youtube_embed_url("https://www.youtube.com/embed/abc"));
+        assert!(!is_youtube_embed_url("https://www.youtube.com/watch?v=abc"));
+        assert!(!is_youtube_embed_url("https://evil.example/embed/abc"));
+        assert!(!is_youtube_embed_url("http://www.youtube.com/embed/abc"));
     }
 }

@@ -1774,6 +1774,7 @@ pub fn run() {
             shield::sniff_media,
             shield::cancel_sniff,
             shield::shield_stats,
+            shield::open_external,
             torrent::torrent_is_supported,
             torrent::torrent_start_stream,
             torrent::torrent_status,

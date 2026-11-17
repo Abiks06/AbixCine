@@ -1,16 +1,42 @@
 import { Fragment, useMemo } from "react";
+import { Link } from "react-router-dom";
 import { Hero } from "../components/Hero";
+import { Icon } from "../components/Icon";
 import { Row } from "../components/Row";
 import { useAuth } from "../lib/account";
 import { useFreshness } from "../lib/fresh";
 import { ANIME_FEEDS, loadAnimeFeed } from "../lib/anilist";
 import { useSettings } from "../lib/settings";
-import { FEEDS, loadFeed, TOP10 } from "../lib/tmdb";
+import { FEEDS, hasTmdb, loadFeed, TOP10 } from "../lib/tmdb";
 import type { Media } from "../lib/types";
 import { useAsync } from "../lib/useAsync";
 
 const EYEBROWS = ["Fresh", "Everyone's watching", "All-time", "By genre", "By genre"];
 const NONE: Media[] = [];
+
+/**
+ * Every shelf settled empty: say why instead of leaving a bare page. Without a catalog the fix is
+ * in Settings; with one, the catalog didn't answer (offline, server asleep), so offer a retry.
+ */
+function NothingHere({ catalog, busy, onRetry }: { catalog: boolean; busy: boolean; onRetry: () => void }) {
+  if (!catalog) {
+    return (
+      <Link to="/settings#catalog" className="notice" viewTransition>
+        <Icon name="info" />
+        <span>Films and series need the AbixCine server or your own TMDB key. Anime works either way. Open Settings to connect.</span>
+        <Icon name="chevR" />
+      </Link>
+    );
+  }
+  return (
+    <div className="empty">
+      <span className="empty-ic"><Icon name="info" size={28} /></span>
+      <h3>Couldn't reach the catalog</h3>
+      <p>Check your connection, then try again.</p>
+      <button className="btn play sm" onClick={onRetry} disabled={busy}>{busy ? <span className="mini-spin" /> : <Icon name="refresh" size={15} />} Try again</button>
+    </div>
+  );
+}
 
 export function Browse({ kind }: { kind: "movie" | "tv" }) {
   const s = useSettings();
@@ -25,10 +51,12 @@ export function Browse({ kind }: { kind: "movie" | "tv" }) {
   );
   const d = data.data;
   const stage = useMemo(() => d?.[1] ?? NONE, [d]);
+  const empty = !!d && d.every((x) => !x.length);
   return (
     <div className="page-flush">
-      <Hero items={stage} label={kind === "movie" ? "Popular films" : "Popular series"} />
+      <Hero items={stage} label={kind === "movie" ? "Popular films" : "Popular series"} loading={!d} />
       <div className="shelves pad">
+        {empty && <NothingHere catalog={hasTmdb()} busy={data.loading} onRetry={data.reload} />}
         {feeds.map((f, i) => (
           <Fragment key={f.id}>
             <Row eyebrow={EYEBROWS[i]} title={f.title} variant="landscape" items={d?.[i]} loading={!d} />
@@ -45,10 +73,12 @@ export function Anime() {
   const data = useAsync(() => Promise.all(ANIME_FEEDS.map((f, i) => loadAnimeFeed(f, i).catch(() => NONE))), [fresh], { keepPrevious: true });
   const d = data.data;
   const stage = useMemo(() => d?.[1] ?? NONE, [d]);
+  const empty = !!d && d.every((x) => !x.length);
   return (
     <div className="page-flush">
-      <Hero items={stage} label="This season" />
+      <Hero items={stage} label="This season" loading={!d} />
       <div className="shelves pad">
+        {empty && <NothingHere catalog busy={data.loading} onRetry={data.reload} />}
         {ANIME_FEEDS.map((f, i) =>
           i === 3 ? (
             <Row key={f.id} eyebrow="Ranked by fans" title={f.title} ranked items={d?.[i]} loading={!d} />

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { getDetail } from "./catalog";
 import type { Media, MediaDetail } from "./types";
 
-export type Featured = Media & Partial<Pick<MediaDetail, "runtime" | "seasons" | "episodeCount">>;
+export type Featured = Media & Partial<Pick<MediaDetail, "runtime" | "seasons" | "episodeCount" | "trailerYouTubeId">>;
 
 /** Lazily fetch title-treatment logos (and HD backdrops) for a handful of featured items. */
 export function useFeatured(items: Media[]) {
@@ -26,6 +26,7 @@ export function useFeatured(items: Media[]) {
                 runtime: d.runtime,
                 seasons: d.seasons,
                 episodeCount: d.episodeCount,
+                trailerYouTubeId: d.trailerYouTubeId,
               },
             })),
         )
