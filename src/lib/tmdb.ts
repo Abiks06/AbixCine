@@ -1,6 +1,6 @@
 import { whenAnimeMappingsHydrated } from "./animeMapping";
 import { cached } from "./cache";
-import { api, getAuth } from "./account";
+import { api, getAuth, isWakingError, whenServerAwake } from "./account";
 import { isFutureIsoDate, normalizeEpisodes, normalizeTmdbSeasons, tmdbReleaseWindows, todayIso, type RawTmdbSeason } from "./normalizer";
 import { getSettings } from "./settings";
 import type { Episode, Media, MediaDetail } from "./types";
@@ -95,7 +95,17 @@ async function get<T = unknown>(path: string, params: Record<string, string | nu
     const key = ownKey();
     if (!key) {
       const qs = new URLSearchParams(Object.entries(params).map(([k, v]) => [k, String(v)]));
-      return api(`/tmdb${path}?${qs}`) as Promise<T>;
+      const url = `/tmdb${path}?${qs}`;
+      // Through the AbixCine server, which may be asleep on a cold launch: wait for it to wake
+      // (shared across every request) and ask again, rather than handing back nothing. Without
+      // this, the first open of the day showed anime only until you left Home and came back.
+      for (let attempt = 0; ; attempt++) {
+        try {
+          return (await api(url)) as T;
+        } catch (e) {
+          if (attempt >= 2 || !isWakingError(e) || !(await whenServerAwake())) throw e;
+        }
+      }
     }
     const url = new URL(API + path);
     const headers: Record<string, string> = { accept: "application/json" };

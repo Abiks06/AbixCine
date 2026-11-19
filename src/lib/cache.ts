@@ -219,6 +219,23 @@ export async function cached<T>(key: string, ttlMs: number, fetcher: () => Promi
     return p;
   };
 
+  if (!hit && !ready) {
+    // A miss during boot isn't a real miss: the disk copy is still loading (cacheReady only waits
+    // HYDRATE_WAIT_MS, and a cold launch can take longer). Ask the network, and if the disk copy
+    // turns out to hold this key, show that the moment it lands; if the network fails (the server
+    // asleep, the PC offline) fall back to it. Before, a slow boot plus a sleeping server left Home
+    // with no films or series at all until it was opened a second time.
+    const bg = run();
+    bg.catch(() => {});
+    const fromDisk = async () => {
+      await hydrated;
+      const h = readEntry(key);
+      if (!h) throw new Error("not cached");
+      return h.value as T;
+    };
+    return Promise.race([bg, fromDisk().catch(() => bg)]).catch(() => fromDisk().catch(() => bg));
+  }
+
   if (hit) {
     // Stale: fetch fresh so what you see is current, but never leave you staring at a spinner.
     // If the network is slow or down, fall back to the last good copy without leaking an unhandled rejection.

@@ -346,6 +346,38 @@ export async function checkServer(signal?: AbortSignal) {
   }
 }
 
+/**
+ * The hosted server sleeps when nobody has used it for a while and takes up to a minute to wake.
+ * A request that fails that way (timeout, network, or the host's 502–504 while it boots) is worth
+ * retrying once the server answers again, not reporting as an empty catalog.
+ */
+export const isWakingError = (e: unknown) =>
+  e instanceof ApiError && e.code !== "aborted" && (e.status === 0 || (e.status >= 502 && e.status <= 504));
+
+let waking: Promise<boolean> | null = null;
+/**
+ * Resolves true once the server answers /health, false if it hasn't within `maxMs` (or the PC is
+ * offline). Every caller waiting at the same moment shares one ping loop, so a page of nine
+ * shelves sends one probe at a time instead of nine retries each.
+ */
+export function whenServerAwake(maxMs = 90_000): Promise<boolean> {
+  if (waking) return waking;
+  const until = Date.now() + maxMs;
+  waking = (async () => {
+    let delay = 1500;
+    while (Date.now() < until) {
+      if (typeof navigator !== "undefined" && navigator.onLine === false) return false;
+      if (await checkServer()) return true;
+      await new Promise((r) => setTimeout(r, delay));
+      delay = Math.min(delay * 1.6, 8000);
+    }
+    return false;
+  })().finally(() => {
+    waking = null;
+  });
+  return waking;
+}
+
 /** Stores register here to pull server state on sign-in and clear on sign-out. */
 interface SyncHook {
   pull?: () => void;
