@@ -65,10 +65,6 @@ pub const BLOCKED_HOSTS: &[&str] = &[
     "bodis.com", "sedoparking.com", "parkingcrew.net", "above.com",
 ];
 
-/// Same as `additionalBrowserArgs` in tauri.conf.json. Autoplay with sound is allowed:
-/// pressing Play in the app is the gesture, and the stream should never start muted.
-pub const BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required";
-
 /// Scripts blocked wherever they're hosted: anti-devtools / anti-adblock kits that blank the
 /// player when they think they're being inspected.
 pub const BLOCKED_URL_PARTS: &[&str] = &["disable-devtool", "devtools-detect", "devtools-detector", "adblock-detect", "fuckadblock", "blockadblock"];
@@ -1773,7 +1769,7 @@ async fn sniff_inner(app: AppHandle, target: url::Url, timeout_ms: Option<u64>, 
         .initialization_script_for_all_frames(hook_js)
         .initialization_script_for_all_frames(NUDGE_JS)
         // Must match the main window's arguments: WebView2 shares one browser per data folder.
-        .additional_browser_args(BROWSER_ARGS)
+        .additional_browser_args(crate::diagnostics::browser_args())
         .build()
         .map_err(|e| e.to_string())?;
 

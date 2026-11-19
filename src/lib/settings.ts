@@ -42,6 +42,8 @@ export interface Settings {
   subdlApiKey?: string;
   /** TV mode for a screen across the room: off, on while a controller is connected, or always. Device only. */
   tvMode?: "off" | "auto" | "on";
+  /** Cinema glow: the letterbox bars take the colour of the picture's edges. Device only. */
+  cinemaGlow?: boolean;
 }
 
 /** Settings that follow the account. Library folders and server credentials stay on this device. */

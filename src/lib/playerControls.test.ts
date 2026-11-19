@@ -65,6 +65,7 @@ describe("key sets", () => {
   });
 
   it("web players only get the keys that drive our own chrome", () => {
+    expect(EMBED_KEYS.has("i")).toBe(true);
     expect(EMBED_KEYS.has("f")).toBe(true);
     expect(EMBED_KEYS.has("Escape")).toBe(true);
     expect(EMBED_KEYS.has("m")).toBe(false);

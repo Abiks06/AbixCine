@@ -13,6 +13,7 @@ import {
 } from "./health";
 import { checkStreamIdentity, expectedRuntime, identityApplies, judgeRuntime, type RuntimeExpectation } from "./identity";
 import { isUrlTokenExpired, native, unwrapProxyUrl } from "./native";
+import { clearLocalScanCache } from "./local";
 import {
   candKey,
   isAbortedProbe,
@@ -129,6 +130,8 @@ const CAPTURE_HOLD_MS = 1500;
 const BACKUP_DELAY_MS = 4000;
 /** After the first ready stream, how long something better still in flight is given to land. */
 const GRACE_MS = 350;
+/** Extra head start given to the user's local library before committing to an online stream. */
+const LOCAL_GRACE_MS = 2500;
 /** ...unless it is the server the viewer chose by hand for this show, which gets a real chance. */
 const CHOICE_GRACE_MS = 9000;
 /** The pick's first-segment check may not hold playback up longer than this. */
@@ -153,8 +156,8 @@ const isEmbed = (c: StreamCandidate) => c.kind === "embed";
 const isMagnet = (c: StreamCandidate) => /^magnet:/i.test(c.url);
 /** Probably a different title: plays, but nowhere near the catalog runtime. */
 const isSuspect = (c: StreamCandidate) => c.identity?.status === "mismatch";
-/** Ready, and nothing says it is another title. */
-const isUsable = (c: StreamCandidate) => !!c.probe?.ok && !isSuspect(c);
+/** Ready, not another title, and not already token-expired. */
+const isUsable = (c: StreamCandidate) => !!c.probe?.ok && !isSuspect(c) && (c.providerId === "local" || !isUrlTokenExpired(c.url));
 /** The stream behind the proxy: two servers capturing the same CDN playlist are one stream. */
 const streamOf = (c: StreamCandidate) => (c.kind === "embed" ? c.pageUrl ?? c.url : unwrapProxyUrl(c.url).url);
 const isAbxsProxied = (url: string) => /^(?:https?:\/\/abxs\.localhost(?:[/:?]|$)|abxs:\/\/)/i.test(url);
@@ -204,8 +207,10 @@ export class SourceSession {
 
   private target = 1;
   private pickKey?: string;
+  private playedKey?: string;
   private pickMs?: number;
   private confirming?: string;
+  private skippedCircuit = new Set<string>();
   private confirmCtl?: AbortController;
   private commitGen = 0;
   private failoverToken = 0;
@@ -258,7 +263,7 @@ export class SourceSession {
     // Without a runtime to compare with there is nothing to check, and the session runs as before.
     this.identityCheck =
       deps.identity ?? (identityApplies(req) ? (c, signal) => this.expectation().then((exp) => checkStreamIdentity(c, exp, signal)) : undefined);
-    this.providers = this.deps.providers.filter((p) => p.isEnabled(this.s));
+    this.providers = this.deps.providers.filter((p) => p.isEnabled(this.s) && this.isProviderApplicable(p));
     this.prio = Object.fromEntries(this.deps.providers.map((p) => [p.id, p.priority]));
     for (const p of this.providers) {
       this.lanes.set(p.id, { providerId: p.id, name: p.name, category: p.category, status: "searching", count: 0 });
@@ -401,8 +406,22 @@ export class SourceSession {
     this.started = true;
     this.t0 = performance.now();
 
-    const direct = this.providers.filter((p) => p.category !== "embed");
-    this.lookupsPending = this.providers.length;
+    const pinned = lastPick(this.req);
+    const runnable: SourceProvider[] = [];
+    this.skippedCircuit.clear();
+    for (const p of this.providers) {
+      const bypassCircuit = p.id === "local" || p.id === "jellyfin" || (pinned?.manual && pinned.providerId === p.id);
+      if (!bypassCircuit && isCircuitOpen(p.id)) {
+        this.skippedCircuit.add(p.id);
+        const lane = this.lanes.get(p.id);
+        if (lane) this.lanes.set(p.id, { ...lane, status: "error", error: "circuit open" });
+        continue;
+      }
+      runnable.push(p);
+    }
+
+    const direct = runnable.filter((p) => p.category !== "embed");
+    this.lookupsPending = runnable.length;
 
     const hold = this.holdMs(direct);
     if (hold <= 0) this.captureOpen = true;
@@ -411,8 +430,8 @@ export class SourceSession {
     // A preview (want 1, the Title page) must not touch the user's accounts: providers with side
     // effects (Debrid magnets) are asked in warm mode until playback is requested.
     const warm = want <= 1;
-    for (const p of this.providers) void this.lookup(p, warm && !!p.sideEffectsOnLookup?.(this.s));
-    if (!this.providers.length) this.evaluate();
+    for (const p of runnable) void this.lookup(p, warm && !!p.sideEffectsOnLookup?.(this.s));
+    if (!runnable.length) this.evaluate();
     this.changed();
     return this;
   }
@@ -424,19 +443,55 @@ export class SourceSession {
     if (n > this.target) {
       this.target = n;
       if (this.started) {
-        this.pump();
+        const pickedIsLocal = !!(this.pickKey && this.cands.get(this.pickKey)?.providerId === "local");
+        if (pickedIsLocal && n < Number.MAX_SAFE_INTEGER) {
+          this.cancelSurplus();
+        } else {
+          if (
+            this.pickKey &&
+            !pickedIsLocal &&
+            !this.backgroundStopped &&
+            this.readyCount() < this.target &&
+            this.captureQueue.length &&
+            !this.backupTimer &&
+            !this.backupsHeld
+          ) {
+            this.backupsHeld = true;
+            this.captureOpen = true;
+            this.backupTimer = setTimeout(() => {
+              this.backupTimer = undefined;
+              this.backupsHeld = false;
+              this.pump();
+              this.changed();
+            }, BACKUP_DELAY_MS);
+          }
+          this.pump();
+        }
         this.changed();
       }
     }
     return this;
   }
 
-  /** Check every server that hasn't been checked. */
+  /** Check every server that hasn't been checked (including providers whose circuit breaker was open). */
   checkAll() {
     this.backgroundStopped = false;
     this.autoDirect = -Infinity;
     this.backupsHeld = false;
     this.captureOpen = true;
+    if (this.skippedCircuit.size) {
+      const skipped = [...this.skippedCircuit];
+      this.skippedCircuit.clear();
+      const warm = this.target <= 1;
+      for (const id of skipped) {
+        const p = this.providers.find((x) => x.id === id);
+        if (!p || this.disposed) continue;
+        const lane = this.lanes.get(id);
+        if (lane) this.lanes.set(id, { ...lane, status: "searching", error: undefined });
+        this.lookupsPending++;
+        void this.lookup(p, warm && !!p.sideEffectsOnLookup?.(this.s));
+      }
+    }
     return this.want(Number.MAX_SAFE_INTEGER);
   }
 
@@ -454,6 +509,11 @@ export class SourceSession {
     this.backupsHeld = false;
     for (const f of this.inflight.values()) if (!f.user) f.ctl.abort();
     this.changed();
+  }
+
+  private isProviderApplicable(p: SourceProvider): boolean {
+    if (p.category === "embed") return true;
+    return this.isApplicableDirect(p);
   }
 
   private isApplicableDirect(p: SourceProvider): boolean {
@@ -556,11 +616,13 @@ export class SourceSession {
 
   /* ----------------------------------------------------------- scheduler */
 
-  /** Ready streams that count: a probable different title is neither a pick nor a backup. */
+  /** Distinct ready streams that count: duplicate CDN mirrors or wrong titles do not inflate backups. */
   private readyCount() {
-    let n = 0;
-    for (const c of this.cands.values()) if (isUsable(c)) n++;
-    return n;
+    const seen = new Set<string>();
+    for (const c of this.cands.values()) {
+      if (isUsable(c)) seen.add(streamOf(c));
+    }
+    return seen.size;
   }
 
   /** Order for checking: what has worked lately for this kind of title, and for this show. */
@@ -571,8 +633,12 @@ export class SourceSession {
     return learnedRank(c.providerId, this.req.media.kind, this.prio[c.providerId] ?? 0) + affinity;
   }
 
+  private hasQueuedLocal() {
+    return this.directQueue.some((k) => this.cands.get(k)?.providerId === "local");
+  }
+
   private takeBest(queue: string[], eligible?: (c: StreamCandidate) => boolean) {
-    let bi = 0;
+    let bi = -1;
     let best = -Infinity;
     for (let i = 0; i < queue.length; i++) {
       const c = this.cands.get(queue[i]);
@@ -582,7 +648,7 @@ export class SourceSession {
         bi = i;
       }
     }
-    return queue.splice(bi, 1)[0];
+    return bi >= 0 ? queue.splice(bi, 1)[0] : undefined;
   }
 
   private running(capture: boolean) {
@@ -594,17 +660,29 @@ export class SourceSession {
   private pump() {
     if (this.disposed || !this.started || this.backgroundStopped) return;
     const wantMore = () => this.readyCount() < this.target;
+    const needLocal = () => !this.playedKey && this.hasQueuedLocal();
 
-    // Direct streams: cheap, so check them as they arrive, best first.
-    while (this.directQueue.length && this.running(false) < DIRECT_POOL && this.autoDirect < AUTO_DIRECT_CHECKS && (wantMore() || !this.pickKey)) {
+    // Direct streams: cheap, so check them as they arrive, best first (and always check late local files).
+    while (
+      this.directQueue.length &&
+      this.running(false) < DIRECT_POOL &&
+      ((this.autoDirect < AUTO_DIRECT_CHECKS && (wantMore() || !this.pickKey)) || needLocal())
+    ) {
+      const onlyLocal = !(this.autoDirect < AUTO_DIRECT_CHECKS && (wantMore() || !this.pickKey));
       this.autoDirect++;
       // Round-robin-ish: prefer providers still under their share; past that, the best candidate wins.
       const underShare = (c: StreamCandidate) => (this.autoByProvider.get(c.providerId) ?? 0) < AUTO_DIRECT_PER_PROVIDER;
-      const fair = this.directQueue.some((k) => {
-        const c = this.cands.get(k);
-        return !!c && underShare(c);
-      });
-      const key = this.takeBest(this.directQueue, fair ? underShare : undefined);
+      const fair =
+        !onlyLocal &&
+        this.directQueue.some((k) => {
+          const c = this.cands.get(k);
+          return !!c && underShare(c);
+        });
+      const key = this.takeBest(
+        this.directQueue,
+        onlyLocal ? (c) => c.providerId === "local" : fair ? underShare : undefined,
+      );
+      if (!key) break;
       const pid = this.cands.get(key)?.providerId;
       if (pid) this.autoByProvider.set(pid, (this.autoByProvider.get(pid) ?? 0) + 1);
       this.launch(key, false);
@@ -617,25 +695,29 @@ export class SourceSession {
       this.launch(fastLane, false);
     }
     // Before the pick, a ready stream means the pick is a moment away: capturing now would only
-    // compete with it. After the pick, captures are backups and start once the stream is under way.
+    // compete with it. After a Local pick, skip automatic embed backups completely.
     const ready = this.readyCount();
     if (!this.pickKey && ready > 0) return;
+    if (this.pickKey && this.cands.get(this.pickKey)?.providerId === "local" && this.target < Number.MAX_SAFE_INTEGER) return;
     if (!this.captureOpen && this.directSettled()) this.captureOpen = true;
     if (this.captureOpen && !this.backupsHeld) {
       // Racing for a first stream: several pages at once. Filling backups: no more than are still needed.
       const limit = this.pickKey ? Math.min(CAPTURE_POOL_BACKUP, this.target - ready) : this.hedged ? CAPTURE_POOL_HEDGED : CAPTURE_POOL;
       while (this.captureQueue.length && this.running(true) < limit && wantMore()) {
-        this.launch(this.takeBest(this.captureQueue), false);
+        const key = this.takeBest(this.captureQueue);
+        if (!key) break;
+        this.launch(key, false);
       }
       this.armHedge();
     }
   }
 
-  /** The server this show last played from skips the hold: capture it straight away. */
+  /** The server this show last played from skips the hold (unless Local library is still scanning). */
   private fastLaneKey() {
     if (this.captureOpen || this.pickKey) return undefined;
     const pinned = lastPick(this.req);
     if (!pinned) return undefined;
+    if (this.lanes.get("local")?.status === "searching" && !pinned.manual) return undefined;
     return this.captureQueue.find((k) => this.cands.get(k)?.providerId === pinned.providerId);
   }
 
@@ -694,8 +776,19 @@ export class SourceSession {
           this.learn(r);
           this.put({ ...r, lookupMs: r.lookupMs ?? c.lookupMs });
           if (r.probe?.ok) this.startIdentity(key);
-          // Only once a pick exists: before that, a capture still running may be the better stream.
-          if (r.probe?.ok && this.pickKey && this.readyCount() >= this.target) this.cancelSurplus();
+          if (r.probe?.ok && r.providerId === "local") {
+            this.cancelSurplus();
+            const confirmCand = this.confirming ? this.cands.get(this.confirming) : undefined;
+            if (confirmCand && confirmCand.providerId !== "local") this.cancelPendingCommit();
+            const curPick = this.pickKey ? this.cands.get(this.pickKey) : undefined;
+            if (curPick && curPick.providerId !== "local" && !this.playedKey && !this.manual.has(this.pickKey!)) {
+              this.pickKey = undefined;
+              this.setPick(key);
+            }
+          } else if (r.probe?.ok && this.pickKey && this.readyCount() >= this.target) {
+            // Only once a pick exists: before that, a capture still running may be the better stream.
+            this.cancelSurplus();
+          }
         }
         this.evaluate();
         this.pump();
@@ -814,6 +907,15 @@ export class SourceSession {
     return false;
   }
 
+  /** Local library is still scanning or probing on this PC: hold off before locking an online stream. */
+  private localPending(best: StreamCandidate) {
+    if (best.providerId === "local") return false;
+    if (this.lanes.get("local")?.status === "searching") return true;
+    for (const k of this.directQueue) if (this.cands.get(k)?.providerId === "local") return true;
+    for (const k of this.inflight.keys()) if (this.cands.get(k)?.providerId === "local") return true;
+    return false;
+  }
+
   /**
    * The server the viewer chose by hand for this show is still being looked up or captured.
    * It gets real time to arrive (a capture takes seconds), where a merely better-scoring stream
@@ -851,7 +953,13 @@ export class SourceSession {
     if (!best) return;
     this.firstReadyAt ??= performance.now();
     const waited = performance.now() - this.firstReadyAt;
-    const left = this.chosenPending(best) ? CHOICE_GRACE_MS - waited : this.canBeBeaten(best) ? GRACE_MS - waited : 0;
+    const left = this.localPending(best)
+      ? LOCAL_GRACE_MS - waited
+      : this.chosenPending(best)
+        ? CHOICE_GRACE_MS - waited
+        : this.canBeBeaten(best)
+          ? GRACE_MS - waited
+          : 0;
     clearTimeout(this.graceTimer);
     if (left > 0) {
       this.graceTimer = setTimeout(() => this.commit(), left);
@@ -875,8 +983,9 @@ export class SourceSession {
   private needsConfirm(c: StreamCandidate) {
     if (this.confirmed.has(candKey(c))) return false;
     if (c.providerId === "local" || c.providerId === "manual" || isEmbed(c) || isMagnet(c)) return false;
+    if (c.kind === "file") return false;
     if (c.via === "sniffed" && isAbxsProxied(c.url) && !isUrlTokenExpired(c.url)) return false;
-    return c.kind === "hls" || c.kind === "file";
+    return c.kind === "hls";
   }
 
   private commit() {
@@ -941,17 +1050,20 @@ export class SourceSession {
     clearTimeout(this.hedgeTimer);
     this.hedgeTimer = undefined;
     // Backups wait a moment so the stream that's about to start gets the bandwidth.
-    if (!this.backgroundStopped && this.readyCount() < this.target && this.captureQueue.length) {
+    // Local files play directly from disk, so never spin up background embed captures for them.
+    const pickedIsLocal = this.cands.get(key)?.providerId === "local";
+    if (!pickedIsLocal && !this.backgroundStopped && this.readyCount() < this.target && this.captureQueue.length) {
       this.backupsHeld = true;
       this.captureOpen = true;
       clearTimeout(this.backupTimer);
       this.backupTimer = setTimeout(() => {
+        this.backupTimer = undefined;
         this.backupsHeld = false;
         this.pump();
         this.changed();
       }, BACKUP_DELAY_MS);
     }
-    if (this.readyCount() >= this.target) this.cancelSurplus();
+    if (pickedIsLocal || this.readyCount() >= this.target) this.cancelSurplus();
     this.changed();
   }
 
@@ -1097,6 +1209,7 @@ export class SourceSession {
         });
       }
       this.confirmed.add(key);
+      this.playedKey = key;
       if (!this.pickKey) {
         this.cancelPendingCommit();
         this.pickKey = key;
@@ -1107,6 +1220,7 @@ export class SourceSession {
       if (this.confirming === key) this.cancelPendingCommit();
       this.put({ ...c, probe: { ok: false, latencyMs: c.probe?.latencyMs ?? 0, error: info.error || "won't play" } });
       this.manual.delete(key);
+      if (this.playedKey === key) this.playedKey = undefined;
       recordPlayback(this.req, c, false);
       recordWin(c.providerId, this.req.media.kind, false);
       if (this.pickKey === key) {
@@ -1224,6 +1338,7 @@ export function acquireSession(req: PlaybackRequest): SourceSession {
 /** Forget every session nobody is using: sources changed, or the viewer asked to look again. */
 export function invalidateSessions() {
   epoch++;
+  clearLocalScanCache();
   for (const [k, s] of sessions) {
     s.invalidate();
     sessions.delete(k);

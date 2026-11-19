@@ -121,7 +121,7 @@ function sample(src: string): Promise<Tones> {
   });
 }
 
-async function tonesFor(m: Media): Promise<Tones> {
+export async function tonesFor(m: Media): Promise<Tones> {
   const src = m.backdrop ?? m.poster;
   const id = `${m.key}|${src ?? ""}`;
   const hit = cache.get(id);
@@ -241,7 +241,6 @@ let previewToken = 0;
 function clearPreview() {
   previewToken++;
   paintLight(baseTones ?? restored?.tones);
-  paintArt(base ? artOf(base) : restored?.src);
 }
 
 /** The title a page is "about" (hero slide, title page, player). Sets the app-wide tones. */
@@ -278,8 +277,6 @@ export function previewLight(m: Media | null) {
       tonesFor(m).then((tones) => {
         if (t === previewToken) paintLight(tones);
       });
-      // The picture follows too, unless the connection asked to save data (it is one more image).
-      if (!(navigator as { connection?: { saveData?: boolean } }).connection?.saveData) paintArt(artOf(m));
     },
     m ? 160 : 80,
   );

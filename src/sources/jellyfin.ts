@@ -107,7 +107,7 @@ export const jellyfinProvider: SourceProvider = {
   id: "jellyfin",
   name: "Jellyfin server",
   category: "external",
-  priority: 20, // external server: below local files by default
+  priority: 32, // personal server: below local files (60), above online extractors and embeds
   isEnabled: (s) => s.jellyfin.enabled && !!s.jellyfin.url && !!s.jellyfin.apiKey,
   async find(req: PlaybackRequest, s, signal) {
     const { url, apiKey } = s.jellyfin;
@@ -159,6 +159,7 @@ export const jellyfinProvider: SourceProvider = {
             label: target.Name + (target.Height ? ` · ${target.Height}p` : "") + (t.audio === "dual" ? " · dual audio" : ""),
             url: streamUrl(url, apiKey, target.Id, t.sourceId, t.audioIndex),
             kind: "hls",
+            via: "direct",
             quality: target.Height || undefined,
             audio: t.audio,
             subtitles: t.subtitles,

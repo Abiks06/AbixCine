@@ -31,6 +31,10 @@ export interface Media {
   originalLanguage?: string;
   /** AniList format ("TV", "MOVIE", "OVA"…). An anime film keeps kind "anime" for source lookup but plays as a film. */
   format?: string;
+  /** ISO date of first release / first air date (`YYYY-MM-DD`). */
+  releaseDate?: string;
+  /** Catalog release status (e.g. "Released", "Returning Series", "NOT_YET_RELEASED", "Planned"). */
+  status?: string;
 }
 
 /** A feature film, whether it came from TMDB or is an AniList anime film. */
@@ -57,6 +61,8 @@ export interface CanonicalSeason {
   number: number;
   name: string;
   episodeCount: number;
+  /** Total planned episodes for an airing/upcoming season when higher than `episodeCount` aired so far. */
+  plannedEpisodeCount?: number;
   year?: number;
   airDate?: string;
   status?: "aired" | "airing" | "upcoming" | "special";
@@ -102,8 +108,6 @@ export interface MediaDetail extends Media {
   cast: { name: string; character?: string; photo?: string; /** Anime: the voice actor. */ actor?: string }[];
   /** Key people behind it: directors, writers, creators, composers, studios' staff. */
   crew: { name: string; job: string; photo?: string }[];
-  /** ISO date of first release / first air date. */
-  releaseDate?: string;
   endDate?: string;
   budget?: number;
   revenue?: number;
@@ -121,6 +125,13 @@ export interface MediaDetail extends Media {
   lastEpisode?: { season: number; episode: number; name?: string; airDate?: string };
   nextEpisode?: { season: number; episode: number; name?: string; airDate?: string };
   totalEpisodes?: number;
+  /**
+   * Films: earliest theatrical / premiere date (TMDB release types 1–3) and earliest
+   * digital / physical / TV date (types 4–6) in any region. `releaseDate` is the earliest
+   * of all of them, which can be a festival premiere months before anything streams.
+   */
+  theatricalReleaseDate?: string;
+  digitalReleaseDate?: string;
   /** Anime: source material and season label, e.g. "Manga", "Fall 2025". */
   source?: string;
   seasonLabel?: string;
@@ -128,7 +139,6 @@ export interface MediaDetail extends Media {
   /** When this record was fetched, so the UI can say how fresh it is. */
   fetchedAt?: number;
   related: Media[];
-  status?: string;
   nextAiring?: { episode: number; at: number };
 }
 

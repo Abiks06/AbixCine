@@ -1,21 +1,25 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { Player, type EpisodeNav } from "../components/Player";
-import { Art } from "../components/Art";
+import { Art, sized } from "../components/Art";
+import { seedState } from "../components/Card";
 import { Icon } from "../components/Icon";
 import { Ambient } from "../components/Ambient";
 import { qualityLabel, SourceBoard, viaLabel } from "../components/SourceBoard";
 import { TitleArt } from "../components/TitleArt";
 import {
+  checkEpisodeAvailability,
   clampSeason,
   decodeKey,
   encodeKey,
   getDetail,
   getSeasonEpisodes,
+  isUnreleasedMedia,
   parseSeasonEpisodeParams,
   resolveNextEpisode,
   resolvePlaybackRequest,
 } from "../lib/catalog";
+import { fmtDate } from "../lib/format";
 import type { MediaDetail } from "../lib/types";
 import { getEntry, getProgress, isDone, saveProgress } from "../lib/progress";
 import { scrobble, watchedFrom } from "../lib/scrobble";
@@ -75,17 +79,26 @@ export function Watch() {
   const prelimEpisode = rawEpisode ?? (isSeries || isEpisodicAnime ? (savedEntry?.episode ?? 1) : undefined);
   const audio = audioParam ?? (isAnime ? audioFor(canonicalKey, [key, d?.key, ...courKeys]) : undefined);
   const requestedSeason = rawSeason ?? (rawEpisode == null ? savedEntry?.season : undefined);
+  const availability = useMemo(
+    () => (detail.data ? checkEpisodeAvailability(detail.data, rawSeason, rawEpisode) : { playable: true as const }),
+    [detail.data, rawSeason, rawEpisode],
+  );
   const resolvedReq = useMemo(
-    () => (d ? resolvePlaybackRequest(d, requestedSeason, prelimEpisode, audio) : null),
-    [d, requestedSeason, prelimEpisode, audio],
+    () => (d && availability.playable ? resolvePlaybackRequest(d, requestedSeason, prelimEpisode, audio) : null),
+    [d, availability.playable, requestedSeason, prelimEpisode, audio],
   );
   const season = resolvedReq ? resolvedReq.season : prelimSeason;
   const episode = resolvedReq ? resolvedReq.episode : prelimEpisode;
   const absolute = resolvedReq?.absolute;
-  const req: PlaybackRequest | null = useMemo(
-    () => resolvedReq ?? (d ? { media: d, season, episode, absolute, audio } : null),
-    [resolvedReq, d, season, episode, absolute, audio],
-  );
+  // Never fall back to a raw server lookup once catalog data loaded and rejected playback (unreleased/unaired);
+  // raw fallback is reserved strictly for offline/catalog-error playback of saved/local titles.
+  const req: PlaybackRequest | null = useMemo(() => {
+    if (resolvedReq) return resolvedReq;
+    if (!detail.data && d && detail.error && !isUnreleasedMedia(d)) {
+      return { media: d, season, episode, absolute, audio };
+    }
+    return null;
+  }, [resolvedReq, detail.data, detail.error, d, season, episode, absolute, audio]);
 
   /* ---------------------------------------------------------------- source */
 
@@ -207,6 +220,23 @@ export function Watch() {
     if ((loc.state as { from?: string } | null)?.from === "app") nav(-1);
     else nav(`/title/${encodeKey(canonicalKey)}`, { replace: true, viewTransition: true });
   }, [loc.state, nav, canonicalKey]);
+  const openInfo = useCallback(() => {
+    nav(`/title/${encodeKey(canonicalKey)}`, { viewTransition: true, state: d ? seedState(d) : undefined });
+  }, [nav, canonicalKey, d]);
+  const latestAired = useMemo(() => {
+    if (!detail.data || availability.playable || isFilm(detail.data)) return null;
+    const playable = [...(detail.data.seasons ?? []), ...(detail.data.specials ?? [])]
+      .filter((s) => s.episodeCount > 0 && s.status !== "upcoming");
+    const sameSeason = rawSeason != null ? playable.find((s) => s.number === rawSeason) : undefined;
+    const targetS = sameSeason ?? playable.filter((s) => s.number > 0).at(-1) ?? playable[0];
+    const candidate = targetS
+      ? { s: targetS.number, e: targetS.episodeCount }
+      : detail.data.episodeCount && detail.data.episodeCount > 0
+        ? { s: undefined, e: detail.data.episodeCount }
+        : null;
+    if (!candidate) return null;
+    return checkEpisodeAvailability(detail.data, candidate.s, candidate.e).playable ? candidate : null;
+  }, [detail.data, availability.playable, rawSeason]);
   useEffect(() => {
     if (start) return;
     // A dialog on top (the command palette) owns Escape; only a bare Escape leaves the race.
@@ -232,7 +262,7 @@ export function Watch() {
       loadSeason: playableSeasons.length ? (s: number) => getSeasonEpisodes(d, s) : undefined,
       loadAll: !playableSeasons.length && key.startsWith("anilist:") ? () => animeEpisodes(key) : undefined,
       go: goEp,
-      fallbackStill: d.backdrop,
+      fallbackStill: sized(d.backdrop, "w300"),
       nextLabel,
     };
   }, [d, key, season, episode, next, goEp]);
@@ -270,6 +300,7 @@ export function Watch() {
         nextLabel={next ? (next.label ?? `${next.s != null ? `Season ${next.s} · ` : ""}Episode ${next.e}`) : undefined}
         onRetry={reloadCatalog}
         onBack={back}
+        onInfo={openInfo}
       />
     );
   }
@@ -279,7 +310,10 @@ export function Watch() {
   if (!d && detail.error) {
     return (
       <div className="race-page">
-        <button className="back race-back" onClick={back}><Icon name="back" size={18} /> Back</button>
+        <div className="race-nav">
+          <button className="back" onClick={back}><Icon name="back" size={18} /> Back</button>
+          <button className="back" onClick={openInfo}><Icon name="info" size={16} /> Details</button>
+        </div>
         <div className="race2 pad">
           <section className="race-hero">
             <div className="title-type md">Can't reach the catalog</div>
@@ -287,6 +321,68 @@ export function Watch() {
               <p>AbixCine couldn't load this title's details{navigator.onLine ? "" : " because you're offline"}. Files on this PC still play once it's in Continue watching or My List.</p>
               <div className="acts">
                 <button className="btn play" onClick={reloadCatalog} autoFocus><Icon name="play" size={16} /> Try again</button>
+                <button className="btn glass" onClick={openInfo}><Icon name="info" size={16} /> Title details</button>
+                <button className="btn glass" onClick={back}><Icon name="back" size={16} /> Back</button>
+              </div>
+            </div>
+          </section>
+        </div>
+      </div>
+    );
+  }
+
+  if (detail.data && !availability.playable) {
+    const airWhen = availability.airDate ? fmtDate(availability.airDate) : "";
+    const reasonHeading =
+      availability.reason === "unreleased_film"
+        ? "This film isn't out yet."
+        : availability.reason === "unreleased_series"
+          ? "No episodes have aired yet."
+          : availability.reason === "unaired_season"
+            ? `${availability.label ?? (rawSeason != null ? `Season ${rawSeason}` : "This season")} hasn't aired yet.`
+            : availability.reason === "unaired_episode"
+              ? `${rawSeason != null ? `Season ${rawSeason} · ` : ""}Episode ${rawEpisode ?? ""} hasn't aired yet.`
+              : `${rawSeason != null ? `Season ${rawSeason} · ` : ""}Episode ${rawEpisode ?? ""} doesn't exist.`;
+    const reasonBody =
+      availability.reason === "missing_episode"
+        ? "AbixCine didn't search any servers because this episode isn't in the aired episode list."
+        : airWhen
+          ? `Expected ${airWhen}. AbixCine skips server lookups until a title or episode has actually released.`
+          : "AbixCine skips server lookups until this title or episode has actually released.";
+    return (
+      <div className="race-page">
+        <Ambient media={detail.data} />
+        <div className="race-bg" aria-hidden>
+          <Art media={detail.data} variant="backdrop" hd />
+          <div className="race-shade" />
+        </div>
+        <div className="race-nav">
+          <button className="back" onClick={back}><Icon name="back" size={18} /> Back</button>
+          <button className="back" onClick={openInfo}><Icon name="info" size={16} /> Details</button>
+        </div>
+        <div className="race2 pad">
+          <section className="race-hero">
+            <div className="kicker">
+              <b>{availability.reason === "missing_episode" ? "Unavailable" : "Not released yet"}</b>
+              <i />
+              <span>{[detail.data.year, airWhen ? `Release ${airWhen}` : null].filter(Boolean).join(" · ") || "AbixCine"}</span>
+            </div>
+            <button type="button" className="race-title-link" onClick={openInfo} title="Open title details">
+              <TitleArt media={detail.data} size="md" />
+            </button>
+            <div className="resolve-empty">
+              <h3>{reasonHeading}</h3>
+              <p>{reasonBody}</p>
+              <div className="acts">
+                <button className="btn play" onClick={openInfo} autoFocus><Icon name="info" size={16} /> Open title details</button>
+                {latestAired && (
+                  <button
+                    className="btn glass"
+                    onClick={() => nav(href(latestAired.s, latestAired.e, audio), { replace: true, state: forwardState({ quick: true }) })}
+                  >
+                    <Icon name="play" size={16} /> Play {latestAired.s != null ? `S${latestAired.s} · E${latestAired.e}` : `Episode ${latestAired.e}`}
+                  </button>
+                )}
                 <button className="btn glass" onClick={back}><Icon name="back" size={16} /> Back</button>
               </div>
             </div>
@@ -322,7 +418,10 @@ export function Watch() {
         {d && <Art media={d} variant="backdrop" hd />}
         <div className="race-shade" />
       </div>
-      <button className="back race-back" onClick={back}><Icon name="back" size={18} /> Back</button>
+      <div className="race-nav">
+        <button className="back" onClick={back}><Icon name="back" size={18} /> Back</button>
+        <button className="back" onClick={openInfo}><Icon name="info" size={16} /> Details</button>
+      </div>
 
       <div className="race2 pad">
         <section className="race-hero">
@@ -331,7 +430,13 @@ export function Watch() {
             <i />
             <span>{[audio ? (audio === "dub" ? "English dub" : "Japanese · subtitled") : null, d?.year].filter(Boolean).join(" · ") || "AbixCine"}</span>
           </div>
-          {d ? <TitleArt media={d} size="md" /> : <div className="title-wait sk" aria-hidden />}
+          {d ? (
+            <button type="button" className="race-title-link" onClick={openInfo} title="Open title details" aria-label={`Open details for ${d.title}`}>
+              <TitleArt media={d} size="md" />
+            </button>
+          ) : (
+            <div className="title-wait sk" aria-hidden />
+          )}
 
           {!empty ? (
             <>

@@ -2,6 +2,7 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useLocation } from "react-router-dom";
+import { useSlidingIndicators } from "../lib/useSlidingIndicator";
 import { AudioToggle } from "../components/AudioToggle";
 import { Avatar } from "../components/Avatar";
 import { TrackersPanel } from "../components/TrackersPanel";
@@ -107,6 +108,7 @@ const SECTIONS = [
 
 export function Settings() {
   const s = useSettings();
+  const indicators = useSlidingIndicators(".set-nav, .sub-seg");
   // Section nav: highlights whichever panel is nearest the top of the viewport.
   const bodyRef = useRef<HTMLDivElement>(null);
   const [active, setActive] = useState<string>("account");
@@ -543,7 +545,7 @@ export function Settings() {
   };
 
   return (
-    <div className="page settings">
+    <div className="page settings" ref={indicators}>
       <div className="set-head">
         <p className="overline">Make it yours</p>
         <h1 className="page-title">Settings</h1>
@@ -1301,6 +1303,7 @@ export function Settings() {
               step={0.05}
               disabled={subPref.bg === "none"}
               value={subPref.bgOpacity}
+              style={{ ["--v" as any]: `${subPref.bgOpacity * 100}%` }}
               onChange={(e) => patchSubPref({ bgOpacity: Number(e.target.value) })}
             />
             <code>{Math.round(subPref.bgOpacity * 100)}%</code>
@@ -1338,6 +1341,7 @@ export function Settings() {
               max={45}
               step={1}
               value={subPref.bottomPct}
+              style={{ ["--v" as any]: `${((subPref.bottomPct - 2) / 43) * 100}%` }}
               onChange={(e) => patchSubPref({ bottomPct: Number(e.target.value) })}
             />
             <code>{subPref.bottomPct}%</code>
@@ -1354,6 +1358,7 @@ export function Settings() {
               max={2.2}
               step={0.05}
               value={subPref.lineHeight}
+              style={{ ["--v" as any]: `${((subPref.lineHeight - 1) / 1.2) * 100}%` }}
               onChange={(e) => patchSubPref({ lineHeight: Number(e.target.value) })}
             />
             <code>{subPref.lineHeight.toFixed(2)}</code>

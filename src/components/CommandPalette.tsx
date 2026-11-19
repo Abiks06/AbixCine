@@ -1,12 +1,14 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Art, sized } from "./Art";
 import { getAuth, leaveGuest, signOut } from "../lib/account";
-import { encodeKey } from "../lib/catalog";
+import { encodeKey, isUnreleasedMedia } from "../lib/catalog";
 import { playHref } from "../lib/play";
 import { matchParts, peekSearch, searchAll } from "../lib/search";
 import { rememberQuery, rememberTitle, useSearchHistory } from "../lib/history";
+import { previewLight, tonesFor } from "../lib/light";
 import { getSettings, updateSettings } from "../lib/settings";
+import { useSlidingIndicator } from "../lib/useSlidingIndicator";
 import type { Media } from "../lib/types";
 import { toggleList, useSaved } from "../lib/watchlist";
 import { kindLabel, seedState } from "./Card";
@@ -44,7 +46,7 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
   // Stays mounted for a beat after closing so it can animate out.
   const [shown, setShown] = useState(open);
   const input = useRef<HTMLInputElement>(null);
-  const listRef = useRef<HTMLDivElement>(null);
+  const listRef = useRef<HTMLDivElement | null>(null);
   const box = useRef<HTMLDivElement>(null);
   const returnTo = useRef<HTMLElement | null>(null);
   const history = useSearchHistory();
@@ -155,11 +157,13 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
         rememberTitle(m);
         nav(`/title/${encodeKey(m.key)}`, { viewTransition: true, state: seedState(m) });
       },
-      play: () => {
-        if (remember) rememberQuery(term);
-        rememberTitle(m);
-        nav(playHref(m), { viewTransition: true, state: { from: "app" } });
-      },
+      play: isUnreleasedMedia(m)
+        ? undefined
+        : () => {
+            if (remember) rememberQuery(term);
+            rememberTitle(m);
+            nav(playHref(m), { viewTransition: true, state: { from: "app" } });
+          },
     });
     // Empty box: recent searches (fill the box) and titles you opened from search.
     if (!low) {
@@ -184,6 +188,47 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
   useEffect(() => {
     listRef.current?.querySelector(".pal-item.on")?.scrollIntoView({ block: "nearest" });
   }, [sel]);
+
+  // The selected title lights the palette: the room behind the glass borrows its light (debounced
+  // in lib/light.ts, so a held arrow key doesn't sample every row), and the pane's own bloom and
+  // preview wash take its tone. Closing hands both back to the page.
+  const curMedia = open ? items[Math.min(sel, items.length - 1)]?.media : undefined;
+  useEffect(() => {
+    if (!open) return;
+    previewLight(curMedia ?? null);
+    const el = box.current;
+    if (!curMedia) {
+      el?.style.removeProperty("--pal-tone");
+      return;
+    }
+    let live = true;
+    const t = setTimeout(() => {
+      tonesFor(curMedia).then((tones) => live && el?.style.setProperty("--pal-tone", tones.tone)).catch(() => {});
+    }, 120);
+    return () => {
+      live = false;
+      clearTimeout(t);
+    };
+  }, [open, curMedia]);
+  const wasOpen = useRef(false);
+  useEffect(() => {
+    if (open) return void (wasOpen.current = true);
+    if (!wasOpen.current) return;
+    wasOpen.current = false;
+    previewLight(null);
+    box.current?.style.removeProperty("--pal-tone");
+  }, [open]);
+
+  // One stable ref callback: the list keeps its own ref for scrolling, the indicator gets the same
+  // node. (A fresh callback each render would detach and re-attach it, and it would never glide.)
+  const listInd = useSlidingIndicator(".pal-item.on");
+  const setList = useCallback(
+    (el: HTMLDivElement | null) => {
+      listRef.current = el;
+      listInd(el);
+    },
+    [listInd],
+  );
 
   if (!shown) return null;
   const run = (i: Item, play = false) => {
@@ -249,7 +294,7 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
           <kbd>Esc</kbd>
         </div>
         <div className="pal-body">
-          <div className="pal-list" ref={listRef} id="pal-list" role="listbox" aria-label="Results">
+          <div className="pal-list" ref={setList} id="pal-list" role="listbox" aria-label="Results">
             {items.map((it, i) => {
               const parts = it.media && low ? matchParts(it.label, term) : null;
               return (
@@ -320,7 +365,7 @@ function Preview({ m }: { m: Media }) {
         {m.overview && <p>{m.overview}</p>}
         <div className="pp-keys">
           <span><kbd>Enter</kbd> Open the title page</span>
-          <span><kbd>Ctrl</kbd><kbd>Enter</kbd> Play straight away</span>
+          {!isUnreleasedMedia(m) && <span><kbd>Ctrl</kbd><kbd>Enter</kbd> Play straight away</span>}
           <button
             type="button"
             className="link-btn"

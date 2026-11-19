@@ -1,7 +1,12 @@
 import { anilistDetail, animeEpisodes, animeFranchiseNodes } from "./anilist";
 import {
+  checkEpisodeAvailability,
   clampEpisode,
   clampSeason,
+  isFutureIsoDate,
+  isTheatricalOnly,
+  isUnairedEpisode,
+  isUnreleasedMedia,
   normalizeEpisodes,
   normalizeTmdbSeasons,
   parseSeasonEpisodeParams,
@@ -9,6 +14,8 @@ import {
   resolveNextEpisode,
   resolvePlaybackRequest,
   stitchCourEpisodes,
+  todayIso,
+  type EpisodeAvailability,
   type NextEpisodeTarget,
   type RawAnilistNode,
 } from "./normalizer";
@@ -17,8 +24,13 @@ import type { CanonicalSeason, Episode, MediaDetail } from "./types";
 import { isFilm } from "./types";
 
 export {
+  checkEpisodeAvailability,
   clampEpisode,
   clampSeason,
+  isFutureIsoDate,
+  isTheatricalOnly,
+  isUnairedEpisode,
+  isUnreleasedMedia,
   normalizeEpisodes,
   normalizeTmdbSeasons,
   parseSeasonEpisodeParams,
@@ -26,6 +38,8 @@ export {
   resolveNextEpisode,
   resolvePlaybackRequest,
   stitchCourEpisodes,
+  todayIso,
+  type EpisodeAvailability,
   type NextEpisodeTarget,
 };
 
@@ -86,8 +100,8 @@ export function getDetail(key: string): Promise<MediaDetail> {
         upcomingSeasons: reconciled.upcomingSeasons.length > 0 ? reconciled.upcomingSeasons : undefined,
         canonicalKey: reconciled.canonicalKey ?? base.key,
         initialSeason: reconciled.initialSeason,
-        episodeCount: activeSeason?.episodeCount ?? base.episodeCount,
-        totalEpisodes: totalMainlineEps > 0 ? totalMainlineEps : base.episodeCount,
+        episodeCount: activeSeason?.episodeCount ?? (reconciled.upcomingSeasons.length > 0 ? undefined : base.episodeCount),
+        totalEpisodes: totalMainlineEps > 0 ? totalMainlineEps : (reconciled.upcomingSeasons.length > 0 ? undefined : base.episodeCount),
       };
     }
 

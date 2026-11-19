@@ -1,7 +1,7 @@
 import { whenAnimeMappingsHydrated } from "./animeMapping";
 import { cached } from "./cache";
 import { api, getAuth } from "./account";
-import { normalizeEpisodes, normalizeTmdbSeasons, type RawTmdbSeason } from "./normalizer";
+import { isFutureIsoDate, normalizeEpisodes, normalizeTmdbSeasons, tmdbReleaseWindows, todayIso, type RawTmdbSeason } from "./normalizer";
 import { getSettings } from "./settings";
 import type { Episode, Media, MediaDetail } from "./types";
 
@@ -55,7 +55,7 @@ interface TmdbEpisodeRaw extends TmdbEpisodeSummaryRaw {
 
 interface TmdbDetailPayload extends TmdbRawMedia {
   videos?: { results?: { site?: string; type?: string; official?: boolean; key?: string }[] };
-  release_dates?: { results?: { iso_3166_1?: string; release_dates?: { certification?: string }[] }[] };
+  release_dates?: { results?: { iso_3166_1?: string; release_dates?: { certification?: string; type?: number; release_date?: string }[] }[] };
   content_ratings?: { results?: { iso_3166_1?: string; rating?: string }[] };
   created_by?: { name?: string; profile_path?: string | null }[];
   credits?: {
@@ -129,6 +129,7 @@ function toMedia(r: TmdbRawMedia, fallbackKind?: "movie" | "tv"): Media | null {
     originalLanguage: r.original_language,
     overview: r.overview ?? "",
     year: date && /^\d{4}/.test(date) ? Number(date.slice(0, 4)) : undefined,
+    releaseDate: date || undefined,
     rating: r.vote_average ? Math.round(r.vote_average * 10) / 10 : undefined,
     poster: img(r.poster_path, "w500"),
     backdrop: img(r.backdrop_path, "w1280"),
@@ -147,15 +148,23 @@ const GENRES: Record<number, string> = {
 
 const list = (rows: TmdbRawMedia[] | undefined, kind?: "movie" | "tv") => (rows ?? []).map((r) => toMedia(r, kind)).filter(Boolean) as Media[];
 
-type Feed = { id: string; title: string; path: string; kind?: "movie" | "tv"; params?: Record<string, string | number>; /** minutes */ ttl?: number };
+type Feed = { id: string; title: string; path: string; kind?: "movie" | "tv"; params?: Record<string, string | number>; /** minutes */ ttl?: number; allowUnreleased?: boolean };
 
-const iso = (d: Date) => d.toISOString().slice(0, 10);
-const daysFromNow = (n: number) => iso(new Date(Date.now() + n * 86400_000));
+const daysFromNow = (n: number) => todayIso(new Date(Date.now() + n * 86400_000));
 /** Date windows are worked out when the feed loads, so "new" always means new today. */
 function liveParams(f: Feed): Record<string, string | number> | undefined {
-  if (f.id === "new-movies") return { ...f.params, "primary_release_date.gte": daysFromNow(-45), "primary_release_date.lte": daysFromNow(0), "vote_count.gte": 20 };
+  // "New releases" means new to watch at home: a digital (4), physical (5) or TV (6) release in
+  // the last 60 days in any region — not a festival premiere or a film still only in cinemas.
+  if (f.id === "new-movies")
+    return { ...f.params, with_release_type: "4|5|6", "release_date.gte": daysFromNow(-60), "release_date.lte": daysFromNow(0), "vote_count.gte": 20 };
   if (f.id === "new-tv") return { ...f.params, "first_air_date.gte": daysFromNow(-60), "first_air_date.lte": daysFromNow(0), "vote_count.gte": 5 };
   if (f.id === "soon") return { ...f.params, "primary_release_date.gte": daysFromNow(1), "primary_release_date.lte": daysFromNow(60) };
+  if (f.path === "/discover/movie" && !f.allowUnreleased) {
+    return { ...f.params, "primary_release_date.lte": daysFromNow(0) };
+  }
+  if (f.path === "/discover/tv" && !f.allowUnreleased) {
+    return { ...f.params, "first_air_date.lte": daysFromNow(0) };
+  }
   return f.params;
 }
 
@@ -167,7 +176,7 @@ export const FEEDS: Record<"home" | "movie" | "tv", Feed[]> = {
     { id: "top-movies", title: "Critically acclaimed", path: "/movie/top_rated", kind: "movie", ttl: 720 },
     { id: "new-movies", title: "New releases", path: "/discover/movie", kind: "movie", params: { sort_by: "popularity.desc" }, ttl: 120 },
     { id: "new-tv", title: "New series", path: "/discover/tv", kind: "tv", params: { sort_by: "popularity.desc" }, ttl: 120 },
-    { id: "soon", title: "Coming soon", path: "/discover/movie", kind: "movie", params: { sort_by: "popularity.desc" }, ttl: 360 },
+    { id: "soon", title: "Coming soon", path: "/discover/movie", kind: "movie", params: { sort_by: "popularity.desc" }, ttl: 360, allowUnreleased: true },
   ],
   movie: [
     { id: "now", title: "In theaters now", path: "/movie/now_playing", kind: "movie", ttl: 120 },
@@ -189,9 +198,13 @@ export async function loadFeed(f: Feed, _i?: number): Promise<Media[]> {
   if (!hasTmdb()) return [];
   const params = liveParams(f);
   const ttl = (f.ttl ?? 180) * 60_000;
-  return cached(`tmdb:${f.path}:${JSON.stringify(params ?? {})}`, ttl, async () => {
+  return cached(`tmdb:v2:${f.path}:${JSON.stringify(params ?? {})}`, ttl, async () => {
     const r = await get<TmdbListResponse>(f.path, params);
-    return list(r.results, f.kind).filter((m) => m.poster || m.backdrop);
+    return list(r.results, f.kind).filter((m) => {
+      if (!(m.poster || m.backdrop)) return false;
+      if (f.allowUnreleased) return isFutureIsoDate(m.releaseDate);
+      return !isFutureIsoDate(m.releaseDate) && Boolean(m.releaseDate || m.year);
+    });
   });
 }
 
@@ -217,7 +230,7 @@ export async function tmdbDetail(key: string): Promise<MediaDetail> {
   const [, kind, id] = key.split(":") as [string, "movie" | "tv", string];
   if ((kind !== "movie" && kind !== "tv") || !id) throw new Error(`Invalid TMDB key: ${key}`);
 
-  return cached(`tmdb:detail:v3:${kind}:${id}`, 3 * HOUR, async () => {
+  return cached(`tmdb:detail:v5:${kind}:${id}`, 3 * HOUR, async () => {
     const extra = kind === "movie" ? "release_dates" : "content_ratings";
     const r = await get<TmdbDetailPayload>(`/${kind}/${id}`, {
       append_to_response: `videos,credits,recommendations,similar,images,external_ids,${extra}`,
@@ -257,7 +270,16 @@ export async function tmdbDetail(key: string): Promise<MediaDetail> {
     // Splitting seasons into cours reads the anime index: wait for it (briefly) so an early visit
     // doesn't cache an unsplit season for three hours.
     if (kind === "tv") await whenAnimeMappingsHydrated();
-    const normalizedSeasons = kind === "tv" ? normalizeTmdbSeasons(r.seasons, base.key, Number(id)) : undefined;
+    const lastEpisode = ep(r.last_episode_to_air);
+    const nextEpisode = ep(r.next_episode_to_air);
+    const normalizedSeasons =
+      kind === "tv"
+        ? normalizeTmdbSeasons(r.seasons, base.key, Number(id), {
+            lastEpisode,
+            nextEpisode,
+            status: r.status,
+          })
+        : undefined;
 
     return {
       ...base,
@@ -280,6 +302,7 @@ export async function tmdbDetail(key: string): Promise<MediaDetail> {
       crew: [...crewMap.values()].sort((a, b) => a.rank - b.rank).slice(0, 12).map(({ rank: _r, ...c }) => c),
       related: (related.length ? related : list(r.similar?.results ?? [], kind)).slice(0, 18),
       releaseDate: r.release_date || r.first_air_date || undefined,
+      ...(kind === "movie" ? releaseWindowFields(r.release_dates?.results) : {}),
       endDate: kind === "tv" && (r.status === "Ended" || r.status === "Canceled") ? r.last_air_date : undefined,
       budget: r.budget || undefined,
       revenue: r.revenue || undefined,
@@ -292,12 +315,17 @@ export async function tmdbDetail(key: string): Promise<MediaDetail> {
       homepage: r.homepage || undefined,
       voteCount: r.vote_count,
       collection: r.belongs_to_collection?.name,
-      lastEpisode: ep(r.last_episode_to_air),
-      nextEpisode: ep(r.next_episode_to_air),
+      lastEpisode,
+      nextEpisode,
       totalEpisodes: r.number_of_episodes,
       fetchedAt: Date.now(),
     };
   });
+}
+
+function releaseWindowFields(results: Parameters<typeof tmdbReleaseWindows>[0]) {
+  const w = tmdbReleaseWindows(results);
+  return { theatricalReleaseDate: w.theatrical, digitalReleaseDate: w.digital };
 }
 
 /** Top-10 style feeds. */

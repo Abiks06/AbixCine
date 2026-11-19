@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { encodeKey } from "../lib/catalog";
+import { encodeKey, isUnreleasedMedia } from "../lib/catalog";
 import { fmtRuntime } from "../lib/format";
 import { useFeatured, type Featured } from "../lib/useLogos";
 import { toggleList, useSaved } from "../lib/watchlist";
 import { playHref } from "../lib/play";
 import { setStageLight } from "../lib/light";
+import { burst } from "../lib/burst";
 import { useSettings } from "../lib/settings";
 import type { Media } from "../lib/types";
 import { isFilm } from "../lib/types";
@@ -37,11 +38,24 @@ export function Hero({ items, label, onActive, loading = true }: { items: Media[
   const [i, setI] = useState(0);
   const [paused, setPaused] = useState(false);
   const [trailer, setTrailer] = useState<{ id: string; title: string } | null>(null);
-  const nav = useNavigate();
   const n = picks.length;
   const cur = n ? i % n : 0;
   const m = picks[cur];
-  const saved = useSaved(m?.key);
+
+  // The slide that just left, kept long enough for its copy to dissolve (see HeroCopy `out`).
+  const [leaving, setLeaving] = useState<{ m: Featured; n: number } | null>(null);
+  const shownRef = useRef<{ m: Featured; n: number } | null>(null);
+  useEffect(() => {
+    if (!m) return;
+    const prev = shownRef.current;
+    shownRef.current = { m, n: cur + 1 };
+    if (!prev || prev.m.key === m.key) return;
+    setLeaving(prev);
+    // Normally the exit's animationend clears it; this is the backstop if it never runs.
+    const t = setTimeout(() => setLeaving((l) => (l?.m.key === prev.m.key ? null : l)), 700);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [m?.key]);
 
   // Don't rotate while the window is in the background or the hero is scrolled away.
   const root = useRef<HTMLElement>(null);
@@ -86,12 +100,12 @@ export function Hero({ items, label, onActive, loading = true }: { items: Media[
   // Nothing to feature once the feeds have settled (offline, no catalog): no stage at all, rather
   // than a placeholder that shimmers forever. The shelves below then start under the top bar.
   if (!m) return loading ? <section className="hero hero-skeleton" ref={root} aria-busy aria-label={`Featured ${label}`} /> : null;
-  const len = length(m);
+  const next = n > 1 ? picks[(cur + 1) % n] : undefined;
 
   return (
     <>
     <section
-      className="hero"
+      className={`hero ${away ? "away" : ""}`}
       ref={root}
       aria-roledescription="carousel"
       aria-label={`Featured ${label}`}
@@ -115,38 +129,13 @@ export function Hero({ items, label, onActive, loading = true }: { items: Media[
       <div className="hero-scrim" />
 
       <div className="hero-body pad">
-        <div className="hero-copy" key={m.key}>
-          <div className="kicker">
-            <b>N°{pad2(cur + 1)}</b>
-            <i />
-            <em>{label}</em>
-          </div>
-          <TitleArt media={m} />
-          <div className="specs">
-            {m.rating ? <span className="star">★ {m.rating.toFixed(1)}</span> : null}
-            <span>{kindLabel(m.kind)}</span>
-            {m.year ? <span>{m.year}</span> : null}
-            {len && <span>{len}</span>}
-            {m.genres.length > 0 && <span>{m.genres.slice(0, 3).join(" · ")}</span>}
-            {m.kind === "anime" && <span className="hi">Sub · Dub</span>}
-          </div>
-          <p className="desc">{m.overview}</p>
-          <div className="acts">
-            <button className="btn play" onClick={() => nav(playHref(m), { viewTransition: true, state: { from: "app" } })}>
-              <Icon name="play" size={16} /> Play
-            </button>
-            <Link className="btn glass" to={`/title/${encodeKey(m.key)}`} state={seedState(m)} viewTransition>
-              <Icon name="info" size={18} /> Details
-            </Link>
-            {isYouTubeId(m.trailerYouTubeId) && (
-              <button type="button" className="btn glass icon" onClick={() => setTrailer({ id: m.trailerYouTubeId!, title: m.title })} aria-label={`Watch the ${m.title} trailer`} aria-haspopup="dialog" title="Trailer">
-                <Icon name="film" size={18} />
-              </button>
-            )}
-            <button className={`btn glass icon ${saved ? "on" : ""}`} onClick={() => toggleList(m)} aria-label={saved ? "Remove from My List" : "Add to My List"} aria-pressed={saved} title={saved ? "In My List" : "Add to My List"}>
-              <Icon name={saved ? "check" : "plus"} size={20} />
-            </button>
-          </div>
+        {/* The outgoing slide's copy stays a beat to dissolve upward while the new one rises
+            into the same cell, so the words never cut while the art is still crossfading. */}
+        <div className="hero-copy-stack">
+          {leaving && leaving.m.key !== m.key && (
+            <HeroCopy key={`out-${leaving.m.key}`} m={leaving.m} n={leaving.n} label={label} out onGone={() => setLeaving(null)} />
+          )}
+          <HeroCopy key={m.key} m={m} n={cur + 1} label={label} onTrailer={setTrailer} />
         </div>
 
         {n > 1 && (
@@ -176,10 +165,83 @@ export function Hero({ items, label, onActive, loading = true }: { items: Media[
             </button>
           ))}
           <span className="hero-count"><b>{pad2(cur + 1)}</b> / {pad2(n)}</span>
+          {/* Where the programme doesn't fit (laptop widths, short windows), one line says what's next. */}
+          {next && (
+            <button type="button" className="hero-next" onClick={advance} aria-label={`Next: ${next.title}`}>
+              <span>Next</span>
+              <b key={next.key}>{next.title}</b>
+              <Icon name="arrowR" size={14} />
+            </button>
+          )}
         </div>
       )}
     </section>
     {trailer && <TrailerModal id={trailer.id} title={trailer.title} onClose={() => setTrailer(null)} />}
     </>
+  );
+}
+
+/**
+ * One slide's words and actions. The outgoing copy (`out`) is a picture of itself: hidden from
+ * assistive tech and pointer, it plays its exit and then asks to be removed.
+ */
+function HeroCopy({ m, n, label, out, onGone, onTrailer }: { m: Featured; n: number; label: string; out?: boolean; onGone?: () => void; onTrailer?: (t: { id: string; title: string }) => void }) {
+  const nav = useNavigate();
+  const saved = useSaved(m.key);
+  const len = length(m);
+  const unreleased = isUnreleasedMedia(m);
+  return (
+    <div
+      className={`hero-copy ${out ? "out" : ""}`}
+      {...(out ? { "aria-hidden": true, inert: "" } : {})}
+      onAnimationEnd={out ? (e) => e.target === e.currentTarget && onGone?.() : undefined}
+    >
+      <div className="kicker">
+        <b>N°{pad2(n)}</b>
+        <i />
+        <em>{label}</em>
+      </div>
+      <TitleArt media={m} />
+      <div className="specs">
+        {m.rating ? <span className="star">★ {m.rating.toFixed(1)}</span> : null}
+        <span>{kindLabel(m.kind)}</span>
+        {m.year ? <span>{m.year}</span> : null}
+        {len && <span>{len}</span>}
+        {m.genres.length > 0 && <span>{m.genres.slice(0, 3).join(" · ")}</span>}
+        {m.kind === "anime" && <span className="hi">Sub · Dub</span>}
+      </div>
+      <p className="desc">{m.overview}</p>
+      <div className="acts">
+        {!unreleased && (
+          <button className="btn play" onClick={() => nav(playHref(m), { viewTransition: true, state: { from: "app" } })}>
+            <Icon name="play" size={16} /> Play
+          </button>
+        )}
+        <Link
+          className={`btn ${unreleased ? "play" : "glass"}`}
+          to={`/title/${encodeKey(m.key)}`}
+          // `morph` tells the title page to name its own title art, so the two morph into each other.
+          state={{ ...seedState(m), morph: "title" }}
+          viewTransition
+          // Tagged on click, not on render: only this navigation morphs the title. A card click on
+          // the same page must not fly the hero's title into some other film's page. The hero
+          // unmounts with the page, so the name never outlives the transition.
+          onClick={(e) => {
+            const art = e.currentTarget.closest(".hero-copy")?.querySelector<HTMLElement>(".title-logo, .title-type");
+            if (art) art.style.viewTransitionName = "hero-title";
+          }}
+        >
+          <Icon name="info" size={18} /> Details
+        </Link>
+        {isYouTubeId(m.trailerYouTubeId) && (
+          <button type="button" className="btn glass icon" onClick={() => onTrailer?.({ id: m.trailerYouTubeId!, title: m.title })} aria-label={`Watch the ${m.title} trailer`} aria-haspopup="dialog" title="Trailer">
+            <Icon name="film" size={18} />
+          </button>
+        )}
+        <button className={`btn glass icon ${saved ? "on" : ""}`} onClick={(e) => { if (!saved) burst(e.currentTarget); toggleList(m); }} aria-label={saved ? "Remove from My List" : "Add to My List"} aria-pressed={saved} title={saved ? "In My List" : "Add to My List"}>
+          <Icon name={saved ? "check" : "plus"} size={20} />
+        </button>
+      </div>
+    </div>
   );
 }

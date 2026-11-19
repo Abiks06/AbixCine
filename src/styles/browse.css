@@ -16,7 +16,8 @@
 .hero-bg.on { opacity: 1; }
 .hero-bg .art { position: absolute; inset: 0; aspect-ratio: auto; height: 100%; background: var(--bg); }
 .hero-bg .art img { object-position: 50% 22%; }
-.hero-bg.on .art img.in { animation: drift 20s linear both; }
+.hero-bg.on .art img.in { animation: drift 20s linear both; will-change: transform; }
+.hero.away .hero-bg.on .art img.in { animation-play-state: paused; }
 @keyframes drift { from { transform: scale(1.08) translate3d(0, -1.2%, 0); } to { transform: scale(1) translate3d(0, 0, 0); } }
 /* Legibility scrim: a light column of shadow under the copy. It is deliberately thin, because the
    copy also sits on its own frosted patch of the art (frost.css), and it fades out with the stage. */
@@ -62,14 +63,41 @@
 @keyframes fill { to { transform: scaleX(1); } }
 .hero-count { margin-left: 12px; font: 500 11px var(--f-mono); letter-spacing: 0.1em; color: var(--fg3); font-variant-numeric: tabular-nums; }
 .hero-count b { color: var(--fg); font-weight: 600; }
-@media (max-width: 1180px), (max-height: 720px) { .hero-queue { display: none; } }
+/* Slide change: the outgoing copy shares the cell with the incoming one and lifts away as the new
+   copy rises. Its frosted patch goes at once, so only one patch is ever under the words. */
+.hero-copy-stack { display: grid; align-items: end; min-width: 0; }
+.hero-copy-stack > .hero-copy { grid-area: 1 / 1; }
+.hero-copy.out { pointer-events: none; animation: copyOut 260ms var(--ease) forwards; }
+.hero-copy.out > * { animation: none; }
+.hero-copy.out::before { display: none; }
+@keyframes copyOut { to { opacity: 0; transform: translateY(-14px); } }
+/* Scrolling away, the stage drifts down at a slower pace than the page and dims into the room,
+   so the shelves slide over it instead of pushing it off. Compositor-only: transform and opacity. */
+@supports (animation-timeline: scroll()) {
+  .hero-stage { animation: stageRecede linear both; animation-timeline: scroll(nearest block); animation-range: 0px 90vh; }
+  @keyframes stageRecede { to { transform: translate3d(0, 24%, 0); opacity: 0.4; } }
+  :root.reduce-motion .hero-stage { animation: none; }
+  @media (prefers-reduced-motion: reduce) { .hero-stage { animation: none !important; } }
+}
+/* the compact programme: one line of "what's next" where the full list doesn't fit */
+.hero-ticks .hero-next { display: none; margin-left: auto; align-items: center; gap: 10px; width: auto; height: 34px; max-width: min(380px, 44vw); padding: 0 12px 0 14px; border-radius: 999px; overflow: hidden;
+  background-clip: border-box; background-color: rgb(10 10 14 / 0.42); backdrop-filter: blur(20px) saturate(1.7) brightness(0.6); box-shadow: var(--rim); color: var(--fg); font-size: 12.5px;
+  transition: background-color var(--fast), transform var(--fast) var(--ease); }
+.hero-ticks .hero-next::before { content: none; }
+.hero-ticks .hero-next:hover { background-color: rgb(255 255 255 / 0.12); }
+.hero-ticks .hero-next:active { transform: scale(0.97); }
+.hero-next span { flex: none; font: 500 10.5px var(--f-mono); letter-spacing: 0.16em; text-transform: uppercase; color: rgb(255 255 255 / 0.74); }
+.hero-next b { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; animation: fade var(--emph) var(--ease) both; }
+.hero-next svg { flex: none; color: var(--tone-ink); }
+@media (max-width: 1180px), (max-height: 720px) { .hero-queue { display: none; } .hero-ticks .hero-next { display: inline-flex; } }
+@media (prefers-reduced-transparency: reduce) { .hero-ticks .hero-next { backdrop-filter: none; background-color: #0d0d13f2; } }
 /* Short windows (the minimum is 600px tall): the synopsis gives up a line before the copy can reach the top bar. */
 @media (max-height: 720px) { .hero .desc { -webkit-line-clamp: 2; } }
 
 /* ---------- shelves ---------- */
 .shelves { display: flex; flex-direction: column; gap: 52px; padding-top: 14px; position: relative; }
 .page-flush > .shelves:first-child { padding-top: calc(var(--top) + 44px); }
-.shelf { position: relative; min-width: 0; }
+.shelf { position: relative; min-width: 0; content-visibility: auto; contain-intrinsic-size: auto 340px; }
 .shelf-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px 20px; margin-bottom: 18px; flex-wrap: wrap; }
 .shelf-title { min-width: 0; }
 .shelf-title h2 { font: 750 clamp(24px, 2.3vw, 32px)/1 var(--f-disp); font-stretch: 84%; letter-spacing: -0.012em; text-wrap: balance; }
@@ -93,7 +121,7 @@
 .page .track { margin-inline: 0; padding-inline: 0; scroll-padding-inline: 0; }
 
 /* ---------- cards ---------- */
-.card { position: relative; flex: none; scroll-snap-align: start; width: clamp(256px, 21.5vw, 340px); animation: rise var(--emph) var(--ease-out) both; animation-delay: calc(var(--i, 0) * 28ms); }
+.card { position: relative; flex: none; scroll-snap-align: start; width: clamp(256px, 21.5vw, 340px); contain: layout style; animation: rise var(--emph) var(--ease-out) both; animation-delay: calc(var(--i, 0) * 28ms); }
 .card.port { width: clamp(158px, 12.6vw, 204px); }
 .card-hit { display: flex; flex-direction: column; gap: 10px; text-align: left; border-radius: var(--r-md); outline-offset: 4px; }
 .card .art-wrap { --mx: 50%; --my: 50%; --rx: 0deg; --ry: 0deg; position: relative; aspect-ratio: 16 / 9; border-radius: var(--r-md); overflow: hidden; background: var(--s1); isolation: isolate;
@@ -104,8 +132,13 @@
 /* rim light: an inner hairline that brightens with the title's own colour */
 .card .art-wrap::before { content: ""; position: absolute; inset: 0; z-index: 3; border-radius: inherit; pointer-events: none; box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.1); transition: box-shadow var(--base); }
 /* pointer light (vars from lib/pointerLight.ts) */
+/* A white core, and around it a fringe in the film's tone, brightest along the top edge where the
+   tilt lifts the rim toward the light: the way a lens edge splits what it catches. */
 .card .art-wrap::after { content: ""; position: absolute; inset: 0; z-index: 2; border-radius: inherit; pointer-events: none; opacity: 0; transition: opacity var(--base) var(--ease);
-  background: radial-gradient(300px circle at var(--mx) var(--my), rgb(255 255 255 / 0.2), transparent 60%); }
+  background:
+    radial-gradient(300px circle at var(--mx) var(--my), rgb(255 255 255 / 0.2), transparent 60%),
+    radial-gradient(420px circle at var(--mx) var(--my), transparent 34%, color-mix(in oklab, var(--tone) 16%, transparent) 52%, transparent 72%),
+    linear-gradient(180deg, color-mix(in oklab, var(--tone) 22%, transparent), transparent 9%); }
 .card:hover .art-wrap, .card:focus-within .art-wrap { transform: perspective(900px) rotateX(var(--ry)) rotateY(var(--rx)) translateY(-6px) scale(1.035);
   box-shadow: 0 30px 60px -26px #000, 0 20px 60px -28px var(--glow); }
 .card:hover .art-wrap::before, .card:focus-within .art-wrap::before { box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.46), inset 0 0 0 1px rgb(255 255 255 / 0.3); }
@@ -114,6 +147,13 @@
 .card:active .art-wrap { transform: translateY(-2px) scale(0.99); transition-duration: var(--fast); }
 /* While the pointer is steering the tilt, the card must track it 1:1 (the spring is for letting go). */
 .card .art-wrap.lit { transition-duration: 60ms, var(--emph); }
+/* Spotlight: while one card on a shelf is under the pointer, its neighbours step back into the room.
+   On the card's link, not the card: the card's entrance animation owns its opacity. Opacity only,
+   so it stays a composite; the shelf itself is never masked or filtered (frost.css rule 3). */
+.card-hit { transition: opacity var(--base) var(--ease); }
+@media (hover: hover) {
+  .track:has(.card:hover) .card:not(:hover) .card-hit { opacity: 0.66; transition-duration: var(--emph); }
+}
 .card-shade { position: absolute; inset: 0; z-index: 1; pointer-events: none; background: linear-gradient(0deg, rgb(4 4 7 / 0.9), rgb(4 4 7 / 0.3) 42%, transparent 66%); }
 .card-title { position: absolute; z-index: 2; left: 14px; right: 56px; bottom: 12px; color: #fff; font: 800 clamp(18px, 1.55vw, 23px)/0.96 var(--f-disp); font-stretch: 78%; letter-spacing: 0; text-transform: uppercase; text-wrap: balance; text-shadow: 0 2px 18px rgb(0 0 0 / 0.7);
   overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
@@ -149,10 +189,29 @@
 .grid .card { width: auto; }
 .grid:has(.port) { grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); }
 
+/* Shelves below the first fold deal their cards in as they scroll into view, instead of having
+   played the entrance unseen on mount. The first two stay on the clock, so the opening screen is
+   immediate. Each shelf is its own view timeline (the cards' nearest scroller is their track,
+   which never scrolls vertically, so they can't use view() directly). */
+@supports (animation-timeline: view()) {
+  .shelves > .shelf:nth-child(n + 3 of .shelf) { view-timeline: --shelf block; }
+  .shelves > .shelf:nth-child(n + 3 of .shelf) :is(.card, .rank) {
+    animation-timeline: --shelf;
+    animation-delay: 0s;
+    animation-range: entry calc(min(var(--i, 0), 8) * 3%) entry calc(38% + min(var(--i, 0), 8) * 3%);
+  }
+  :root.reduce-motion .shelves > .shelf :is(.card, .rank) { animation-timeline: auto; }
+  @media (prefers-reduced-motion: reduce) { .shelves > .shelf :is(.card, .rank) { animation-timeline: auto !important; } }
+}
+
 /* top 10: the number is the architecture, the poster leans on it */
 .rank { position: relative; display: flex; align-items: flex-end; flex: none; scroll-snap-align: start; padding-left: clamp(54px, 5vw, 84px); animation: rise var(--emph) var(--ease-out) both; animation-delay: calc(var(--i, 0) * 28ms); }
-.rank-n { position: absolute; left: 0; bottom: 30px; z-index: 0; font: 800 clamp(150px, 15vw, 220px)/0.74 var(--f-disp); font-stretch: 75%; letter-spacing: -0.07em; color: transparent; -webkit-text-stroke: 2px rgb(255 255 255 / 0.46); transition: -webkit-text-stroke-color var(--base), color var(--base); pointer-events: none; }
-.rank:hover .rank-n { -webkit-text-stroke-color: var(--tone-ink); color: color-mix(in oklab, var(--tone) 12%, transparent); }
+.rank-n { position: absolute; left: 0; bottom: 30px; z-index: 0; font: 800 clamp(150px, 15vw, 220px)/0.74 var(--f-disp); font-stretch: 75%; letter-spacing: -0.07em; color: transparent; -webkit-text-stroke: 2px rgb(255 255 255 / 0.46); pointer-events: none;
+  /* the numeral sinks into the floor rather than ending on a hard baseline */
+  -webkit-mask-image: linear-gradient(180deg, #000 56%, transparent 100%); mask-image: linear-gradient(180deg, #000 56%, transparent 100%);
+  transition: -webkit-text-stroke-color var(--base), color var(--base), transform var(--emph) var(--ease-out), filter var(--emph) var(--ease); }
+/* the poster leans forward, so the number leans back: a few pixels of counter-parallax */
+.rank:hover .rank-n { -webkit-text-stroke-color: var(--tone-ink); color: color-mix(in oklab, var(--tone) 12%, transparent); transform: translateX(-6px) scale(1.03); filter: drop-shadow(0 0 28px color-mix(in oklab, var(--tone) 32%, transparent)); }
 .rank.r10 { padding-left: clamp(104px, 9.6vw, 160px); }
 .rank .card { z-index: 1; animation: none; }
 
@@ -193,7 +252,7 @@ p.muted.drive-note { margin: 0; max-width: 64ch; line-height: 1.6; }
   mask-image: linear-gradient(180deg, #000 0%, #000 46%, rgb(0 0 0 / 0.5) 68%, rgb(0 0 0 / 0.16) 82%, transparent 100%); }
 .tp-stage .art { position: absolute; inset: 0; aspect-ratio: auto; height: 100%; background: var(--bg); }
 .tp-stage .art img { object-position: 50% 20%; }
-.tp-stage .art img.in { animation: drift 26s linear both; }
+.tp-stage .art img.in { animation: drift 26s linear both; will-change: transform; }
 .tp-scrim { position: absolute; inset: 0; pointer-events: none;
   background:
     linear-gradient(90deg, rgb(7 7 10 / 0.72) 0%, rgb(7 7 10 / 0.52) 32%, rgb(7 7 10 / 0.18) 66%, rgb(7 7 10 / 0.34) 100%),
@@ -232,6 +291,7 @@ p.muted.drive-note { margin: 0; max-width: 64ch; line-height: 1.6; }
 .smart-refresh.spinning svg { animation: spin 0.9s linear infinite; }
 .smart-note { font-size: 13px; line-height: 1.5; color: var(--fg2); text-wrap: pretty; }
 .smart-note b { color: var(--fg); font-weight: 600; }
+.smart-note .btn { margin-top: 10px; display: flex; }
 .smart .btn { align-self: flex-start; }
 .smart-more { align-self: flex-start; font-size: 12px; color: var(--fg2); padding: 2px; transition: color var(--fast); }
 .smart-more:hover { color: var(--fg); }
@@ -282,8 +342,12 @@ p.muted.drive-note { margin: 0; max-width: 64ch; line-height: 1.6; }
 .ec-num { position: absolute; left: 13px; bottom: 9px; z-index: 1; font: 800 38px/0.9 var(--f-disp); font-stretch: 75%; letter-spacing: -0.03em; color: #fff; text-shadow: 0 4px 24px rgb(0 0 0 / 0.8); }
 .ec-rt { position: absolute; right: 10px; bottom: 10px; z-index: 1; font: 500 10.5px var(--f-mono); padding: 3px 7px; border-radius: 6px; background: rgb(4 4 7 / 0.72); }
 .ec-ribbon { position: absolute; left: 10px; top: 10px; z-index: 1; font: 600 9.5px var(--f-mono); letter-spacing: 0.12em; text-transform: uppercase; padding: 5px 9px; border-radius: 999px; background: var(--tone); color: var(--on-tone); }
+.ec-ribbon.muted { background: rgb(10 10 14 / 0.78); color: var(--fg2); box-shadow: inset 0 0 0 1px var(--line-2); }
 .ec-seen { position: absolute; right: 10px; top: 10px; z-index: 1; width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; background: var(--ok); color: #04140c; }
 .ep-card.seen .ec-th img { filter: saturate(0.45) brightness(0.6); }
+.ep-card.unaired { opacity: 0.62; cursor: default; }
+.ep-card.unaired:hover .ec-th, .ep-card.unaired:focus-visible .ec-th { transform: none; box-shadow: inset 0 0 0 1px var(--line); }
+.ep-card.unaired:hover .ec-th img { transform: none; }
 .ec-play { position: absolute; left: 50%; top: 50%; z-index: 1; width: 48px; height: 48px; margin: -24px; border-radius: 50%; display: grid; place-items: center; background: var(--fg); color: #08080b;
   opacity: 0; transform: scale(0.7); transition: opacity var(--base), transform var(--base) var(--spring); box-shadow: 0 10px 30px rgb(0 0 0 / 0.5); }
 .ep-card:hover .ec-play, .ep-card:focus-visible .ec-play { opacity: 1; transform: none; }

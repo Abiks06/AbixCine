@@ -50,7 +50,7 @@ export function isKeyboardFocused(el: Element | null | undefined): boolean {
  * Shortcuts that still mean something on a web player (an embed): its picture and sound live in
  * a sealed frame, so seeking, volume, subtitle and speed keys would only show toasts that lie.
  */
-export const EMBED_KEYS: ReadonlySet<string> = new Set(["s", "e", "n", "f", "F11", "Escape"]);
+export const EMBED_KEYS: ReadonlySet<string> = new Set(["s", "e", "n", "i", "f", "F11", "Escape"]);
 
 /** One step slower or faster through the speed list (an unknown speed starts from 1×). */
 export function nextSpeed(speeds: readonly number[], current: number, dir: 1 | -1): number {

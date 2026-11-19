@@ -9,7 +9,7 @@ import { ANIME_FEEDS, loadAnimeFeed } from "../lib/anilist";
 import { useSettings } from "../lib/settings";
 import { FEEDS, hasTmdb, loadFeed, TOP10 } from "../lib/tmdb";
 import type { Media } from "../lib/types";
-import { useAsync } from "../lib/useAsync";
+import { useProgressiveFeeds } from "../lib/useAsync";
 
 const EYEBROWS = ["Fresh", "Everyone's watching", "All-time", "By genre", "By genre"];
 const NONE: Media[] = [];
@@ -44,23 +44,23 @@ export function Browse({ kind }: { kind: "movie" | "tv" }) {
   const fresh = useFreshness();
   const feeds = FEEDS[kind];
   // Each shelf settles on its own: one failed feed leaves the others (and the hero) standing.
-  const data = useAsync(
-    () => Promise.all([...feeds, TOP10[kind]].map((f, i) => loadFeed(f, i + (kind === "tv" ? 20 : 10)).catch(() => NONE))),
+  const data = useProgressiveFeeds(
+    [...feeds, TOP10[kind]].map((f, i) => () => loadFeed(f, i + (kind === "tv" ? 20 : 10)).catch(() => NONE)),
     [kind, s.tmdbKey, auth.tmdbProxy, fresh],
     { keepPrevious: true },
   );
-  const d = data.data;
-  const stage = useMemo(() => d?.[1] ?? NONE, [d]);
-  const empty = !!d && d.every((x) => !x.length);
+  const d = data.items;
+  const stage = useMemo(() => d[1] ?? NONE, [d[1]]); // eslint-disable-line react-hooks/exhaustive-deps
+  const empty = !data.loading && d.every((x) => !x?.length);
   return (
     <div className="page-flush">
-      <Hero items={stage} label={kind === "movie" ? "Popular films" : "Popular series"} loading={!d} />
+      <Hero items={stage} label={kind === "movie" ? "Popular films" : "Popular series"} loading={!data.settled[1] && !d[1]} />
       <div className="shelves pad">
         {empty && <NothingHere catalog={hasTmdb()} busy={data.loading} onRetry={data.reload} />}
         {feeds.map((f, i) => (
           <Fragment key={f.id}>
-            <Row eyebrow={EYEBROWS[i]} title={f.title} variant="landscape" items={d?.[i]} loading={!d} />
-            {i === 0 && <Row eyebrow="Trending today" title={TOP10[kind].title} ranked chart={TOP10[kind].id} items={d?.[feeds.length]} loading={!d} />}
+            <Row eyebrow={EYEBROWS[i]} title={f.title} variant="landscape" items={d[i]} loading={!data.settled[i] && !d[i]} />
+            {i === 0 && <Row eyebrow="Trending today" title={TOP10[kind].title} ranked chart={TOP10[kind].id} items={d[feeds.length]} loading={!data.settled[feeds.length] && !d[feeds.length]} />}
           </Fragment>
         ))}
       </div>
@@ -70,20 +70,24 @@ export function Browse({ kind }: { kind: "movie" | "tv" }) {
 
 export function Anime() {
   const fresh = useFreshness();
-  const data = useAsync(() => Promise.all(ANIME_FEEDS.map((f, i) => loadAnimeFeed(f, i).catch(() => NONE))), [fresh], { keepPrevious: true });
-  const d = data.data;
-  const stage = useMemo(() => d?.[1] ?? NONE, [d]);
-  const empty = !!d && d.every((x) => !x.length);
+  const data = useProgressiveFeeds(
+    ANIME_FEEDS.map((f, i) => () => loadAnimeFeed(f, i).catch(() => NONE)),
+    [fresh],
+    { keepPrevious: true },
+  );
+  const d = data.items;
+  const stage = useMemo(() => d[1] ?? NONE, [d[1]]); // eslint-disable-line react-hooks/exhaustive-deps
+  const empty = !data.loading && d.every((x) => !x?.length);
   return (
     <div className="page-flush">
-      <Hero items={stage} label="This season" loading={!d} />
+      <Hero items={stage} label="This season" loading={!data.settled[1] && !d[1]} />
       <div className="shelves pad">
         {empty && <NothingHere catalog busy={data.loading} onRetry={data.reload} />}
         {ANIME_FEEDS.map((f, i) =>
           i === 3 ? (
-            <Row key={f.id} eyebrow="Ranked by fans" title={f.title} ranked items={d?.[i]} loading={!d} />
+            <Row key={f.id} eyebrow="Ranked by fans" title={f.title} ranked items={d[i]} loading={!data.settled[i] && !d[i]} />
           ) : (
-            <Row key={f.id} eyebrow={["Right now", "Simulcast", "Essentials"][i]} title={f.title} items={d?.[i]} loading={!d} />
+            <Row key={f.id} eyebrow={["Right now", "Simulcast", "Essentials"][i]} title={f.title} items={d[i]} loading={!data.settled[i] && !d[i]} />
           ),
         )}
       </div>

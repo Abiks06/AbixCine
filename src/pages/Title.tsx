@@ -10,20 +10,28 @@ import { TitleArt } from "../components/TitleArt";
 import { TrailerModal } from "../components/TrailerModal";
 import { isYouTubeId } from "../lib/trailer";
 import {
+  checkEpisodeAvailability,
   clampEpisode,
   clampSeason,
   decodeKey,
   encodeKey,
   getDetail,
   getSeasonEpisodes,
+  isFutureIsoDate,
+  isTheatricalOnly,
+  isUnairedEpisode,
+  isUnreleasedMedia,
   parseSeasonEpisodeParams,
   resolvePlaybackRequest,
 } from "../lib/catalog";
 import { fmtAgo, fmtDate, fmtMoney, fmtRuntime, languageName } from "../lib/format";
 import { getProgress, useMatchedProgress, useProgressStore } from "../lib/progress";
 import { audioFor, setAudioFor, useSettings } from "../lib/settings";
+import { toast } from "../lib/toast";
 import { isFilm, type CanonicalSeason, type Episode, type Media, type MediaDetail } from "../lib/types";
 import { useAsync } from "../lib/useAsync";
+import { useSlidingIndicator } from "../lib/useSlidingIndicator";
+import { burst } from "../lib/burst";
 import { toggleList, useSaved } from "../lib/watchlist";
 
 type Tab = "episodes" | "cast" | "details" | "more";
@@ -42,6 +50,9 @@ const loadView = (): EpView | null => {
 const nice = (status: string) => status.replace(/_/g, " ").toLowerCase().replace(/^\w/, (c) => c.toUpperCase());
 
 export function Title() {
+  const tabInd = useSlidingIndicator();
+  const seasonInd = useSlidingIndicator();
+  const viewInd = useSlidingIndicator();
   const rawKeyParam = useParams().key ?? "";
   const key = decodeKey(rawKeyParam);
   const [searchParams] = useSearchParams();
@@ -53,6 +64,8 @@ export function Title() {
   // The card that brought you here hands over what it already knew, so the stage paints on the
   // first frame (and the artwork can morph into it) while cast, seasons and servers arrive.
   const seed = (loc.state as { seed?: Media } | null)?.seed;
+  // Arrived from the hero's Details: the title art takes the hero's name and morphs out of it.
+  const morphTitle = (loc.state as { morph?: string } | null)?.morph === "title";
   const d: MediaDetail | undefined = useMemo(
     () => detail ?? (seed && seed.key === key ? { ...seed, cast: [], crew: [], related: [] } : undefined),
     [detail, seed, key],
@@ -89,6 +102,13 @@ export function Title() {
     return latest;
   }, [d, latest]);
 
+  const validProgress = useMemo(() => {
+    if (!matchedProgress) return undefined;
+    if (!detail) return matchedProgress;
+    const avail = checkEpisodeAvailability(detail, matchedProgress.season, matchedProgress.episode);
+    return avail.playable ? matchedProgress : undefined;
+  }, [detail, matchedProgress]);
+
   // Per-title view state resets when the title changes (this component stays mounted across titles).
   const [pickedSeason, setPickedSeason] = useState<number | null>(null);
   const [tab, setTab] = useState<Tab>("episodes");
@@ -113,9 +133,9 @@ export function Title() {
   // Active canonical season, strictly clamped to playable seasons / specials.
   const activeSeasonObj: CanonicalSeason | undefined = useMemo(() => {
     if (!d || isFilm(d)) return undefined;
-    const preferred = pickedSeason ?? routeParams.season ?? matchedProgress?.season ?? d.initialSeason;
+    const preferred = pickedSeason ?? routeParams.season ?? validProgress?.season ?? d.initialSeason;
     return clampSeason(d, preferred);
-  }, [d, pickedSeason, routeParams.season, matchedProgress?.season]);
+  }, [d, pickedSeason, routeParams.season, validProgress?.season]);
 
   const season = activeSeasonObj?.number ?? 1;
 
@@ -132,7 +152,7 @@ export function Title() {
   useEffect(() => () => clearTimeout(swapTimer.current), []);
   const [view, setView] = useState<EpView | null>(loadView);
 
-  const resumeEpisode = matchedProgress && (matchedProgress.season == null || matchedProgress.season === season) ? matchedProgress.episode ?? 1 : 1;
+  const resumeEpisode = validProgress && (validProgress.season == null || validProgress.season === season) ? validProgress.episode ?? 1 : 1;
   useEffect(() => {
     setPage(Math.max(0, Math.floor((resumeEpisode - 1) / PAGE)));
   }, [key, season, resumeEpisode]);
@@ -145,6 +165,12 @@ export function Title() {
   // no episode list, "Play" not "Play E1", and its runtime rather than "1 episode".
   const film = d ? isFilm(d) : key.includes(":movie:");
   const isSeries = !film;
+  const unreleasedFilm = film && ready && isUnreleasedMedia(d);
+  // Out in cinemas but not on digital/disc anywhere yet: servers almost never have it, so don't
+  // race every server automatically — say why, and let the viewer check anyway (local files, etc.).
+  const theatricalOnly = film && ready && !unreleasedFilm && isTheatricalOnly(d);
+  const [checkAnyway, setCheckAnyway] = useState(false);
+  useEffect(() => setCheckAnyway(false), [key]);
   const hasPlayableEps = !!(
     isSeries &&
     ((d?.seasons && d.seasons.length > 0) ||
@@ -156,20 +182,25 @@ export function Title() {
   // What pressing Play would start: clamped resume point, else the first episode of the active season, else the film.
   const startS = useMemo(() => {
     if (!d || isFilm(d)) return undefined;
-    if (matchedProgress?.season != null) {
-      return clampSeason(d, matchedProgress.season)?.number ?? activeSeasonObj?.number;
+    if (validProgress?.season != null) {
+      return clampSeason(d, validProgress.season)?.number ?? activeSeasonObj?.number;
     }
     return activeSeasonObj?.number;
-  }, [d, matchedProgress?.season, activeSeasonObj?.number]);
+  }, [d, validProgress?.season, activeSeasonObj?.number]);
 
   const startE = useMemo(() => {
     if (!d || isFilm(d)) return undefined;
     const targetS = startS != null ? clampSeason(d, startS) : activeSeasonObj;
-    return clampEpisode(targetS, matchedProgress?.episode ?? routeParams.episode ?? 1, d.episodeCount);
-  }, [d, startS, activeSeasonObj, matchedProgress?.episode, routeParams.episode]);
+    return clampEpisode(targetS, validProgress?.episode ?? routeParams.episode ?? 1, d.episodeCount);
+  }, [d, startS, activeSeasonObj, validProgress?.episode, routeParams.episode]);
 
-  // Only the real record drives the source lookup: a seed has no seasons to resolve an episode against.
-  const req = useMemo(() => (detail ? resolvePlaybackRequest(detail, startS, startE, audio) : null), [detail, startS, startE, audio]);
+  const canPlay = ready && ((film && !unreleasedFilm) || hasPlayableEps);
+
+  // Only the real record drives the source lookup, and only when the film/episode is released.
+  const req = useMemo(
+    () => (detail && canPlay && (!theatricalOnly || checkAnyway) ? resolvePlaybackRequest(detail, startS, startE, audio) : null),
+    [detail, canPlay, theatricalOnly, checkAnyway, startS, startE, audio],
+  );
 
   if (error && !d) {
     return (
@@ -207,12 +238,12 @@ export function Title() {
   };
 
   const epTag =
-    matchedProgress && startE != null
+    validProgress && startE != null
       ? `${startS != null && (d.seasons?.length ?? 0) > 1 ? `S${startS} · ` : startS === 0 ? "Specials · " : ""}E${startE}`
       : "";
-  const playLabel = matchedProgress && hasPlayableEps
-    ? matchedProgress.upNext ? `Play ${epTag}` : epTag ? `Resume ${epTag}` : "Resume"
-    : matchedProgress && film && matchedProgress.position > 30 ? "Resume"
+  const playLabel = validProgress && hasPlayableEps
+    ? validProgress.upNext ? `Play ${epTag}` : epTag ? `Resume ${epTag}` : "Resume"
+    : validProgress && film && validProgress.position > 30 ? "Resume"
     : hasPlayableEps ? "Play E1" : "Play";
 
   const firstSeason = d.seasons?.[0];
@@ -259,12 +290,12 @@ export function Title() {
   };
 
   const epList: Episode[] = eps.data ?? [];
+  const airedCount = activeSeasonObj?.episodeCount ?? (isSeries ? d.episodeCount : undefined);
   const hasMultipleSelectors =
     mainlineCount > 1 ||
     (mainlineCount >= 1 && (d.specials?.length ?? 0) > 0) ||
     (d.upcomingSeasons?.length ?? 0) > 0;
-  const canPlay = ready && (film || hasPlayableEps);
-  const resumePct = matchedProgress && !matchedProgress.upNext && matchedProgress.duration > 0 ? Math.min(1, matchedProgress.position / matchedProgress.duration) : null;
+  const resumePct = validProgress && !validProgress.upNext && validProgress.duration > 0 ? Math.min(1, validProgress.position / validProgress.duration) : null;
 
   return (
     <div className="tp">
@@ -281,7 +312,7 @@ export function Title() {
               <b>{kindLabel(d.kind, d.format)}</b>
               {d.genres.length > 0 && <><i /><span>{d.genres.slice(0, 3).join(" · ")}</span></>}
             </div>
-            <TitleArt media={d} />
+            <TitleArt media={d} vtName={morphTitle ? "hero-title" : undefined} />
             {d.tagline && <div className="tagline">{d.tagline}</div>}
             <div className="specs">
               {d.rating ? <span className="star">★ {d.rating.toFixed(1)} <small>{key.startsWith("anilist:") ? "AniList" : "TMDB"}</small></span> : null}
@@ -293,6 +324,15 @@ export function Title() {
               {anime && <span className="hi">Sub · Dub</span>}
             </div>
             <p className="desc">{d.overview}</p>
+            {unreleasedFilm && (
+              <div className="airing"><Icon name="clock" size={14} /> {d.releaseDate ? `Releases ${fmtDate(d.releaseDate)}` : "Not released yet"}</div>
+            )}
+            {theatricalOnly && (
+              <div className="airing">
+                <Icon name="clock" size={14} />{" "}
+                {d.digitalReleaseDate ? `In cinemas now · streaming from ${fmtDate(d.digitalReleaseDate)}` : "In cinemas now · no digital release announced yet"}
+              </div>
+            )}
             {d.nextAiring && (
               <div className="airing"><Icon name="clock" size={14} /> Episode {d.nextAiring.episode} airs {new Date(d.nextAiring.at).toLocaleString(undefined, { weekday: "long", hour: "numeric", minute: "2-digit" })}</div>
             )}
@@ -302,7 +342,7 @@ export function Title() {
               ) : !ready ? (
                 <button className="btn play" disabled><span className="mini-spin" /> Loading</button>
               ) : null}
-              <button className={`btn glass ${saved ? "on" : ""}`} onClick={() => toggleList(d)} aria-pressed={saved}>
+              <button className={`btn glass ${saved ? "on" : ""}`} onClick={(e) => { if (!saved) burst(e.currentTarget); toggleList(d); }} aria-pressed={saved}>
                 <Icon name={saved ? "check" : "bookmark"} size={17} /> {saved ? "In My List" : "My List"}
               </button>
               {audio && <AudioToggle value={audio} onChange={changeAudio} />}
@@ -310,10 +350,10 @@ export function Title() {
                 <button type="button" className="btn glass" onClick={() => setTrailerOpen(true)} aria-haspopup="dialog"><Icon name="film" size={17} /> Trailer</button>
               )}
             </div>
-            {resumePct != null && matchedProgress && (
+            {resumePct != null && validProgress && (
               <div className="resume">
                 <div className="resume-bar"><i style={{ transform: `scaleX(${resumePct})` }} /></div>
-                <span>{Math.max(1, Math.round((matchedProgress.duration - matchedProgress.position) / 60))}m left{startE != null ? ` in E${startE}` : ""}</span>
+                <span>{Math.max(1, Math.round((validProgress.duration - validProgress.position) / 60))}m left{startE != null ? ` in E${startE}` : ""}</span>
               </div>
             )}
           </div>
@@ -322,19 +362,38 @@ export function Title() {
           ) : (
             <aside className="smart">
               <div className="h"><span><Icon name="layers" size={16} /> Servers</span></div>
-              <div className="smart-note">{!ready ? "Finding where this plays…" : isSeries && !hasPlayableEps ? "No aired episodes available yet." : "Loading season…"}</div>
+              <div className="smart-note">
+                {!ready
+                  ? "Finding where this plays…"
+                  : unreleasedFilm
+                    ? d.releaseDate
+                      ? `Not out yet — releases ${fmtDate(d.releaseDate)}. Servers will appear once it's available.`
+                      : "Not released yet — servers will appear once it's available."
+                    : theatricalOnly
+                      ? (
+                          <>
+                            {d.digitalReleaseDate
+                              ? `Still in cinemas — digital release ${fmtDate(d.digitalReleaseDate)}. Servers rarely carry it before then.`
+                              : "Still in cinemas — servers rarely carry a film before its digital release."}{" "}
+                            <button type="button" className="btn glass sm" onClick={() => setCheckAnyway(true)}>Check servers anyway</button>
+                          </>
+                        )
+                    : isSeries && !hasPlayableEps
+                      ? "No aired episodes available yet."
+                      : "Loading season…"}
+              </div>
             </aside>
           )}
         </div>
 
-        <div className="tabbar" role="tablist">
+        <div className="tabbar" role="tablist" ref={tabInd}>
           {tabs.map(([id, label]) => (
             <button key={id} role="tab" aria-selected={curTab === id} className={curTab === id ? "on" : ""} onClick={() => setTab(id)}>{label}</button>
           ))}
           {curTab === "episodes" && ready && (
             <div className="tabbar-end">
               {hasMultipleSelectors && (
-                <div className="season-pick" role="group" aria-label="Seasons">
+                <div className="season-pick" role="group" aria-label="Seasons" ref={seasonInd}>
                   {(d.seasons ?? []).map((s) => {
                     const courNote = s.cours && s.cours.length > 1 ? ` · ${s.cours.length} parts merged` : "";
                     return (
@@ -355,7 +414,7 @@ export function Title() {
                   ))}
                 </div>
               )}
-              <div className="view-pick" role="group" aria-label="Episode layout">
+              <div className="view-pick" role="group" aria-label="Episode layout" ref={viewInd}>
                 <button className={view !== "grid" ? "on" : ""} aria-pressed={view !== "grid"} title="Editorial list" aria-label="Editorial list" onClick={() => chooseView("list")}><Icon name="rows" size={15} /></button>
                 <button className={view === "grid" ? "on" : ""} aria-pressed={view === "grid"} title="Compact grid" aria-label="Compact grid" onClick={() => chooseView("grid")}><Icon name="grid" size={15} /></button>
               </div>
@@ -370,7 +429,7 @@ export function Title() {
             const pages = Math.max(1, Math.ceil(epList.length / PAGE));
             const safePage = Math.max(0, Math.min(page, pages - 1));
             const shown = paged ? epList.slice(safePage * PAGE, safePage * PAGE + PAGE) : epList;
-            const upNext = matchedProgress?.episode != null ? matchedProgress.episode : undefined;
+            const upNext = validProgress?.episode != null ? validProgress.episode : undefined;
             const waiting = !ready || (eps.loading && !eps.data);
 
             if (!waiting && epList.length === 0) {
@@ -390,7 +449,7 @@ export function Title() {
 
             return (
               <>
-                {(paged || epList.length > 12) && (
+                {(paged || (airedCount ?? epList.length) > 12) && (
                   <div className="ep-tools">
                     {paged && (
                       <div className="season-strip" ref={stripRef}>
@@ -403,7 +462,14 @@ export function Title() {
                       className="ep-jump"
                       onSubmit={(ev) => {
                         ev.preventDefault();
-                        const clamped = clampEpisode(activeSeasonObj, Number(jump), epList.length);
+                        const raw = Number(jump);
+                        const maxEp = airedCount ?? epList.length;
+                        if (!raw || raw < 1 || maxEp < 1) return;
+                        if (raw > maxEp) {
+                          toast(`Only ${maxEp} aired episode${maxEp === 1 ? "" : "s"} available so far`, { icon: "info" });
+                          return;
+                        }
+                        const clamped = clampEpisode(activeSeasonObj, raw, epList.length);
                         if (clamped != null) watch(season, clamped);
                       }}
                     >
@@ -416,18 +482,44 @@ export function Title() {
                 <div className={`ep-grid swap ${swap ? "out" : ""} ${layout}`} key={`${season}-${audio}-${safePage}`}>
                   {waiting && Array.from({ length: 6 }, (_, i) => <div key={i} className="ep-card skeleton" />)}
                   {!waiting && shown.map((e, i) => {
-                    const pKey = e.sourceKey ?? d.key;
-                    const pEp = e.courEpisode ?? e.number;
-                    const p = getProgress(canonicalKey, season, e.number, [d.key, pKey]) ?? getProgress(pKey, undefined, pEp);
-                    const isCur = upNext === e.number && (matchedProgress?.season ?? season) === season;
-                    const watched = !!p && p.duration > 0 && p.position / p.duration > 0.92;
+                    const unaired = isUnairedEpisode(e, { airedCount, seriesStatus: d.status });
                     // Episodes without their own still (often unaired ones) get the show's art, dimmed.
                     // Tiles are ~300px wide: the full-size backdrop (up to `original`) was decoded 50 times over.
                     const still = e.still ?? sized(d.backdrop, "w300");
-                    const left = p && p.duration > 0 && !watched ? Math.max(1, Math.round((p.duration - p.position) / 60)) : null;
                     const fallback = e.airDate
                       ? new Date(`${e.airDate}T12:00:00`).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })
                       : audio ? (audio === "dub" ? "English dub" : "Japanese audio · English subtitles") : "";
+                    if (unaired) {
+                      const airLabel = e.airDate
+                        ? `Airs ${new Date(`${e.airDate}T12:00:00`).toLocaleDateString(undefined, { month: "short", day: "numeric" })}`
+                        : "TBA";
+                      return (
+                        <div
+                          key={e.number}
+                          className="ep-card unaired"
+                          aria-disabled="true"
+                          style={{ ["--i" as string]: Math.min(i, 8) }}
+                          title={e.airDate ? `Episode ${e.number} airs ${fmtDate(e.airDate)}` : `Episode ${e.number} hasn't aired yet`}
+                        >
+                          <div className="ec-th">
+                            {still && <img src={still} alt="" loading="lazy" decoding="async" className="dim" />}
+                            <span className="ec-num">{e.number}</span>
+                            <span className="ec-ribbon muted">{airLabel}</span>
+                            {e.runtime ? <span className="ec-rt">{e.runtime}m</span> : null}
+                          </div>
+                          <div className="ec-tx">
+                            <div className="ec-t">{e.title}</div>
+                            <div className="ec-d">{e.overview || fallback}</div>
+                          </div>
+                        </div>
+                      );
+                    }
+                    const pKey = e.sourceKey ?? d.key;
+                    const pEp = e.courEpisode ?? e.number;
+                    const p = getProgress(canonicalKey, season, e.number, [d.key, pKey]) ?? getProgress(pKey, undefined, pEp);
+                    const isCur = upNext === e.number && (validProgress?.season ?? season) === season;
+                    const watched = !!p && p.duration > 0 && p.position / p.duration > 0.92;
+                    const left = p && p.duration > 0 && !watched ? Math.max(1, Math.round((p.duration - p.position) / 60)) : null;
                     return (
                       <button key={e.number} className={`ep-card ${isCur ? "cur" : ""} ${watched ? "seen" : ""}`} style={{ ["--i" as string]: Math.min(i, 8) }} onClick={() => watch(season, e.number)}>
                         <div className="ec-th">
@@ -504,7 +596,9 @@ function Details({ d, anime }: { d: MediaDetail; anime: boolean }) {
   const multiple = d.budget && d.revenue ? d.revenue / d.budget : 0;
   const ended = !!d.status && !/return|airing|production|releasing|planned/i.test(d.status);
   const rows: [string, string | undefined | null][] = [
-    [isFilm(d) ? "Released" : "First aired", fmtDate(d.releaseDate)],
+    [isFilm(d) ? (isUnreleasedMedia(d) ? "Releases" : "Released") : "First aired", fmtDate(d.releaseDate)],
+    ["In cinemas", isFilm(d) && d.theatricalReleaseDate && d.theatricalReleaseDate !== d.releaseDate?.slice(0, 10) ? fmtDate(d.theatricalReleaseDate) : ""],
+    [isFilm(d) && isFutureIsoDate(d.digitalReleaseDate) ? "Digital release" : "On digital", isFilm(d) ? fmtDate(d.digitalReleaseDate) : ""],
     ["Last aired", !isFilm(d) && ended ? fmtDate(d.endDate) : ""],
     ["Season", d.seasonLabel],
     ["Format", d.format],

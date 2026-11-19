@@ -152,7 +152,7 @@ function bump(providerId: string, ok: boolean, latencyMs?: number, weight = 1) {
       h.latency = nextLat;
       h.latencyMs = nextLat;
     }
-    if (h.streak >= CIRCUIT_STREAK_THRESHOLD) {
+    if (providerId !== "local" && h.streak >= CIRCUIT_STREAK_THRESHOLD) {
       const exp = Math.min(4, h.streak - CIRCUIT_STREAK_THRESHOLD);
       const cooldown = Math.min(CIRCUIT_MAX_MS, CIRCUIT_BASE_MS * Math.pow(2, exp));
       h.circuitUntil = now + cooldown;
@@ -164,6 +164,7 @@ function bump(providerId: string, ok: boolean, latencyMs?: number, weight = 1) {
 
 /** Is the circuit breaker currently open (tripped) for this provider? */
 export function isCircuitOpen(providerId: string): boolean {
+  if (providerId === "local") return false;
   const h = getHealth(providerId);
   return !!h.circuitUntil && Date.now() < h.circuitUntil;
 }

@@ -23,7 +23,7 @@ import {
 import { DIRECT_EXTRACTORS } from "./extractors";
 import { jellyfinProvider } from "./jellyfin";
 import { kisskhProvider, decryptKisskhSubtitle } from "./kisskh";
-import { localProvider, sidecarTrack } from "./local";
+import { clearLocalScanCache, localProvider, sidecarTrack } from "./local";
 import {
   availableSources,
   candLine,
@@ -440,6 +440,39 @@ describe("subtitle metadata inference & source providers", () => {
     );
     expect(resErr).toHaveLength(1);
     expect(resErr[0].subtitles).toEqual([]);
+  });
+
+  it("falls back to untagged local files when dub is requested and skips explicitly subbed ones", async () => {
+    clearLocalScanCache();
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "scan_library") {
+        return {
+          files: [
+            { path: "D:/AnimeAudioFallback/Frieren/Frieren - 01.mkv", name: "Frieren - 01", size: 400_000_000, subs: [] },
+            { path: "D:/AnimeAudioFallback/Other/Frieren - 02 [Subbed].mkv", name: "Frieren - 02 [Subbed]", size: 400_000_000, subs: [] },
+          ],
+          errors: [],
+        };
+      }
+      return [];
+    });
+    mockIsTauri.mockReturnValue(true);
+    const settings = { ...getSettings(), libraryPaths: ["D:/AnimeAudioFallback"] };
+    const untaggedHit = await localProvider.find(
+      { media: { key: "anilist:154587", kind: "anime", title: "Frieren", overview: "", genres: [] }, episode: 1, audio: "dub" },
+      settings,
+      new AbortController().signal,
+    );
+    expect(untaggedHit).toHaveLength(1);
+    expect(untaggedHit[0].via).toBe("direct");
+    expect(untaggedHit[0].audio).toBeUndefined();
+
+    const subbedSkip = await localProvider.find(
+      { media: { key: "anilist:154587", kind: "anime", title: "Frieren", overview: "", genres: [] }, episode: 2, audio: "dub" },
+      settings,
+      new AbortController().signal,
+    );
+    expect(subbedSkip).toHaveLength(0);
   });
 
   it("infers sniffed subtitle metadata and filters thumbnails in verifyEmbed and kisskhProvider", async () => {

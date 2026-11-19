@@ -63,6 +63,7 @@ export function suspectNote(c: StreamCandidate) {
 function laneNote(lane: Lane) {
   if (lane.status === "timeout") return "Didn't answer in time";
   const e = lane.error ?? "";
+  if (/circuit open|cooling down/i.test(e)) return "Resting after recent errors";
   if (/enc-dec\.app unavailable/i.test(e)) return "Its decoding service is down";
   if (/\b(?:401|403)\b/.test(e)) return "Refused the request";
   if (/\btime(?:d)? ?out\b/i.test(e)) return "Didn't answer in time";

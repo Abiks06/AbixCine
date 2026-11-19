@@ -1,13 +1,25 @@
-# Builds the signed Windows installer and publishes it as a GitHub release.
+# Builds the Windows installers and publishes them as a GitHub release.
 # The release carries latest.json, which installed copies of AbixCine read to update themselves.
 #
 # Release a new version:  npm run version:bump -- 1.0.1  →  commit  →  git tag v1.0.1  →  git push --tags
 #
 # Required repository secrets (Settings → Secrets and variables → Actions):
-#   TAURI_SIGNING_PRIVATE_KEY           contents of ~/.tauri/abixcine.key
+#   TAURI_SIGNING_PRIVATE_KEY           contents of ~/.tauri/abixcine.key   (updater signature, not Authenticode)
 #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  contents of ~/.tauri/abixcine.key.password
 # Optional:
 #   VITE_TMDB_KEY                       bake a TMDB key into the build (otherwise the AbixCine server proxies TMDB)
+#
+# Windows Authenticode signing (DIST-01). Without it SmartScreen warns and Windows 11 Smart App
+# Control blocks the installer outright. Configure ONE of these; with neither, the build is unsigned.
+#   A) Azure Trusted Signing (recommended):
+#        secrets  AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID   (app registration with the
+#                 "Trusted Signing Certificate Profile Signer" role on the signing account)
+#        vars     TRUSTED_SIGNING_ENDPOINT  e.g. https://eus.codesigning.azure.net
+#                 TRUSTED_SIGNING_ACCOUNT   the Trusted Signing account name
+#                 TRUSTED_SIGNING_PROFILE   the certificate profile name
+#   B) A code-signing certificate as a .pfx file (e.g. from SignPath / a CA):
+#        secrets  WINDOWS_CERTIFICATE           base64 of the .pfx
+#                 WINDOWS_CERTIFICATE_PASSWORD  its password
 name: Release
 
 on:
@@ -47,33 +59,137 @@ jobs:
         shell: bash
         run: node scripts/bump-version.mjs --check "${GITHUB_REF_NAME#v}"
 
-      - name: Build, sign and publish
+      - name: Read version
+        id: version
+        shell: bash
+        run: echo "value=$(node -p "require('./src-tauri/tauri.conf.json').version")" >> "$GITHUB_OUTPUT"
+
+      # Writes a tauri config overlay that turns on Authenticode signing for every binary Tauri
+      # produces (abixcine.exe, the NSIS setup + uninstaller, the MSI) — only when credentials exist.
+      - name: Configure Windows code signing
+        id: signing
+        shell: pwsh
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          TS_ENDPOINT: ${{ vars.TRUSTED_SIGNING_ENDPOINT }}
+          TS_ACCOUNT: ${{ vars.TRUSTED_SIGNING_ACCOUNT }}
+          TS_PROFILE: ${{ vars.TRUSTED_SIGNING_PROFILE }}
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $overlay = Join-Path $env:RUNNER_TEMP "tauri.signing.json"
+          if ($env:AZURE_CLIENT_ID -and $env:AZURE_CLIENT_SECRET -and $env:AZURE_TENANT_ID -and $env:TS_ENDPOINT -and $env:TS_ACCOUNT -and $env:TS_PROFILE) {
+            cargo install trusted-signing-cli --locked
+            $cfg = @{ bundle = @{ windows = @{ signCommand = @{
+              cmd  = "trusted-signing-cli"
+              args = @("-e", $env:TS_ENDPOINT, "-a", $env:TS_ACCOUNT, "-c", $env:TS_PROFILE, "-d", "AbixCine", "%1")
+            } } } }
+            $cfg | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 $overlay
+            "mode=trusted-signing" >> $env:GITHUB_OUTPUT
+          } elseif ($env:WINDOWS_CERTIFICATE -and $env:WINDOWS_CERTIFICATE_PASSWORD) {
+            $pfx = Join-Path $env:RUNNER_TEMP "abixcine.pfx"
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+            $pw = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+            $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $pw
+            Remove-Item $pfx
+            $cfg = @{ bundle = @{ windows = @{
+              certificateThumbprint = $cert.Thumbprint
+              digestAlgorithm       = "sha256"
+              timestampUrl          = "http://timestamp.digicert.com"
+            } } }
+            $cfg | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 $overlay
+            "mode=pfx" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Host "::warning::No Authenticode credentials configured — the installers will be UNSIGNED (see DIST-01 in the header of this workflow)."
+            "mode=none" >> $env:GITHUB_OUTPUT
+            "args=--features torrent --bundles nsis,msi" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          "args=--features torrent --bundles nsis,msi --config $overlay" >> $env:GITHUB_OUTPUT
+
+      # Published as a draft first: it only goes public (and reaches the updater) after the
+      # signature check and the portable zip below succeed.
+      - name: Build, sign and upload (draft)
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           VITE_TMDB_KEY: ${{ secrets.VITE_TMDB_KEY }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
         with:
           tagName: v__VERSION__
           releaseName: AbixCine v__VERSION__
           releaseBody: |
-            Download **AbixCine_*_x64-setup.exe** below and run it to install AbixCine on 64-bit Windows 10 or 11.
-            If Windows SmartScreen warns about an unrecognized app, click **More info → Run anyway** (the installer is unsigned).
+            **Install:** download **AbixCine_*_x64-setup.exe** below and run it (64-bit Windows 10 or 11).
+
+            Other ways to install:
+            - **AbixCine_*_x64_en-US.msi** — for PCs where `.exe` installers are blocked or managed by IT (installs for all users; needs admin).
+            - **AbixCine_*_x64-portable.zip** — no installer: unzip anywhere and run `abixcine.exe`. Needs the [Microsoft Edge WebView2 Runtime](https://go.microsoft.com/fwlink/p/?LinkId=2124703) (already on Windows 11). Doesn't update itself.
+
+            If Windows or your browser warns about the download:
+            - **Edge / Chrome:** choose **Keep → Keep anyway**.
+            - **"Windows protected your PC" (SmartScreen):** click **More info → Run anyway**.
+            - **Windows 11 Smart App Control** blocks apps it can't verify with no "Run anyway" option; use a signed build or turn Smart App Control off in Windows Security.
+
+            **Won't start?** AbixCine writes `%LOCALAPPDATA%\app.abixcine.desktop\startup.log` — attach it to a bug report. If the window never appears, the next launch automatically retries in safe graphics mode (GPU off); you can also force it with `abixcine.exe --safe-mode`.
+
             Already installed? AbixCine updates itself: you'll see a prompt in the app.
-          releaseDraft: false
+          releaseDraft: true
           prerelease: false
           includeUpdaterJson: true
+          # Existing installs are per-user NSIS; the updater must keep pointing at the NSIS build.
+          updaterJsonPreferNsis: true
           # Torrent streaming is behind a cargo feature; without this the installer shipped the stub.
-          args: --features torrent
+          args: ${{ steps.signing.outputs.args }}
 
-      - name: Remove redundant .sig asset from release page
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Verify Authenticode signatures
+        if: steps.signing.outputs.mode != 'none'
+        shell: pwsh
+        run: |
+          $files = @(Get-Item src-tauri/target/release/abixcine.exe) +
+                   @(Get-ChildItem src-tauri/target/release/bundle/nsis/*.exe) +
+                   @(Get-ChildItem src-tauri/target/release/bundle/msi/*.msi)
+          $bad = 0
+          foreach ($f in $files) {
+            $sig = Get-AuthenticodeSignature $f.FullName
+            Write-Host "$($f.Name): $($sig.Status) $($sig.SignerCertificate.Subject)"
+            if ($sig.Status -ne "Valid") { $bad++ }
+          }
+          if ($bad) { Write-Error "$bad file(s) are not validly signed"; exit 1 }
+
+      - name: Build and upload portable zip
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP "AbixCine"
+          New-Item -ItemType Directory -Force (Join-Path $stage "resources") | Out-Null
+          Copy-Item src-tauri/target/release/abixcine.exe $stage
+          # Same layout as the installed app: <exe dir>/resources/ffmpeg (see bundled_ffmpeg_dirs in lib.rs).
+          Copy-Item -Recurse src-tauri/resources/ffmpeg (Join-Path $stage "resources/ffmpeg")
+          $zip = "AbixCine_$($env:VERSION)_x64-portable.zip"
+          Compress-Archive -Path "$stage/*" -DestinationPath $zip -Force
+          gh release upload "v$($env:VERSION)" $zip --clobber
+
+      - name: Remove redundant .sig assets from release page
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.value }}
         run: |
-          SIG_NAME=$(gh release view "${GITHUB_REF_NAME}" --json assets --jq '.assets[].name | select(endswith(".sig"))' || true)
-          if [ -n "$SIG_NAME" ]; then
-            gh release delete-asset "${GITHUB_REF_NAME}" "$SIG_NAME" --yes || true
-          fi
+          gh release view "v${VERSION}" --json assets --jq '.assets[].name | select(endswith(".sig"))' | while read -r SIG; do
+            [ -n "$SIG" ] && gh release delete-asset "v${VERSION}" "$SIG" --yes || true
+          done
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.value }}
+        run: gh release edit "v${VERSION}" --draft=false --latest

@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getSettings } from "../lib/settings";
 import type { PlaybackRequest } from "../lib/types";
-import { getHealth, lastPick, resetHealth } from "./health";
-import { candKey } from "./registry";
+import { CIRCUIT_STREAK_THRESHOLD, getHealth, isCircuitOpen, lastPick, recordLookupFailure, recordPlayback, resetHealth } from "./health";
+import { candKey, score } from "./registry";
 import { acquireSession, invalidateSessions, SourceSession, type SessionDeps } from "./session";
 import type { SourceProvider, StreamCandidate } from "./types";
 
@@ -469,3 +469,236 @@ describe("source session: audit fixes", () => {
     expect(session.getSnapshot().pick?.providerId).toBe("vidrock");
   });
 });
+
+describe("source session: local priority & server scheduler improvements", () => {
+  const localCand = (name = "Movie.mkv", quality?: number): StreamCandidate => ({
+    providerId: "local",
+    providerName: "Local library",
+    label: name,
+    url: `asset://localhost/${encodeURIComponent(name)}`,
+    kind: "file",
+    via: "direct",
+    localPath: `D:/Movies/${name}`,
+    ...(quality ? { quality } : {}),
+  });
+
+  it("prioritizes local library files (even without a resolution tag) over 1080p online streams with history", () => {
+    const req = request("tmdb:movie:500");
+    // Give vidrock strong prior history (non-manual pick + playback).
+    recordPlayback(req, direct("vidrock"), true);
+    const localScored = score(
+      { ...localCand("Film.mkv"), probe: { ok: true, latencyMs: 5 } },
+      1080,
+      60,
+      req,
+    );
+    const onlineScored = score(
+      { ...direct("vidrock"), quality: 1080, probe: { ok: true, latencyMs: 40, quality: 1080 } },
+      1080,
+      24.5,
+      req,
+    );
+    expect(localScored.score!).toBeGreaterThan(onlineScored.score!);
+    expect(localScored.why).toContain("on this PC");
+  });
+
+  it("waits briefly for a slower local lookup and promotes local over an unplayed online auto-pick", async () => {
+    // Wait up to LOCAL_GRACE_MS (2.5s) before committing to an online stream.
+    const a = make(
+      [
+        provider("local", "local", () => sleep(600).then(() => [localCand()]), 60),
+        provider("vidrock", "external", [direct("vidrock")], 24.5),
+      ],
+      { local: { ms: 10 }, vidrock: { ms: 20, quality: 1080 } },
+    );
+    a.session.start(1);
+    await tick(250);
+    expect(a.session.getSnapshot().pick).toBeUndefined();
+    await tick(600);
+    expect(a.session.getSnapshot().pick?.providerId).toBe("local");
+
+    // If local arrives after LOCAL_GRACE_MS while the viewer hasn't started playing yet, promote it.
+    const b = make(
+      [
+        provider("local", "local", () => sleep(3000).then(() => [localCand()]), 60),
+        provider("vidrock", "external", [direct("vidrock")], 24.5),
+      ],
+      { local: { ms: 10 }, vidrock: { ms: 20, quality: 1080 } },
+    );
+    b.session.start(1);
+    await tick(2700);
+    expect(b.session.getSnapshot().pick?.providerId).toBe("vidrock");
+    await tick(500);
+    expect(b.session.getSnapshot().pick?.providerId).toBe("local");
+  });
+
+  it("does not spin up background embed captures when a local file is picked", async () => {
+    const { session, calls } = make(
+      [
+        provider("local", "local", [localCand()], 60),
+        provider("vidfast", "embed", [embed("vidfast")]),
+        provider("vidnest", "embed", [embed("vidnest")]),
+      ],
+      { local: { ms: 10 }, vidfast: { ms: 200 }, vidnest: { ms: 200 } },
+    );
+    session.start(1);
+    await tick(100);
+    expect(session.getSnapshot().pick?.providerId).toBe("local");
+    session.start(3);
+    await tick(10_000);
+    expect(calls).toEqual(["local"]);
+    expect(session.getSnapshot().waiting).toBe(2);
+  });
+
+  it("skips circuit-open external providers automatically while keeping local immune and retrying on checkAll", async () => {
+    for (let i = 0; i < CIRCUIT_STREAK_THRESHOLD; i++) recordLookupFailure("dead-ext", 5000);
+    for (let i = 0; i < 5; i++) recordLookupFailure("local", 500);
+    expect(isCircuitOpen("dead-ext")).toBe(true);
+    expect(isCircuitOpen("local")).toBe(false);
+
+    const deadFind = vi.fn(async () => [direct("dead-ext")]);
+    const deadProv: SourceProvider = {
+      id: "dead-ext",
+      name: "DeadExt",
+      category: "external",
+      priority: 22,
+      isEnabled: () => true,
+      find: deadFind,
+    };
+    const { session } = make([
+      deadProv,
+      provider("local", "local", [localCand()], 60),
+    ], { local: { ms: 10 }, "dead-ext": { ms: 10 } });
+    session.start(1);
+    await tick(100);
+    expect(deadFind).not.toHaveBeenCalled();
+    expect(session.getSnapshot().lanes.find((l) => l.providerId === "dead-ext")).toMatchObject({
+      status: "error",
+      error: "circuit open",
+    });
+    expect(session.getSnapshot().pick?.providerId).toBe("local");
+
+    session.checkAll();
+    await tick(100);
+    expect(deadFind).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips obviously inapplicable direct providers up front", async () => {
+    const hianimeFind = vi.fn(async () => [direct("hianime")]);
+    const vixsrcFind = vi.fn(async () => [direct("vixsrc")]);
+    const hianime: SourceProvider = {
+      id: "hianime",
+      name: "HiAnime",
+      category: "external",
+      priority: 26,
+      isEnabled: () => true,
+      find: hianimeFind,
+    };
+    const vixsrc: SourceProvider = {
+      id: "vixsrc",
+      name: "VixSrc",
+      category: "external",
+      priority: 23.5,
+      isEnabled: () => true,
+      find: vixsrcFind,
+    };
+
+    const movieCheck = checker({});
+    const sMovie = new SourceSession(request("tmdb:movie:1"), {
+      providers: [hianime, vixsrc],
+      settings: getSettings(),
+      probe: movieCheck.run,
+      capture: movieCheck.run,
+      confirm: async () => ({ ok: true }),
+    });
+    sMovie.start(1);
+    await tick(50);
+    expect(hianimeFind).not.toHaveBeenCalled();
+    expect(vixsrcFind).toHaveBeenCalledTimes(1);
+
+    hianimeFind.mockClear();
+    vixsrcFind.mockClear();
+    const dubCheck = checker({});
+    const sAnimeDub = new SourceSession(
+      { media: { key: "anilist:1", kind: "anime", title: "Anime", overview: "", genres: [] }, episode: 1, audio: "dub" },
+      {
+        providers: [hianime, vixsrc],
+        settings: getSettings(),
+        probe: dubCheck.run,
+        capture: dubCheck.run,
+        confirm: async () => ({ ok: true }),
+      },
+    );
+    sAnimeDub.start(1);
+    await tick(50);
+    expect(vixsrcFind).not.toHaveBeenCalled();
+    expect(hianimeFind).toHaveBeenCalledTimes(1);
+  });
+
+  it("deduplicates shared CDN URLs in readyCount and avoids token-expired backups in failover", async () => {
+    const pastSec = Math.floor((Date.now() - 60_000) / 1000);
+    const expiredCand: StreamCandidate = {
+      providerId: "stale-direct",
+      providerName: "stale-direct",
+      label: "stale-direct",
+      url: `https://cdn.example/video.m3u8?expires=${pastSec}`,
+      kind: "hls",
+      via: "direct",
+    };
+    const { session } = make(
+      [
+        provider("vidrock", "external", [direct("vidrock")], 25),
+        provider("stale-direct", "external", [expiredCand], 24),
+        provider("e1", "embed", [embed("e1")]),
+      ],
+      {
+        vidrock: { ms: 10 },
+        "stale-direct": { ms: 20 },
+        e1: { ms: 30, ok: false },
+      },
+    );
+    session.start(3);
+    await tick(500);
+    const pick = session.getSnapshot().pick!;
+    expect(pick.providerId).toBe("vidrock");
+
+    // Force failover when stale-direct has an expired token and e1 fails: failover skips expired and returns null.
+    session.report(candKey(pick), false, { error: "403" });
+    const failedOver = session.failover(candKey(pick));
+    await tick(500);
+    expect(await failedOver).toBeNull();
+
+    // Two captures resolving to the exact same CDN URL count as 1 unique stream in readyCount(),
+    // so start(2) continues searching and discovers a distinct 3rd backup instead of stopping early.
+    const dupSession = new SourceSession(request("tmdb:movie:99"), {
+      providers: [
+        provider("e1", "embed", [embed("e1")]),
+        provider("e2", "embed", [embed("e2")]),
+        provider("e3", "embed", [embed("e3")]),
+      ],
+      settings: getSettings(),
+      probe: async (c) => ({
+        ...c,
+        url: c.providerId === "e3" ? "https://cdn.example/distinct.m3u8" : "https://cdn.example/identical.m3u8",
+        kind: "hls",
+        via: "sniffed",
+        probe: { ok: true, latencyMs: 10 },
+      }),
+      capture: async (c) => ({
+        ...c,
+        url: c.providerId === "e3" ? "https://cdn.example/distinct.m3u8" : "https://cdn.example/identical.m3u8",
+        kind: "hls",
+        via: "sniffed",
+        probe: { ok: true, latencyMs: 10 },
+      }),
+      confirm: async () => ({ ok: true }),
+    });
+    dupSession.start(2);
+    await tick(6000);
+    const firstPick = dupSession.getSnapshot().pick!;
+    const failoverProm = dupSession.failover(candKey(firstPick));
+    await tick(500);
+    expect((await failoverProm)?.providerId).toBe("e3");
+  });
+});
+

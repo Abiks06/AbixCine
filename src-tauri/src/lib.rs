@@ -1,4 +1,6 @@
 use serde::Serialize;
+mod diagnostics;
+mod gateway;
 mod shield;
 mod stream;
 mod torrent;
@@ -10,7 +12,28 @@ use tauri::Manager;
 
 static LIBRARY_ROOTS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
 static MEDIA_PREPARE_LOCK: Mutex<()> = Mutex::new(());
-static MEDIA_TOOL_SPAWNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ACTIVE_MEDIA_PIDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+
+fn active_media_pids() -> &'static Mutex<HashSet<u32>> {
+    ACTIVE_MEDIA_PIDS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+struct ActivePidGuard(u32);
+
+impl ActivePidGuard {
+    fn new(pid: u32) -> Self {
+        let mut set = active_media_pids().lock().unwrap_or_else(|e| e.into_inner());
+        set.insert(pid);
+        Self(pid)
+    }
+}
+
+impl Drop for ActivePidGuard {
+    fn drop(&mut self) {
+        let mut set = active_media_pids().lock().unwrap_or_else(|e| e.into_inner());
+        set.remove(&self.0);
+    }
+}
 
 #[derive(Serialize)]
 struct LibFile {
@@ -391,7 +414,6 @@ fn ffprobe_tool(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 }
 
 fn background_command(program: &Path) -> std::process::Command {
-    MEDIA_TOOL_SPAWNED.store(true, std::sync::atomic::Ordering::Relaxed);
     let mut cmd = std::process::Command::new(program);
     #[cfg(windows)]
     {
@@ -400,6 +422,17 @@ fn background_command(program: &Path) -> std::process::Command {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     cmd
+}
+
+fn run_background_output(cmd: &mut std::process::Command) -> std::io::Result<std::process::Output> {
+    use std::process::Stdio;
+    let child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let _guard = ActivePidGuard::new(child.id());
+    child.wait_with_output()
 }
 
 fn ensure_in_allowed_roots(path: &Path, allowed_roots: &[PathBuf]) -> Result<PathBuf, String> {
@@ -953,6 +986,18 @@ mod local_media_tests {
         assert_eq!(got_big.len(), 16);
         assert_eq!(got_big, format!("{expected_big:016x}"));
     }
+
+    #[test]
+    fn active_pid_guard_registers_and_cleans_up_on_drop() {
+        const TEST_PID: u32 = 0xFFFF_FFFE;
+        {
+            let _guard = ActivePidGuard::new(TEST_PID);
+            let set = active_media_pids().lock().unwrap_or_else(|e| e.into_inner());
+            assert!(set.contains(&TEST_PID));
+        }
+        let set = active_media_pids().lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!set.contains(&TEST_PID));
+    }
 }
 
 /// The codec of the `n`-th audio stream (audio-relative, as in `-map 0:a:n`).
@@ -1002,10 +1047,11 @@ fn prepare_local_media_file(
         return Err("The requested file is not a supported local video".into());
     }
 
-    let probe = background_command(&ffprobe)
+    let mut probe_cmd = background_command(&ffprobe);
+    probe_cmd
         .args(["-v", "error", "-show_entries", "stream=index,codec_type,codec_name,channels", "-of", "json"])
-        .arg(&canonical)
-        .output()
+        .arg(&canonical);
+    let probe = run_background_output(&mut probe_cmd)
         .map_err(|e| format!("Could not inspect local media: {e}"))?;
     if !probe.status.success() {
         return Err(format!("Could not inspect local media: {}", String::from_utf8_lossy(&probe.stderr)));
@@ -1089,10 +1135,10 @@ fn prepare_local_media_file(
     if !subtitle_indices.is_empty() {
         command.args(["-c:s", "mov_text"]);
     }
-    let result = command
+    command
         .args(["-movflags", "+faststart", "-f", "mp4"])
-        .arg(&partial)
-        .output()
+        .arg(&partial);
+    let result = run_background_output(&mut command)
         .map_err(|e| format!("Could not convert local audio: {e}"))?;
     if !result.status.success() || !partial.metadata().map(|m| m.len() > 0).unwrap_or(false) {
         let _ = std::fs::remove_file(&partial);
@@ -1126,7 +1172,8 @@ async fn probe_local_audio(app: tauri::AppHandle, path: String) -> Result<Vec<Lo
     let ffprobe = ffprobe_tool(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
         let canonical = ensure_in_library_roots(&path)?;
-        let out = background_command(&ffprobe)
+        let mut out_cmd = background_command(&ffprobe);
+        out_cmd
             .args([
                 "-v",
                 "error",
@@ -1137,8 +1184,8 @@ async fn probe_local_audio(app: tauri::AppHandle, path: String) -> Result<Vec<Lo
                 "-of",
                 "json",
             ])
-            .arg(&canonical)
-            .output()
+            .arg(&canonical);
+        let out = run_background_output(&mut out_cmd)
             .map_err(|e| format!("Could not inspect local audio: {e}"))?;
         if !out.status.success() {
             return Err(format!("Could not inspect local audio: {}", String::from_utf8_lossy(&out.stderr)));
@@ -1271,10 +1318,11 @@ fn parse_ffprobe_subtitles(probe: &serde_json::Value) -> Vec<EmbeddedSubtitle> {
 }
 
 fn probe_subtitles_sync(canonical: &Path, ffprobe: &Path) -> Result<Vec<EmbeddedSubtitle>, String> {
-    let out = background_command(ffprobe)
+    let mut out_cmd = background_command(ffprobe);
+    out_cmd
         .args(["-v", "quiet", "-print_format", "json", "-show_streams", "-select_streams", "s"])
-        .arg(canonical)
-        .output()
+        .arg(canonical);
+    let out = run_background_output(&mut out_cmd)
         .map_err(|e| format!("Could not probe local subtitles: {e}"))?;
     if !out.status.success() {
         let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
@@ -1377,14 +1425,15 @@ fn extract_local_subtitle_sync(
     let partial = cache_dir.join(format!("{hash:016x}.partial.{}.{seq}.{format}", std::process::id()));
     let _ = std::fs::remove_file(&partial);
 
-    let result = background_command(ffmpeg)
+    let mut sub_cmd = background_command(ffmpeg);
+    sub_cmd
         .args(["-hide_banner", "-nostdin", "-y", "-v", "error", "-i"])
         .arg(canonical)
         .arg("-map")
         .arg(format!("0:{stream_index}"))
         .args(["-c:s", ffmpeg_codec])
-        .arg(&partial)
-        .output()
+        .arg(&partial);
+    let result = run_background_output(&mut sub_cmd)
         .map_err(|e| format!("Could not extract subtitle: {e}"))?;
 
     if !result.status.success() || !partial.metadata().map(|m| m.len() > 0).unwrap_or(false) {
@@ -1591,15 +1640,26 @@ pub(crate) fn debug_env_string(name: &str) -> Result<String, std::env::VarError>
 
 fn cleanup_before_exit(app: &tauri::AppHandle) {
     shield::close_all_sniff_windows(app);
+    let pids: Vec<u32> = {
+        let mut set = active_media_pids().lock().unwrap_or_else(|e| e.into_inner());
+        set.drain().collect()
+    };
     #[cfg(windows)]
-    if MEDIA_TOOL_SPAWNED.swap(false, std::sync::atomic::Ordering::Relaxed) {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let _ = std::process::Command::new("taskkill")
-            .args(["/F", "/IM", "ffmpeg.exe", "/IM", "ffprobe.exe"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .status();
+    if !pids.is_empty() {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+        for pid in pids {
+            // Terminate only PIDs spawned by AbixCine rather than invoking `taskkill /F /IM`.
+            unsafe {
+                if let Ok(handle) = OpenProcess(PROCESS_TERMINATE, false, pid) {
+                    let _ = TerminateProcess(handle, 1);
+                    let _ = CloseHandle(handle);
+                }
+            }
+        }
     }
+    #[cfg(not(windows))]
+    let _ = pids;
 }
 
 #[tauri::command]
@@ -1609,6 +1669,19 @@ fn prepare_for_update_exit(app: tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Before anything else: panic hook, startup.log, safe-graphics decision (see diagnostics.rs).
+    let startup = diagnostics::init();
+    #[cfg(windows)]
+    diagnostics::require_webview();
+    let mut context = tauri::generate_context!();
+    // One argument string for every webview (WebView2 shares a browser per data folder); in safe
+    // graphics mode it also turns GPU compositing off.
+    for w in context.config_mut().app.windows.iter_mut() {
+        w.additional_browser_args = Some(diagnostics::browser_args().to_string());
+    }
+    if startup.safe_mode {
+        diagnostics::log(format!("webview args: {}", diagnostics::browser_args()));
+    }
     let mut builder = tauri::Builder::default();
     // A second launch (e.g. from the Start menu while it's open) focuses the existing window.
     // The debug sniff harness runs alongside an installed copy, so it skips this.
@@ -1623,7 +1696,7 @@ pub fn run() {
             }
         }));
     }
-    builder
+    let result = builder
         .on_window_event(|window, event| {
             if window.label() == "main"
                 && matches!(
@@ -1657,6 +1730,9 @@ pub fn run() {
             tauri::async_runtime::spawn(async move { responder.respond(stream::handle(req).await) });
         })
         .setup(|app| {
+            diagnostics::log("setup");
+            // Zero-copy loopback transport for proxied streams (gateway.rs); abxs: stays as fallback.
+            gateway::start();
             if let Ok(cache) = app.path().app_cache_dir() {
                 std::thread::spawn(move || sweep_partials(&cache.join("local-media")));
             }
@@ -1779,8 +1855,20 @@ pub fn run() {
             torrent::torrent_start_stream,
             torrent::torrent_status,
             torrent::torrent_stop,
-            prepare_for_update_exit
+            prepare_for_update_exit,
+            diagnostics::app_ready,
+            gateway::stream_gateway,
+            diagnostics::reset_safe_mode,
+            diagnostics::log_frontend_error
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running AbixCine");
+        .run(context);
+    if let Err(e) = result {
+        diagnostics::fatal(
+            "AbixCine couldn't start",
+            &format!(
+                "The app window could not be created ({e}).\n\nIf this keeps happening, start AbixCine with \
+                 --safe-mode, or update your graphics driver and the Microsoft Edge WebView2 Runtime."
+            ),
+        );
+    }
 }

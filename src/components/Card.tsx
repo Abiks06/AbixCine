@@ -1,10 +1,11 @@
 import { memo, type MouseEvent, type ReactNode } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { encodeKey, getDetail } from "../lib/catalog";
+import { encodeKey, getDetail, isUnreleasedMedia } from "../lib/catalog";
 import { previewLight } from "../lib/light";
 import { playHref } from "../lib/play";
 import type { Move } from "../lib/ranks";
 import { toggleList, useSaved } from "../lib/watchlist";
+import { burst } from "../lib/burst";
 import type { Media } from "../lib/types";
 import { Art } from "./Art";
 import { Icon } from "./Icon";
@@ -53,6 +54,8 @@ interface Props {
   label?: string;
   progress?: number;
   to?: string;
+  /** Optional direct navigation target for a secondary info button (e.g. Continue watching cards). */
+  infoTo?: string;
   /** Shows a dismiss button on the artwork (Continue watching). */
   onRemove?: () => void;
   removeLabel?: string;
@@ -95,10 +98,11 @@ function warm(key: string) {
 }
 
 /** Memoised: a shelf of cards shouldn't re-render because the hero above it changed slide. */
-export const Card = memo(function Card({ media, index = 0, variant = "landscape", rank, move, extra, sub, right, label, progress, to, onRemove, removeLabel, onOpen }: Props) {
+export const Card = memo(function Card({ media, index = 0, variant = "landscape", rank, move, extra, sub, right, label, progress, to, infoTo, onRemove, removeLabel, onOpen }: Props) {
   const saved = useSaved(media.key);
   const nav = useNavigate();
   const port = variant !== "landscape";
+  const unreleased = isUnreleasedMedia(media);
   const peek = () => {
     previewLight(media);
     warm(media.key);
@@ -140,7 +144,11 @@ export const Card = memo(function Card({ media, index = 0, variant = "landscape"
               <>
                 <span className="badge">{kindLabel(media.kind, media.format)}</span>
                 {media.year}
-                {media.kind === "anime" && <span className="badge dim">Sub · Dub</span>}
+                {unreleased ? (
+                  <span className="badge dim">Coming soon</span>
+                ) : (
+                  media.kind === "anime" && <span className="badge dim">Sub · Dub</span>
+                )}
               </>
             )}
             {!port && aside}
@@ -153,7 +161,7 @@ export const Card = memo(function Card({ media, index = 0, variant = "landscape"
           <button className="act dismiss" aria-label={removeLabel ?? "Remove"} title={removeLabel ?? "Remove"} onClick={onRemove}>
             <Icon name="x" size={14} />
           </button>
-        ) : (
+        ) : !unreleased ? (
           <button
             className="act play"
             aria-label={`Play ${media.title}`}
@@ -165,8 +173,21 @@ export const Card = memo(function Card({ media, index = 0, variant = "landscape"
           >
             <Icon name="play" size={13} />
           </button>
+        ) : null}
+        {infoTo && (
+          <button
+            className="act info"
+            aria-label={`Details for ${media.title}`}
+            title="Title details"
+            onClick={() => {
+              onOpen?.();
+              nav(infoTo, { viewTransition: true, state: seedState(media) });
+            }}
+          >
+            <Icon name="info" size={14} />
+          </button>
         )}
-        <button className={`act save ${saved ? "on" : ""}`} aria-label={saved ? "Remove from My List" : "Add to My List"} title={saved ? "In My List" : "Add to My List"} aria-pressed={saved} onClick={() => toggleList(media)}>
+        <button className={`act save ${saved ? "on" : ""}`} aria-label={saved ? "Remove from My List" : "Add to My List"} title={saved ? "In My List" : "Add to My List"} aria-pressed={saved} onClick={(e) => { if (!saved) burst(e.currentTarget); toggleList(media); }}>
           <Icon name={saved ? "check" : "plus"} size={15} />
         </button>
       </div>

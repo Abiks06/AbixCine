@@ -80,9 +80,15 @@ export function normalizeHeaders(headers: StreamHeaders = {}, fallbackPageUrl?: 
   };
 }
 
-/** Extract the raw target URL and headers if `url` is wrapped in the local `abxs` stream proxy. */
+/**
+ * Any form of the local stream proxy: the `abxs:` custom protocol, or the loopback streaming
+ * gateway (`http://127.0.0.1:<port>/<token>/p?…`, see src-tauri/src/gateway.rs).
+ */
+export const PROXY_URL_RX = /^(?:https?:\/\/abxs\.localhost|abxs:\/\/localhost|http:\/\/127\.0\.0\.1:\d+\/[0-9a-f]{32})\/p\?/i;
+
+/** Extract the raw target URL and headers if `url` is wrapped in the local stream proxy. */
 export function unwrapProxyUrl(url: string): { url: string; headers: StreamHeaders; proxied: boolean } {
-  if (/^(?:http:\/\/abxs\.localhost|abxs:\/\/localhost)\/p\?/i.test(url)) {
+  if (PROXY_URL_RX.test(url)) {
     try {
       const qs = new URL(url.replace(/^abxs:\/\//i, "http://")).searchParams;
       const rawU = qs.get("u");
@@ -104,6 +110,56 @@ export function proxyUrl(url: string, headers: StreamHeaders = {}, fallbackPageU
   const h = Object.fromEntries(Object.entries(merged).filter(([, v]) => v));
   return `${PROXY_BASE}/p?u=${b64(unwrapped.url)}&h=${b64(JSON.stringify(h))}`;
 }
+
+/* --------------------------------------------------------- streaming gateway */
+
+const ABXS_PREFIX_RX = /^(?:https?:\/\/abxs\.localhost|abxs:\/\/localhost)(?=\/p\?)/i;
+let gatewayBase: string | null = null;
+let gatewayInit: Promise<void> | null = null;
+
+/**
+ * Find the loopback streaming gateway and check this webview can actually reach it (a policy
+ * or firewall could block loopback); without it, playback stays on `abxs:`.
+ */
+export function initStreamGateway(): Promise<void> {
+  if (!native) return Promise.resolve();
+  gatewayInit ??= (async () => {
+    try {
+      const base = await invoke<string | null>("stream_gateway");
+      if (!base) return;
+      const ctl = new AbortController();
+      const t = setTimeout(() => ctl.abort(), 2000);
+      try {
+        const r = await fetch(`${base}/ping`, { signal: ctl.signal, cache: "no-store" });
+        if (r.ok) gatewayBase = base;
+      } finally {
+        clearTimeout(t);
+      }
+    } catch {
+      gatewayBase = null;
+    }
+  })();
+  return gatewayInit;
+}
+
+/** Stop using the gateway for the rest of this launch (e.g. after it failed mid-playback). */
+export function disableStreamGateway() {
+  gatewayBase = null;
+}
+
+export const streamGatewayActive = () => gatewayBase != null;
+
+/**
+ * The URL to hand the media element / hls.js / shaka. Candidates keep their canonical `abxs:`
+ * URL (keys, health memory and caches depend on it); only the player's actual load goes through
+ * the gateway, which streams bodies instead of buffering each one whole.
+ */
+export function playbackUrl(url: string): string {
+  if (!gatewayBase) return url;
+  return url.replace(ABXS_PREFIX_RX, gatewayBase);
+}
+
+if (native) void initStreamGateway();
 
 const EXP_PARAM_NAMES = new Set(["exp", "expires", "e", "token_exp", "validto", "endtime", "etime", "until"]);
 

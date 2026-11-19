@@ -106,15 +106,110 @@ function isShortOrSpecialNode(node: RawAnilistNode, rootFormat?: string | null):
   return false;
 }
 
+/** Local calendar date (`YYYY-MM-DD`) so release comparisons match the viewer's clock. */
+export function todayIso(now = new Date()): string {
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, "0");
+  const d = String(now.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+/** Whether an ISO date (`YYYY-MM-DD...`) is strictly after today. */
+export function isFutureIsoDate(dateStr?: string | null, now = new Date()): boolean {
+  if (!dateStr || typeof dateStr !== "string") return false;
+  const trimmed = dateStr.trim();
+  if (!/^\d{4}-\d{2}-\d{2}/.test(trimmed)) return false;
+  return trimmed.slice(0, 10) > todayIso(now);
+}
+
+export const UNRELEASED_STATUS_RX = /^(?:not_yet_released|rumored|planned|in production|post production)$/i;
+
+/** Whether a film or entry has not been released yet based on its status or release date. */
+export function isUnreleasedMedia(
+  m?: Pick<Media, "releaseDate" | "status"> | null,
+  now = new Date(),
+): boolean {
+  if (!m) return false;
+  if (m.status && UNRELEASED_STATUS_RX.test(m.status.trim())) return true;
+  return isFutureIsoDate(m.releaseDate, now);
+}
+
+/** How long a film with no announced digital date is assumed to still be theatre-only. */
+export const THEATRICAL_WINDOW_DAYS = 45;
+
+/** TMDB `release_dates` rows → earliest theatrical (types 1–3) and digital/physical/TV (4–6) dates. */
+export function tmdbReleaseWindows(
+  results?: { iso_3166_1?: string; release_dates?: { type?: number; release_date?: string }[] }[] | null,
+): { theatrical?: string; digital?: string } {
+  const theatrical: string[] = [];
+  const digital: string[] = [];
+  for (const country of results ?? []) {
+    for (const r of country.release_dates ?? []) {
+      const date = typeof r.release_date === "string" ? r.release_date.slice(0, 10) : "";
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || typeof r.type !== "number") continue;
+      if (r.type >= 1 && r.type <= 3) theatrical.push(date);
+      else if (r.type >= 4 && r.type <= 6) digital.push(date);
+    }
+  }
+  return { theatrical: theatrical.sort()[0], digital: digital.sort()[0] };
+}
+
+/**
+ * A film that is out in cinemas but not yet on digital / disc / TV anywhere, so streaming
+ * servers almost never carry it. Known future digital date → yes. No digital date at all →
+ * only while the premiere is within {@link THEATRICAL_WINDOW_DAYS} (older films often lack the
+ * data and are long available). Catalogs without release types (AniList) are never flagged.
+ */
+export function isTheatricalOnly(
+  m?: Pick<MediaDetail, "kind" | "format" | "releaseDate" | "status" | "theatricalReleaseDate" | "digitalReleaseDate"> | null,
+  now = new Date(),
+): boolean {
+  if (!m || !isFilm(m) || isUnreleasedMedia(m, now)) return false;
+  if (m.digitalReleaseDate) return isFutureIsoDate(m.digitalReleaseDate, now);
+  const premiere = m.theatricalReleaseDate;
+  if (!premiere) return false;
+  if (isFutureIsoDate(premiere, now)) return false;
+  const cutoff = todayIso(new Date(now.getTime() - THEATRICAL_WINDOW_DAYS * 86400_000));
+  return premiere.slice(0, 10) > cutoff;
+}
+
+/** Whether a specific episode has not aired yet (future air date or past the aired episode count). */
+export function isUnairedEpisode(
+  ep?: Pick<Episode, "airDate" | "number"> | null,
+  opts?: { airedCount?: number; seriesStatus?: string; now?: Date },
+): boolean {
+  if (!ep) return false;
+  if (isFutureIsoDate(ep.airDate, opts?.now)) return true;
+  if (typeof opts?.airedCount === "number" && opts.airedCount >= 0 && ep.number > opts.airedCount) {
+    return true;
+  }
+  return false;
+}
+
 /** Calculate how many episodes have aired or are available for an AniList entry. */
-export function resolveAnilistEpisodeCount(node: RawAnilistNode): number {
+export function resolveAnilistEpisodeCount(node: RawAnilistNode, now = new Date()): number {
   const status = node.status ?? "";
   if (status === "NOT_YET_RELEASED") return 0;
   if (node.nextAiringEpisode && typeof node.nextAiringEpisode.episode === "number") {
-    const aired = Math.max(0, node.nextAiringEpisode.episode - 1);
-    // For currently airing shows, use the total planned episodes if known and > 0, or aired count if total is unknown.
-    if (typeof node.episodes === "number" && node.episodes > 0) return node.episodes;
+    let aired = Math.max(0, node.nextAiringEpisode.episode - 1);
+    if (
+      typeof node.nextAiringEpisode.airingAt === "number" &&
+      node.nextAiringEpisode.airingAt * 1000 <= now.getTime()
+    ) {
+      aired = Math.max(aired, node.nextAiringEpisode.episode);
+    }
+    if (typeof node.episodes === "number" && node.episodes > 0) {
+      return Math.min(aired, node.episodes);
+    }
     return aired;
+  }
+  if (status === "RELEASING" && node.startDate?.year) {
+    const startYear = node.startDate.year;
+    if (startYear > now.getFullYear()) return 0;
+    if (node.startDate.month && node.startDate.day) {
+      const iso = `${startYear}-${String(node.startDate.month).padStart(2, "0")}-${String(node.startDate.day).padStart(2, "0")}`;
+      if (isFutureIsoDate(iso, now)) return 0;
+    }
   }
   if (typeof node.episodes === "number" && node.episodes > 0) return node.episodes;
   return 0;
@@ -128,14 +223,22 @@ function nodeSortKey(m: RawAnilistNode): number {
   return y * 10000 + mo * 100 + d;
 }
 
+export interface NormalizeTmdbSeasonsOptions {
+  lastEpisode?: { season: number; episode: number; airDate?: string };
+  nextEpisode?: { season: number; episode: number; airDate?: string };
+  status?: string;
+  now?: Date;
+}
+
 /**
  * Normalize TMDB `seasons` array into playable `seasons`, `specials` (`Season 0`), and
- * `upcomingSeasons` (0-episode / unaired TBA entries).
+ * `upcomingSeasons` (0-episode / future / unaired entries).
  */
 export function normalizeTmdbSeasons(
   rawSeasons: RawTmdbSeason[] | undefined | null,
   seriesKey?: string,
   tmdbId?: number,
+  opts?: NormalizeTmdbSeasonsOptions,
 ): ReconciledSeasons {
   const seasons: CanonicalSeason[] = [];
   const specials: CanonicalSeason[] = [];
@@ -145,7 +248,8 @@ export function normalizeTmdbSeasons(
     return { seasons, specials, upcomingSeasons };
   }
 
-  const nowIso = new Date().toISOString().slice(0, 10);
+  const now = opts?.now;
+  const nowIso = todayIso(now);
 
   for (const s of rawSeasons) {
     if (!s || typeof s.season_number !== "number" || !Number.isInteger(s.season_number) || s.season_number < 0) {
@@ -160,7 +264,7 @@ export function normalizeTmdbSeasons(
     const name = (s.name && s.name.trim()) || (num === 0 ? "Specials" : `Season ${num}`);
 
     if (num === 0) {
-      if (epCount > 0) {
+      if (epCount > 0 && !isFutureIsoDate(airDate, now)) {
         specials.push({
           number: 0,
           name: name || "Specials",
@@ -174,12 +278,25 @@ export function normalizeTmdbSeasons(
       continue;
     }
 
-    // Exclude seasons with 0 episodes or strictly future air dates when no episodes exist yet.
-    if (epCount <= 0) {
+    const futureAir = !!airDate && airDate.slice(0, 10) > nowIso;
+    const unreleasedShow = !!opts?.status && UNRELEASED_STATUS_RX.test(opts.status.trim()) && !opts.lastEpisode;
+    const nextPremiered =
+      opts?.nextEpisode?.season === num &&
+      !!opts.nextEpisode.airDate &&
+      !isFutureIsoDate(opts.nextEpisode.airDate, now);
+    const pastLastSeason =
+      !!opts?.lastEpisode &&
+      num > opts.lastEpisode.season &&
+      (!airDate || futureAir) &&
+      !nextPremiered;
+
+    // Exclude seasons with 0 episodes or strictly future / unaired premiere dates.
+    if (epCount <= 0 || futureAir || unreleasedShow || pastLastSeason) {
       upcomingSeasons.push({
         number: num,
         name,
         episodeCount: 0,
+        ...(epCount > 0 ? { plannedEpisodeCount: epCount } : {}),
         year,
         airDate,
         status: "upcoming",
@@ -188,15 +305,49 @@ export function normalizeTmdbSeasons(
       continue;
     }
 
-    const isUpcoming = !!airDate && airDate > nowIso;
-    const mapped = tmdbId ? getTmdbSeasonMappingSync(tmdbId, num, epCount) : undefined;
+    let airedCount = epCount;
+    let isAiring = false;
+    if (opts?.nextEpisode && opts.nextEpisode.season === num) {
+      isAiring = true;
+      const nextUnaired = !opts.nextEpisode.airDate || isFutureIsoDate(opts.nextEpisode.airDate, now);
+      if (nextUnaired) {
+        airedCount = Math.min(epCount, Math.max(0, opts.nextEpisode.episode - 1));
+      }
+    } else if (
+      opts?.lastEpisode &&
+      opts.lastEpisode.season === num &&
+      opts.lastEpisode.episode > 0 &&
+      opts.lastEpisode.episode < epCount &&
+      opts.status &&
+      /returning|production|planned/i.test(opts.status)
+    ) {
+      isAiring = true;
+      airedCount = opts.lastEpisode.episode;
+    }
+
+    if (airedCount <= 0) {
+      upcomingSeasons.push({
+        number: num,
+        name,
+        episodeCount: 0,
+        plannedEpisodeCount: epCount,
+        year,
+        airDate,
+        status: "upcoming",
+        key: seriesKey,
+      });
+      continue;
+    }
+
+    const mapped = tmdbId ? getTmdbSeasonMappingSync(tmdbId, num, airedCount) : undefined;
     seasons.push({
       number: num,
       name,
-      episodeCount: epCount,
+      episodeCount: airedCount,
+      ...(airedCount < epCount ? { plannedEpisodeCount: epCount } : {}),
       year,
       airDate,
-      status: isUpcoming ? "upcoming" : "aired",
+      status: isAiring ? "airing" : "aired",
       key: seriesKey,
       ...(mapped?.anilistId ? { anilistId: mapped.anilistId } : {}),
       ...(mapped?.malId ? { malId: mapped.malId } : {}),
@@ -595,8 +746,10 @@ export function clampSeason(
   requestedSeason?: number | null,
 ): CanonicalSeason | undefined {
   if (!detail) return undefined;
-  const playableSeasons = (detail.seasons ?? []).filter((s) => s.number > 0 && s.episodeCount > 0);
-  const playableSpecials = (detail.specials ?? []).filter((s) => s.episodeCount > 0);
+  const playableSeasons = (detail.seasons ?? []).filter(
+    (s) => s.number > 0 && s.episodeCount > 0 && s.status !== "upcoming",
+  );
+  const playableSpecials = (detail.specials ?? []).filter((s) => s.episodeCount > 0 && s.status !== "upcoming");
 
   if (requestedSeason === 0 && playableSpecials.length > 0) {
     return playableSpecials[0];
@@ -639,6 +792,111 @@ export function clampEpisode(
   return Math.max(1, Math.min(max, intEp));
 }
 
+export type UnavailableReason =
+  | "unreleased_film"
+  | "unreleased_series"
+  | "unaired_season"
+  | "unaired_episode"
+  | "missing_episode";
+
+export type EpisodeAvailability =
+  | { playable: true }
+  | { playable: false; reason: UnavailableReason; airDate?: string; label?: string };
+
+/**
+ * Determine whether a title (or an explicit season/episode request) is actually released/aired
+ * before the app mounts `<SmartSource>` or launches a server search.
+ */
+export function checkEpisodeAvailability(
+  detail: MediaDetail,
+  requestedSeason?: number | null,
+  requestedEpisode?: number | null,
+  now = new Date(),
+): EpisodeAvailability {
+  if (!detail) return { playable: false, reason: "missing_episode" };
+  if (isFilm(detail)) {
+    if (isUnreleasedMedia(detail, now)) {
+      return { playable: false, reason: "unreleased_film", airDate: detail.releaseDate };
+    }
+    return { playable: true };
+  }
+
+  const playableSeasons = [...(detail.seasons ?? []), ...(detail.specials ?? [])].filter(
+    (s) => s.episodeCount > 0 && s.status !== "upcoming",
+  );
+  const hasStandaloneEps =
+    typeof detail.episodeCount === "number" &&
+    detail.episodeCount > 0 &&
+    !(detail.status && UNRELEASED_STATUS_RX.test(detail.status.trim()));
+  if (playableSeasons.length === 0 && !hasStandaloneEps) {
+    return {
+      playable: false,
+      reason: "unreleased_series",
+      airDate: detail.releaseDate ?? detail.upcomingSeasons?.[0]?.airDate,
+    };
+  }
+
+  let targetSeason: CanonicalSeason | undefined;
+  if (requestedSeason != null && Number.isInteger(requestedSeason)) {
+    targetSeason = playableSeasons.find((s) => s.number === requestedSeason);
+    if (!targetSeason) {
+      if (playableSeasons.length > 0) {
+        const up = detail.upcomingSeasons?.find((u) => u.number === requestedSeason);
+        if (up) {
+          return { playable: false, reason: "unaired_season", airDate: up.airDate, label: up.name };
+        }
+        return { playable: false, reason: "missing_episode" };
+      }
+      if (requestedSeason !== 1) {
+        return { playable: false, reason: "missing_episode" };
+      }
+    }
+  } else {
+    targetSeason = clampSeason(detail, requestedSeason);
+  }
+
+  if (requestedEpisode != null && Number.isFinite(requestedEpisode)) {
+    const intEp = Math.floor(requestedEpisode);
+    if (intEp < 1) return { playable: false, reason: "missing_episode" };
+    let effectiveEp = intEp;
+    if (requestedSeason == null && targetSeason?.cours && targetSeason.cours.length > 1) {
+      const matchedCour = targetSeason.cours.find((c) => c.key === detail.key);
+      if (matchedCour && matchedCour.startEpisode > 1 && intEp <= matchedCour.episodeCount) {
+        effectiveEp = matchedCour.startEpisode + intEp - 1;
+      }
+    }
+
+    const maxEps = targetSeason?.episodeCount ?? detail.episodeCount ?? 0;
+    const nextAiringUnaired =
+      detail.nextAiring && detail.nextAiring.at > now.getTime() && effectiveEp >= detail.nextAiring.episode;
+    if ((maxEps > 0 && effectiveEp > maxEps) || nextAiringUnaired) {
+      if (
+        detail.nextEpisode &&
+        (targetSeason == null || detail.nextEpisode.season === targetSeason.number) &&
+        detail.nextEpisode.episode === effectiveEp
+      ) {
+        return { playable: false, reason: "unaired_episode", airDate: detail.nextEpisode.airDate };
+      }
+      if (detail.nextAiring && effectiveEp >= detail.nextAiring.episode) {
+        return {
+          playable: false,
+          reason: "unaired_episode",
+          airDate:
+            effectiveEp === detail.nextAiring.episode
+              ? new Date(detail.nextAiring.at).toISOString()
+              : undefined,
+        };
+      }
+      if (targetSeason?.plannedEpisodeCount && effectiveEp <= targetSeason.plannedEpisodeCount) {
+        return { playable: false, reason: "unaired_episode" };
+      }
+      return { playable: false, reason: "missing_episode" };
+    }
+  }
+
+  return { playable: true };
+}
+
 /**
  * Resolve a canonical `(detail, season, episode, audio)` tuple into a `PlaybackRequest`
  * that maps multi-cour/multi-season anime to the exact underlying cour's AniList/MAL ID
@@ -649,10 +907,12 @@ export function resolvePlaybackRequest(
   requestedSeason?: number | null,
   requestedEpisode?: number | null,
   audio?: "sub" | "dub",
+  now = new Date(),
 ): PlaybackRequest | null {
   if (!detail) return null;
 
   if (isFilm(detail)) {
+    if (isUnreleasedMedia(detail, now)) return null;
     return { media: detail, audio };
   }
 
@@ -784,15 +1044,29 @@ export function resolveNextEpisode(
   currentSeason?: number | null,
   currentEpisode?: number | null,
   audio?: "sub" | "dub",
+  now = new Date(),
 ): NextEpisodeTarget | null {
   if (!detail || isFilm(detail) || currentEpisode == null) return null;
 
-  const allSeasons = [...(detail.seasons ?? []), ...(detail.specials ?? [])].filter((s) => s.episodeCount > 0);
+  const allSeasons = [...(detail.seasons ?? []), ...(detail.specials ?? [])].filter(
+    (s) => s.episodeCount > 0 && s.status !== "upcoming",
+  );
   if (allSeasons.length > 0 && currentSeason != null) {
     const cur = allSeasons.find((s) => s.number === currentSeason);
     if (cur && currentEpisode < cur.episodeCount) {
       const nextEp = currentEpisode + 1;
-      const req = resolvePlaybackRequest(detail, currentSeason, nextEp, audio);
+      if (detail.nextAiring && detail.nextAiring.at > now.getTime() && nextEp >= detail.nextAiring.episode) {
+        return null;
+      }
+      if (
+        detail.nextEpisode &&
+        detail.nextEpisode.season === currentSeason &&
+        nextEp >= detail.nextEpisode.episode &&
+        (!detail.nextEpisode.airDate || isFutureIsoDate(detail.nextEpisode.airDate, now))
+      ) {
+        return null;
+      }
+      const req = resolvePlaybackRequest(detail, currentSeason, nextEp, audio, now);
       const prefix = currentSeason === 0 ? "Specials" : `Season ${currentSeason}`;
       return {
         s: currentSeason,
@@ -805,10 +1079,11 @@ export function resolveNextEpisode(
     }
     if (currentSeason > 0) {
       const nextSeason = (detail.seasons ?? [])
-        .filter((s) => s.number > currentSeason && s.episodeCount > 0)
+        .filter((s) => s.number > currentSeason && s.episodeCount > 0 && s.status !== "upcoming")
         .sort((a, b) => a.number - b.number)[0];
       if (nextSeason) {
-        const req = resolvePlaybackRequest(detail, nextSeason.number, 1, audio);
+        if (isFutureIsoDate(nextSeason.airDate, now)) return null;
+        const req = resolvePlaybackRequest(detail, nextSeason.number, 1, audio, now);
         return {
           s: nextSeason.number,
           e: 1,
@@ -824,6 +1099,17 @@ export function resolveNextEpisode(
 
   if (detail.episodeCount && currentEpisode < detail.episodeCount) {
     const nextEp = currentEpisode + 1;
+    if (detail.nextAiring && detail.nextAiring.at > now.getTime() && nextEp >= detail.nextAiring.episode) {
+      return null;
+    }
+    if (
+      detail.nextEpisode &&
+      (currentSeason == null || detail.nextEpisode.season === currentSeason) &&
+      nextEp >= detail.nextEpisode.episode &&
+      (!detail.nextEpisode.airDate || isFutureIsoDate(detail.nextEpisode.airDate, now))
+    ) {
+      return null;
+    }
     return {
       s: undefined,
       e: nextEp,

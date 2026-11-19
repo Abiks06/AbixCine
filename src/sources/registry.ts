@@ -667,7 +667,7 @@ export async function probeHedged(candidates: StreamCandidate[], opts: HedgedPro
 export function score(c: StreamCandidate, preferred: number, priority: number, req: PlaybackRequest): StreamCandidate {
   if (!c.probe) return { ...c, score: -500 + priority, why: [] };
   if (!c.probe.ok) return { ...c, score: -1000 + priority, why: [] };
-  const q = c.probe.quality ?? c.quality ?? 720;
+  const q = c.probe.quality ?? c.quality ?? (c.providerId === "local" ? preferred : 720);
   const qScore = q <= preferred ? q / preferred : 1 - (q - preferred) / (preferred * 4);
   const avg = getHealth(c.providerId).latency;
   const ms = avg == null ? c.probe.latencyMs : c.probe.latencyMs * 0.6 + avg * 0.4;
@@ -694,10 +694,14 @@ export function score(c: StreamCandidate, preferred: number, priority: number, r
   // Plays, but nowhere near the catalog runtime: probably another title (or a trailer). Below every
   // stream that isn't, whatever its quality or record.
   const otherTitle = c.identity?.status === "mismatch" ? 120 : 0;
+  // User's own local files always beat remote streams unless this exact file failed or mismatched.
+  const localBonus = c.providerId === "local" && !broken && !otherTitle ? 50 : 0;
   const why: string[] = [];
   if (otherTitle) why.push("might be a different title");
-  if (own && c.via !== "direct") why.push("ad-free");
-  if (c.via === "direct") why.push("direct stream");
+  if (c.providerId === "local") why.push("on this PC");
+  else if (c.providerId === "jellyfin") why.push("your server");
+  if (own && c.via !== "direct" && c.providerId !== "local" && c.providerId !== "jellyfin") why.push("ad-free");
+  if (c.via === "direct" && c.providerId !== "local" && c.providerId !== "jellyfin") why.push("direct stream");
   if (req.audio && (c.audio === req.audio || c.audio === "dual")) why.push(req.audio === "dub" ? "English dub" : "subtitled");
   if (memory) why.push(pick?.manual ? "your choice for this show" : "played this show before");
   if (languageMiss) why.push("French source for non-French title");
@@ -707,7 +711,7 @@ export function score(c: StreamCandidate, preferred: number, priority: number, r
   return {
     ...c,
     why,
-    score: own + qScore * 40 - latency * 20 + (rel - 0.5) * 20 + memory - shaky - tripped - languageMiss - audioMiss - broken - otherTitle + priority * 0.5,
+    score: own + localBonus + qScore * 40 - latency * 20 + (rel - 0.5) * 20 + memory - shaky - tripped - languageMiss - audioMiss - broken - otherTitle + priority * 0.5,
   };
 }
 

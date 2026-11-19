@@ -24,3 +24,77 @@ export function useAsync<T>(fn: () => Promise<T>, deps: unknown[], opts: { keepP
   const reload = useCallback(() => setNonce((n) => n + 1), []);
   return { ...state, reload };
 }
+
+/**
+ * Run multiple independent feed loaders concurrently and let each slot render as soon as it resolves
+ * (coalescing same-frame cache hits) so one cold endpoint never stalls an entire browse page.
+ */
+export function useProgressiveFeeds<T>(
+  loaders: (() => Promise<T>)[],
+  deps: unknown[],
+  opts: { keepPrevious?: boolean } = {},
+) {
+  const [state, setState] = useState<{ items: (T | undefined)[]; settled: boolean[] }>(() => ({
+    items: new Array<T | undefined>(loaders.length).fill(undefined),
+    settled: new Array<boolean>(loaders.length).fill(false),
+  }));
+  const [nonce, setNonce] = useState(0);
+
+  useEffect(() => {
+    let live = true;
+    const count = loaders.length;
+    setState((prev) => ({
+      items:
+        opts.keepPrevious && prev.items.length === count
+          ? prev.items
+          : new Array<T | undefined>(count).fill(undefined),
+      settled: new Array<boolean>(count).fill(false),
+    }));
+    if (count === 0) return;
+
+    const pending = new Map<number, { hasValue: boolean; value?: T }>();
+    let flushTimer: ReturnType<typeof setTimeout> | undefined;
+    const flush = () => {
+      flushTimer = undefined;
+      if (!live || pending.size === 0) return;
+      const batch = new Map(pending);
+      pending.clear();
+      setState((prev) => {
+        const nextItems = prev.items.length === count ? [...prev.items] : new Array<T | undefined>(count).fill(undefined);
+        const nextSettled = prev.settled.length === count ? [...prev.settled] : new Array<boolean>(count).fill(false);
+        for (const [idx, entry] of batch) {
+          if (entry.hasValue) nextItems[idx] = entry.value;
+          nextSettled[idx] = true;
+        }
+        return { items: nextItems, settled: nextSettled };
+      });
+    };
+
+    loaders.forEach((load, i) => {
+      Promise.resolve()
+        .then(() => load())
+        .then(
+          (value) => {
+            if (!live) return;
+            pending.set(i, { hasValue: true, value });
+            flushTimer ??= setTimeout(flush, 16);
+          },
+          () => {
+            if (!live) return;
+            pending.set(i, { hasValue: false });
+            flushTimer ??= setTimeout(flush, 16);
+          },
+        );
+    });
+
+    return () => {
+      live = false;
+      clearTimeout(flushTimer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [...deps, nonce]);
+
+  const reload = useCallback(() => setNonce((n) => n + 1), []);
+  const loading = state.settled.length !== loaders.length || state.settled.some((s) => !s);
+  return { items: state.items, settled: state.settled, loading, reload };
+}

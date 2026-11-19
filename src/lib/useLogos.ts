@@ -11,31 +11,42 @@ export function useFeatured(items: Media[]) {
   const keys = items.map((m) => m.key).join("|");
   useEffect(() => {
     let live = true;
-    items.forEach((m) => {
-      if (fetched.current.has(m.key)) return;
+    let batch: Record<string, Partial<Featured>> = {};
+    let flushTimer: ReturnType<typeof setTimeout> | undefined;
+    const flush = () => {
+      flushTimer = undefined;
+      if (!live || !Object.keys(batch).length) return;
+      const found = batch;
+      batch = {};
+      setExtra((x) => ({ ...x, ...found }));
+    };
+    const jobs = items.map((m) => {
+      if (fetched.current.has(m.key)) return Promise.resolve();
       fetched.current.add(m.key);
-      getDetail(m.key)
-        .then(
-          (d) =>
-            live &&
-            setExtra((x) => ({
-              ...x,
-              [m.key]: {
-                logo: d.logo,
-                backdrop: d.backdrop ?? m.backdrop,
-                runtime: d.runtime,
-                seasons: d.seasons,
-                episodeCount: d.episodeCount,
-                trailerYouTubeId: d.trailerYouTubeId,
-              },
-            })),
-        )
+      return getDetail(m.key)
+        .then((d) => {
+          if (!live) return;
+          batch[m.key] = {
+            logo: d.logo,
+            backdrop: d.backdrop ?? m.backdrop,
+            runtime: d.runtime,
+            seasons: d.seasons,
+            episodeCount: d.episodeCount,
+            trailerYouTubeId: d.trailerYouTubeId,
+          };
+          flushTimer ??= setTimeout(flush, 100);
+        })
         .catch(() => {
           fetched.current.delete(m.key);
         });
     });
+    void Promise.allSettled(jobs).then(() => {
+      clearTimeout(flushTimer);
+      flush();
+    });
     return () => {
       live = false;
+      clearTimeout(flushTimer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [keys]);

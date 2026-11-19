@@ -683,7 +683,7 @@ fn rewrite_mpd(text: &str, manifest_url: &str, h: &Hdrs, base: &str) -> String {
 }
 
 /// The only page that should read proxied media: AbixCine's own window.
-fn app_origin() -> &'static str {
+pub(crate) fn app_origin() -> &'static str {
     if cfg!(debug_assertions) {
         "http://localhost:1420"
     } else if cfg!(windows) {
@@ -693,11 +693,17 @@ fn app_origin() -> &'static str {
     }
 }
 
+pub(crate) fn cors_builder(b: tauri::http::response::Builder) -> tauri::http::response::Builder {
+    cors(b)
+}
+
 fn cors(b: tauri::http::response::Builder) -> tauri::http::response::Builder {
     b.header("Access-Control-Allow-Origin", app_origin())
         .header("Vary", "Origin")
         .header("Access-Control-Allow-Headers", "*")
         .header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+        // The loopback gateway (gateway.rs) is a private-network target for Chromium.
+        .header("Access-Control-Allow-Private-Network", "true")
         .header("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges")
         .header("Cross-Origin-Resource-Policy", "cross-origin")
         .header("Timing-Allow-Origin", "*")
@@ -928,6 +934,38 @@ pub(crate) fn build_media_response(
     body: Vec<u8>,
     was_unwrapped: bool,
 ) -> Response<Vec<u8>> {
+    let len = body.len();
+    media_head(
+        upstream_status,
+        synthetically_chunked,
+        chunk_start,
+        upstream_cl,
+        upstream_crange,
+        upstream_accept_ranges,
+        resolved_ctype,
+        Some(len),
+        was_unwrapped,
+    )
+    .body(body)
+    .unwrap()
+}
+
+/// Status and headers of a proxied media response. `body_len` is the buffered body's size, or
+/// `None` for a streamed body: then only upstream's own Content-Length is forwarded, and without
+/// one the gateway answers chunked (a guessed length of 0 would truncate the body to nothing).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn media_head(
+    upstream_status: StatusCode,
+    synthetically_chunked: bool,
+    chunk_start: u64,
+    upstream_cl: Option<u64>,
+    upstream_crange: Option<&str>,
+    upstream_accept_ranges: Option<&str>,
+    resolved_ctype: Option<String>,
+    body_len: Option<usize>,
+    was_unwrapped: bool,
+) -> tauri::http::response::Builder {
+    let known_len = body_len.unwrap_or(0);
     let out_status = if synthetically_chunked {
         StatusCode::PARTIAL_CONTENT
     } else {
@@ -938,12 +976,12 @@ pub(crate) fn build_media_response(
         b = b.header(header::CONTENT_TYPE, ct);
     }
     if synthetically_chunked {
-        if !was_unwrapped && !body.is_empty() {
-            b = b.header(header::CONTENT_RANGE, build_content_range(chunk_start, body.len(), upstream_cl));
+        if !was_unwrapped && known_len > 0 {
+            b = b.header(header::CONTENT_RANGE, build_content_range(chunk_start, known_len, upstream_cl));
         }
         b = b.header(header::ACCEPT_RANGES, "bytes");
         if !was_unwrapped {
-            b = b.header(header::CONTENT_LENGTH, body.len().to_string());
+            b = b.header(header::CONTENT_LENGTH, known_len.to_string());
         }
     } else {
         if !was_unwrapped {
@@ -959,30 +997,85 @@ pub(crate) fn build_media_response(
                 b = b.header(header::ACCEPT_RANGES, "bytes");
             }
             if !was_unwrapped {
-                let len = upstream_cl.unwrap_or(body.len() as u64);
-                b = b.header(header::CONTENT_LENGTH, len.to_string());
+                if let Some(len) = upstream_cl.or(body_len.map(|n| n as u64)) {
+                    b = b.header(header::CONTENT_LENGTH, len.to_string());
+                }
             }
         }
     }
-    b.body(body).unwrap()
+    b
+}
+
+impl From<Response<Vec<u8>>> for Proxied {
+    fn from(r: Response<Vec<u8>>) -> Self {
+        Proxied::Full(r)
+    }
+}
+
+/// A proxied response: fully buffered, or headers plus a live upstream body (gateway only).
+pub(crate) enum Proxied {
+    Full(Response<Vec<u8>>),
+    Stream {
+        head: tauri::http::response::Builder,
+        /// Bytes already read from upstream to classify the body (possibly de-disguised).
+        prefix: Vec<u8>,
+        rest: reqwest::Response,
+    },
+}
+
+/// Whether a (start of a) response body is an HLS playlist or DASH manifest that must be rewritten.
+fn body_is_manifest(body: &[u8], target: &str, ctype_lower: &str, looks_playlist: bool, looks_dash: bool) -> bool {
+    let magic_m3u8 = is_extm3u_bytes(body);
+    if magic_m3u8 || (!looks_like_binary_media_path(target) && (looks_playlist || ctype_lower.contains("mpegurl"))) {
+        return true;
+    }
+    let non_binary_media = !ctype_lower.starts_with("video/") && !ctype_lower.starts_with("audio/") && !looks_like_binary_media_path(target);
+    non_binary_media
+        && (looks_dash || ctype_lower.contains("dash+xml") || String::from_utf8_lossy(&body[..body.len().min(MPD_SNIFF_WINDOW)]).contains("<MPD"))
+}
+
+/// Outbound range for the streaming gateway: the player's own range goes upstream unchanged
+/// (nothing is buffered, so an open-ended `bytes=N-` is fine); the window is only kept for the
+/// rare upstream that ignores `Range`, which still takes the capped, buffered path.
+pub(crate) fn plan_outbound_range_streaming(raw_range: Option<&str>, looks_playlist: bool, looks_dash: bool) -> (Option<String>, Option<(u64, u64)>) {
+    let Some(r) = raw_range else { return (None, None) };
+    if looks_playlist || looks_dash {
+        return (Some(r.to_string()), None);
+    }
+    let window = parse_byte_range(r).map(|(start, end)| {
+        let len = end.map(|e| e.saturating_sub(start).saturating_add(1)).unwrap_or(RANGE_CHUNK);
+        (start, len.min(RANGE_CHUNK))
+    });
+    (Some(r.to_string()), window)
 }
 
 pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
+    match handle_with(req, PROXY_BASE, false).await {
+        Proxied::Full(r) => r,
+        // Never produced when `streaming` is false.
+        Proxied::Stream { .. } => fail(StatusCode::INTERNAL_SERVER_ERROR, "unexpected stream"),
+    }
+}
+
+/// The proxy behind both transports. `base` is what nested playlist URIs are rewritten to;
+/// with `streaming`, media bodies are handed back unread ([`Proxied::Stream`]) instead of being
+/// collected into memory first (the `abxs:` custom protocol can only return a whole `Vec<u8>`).
+pub(crate) async fn handle_with(req: Request<Vec<u8>>, base: &str, streaming: bool) -> Proxied {
     if req.method() == tauri::http::Method::OPTIONS {
-        return cors(Response::builder().status(StatusCode::NO_CONTENT)).body(Vec::new()).unwrap();
+        return cors(Response::builder().status(StatusCode::NO_CONTENT)).body(Vec::new()).unwrap().into();
     }
     let q = query(req.uri());
     let Some(raw_target) = q.get("u").and_then(|u| B64.decode(u).ok()).and_then(|b| String::from_utf8(b).ok()) else {
         let raw = q.get("u").cloned().unwrap_or_default();
         let why = B64.decode(&raw).err().map(|e| e.to_string()).unwrap_or_else(|| "not utf-8".into());
-        return fail(StatusCode::BAD_REQUEST, &format!("missing url (len {} uri len {}: {why})", raw.len(), req.uri().to_string().len()));
+        return fail(StatusCode::BAD_REQUEST, &format!("missing url (len {} uri len {}: {why})", raw.len(), req.uri().to_string().len())).into();
     };
     let target = match q.get("t").filter(|t| !t.is_empty()) {
         Some(t) => join_template(&raw_target, &unescape_tail(t)),
         None => raw_target,
     };
     if let Err(e) = validate_proxy_target(&target) {
-        return fail(StatusCode::FORBIDDEN, &e);
+        return fail(StatusCode::FORBIDDEN, &e).into();
     }
     let h: Hdrs = q
         .get("h")
@@ -992,7 +1085,6 @@ pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
     // Where the webview can reach us. The request URI can't tell us: on Windows wry hands the
     // handler `abxs://localhost/...` even though the page requested `http://abxs.localhost/...`,
     // and a playlist pointing at abxs:// would be unloadable there.
-    let base = PROXY_BASE;
 
     let looks_playlist = looks_like_hls_url(&target);
     let looks_dash = looks_like_dash_url(&target);
@@ -1005,14 +1097,14 @@ pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
                 .header(header::CONTENT_TYPE, "application/dash+xml")
                 .header(header::CACHE_CONTROL, "no-cache")
                 .body(out.into_bytes())
-                .unwrap();
+                .unwrap().into();
         }
         let out = rewrite_playlist(&text, &final_url, &h, base);
         return cors(Response::builder().status(200))
             .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
             .header(header::CACHE_CONTROL, "no-cache")
             .body(out.into_bytes())
-            .unwrap();
+            .unwrap().into();
     }
 
     // A HEAD probe asks for the headers only. It used to be sent upstream as a GET, which
@@ -1033,14 +1125,18 @@ pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
                 b.body(Vec::new()).unwrap()
             }
             Err(e) => fail(StatusCode::BAD_GATEWAY, &e.to_string()),
-        };
+        }.into();
     }
     if req.method() != tauri::http::Method::GET {
-        return fail(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+        return fail(StatusCode::METHOD_NOT_ALLOWED, "method not allowed").into();
     }
 
     let raw_range = req.headers().get(header::RANGE).and_then(|v| v.to_str().ok());
-    let (outbound_range, mut requested_range) = plan_outbound_range(raw_range, &target, looks_playlist, looks_dash);
+    let (outbound_range, mut requested_range) = if streaming {
+        plan_outbound_range_streaming(raw_range, looks_playlist, looks_dash)
+    } else {
+        plan_outbound_range(raw_range, &target, looks_playlist, looks_dash)
+    };
     let suffix_len = raw_range.and_then(parse_suffix_range);
     let can_retry = req.method() == tauri::http::Method::GET;
 
@@ -1065,13 +1161,13 @@ pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
                     tokio::time::sleep(Duration::from_millis(300)).await;
                     continue;
                 }
-                return fail(StatusCode::BAD_GATEWAY, &e.to_string());
+                return fail(StatusCode::BAD_GATEWAY, &e.to_string()).into();
             }
         }
     }
     let mut res = match res_opt {
         Some(r) => r,
-        None => return fail(StatusCode::BAD_GATEWAY, "upstream retry exhausted"),
+        None => return fail(StatusCode::BAD_GATEWAY, "upstream retry exhausted").into(),
     };
 
     let status = res.status();
@@ -1117,7 +1213,8 @@ pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
         &final_url,
         &ctype,
         upstream_cl,
-    ) {
+    ) && !(streaming && requested_range.is_none())
+    {
         let (start, max_len) = requested_range.unwrap_or((0, RANGE_CHUNK));
         if let Some(total) = upstream_cl {
             if start >= total {
@@ -1125,16 +1222,16 @@ pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
                     .header(header::CONTENT_RANGE, format!("bytes */{total}"))
                     .header(header::ACCEPT_RANGES, "bytes")
                     .body(Vec::new())
-                    .unwrap();
+                    .unwrap().into();
             }
         }
         if start > MAX_RANGE_SKIP {
-            return fail(StatusCode::BAD_GATEWAY, "upstream ignored Range for large offset");
+            return fail(StatusCode::BAD_GATEWAY, "upstream ignored Range for large offset").into();
         }
         let mut window = RangeWindow::new(start, max_len as usize);
         while let Some(chunk) = match res.chunk().await {
             Ok(c) => c,
-            Err(e) => return fail(StatusCode::BAD_GATEWAY, &e.to_string()),
+            Err(e) => return fail(StatusCode::BAD_GATEWAY, &e.to_string()).into(),
         } {
             if window.push_chunk(&chunk) {
                 break;
@@ -1156,7 +1253,7 @@ pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
                 .header(header::CONTENT_RANGE, "bytes */*")
                 .header(header::ACCEPT_RANGES, "bytes")
                 .body(Vec::new())
-                .unwrap();
+                .unwrap().into();
         }
         let chunked = (has_more || start > 0) && !buf.is_empty();
         (buf, chunked, start)
@@ -1165,7 +1262,40 @@ pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
         // above, and buffering it whole could take gigabytes of RAM.
         let mut buf: Vec<u8> = Vec::with_capacity(upstream_cl.map(|n| n.min(MAX_BUFFERED_BODY as u64) as usize).unwrap_or(0));
         let mut overflow = false;
-        loop {
+        let mut eof = false;
+        // Streaming gateway: read just enough to tell a manifest (rewritten, so buffered) from
+        // media bytes, then hand the rest of the upstream body straight to the player.
+        if streaming && status.is_success() {
+            while buf.len() < MPD_SNIFF_WINDOW {
+                match res.chunk().await {
+                    Ok(Some(c)) => buf.extend_from_slice(&c),
+                    Ok(None) => {
+                        eof = true;
+                        break;
+                    }
+                    Err(e) => return fail(StatusCode::BAD_GATEWAY, &e.to_string()).into(),
+                }
+            }
+            // Image-disguised TS segments are small and need up to 64 KiB scanned: buffered path.
+            if !eof && !looks_disguised(&buf) && !body_is_manifest(&buf, &target, &ctype_lower, looks_playlist, looks_dash) {
+                let resolved_ctype = resolve_proxy_content_type(&target, &final_url, &ctype)
+                    .map(|ct| if is_active_document_type(&ct) { "application/octet-stream".to_string() } else { ct });
+                let head = media_head(
+                    status,
+                    false,
+                    0,
+                    upstream_cl,
+                    crange.as_deref(),
+                    upstream_accept_ranges.as_deref(),
+                    resolved_ctype,
+                    None,
+                    false,
+                );
+                return Proxied::Stream { head, prefix: buf, rest: res };
+            }
+        }
+        // The rest of the body, unless the sniff above already reached its end.
+        while !eof {
             match res.chunk().await {
                 Ok(Some(c)) => {
                     if buf.len() + c.len() > MAX_BUFFERED_BODY {
@@ -1176,14 +1306,14 @@ pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
                     }
                     buf.extend_from_slice(&c);
                 }
-                Ok(None) => break,
-                Err(e) => return fail(StatusCode::BAD_GATEWAY, &e.to_string()),
+                Ok(None) => eof = true,
+                Err(e) => return fail(StatusCode::BAD_GATEWAY, &e.to_string()).into(),
             }
         }
         drop(res);
         if overflow {
             if status != StatusCode::OK || is_manifest_hint {
-                return fail(StatusCode::BAD_GATEWAY, "upstream body too large to proxy");
+                return fail(StatusCode::BAD_GATEWAY, "upstream body too large to proxy").into();
             }
             // Same contract as the guard: the first window as a 206, the player asks for the rest.
             buf.truncate(RANGE_CHUNK as usize);
@@ -1206,7 +1336,7 @@ pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
                 .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
                 .header(header::CACHE_CONTROL, "no-cache")
                 .body(out.into_bytes())
-                .unwrap();
+                .unwrap().into();
         }
         let non_binary_media = !ctype_lower.starts_with("video/")
             && !ctype_lower.starts_with("audio/")
@@ -1228,7 +1358,7 @@ pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
                 .header(header::CONTENT_TYPE, "application/dash+xml")
                 .header(header::CACHE_CONTROL, "no-cache")
                 .body(out.into_bytes())
-                .unwrap();
+                .unwrap().into();
         }
     }
 
@@ -1251,13 +1381,15 @@ pub async fn handle(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
         resolved_ctype,
         body,
         was_unwrapped,
-    )
+    ).into()
+}
+
+fn looks_disguised(body: &[u8]) -> bool {
+    body.starts_with(&[0x89, 0x50, 0x4e, 0x47]) || (body.len() > 12 && &body[0..4] == b"RIFF" && &body[8..12] == b"WEBP")
 }
 
 fn unwrap_disguised_segment(body: Vec<u8>) -> (Vec<u8>, bool) {
-    let png = body.starts_with(&[0x89, 0x50, 0x4e, 0x47]);
-    let webp = body.len() > 12 && &body[0..4] == b"RIFF" && &body[8..12] == b"WEBP";
-    if !(png || webp) {
+    if !looks_disguised(&body) {
         return (body, false);
     }
     // Find the first MPEG-TS sync byte that repeats every 188 bytes.
@@ -1591,6 +1723,118 @@ pub async fn http_fetch_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PERF-07: in streaming mode a ranged media request is passed through unbuffered (the
+    /// player's open-ended range goes upstream as-is), while playlists are still rewritten —
+    /// to the gateway's base, so nested segments stay on the gateway.
+    #[test]
+    fn streaming_mode_passes_media_through_and_rewrites_playlists_to_gateway_base() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        tauri::async_runtime::block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().unwrap();
+            let total = 3 * 1024 * 1024usize; // bigger than the 8 KiB sniff window, many chunks
+            let movie: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+            let movie_srv = movie.clone();
+            let seen_range = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+            let seen_srv = seen_range.clone();
+            tokio::spawn(async move {
+                for _ in 0..3 {
+                    let (mut sock, _) = listener.accept().await.unwrap();
+                    let movie = movie_srv.clone();
+                    let seen = seen_srv.clone();
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 4096];
+                        let n = sock.read(&mut buf).await.unwrap_or(0);
+                        let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let path = req.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("").to_string();
+                        if path.starts_with("/movie.mp4") {
+                            let range = req.lines().find_map(|l| l.strip_prefix("range: ").or_else(|| l.strip_prefix("Range: "))).unwrap_or("").to_string();
+                            *seen.lock().unwrap() = range.clone();
+                            let start: usize = range.trim_start_matches("bytes=").trim_end_matches('-').parse().unwrap_or(0);
+                            let hdr = format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{}/{total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                                total - start,
+                                total - 1
+                            );
+                            let _ = sock.write_all(hdr.as_bytes()).await;
+                            for c in movie[start..].chunks(64 * 1024) {
+                                let _ = sock.write_all(c).await;
+                            }
+                        } else if path.starts_with("/seg-1.jpg") {
+                            // A TS segment disguised as an image, sent chunked: no Content-Length.
+                            let hdr = "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+                            let _ = sock.write_all(hdr.as_bytes()).await;
+                            for c in movie[..200_000].chunks(32 * 1024) {
+                                let _ = sock.write_all(format!("{:x}\r\n", c.len()).as_bytes()).await;
+                                let _ = sock.write_all(c).await;
+                                let _ = sock.write_all(b"\r\n").await;
+                            }
+                            let _ = sock.write_all(b"0\r\n\r\n").await;
+                        } else {
+                            let body = b"#EXTM3U\n#EXTINF:6.0,\nseg0.ts\n";
+                            let hdr = format!("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                            let _ = sock.write_all(hdr.as_bytes()).await;
+                            let _ = sock.write_all(body).await;
+                        }
+                    });
+                }
+            });
+
+            let mk = |u: &str, range: Option<&str>| {
+                let uri = format!("http://127.0.0.1:1/p?u={}&h={}", B64.encode(u), B64.encode(b"{}"));
+                let mut b = Request::builder().method("GET").uri(uri);
+                if let Some(r) = range {
+                    b = b.header(header::RANGE, r);
+                }
+                b.body(Vec::new()).unwrap()
+            };
+            TEST_ALLOW_LOOPBACK.with(|c| c.set(true));
+
+            let start = 1_000_000usize;
+            match handle_with(mk(&format!("http://{addr}/movie.mp4"), Some(&format!("bytes={start}-"))), "http://gw/tok", true).await {
+                Proxied::Stream { head, prefix, mut rest } => {
+                    let r = head.body(()).unwrap();
+                    assert_eq!(r.status(), StatusCode::PARTIAL_CONTENT);
+                    assert_eq!(r.headers()[header::CONTENT_LENGTH], (total - start).to_string().as_str());
+                    assert_eq!(r.headers()[header::CONTENT_RANGE], format!("bytes {start}-{}/{total}", total - 1).as_str());
+                    assert!(prefix.len() < 1024 * 1024, "only a sniff prefix may be buffered, got {}", prefix.len());
+                    let mut got = prefix;
+                    while let Some(c) = rest.chunk().await.unwrap() {
+                        got.extend_from_slice(&c);
+                    }
+                    assert!(got == movie[start..], "streamed bytes differ");
+                }
+                Proxied::Full(r) => panic!("expected a streamed body, got buffered {}", r.status()),
+            }
+            assert_eq!(*seen_range.lock().unwrap(), format!("bytes={start}-"), "open-ended range must go upstream uncapped");
+
+            // Regression: a chunked upstream (no Content-Length) must not be announced as length 0.
+            match handle_with(mk(&format!("http://{addr}/seg-1.jpg"), None), "http://gw/tok", true).await {
+                Proxied::Stream { head, prefix, mut rest } => {
+                    let r = head.body(()).unwrap();
+                    assert_eq!(r.status(), StatusCode::OK);
+                    assert!(r.headers().get(header::CONTENT_LENGTH).is_none(), "unknown length must be left out: {:?}", r.headers());
+                    let mut got = prefix;
+                    while let Some(c) = rest.chunk().await.unwrap() {
+                        got.extend_from_slice(&c);
+                    }
+                    assert!(got == movie[..200_000], "chunked body must pass through whole");
+                }
+                Proxied::Full(r) => panic!("expected a streamed body, got buffered {}", r.status()),
+            }
+
+            match handle_with(mk(&format!("http://{addr}/index.m3u8"), None), "http://gw/tok", true).await {
+                Proxied::Full(r) => {
+                    let text = String::from_utf8(r.body().clone()).unwrap();
+                    assert!(text.lines().any(|l| l.starts_with("http://gw/tok/p?u=")), "segments must point at the gateway: {text}");
+                }
+                Proxied::Stream { .. } => panic!("playlists must be buffered and rewritten"),
+            }
+            TEST_ALLOW_LOOPBACK.with(|c| c.set(false));
+        });
+    }
 
     #[test]
     fn suffix_ranges_and_templated_dash_urls_round_trip() {

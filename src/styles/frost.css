@@ -34,11 +34,13 @@
 
 @property --gx { syntax: "<length>"; inherits: false; initial-value: -400px; }
 @property --gy { syntax: "<length>"; inherits: false; initial-value: -400px; }
-@property --glow { syntax: "<number>"; inherits: false; initial-value: 0; }
+/* Pointer intensity on a pane's rim. Not --glow: that name is the film-tinted bloom colour on
+   :root (base.css), and registering it as a <number> made every var(--glow) shadow invalid. */
+@property --p-glow { syntax: "<number>"; inherits: false; initial-value: 0; }
 
 :root {
-  /* white fractal noise at ~8% alpha: the "ground" in ground glass */
-  --frost-grain: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='180' height='180'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.92' numOctaves='3' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0.085 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
+  /* white frost grain tile cached as static PNG (replaces runtime SVG feTurbulence filter) */
+  --frost-grain: url("../assets/frost-grain.png");
   --frost-light: radial-gradient(120% 70% at 12% -12%, rgb(255 255 255 / 0.15), rgb(255 255 255 / 0.04) 45%, transparent 70%);
   --frost-sheen: linear-gradient(
     180deg,
@@ -160,23 +162,26 @@
   box-shadow: none;
 }
 
-/* The glow: where the pointer is, the rim catches more light. --gx / --gy / --glow don't
+/* The glow: where the pointer is, the rim catches more light. --gx / --gy / --p-glow don't
    inherit (so moving the pointer never restyles a pane's content); the rim asks for them by name.
-   The fade lives on the rim itself, which leaves each pane's own transitions alone. */
-:is(.panel, .smart, .auth-card, .hero-queue, .file, .notice, .facts, .update-toast, .dock, .tools, .top-hit).glow {
-  --glow: 1;
+   The fade lives on the rim itself, which leaves each pane's own transitions alone.
+   The highlight has a white core and a wider fringe in the film's tone, the way a lens edge
+   splits the light it catches. Keep this list in step with PANES in lib/pointerLight.ts. */
+:is(.panel, .smart, .auth-card, .hero-queue, .file, .notice, .facts, .update-toast, .dock, .tools, .top-hit, .palette, .psheet, .race-grid-wrap, .pbot, .ptop-actions).glow {
+  --p-glow: 1;
 }
-:is(.panel, .smart, .auth-card, .hero-queue, .file, .notice, .facts, .update-toast, .dock)::before,
+:is(.panel, .smart, .auth-card, .hero-queue, .file, .notice, .facts, .update-toast, .dock, .palette, .psheet, .race-grid-wrap, .pbot, .ptop-actions)::before,
 :is(.tools, .top-hit)::after {
   --gx: inherit;
   --gy: inherit;
-  --glow: inherit;
+  --p-glow: inherit;
   background:
-    radial-gradient(240px circle at var(--gx) var(--gy), rgb(255 255 255 / calc(0.7 * var(--glow))), transparent 72%),
+    radial-gradient(240px circle at var(--gx) var(--gy), rgb(255 255 255 / calc(0.7 * var(--p-glow))), transparent 60%),
+    radial-gradient(340px circle at calc(var(--gx) + 14px) calc(var(--gy) + 10px), color-mix(in oklab, var(--tone) calc(34% * var(--p-glow)), transparent), transparent 72%),
     var(--frost-edge);
-  transition: --glow 480ms var(--ease);
+  transition: --p-glow 480ms var(--ease);
 }
-:is(.panel, .smart, .auth-card, .hero-queue, .file, .notice, .facts, .update-toast, .dock).glow::before,
+:is(.panel, .smart, .auth-card, .hero-queue, .file, .notice, .facts, .update-toast, .dock, .palette, .psheet, .race-grid-wrap, .pbot, .ptop-actions).glow::before,
 :is(.tools, .top-hit).glow::after {
   transition-duration: 160ms;
 }
@@ -186,15 +191,15 @@
 .hero-queue::after {
   --gx: inherit;
   --gy: inherit;
-  --glow: inherit;
+  --p-glow: inherit;
   content: "";
   position: absolute;
   inset: 0;
   z-index: -1;
   border-radius: inherit;
   pointer-events: none;
-  background: radial-gradient(420px circle at var(--gx) var(--gy), rgb(255 255 255 / calc(0.05 * var(--glow))), transparent 70%);
-  transition: --glow 480ms var(--ease);
+  background: radial-gradient(420px circle at var(--gx) var(--gy), rgb(255 255 255 / calc(0.05 * var(--p-glow))), transparent 70%);
+  transition: --p-glow 480ms var(--ease);
 }
 
 /* ---------- smoke: floating glass over sharp content ---------- */
@@ -247,9 +252,14 @@
 .auth-card {
   backdrop-filter: var(--glass-thick);
 }
+/* The palette takes the tone of the title selected in it (CommandPalette writes --pal-tone inline;
+   without one it is the page's tone). Registered so moving the selection fades, never flicks. */
+@property --pal-tone { syntax: "<color>"; inherits: true; initial-value: transparent; }
 .palette {
+  --pal-tone: var(--tone);
   background-color: color-mix(in oklab, var(--s1) 50%, transparent);
-  box-shadow: var(--rim), 0 60px 140px rgb(0 0 0 / 0.6), 0 0 140px -50px var(--glow);
+  box-shadow: var(--rim), 0 60px 140px rgb(0 0 0 / 0.6), 0 0 140px -50px color-mix(in oklab, var(--pal-tone) 42%, transparent);
+  transition: --pal-tone var(--slow) var(--ease);
 }
 .psheet {
   background-image: var(--frost-grain), var(--frost-light), var(--frost-sheen);
@@ -261,7 +271,7 @@
 }
 /* the palette's own interior is glass too: the preview pane and footer are a deeper tint of it */
 .pal-preview {
-  background: rgb(0 0 0 / 0.16);
+  background: radial-gradient(130% 70% at 50% 0%, color-mix(in oklab, var(--pal-tone) 18%, transparent), transparent 72%), rgb(0 0 0 / 0.16);
 }
 .pal-foot {
   background: rgb(0 0 0 / 0.14);
@@ -278,8 +288,8 @@
   inset: 0 0 -18px;
   background:
     var(--frost-grain),
-    linear-gradient(180deg, rgb(9 9 13 / 0.62) 0%, rgb(9 9 13 / 0.5) 62%, rgb(9 9 13 / 0.3) 82%, transparent);
-  backdrop-filter: blur(22px) saturate(1.9) brightness(0.7);
+    linear-gradient(180deg, rgb(9 9 13 / 0.68) 0%, rgb(9 9 13 / 0.54) 62%, rgb(9 9 13 / 0.3) 82%, transparent);
+  backdrop-filter: blur(16px) saturate(1.85) brightness(0.72);
   -webkit-mask-image: linear-gradient(180deg, #000 0%, #000 58%, transparent 100%);
   mask-image: linear-gradient(180deg, #000 0%, #000 58%, transparent 100%);
 }
@@ -345,7 +355,7 @@
   inset: -90px -150px -96px calc(var(--pad) * -1);
   pointer-events: none;
   animation: none;
-  backdrop-filter: blur(30px) saturate(1.6) brightness(0.52);
+  backdrop-filter: blur(18px) saturate(1.6) brightness(0.55);
   -webkit-mask-image: linear-gradient(90deg, #000 0%, #000 64%, transparent 100%), linear-gradient(0deg, transparent 0%, #000 24%, #000 72%, transparent 100%);
   -webkit-mask-composite: source-in;
   mask-image: linear-gradient(90deg, #000 0%, #000 64%, transparent 100%), linear-gradient(0deg, transparent 0%, #000 24%, #000 72%, transparent 100%);
@@ -486,6 +496,62 @@ a.file:hover {
   background-color: rgb(255 255 255 / 0.07);
   background-image: var(--frost-grain), linear-gradient(180deg, color-mix(in oklab, var(--tone) 12%, rgb(255 255 255 / 0.06)), rgb(255 255 255 / 0.015));
   box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.14), inset 0 0 0 1px rgb(255 255 255 / 0.07), 0 10px 24px -16px color-mix(in oklab, var(--tone) 50%, transparent);
+}
+
+/* ---------- sliding indicators (lib/useSlidingIndicator.ts) ---------- */
+/* The selected option's fill moves to the group's ::before, which glides between options. Until
+   the hook has measured (no data-ind), the option keeps its own fill, so nothing is ever unlit. */
+.seg-pills, .seg3, .sub-seg, .season-pick, .view-pick, .ps-tabs, .pal-list, .tabbar {
+  position: relative;
+}
+.seg-pills, .seg3, .sub-seg, .season-pick, .view-pick, .ps-tabs, .pal-list, .tabbar, .set-nav {
+  isolation: isolate;
+}
+[data-ind]::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: -1;
+  width: var(--ind-w);
+  height: var(--ind-h);
+  transform: translate(var(--ind-x), var(--ind-y));
+  border-radius: var(--ind-r, 999px);
+  background: var(--ind-bg, var(--fg));
+  box-shadow: var(--ind-shadow, inset 0 -1.5px 0 rgb(0 0 0 / 0.1), 0 6px 18px -10px var(--glow));
+  pointer-events: none;
+}
+[data-ind="live"]::before {
+  transition: transform var(--emph) var(--ease-out), width var(--emph) var(--ease-out), height var(--emph) var(--ease-out);
+}
+[data-ind] > button.on,
+[data-ind] .pal-item.on {
+  background: transparent;
+  box-shadow: none;
+}
+.seg3 { --ind-r: 9px; }
+.sub-seg { --ind-r: 11px; }
+.view-pick { --ind-bg: rgb(255 255 255 / 0.14); --ind-shadow: inset 0 1px 0 rgb(255 255 255 / 0.12); }
+.pal-list { --ind-r: var(--r-sm); --ind-bg: rgb(255 255 255 / 0.1); --ind-shadow: inset 0 1px 0 rgb(255 255 255 / 0.1); }
+/* the palette's list moves fast under the arrow keys: a quicker glide keeps up with a held key */
+.pal-list[data-ind="live"]::before { transition-duration: var(--base); }
+.set-nav {
+  --ind-r: var(--r-sm);
+  --ind-bg: var(--frost-grain), linear-gradient(180deg, color-mix(in oklab, var(--tone) 12%, rgb(255 255 255 / 0.06)), rgb(255 255 255 / 0.015)), rgb(255 255 255 / 0.07);
+  --ind-shadow: inset 0 1px 0 rgb(255 255 255 / 0.14), inset 0 0 0 1px rgb(255 255 255 / 0.07), 0 10px 24px -16px color-mix(in oklab, var(--tone) 50%, transparent);
+}
+/* the title page's tabs: an underline in the tone, gliding along the rule */
+.tabbar[data-ind]::before {
+  top: auto;
+  bottom: -1px;
+  height: 2px;
+  transform: translateX(var(--ind-x));
+  border-radius: 2px;
+  background: var(--tone);
+  box-shadow: 0 0 12px -2px var(--glow);
+}
+.tabbar[data-ind] > button[role="tab"]::after {
+  display: none;
 }
 
 /* Inputs read as wells cut into the frost. Fill only: the focus ring stays browse.css's. */

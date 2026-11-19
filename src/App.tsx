@@ -9,6 +9,7 @@ import { Toasts } from "./components/Toasts";
 import { UpdateToast } from "./components/UpdateToast";
 import { bootAccount, useAuth } from "./lib/account";
 import { getSettings, useSettings } from "./lib/settings";
+import { installErrorLog, reportAppReady } from "./lib/startup";
 import { installTvMode, setTvMode } from "./lib/tvMode";
 import { Auth } from "./pages/Auth";
 import { Home } from "./pages/Home";
@@ -84,6 +85,7 @@ function RouteCrash() {
   return <Crash error={useRouteError()} />;
 }
 
+installErrorLog();
 void bootAccount();
 const osReduced = () => window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
 const SKIP_SPLASH = getSettings().reduceMotion || osReduced();
@@ -97,6 +99,9 @@ function Shell() {
   const watching = loc.pathname.startsWith("/watch/");
   const main = useRef<HTMLElement>(null);
   const [palette, setPalette] = useState(false);
+
+  // First render reached: this launch started fine (see src-tauri/src/diagnostics.rs).
+  useEffect(() => reportAppReady(), []);
 
   // Reduced motion lives on <html>, where it can reach ::view-transition pseudo-elements too.
   useEffect(() => {
@@ -117,6 +122,12 @@ function Shell() {
   // In a layout effect so the position is set before the view transition snapshots the page.
   const navType = useNavigationType();
   const scrolls = useRef(new Map<string, number>());
+  // Which way the page change goes, for the view transition's depth (base.css): a new page comes
+  // forward out of the old one, Back recedes. Set in a layout effect, inside the transition's
+  // update, so the pseudo-elements read it before they start animating.
+  useLayoutEffect(() => {
+    document.documentElement.dataset.nav = navType === "POP" ? "back" : "forward";
+  }, [loc.key, navType]);
   useLayoutEffect(() => {
     const el = main.current;
     if (!el) return;
@@ -146,15 +157,26 @@ function Shell() {
     // Keyed on the path only: the search page rewrites ?q= as you type and must not jump to the top.
   }, [loc.pathname]); // eslint-disable-line react-hooks/exhaustive-deps
   const app = useRef<HTMLDivElement>(null);
+  const scrollRaf = useRef(0);
+  const scrolledRef = useRef(false);
+  useEffect(() => () => cancelAnimationFrame(scrollRaf.current), []);
   const onScroll = () => {
-    const el = main.current;
-    if (!el) return;
-    const m = scrolls.current;
-    m.delete(loc.key);
-    m.set(loc.key, el.scrollTop);
-    if (m.size > SCROLL_MEMORY) m.delete(m.keys().next().value as string);
-    // The top bar firms up once content slides beneath it (attribute, not state: no re-render per scroll).
-    app.current?.toggleAttribute("data-scrolled", el.scrollTop > 24);
+    if (scrollRaf.current) return;
+    scrollRaf.current = requestAnimationFrame(() => {
+      scrollRaf.current = 0;
+      const el = main.current;
+      if (!el) return;
+      const m = scrolls.current;
+      m.delete(loc.key);
+      m.set(loc.key, el.scrollTop);
+      if (m.size > SCROLL_MEMORY) m.delete(m.keys().next().value as string);
+      // Only touch the DOM attribute when crossing the threshold (attribute, not state: no re-render per scroll).
+      const scrolled = el.scrollTop > 24;
+      if (scrolled !== scrolledRef.current) {
+        scrolledRef.current = scrolled;
+        app.current?.toggleAttribute("data-scrolled", scrolled);
+      }
+    });
   };
 
   // Never strand the window in fullscreen once you leave the player.

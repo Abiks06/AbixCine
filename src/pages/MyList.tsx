@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { useSlidingIndicator } from "../lib/useSlidingIndicator";
 import { Link } from "react-router-dom";
 import { Card } from "../components/Card";
 import { Icon } from "../components/Icon";
@@ -21,6 +22,7 @@ const SORTS = [
 type Sort = (typeof SORTS)[number]["id"];
 
 export function MyList() {
+  const sortInd = useSlidingIndicator();
   const list = useWatchlist();
   const { user } = useAuth();
   const [kind, setKind] = useState<Kind>("all");
@@ -64,7 +66,7 @@ export function MyList() {
                 </button>
               ))}
             </div>
-            <div className="seg-pills" role="radiogroup" aria-label="Sort">
+            <div className="seg-pills" role="radiogroup" aria-label="Sort" ref={sortInd}>
               {SORTS.map((o) => (
                 <button key={o.id} role="radio" aria-checked={sort === o.id} className={sort === o.id ? "on" : ""} onClick={() => setSort(o.id)}>{o.label}</button>
               ))}

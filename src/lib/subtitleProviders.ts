@@ -6,7 +6,7 @@
  */
 
 import { invoke, isTauri } from "@tauri-apps/api/core";
-import { DEFAULT_UA, httpFetch, httpFetchBytes, unwrapProxyUrl } from "../sources/native";
+import { DEFAULT_UA, httpFetch, httpFetchBytes, PROXY_URL_RX, unwrapProxyUrl } from "../sources/native";
 import { decryptKisskhSubtitle, isEncryptedSubCandidateUrl } from "./kisskhSubs";
 import {
   decodeSubtitle,
@@ -707,7 +707,7 @@ function isWebviewLocalOrProxyUrl(url: string): boolean {
   try {
     const parsed = new URL(trimmed);
     const host = parsed.hostname.toLowerCase();
-    return host === "abxs.localhost" || host === "asset.localhost";
+    return host === "abxs.localhost" || host === "asset.localhost" || (host === "127.0.0.1" && PROXY_URL_RX.test(trimmed));
   } catch {
     return true;
   }

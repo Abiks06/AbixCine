@@ -469,6 +469,7 @@ export const SubtitleSheet = memo(function SubtitleSheet({
               max={45}
               step={1}
               value={subPref.bottomPct}
+              style={{ ["--v" as any]: `${((subPref.bottomPct - 2) / 43) * 100}%` }}
               onChange={(e) => onPatchPref({ bottomPct: Number(e.target.value) })}
               aria-label="Subtitle bottom offset"
             />

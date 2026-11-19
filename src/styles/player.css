@@ -65,6 +65,9 @@
   linear-gradient(90deg, rgb(7 7 10 / 0.96) 0%, rgb(7 7 10 / 0.78) 44%, rgb(7 7 10 / 0.6) 100%),
   linear-gradient(0deg, var(--bg), transparent 46%); }
 .race-back { position: absolute; top: 22px; left: var(--pad); z-index: 2; }
+.race-nav { position: absolute; top: 22px; left: var(--pad); z-index: 2; display: flex; align-items: center; gap: 8px; }
+.race-title-link { text-align: left; border-radius: var(--r-sm); transition: opacity var(--fast); max-width: 100%; }
+.race-title-link:hover { opacity: 0.85; }
 .race2 { position: relative; width: 100%; max-width: 1560px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(340px, 500px); align-items: center; gap: 64px; padding-block: 96px 64px; }
 .race-hero { display: flex; flex-direction: column; align-items: flex-start; gap: 22px; min-width: 0; }
 .race-hero > * { animation: rise 0.7s var(--ease-out) both; }
@@ -130,6 +133,9 @@
 .player.idle { cursor: none; }
 .player.is-paused { --hud: rgb(14 14 19 / 0.3); }
 .screen { position: absolute; inset: 0; z-index: 1; background: #000; }
+/* Cinema glow (player/Ambilight.tsx): a 32×18 copy of the frame, stretched past the edges and
+   blurred to colour. Under the video, so it shows only in the bars; dim, so it never competes. */
+.ambi { position: absolute; inset: -8%; width: 116%; height: 116%; pointer-events: none; filter: blur(48px) saturate(1.4) brightness(0.6); opacity: 0.9; animation: fade var(--slow) var(--ease) both; }
 .screen video, .enhance-canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: block; }
 /* opacity, not visibility: a hidden <video> can be throttled, which starves the upscaler */
 .screen video.under { opacity: 0; }
@@ -200,6 +206,8 @@
 .player.has-sheet .ptop { padding-right: calc(var(--sheet-w) + 28px); }
 .player.idle .ptop { transform: translateY(-14px); }
 .ptitle { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.ptitle-btn { text-align: left; border-radius: var(--r-sm); transition: opacity var(--fast); }
+.ptitle-btn:hover { opacity: 0.85; }
 .plogo { max-height: 36px; max-width: 230px; object-fit: contain; object-position: left; filter: drop-shadow(0 2px 12px rgb(0 0 0 / 0.7)); }
 .pt { font: 750 21px/1.05 var(--f-disp); font-stretch: 82%; letter-spacing: -0.015em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-shadow: 0 2px 14px rgb(0 0 0 / 0.7); }
 .ps { color: var(--fg2); font: 500 11px var(--f-mono); letter-spacing: 0.06em; text-transform: uppercase; text-shadow: 0 1px 8px rgb(0 0 0 / 0.8); }
@@ -242,6 +250,9 @@
 .cc-btn.main { width: 92px; height: 92px; background: var(--fg); color: #08080b; box-shadow: 0 0 90px -14px var(--glow); backdrop-filter: none; }
 .cc-btn.main:hover { background: #fff; transform: scale(1.04); }
 .cc-btn.main:active { transform: scale(0.96); }
+/* magnetic: leans toward the pointer (lib/pointerLight.ts), springs home on release */
+.cc-btn.main { translate: var(--mag-x, 0px) var(--mag-y, 0px); transition: opacity var(--base) var(--ease), transform var(--fast) var(--ease), background-color var(--fast), translate var(--emph) var(--spring); }
+.cc-btn.main.mag { transition: opacity var(--base) var(--ease), transform var(--fast) var(--ease), background-color var(--fast), translate 90ms linear; }
 /* bottom capsule */
 .pbot { position: absolute; left: 16px; right: 16px; bottom: 16px; padding: 8px 14px 10px; display: flex; flex-direction: column; gap: 4px; border-radius: 26px;
   background-color: var(--hud); backdrop-filter: var(--hud-blur); box-shadow: var(--rim), 0 24px 60px -24px #000;
@@ -313,6 +324,8 @@
 .ep-row { display: flex; gap: 12px; align-items: center; padding: 7px; border-radius: var(--r-sm); text-align: left; transition: background var(--fast); animation: rise 0.35s var(--ease-out) both; animation-delay: calc(var(--i, 0) * 18ms); }
 .ep-row:hover { background: rgb(255 255 255 / 0.07); }
 .ep-row.cur { background: color-mix(in oklab, var(--tone) 12%, transparent); box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--tone) 50%, transparent); }
+.ep-row.unaired { opacity: 0.55; cursor: default; }
+.ep-row.unaired:hover { background: transparent; }
 .ep-row.skeleton { height: 72px; animation: shimmer 1.7s linear infinite; background: linear-gradient(90deg, rgb(255 255 255 / 0.02), rgb(255 255 255 / 0.07), rgb(255 255 255 / 0.02)); background-size: 200% 100%; }
 .ep-th { position: relative; width: 112px; aspect-ratio: 16 / 9; border-radius: 8px; overflow: hidden; flex: none; background: rgb(255 255 255 / 0.06); }
 .ep-th img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; opacity: 0.85; }
@@ -369,10 +382,29 @@
   transform: translateX(-50%); animation: ptoast-in 240ms var(--ease-out) both; }
 .ptoast.out { animation: ptoast-out 200ms var(--ease) forwards; }
 .ptoast .dot { flex: none; background: var(--tone); box-shadow: 0 0 0 3px color-mix(in oklab, var(--tone) 24%, transparent); }
+/* a level bar for continuous changes (volume, speed); the toast stays mounted while you keep
+   adjusting, so the fill glides from level to level. Transform only. */
+.pt-meter { position: relative; flex: none; width: 92px; height: 4px; margin-left: 4px; border-radius: 99px; overflow: hidden; background: rgb(255 255 255 / 0.16); box-shadow: inset 0 1px 1px rgb(0 0 0 / 0.4); }
+.pt-meter i { position: absolute; inset: 0; border-radius: inherit; transform-origin: left; background: linear-gradient(90deg, color-mix(in oklab, var(--tone) 70%, #fff), var(--tone)); transition: transform var(--base) var(--ease-out); }
+.pt-meter::after { content: ""; position: absolute; top: -1px; bottom: -1px; left: var(--mark, -10px); width: 2px; margin-left: -1px; background: rgb(255 255 255 / 0.7); }
 @keyframes ptoast-in { from { opacity: 0; transform: translate(-50%, -10px) scale(0.98); } }
 @keyframes ptoast-out { to { opacity: 0; transform: translate(-50%, -6px); } }
 .seek-bump { position: absolute; top: 50%; z-index: 4; display: flex; flex-direction: column; align-items: center; gap: 6px; width: 96px; height: 96px; margin-top: -48px; justify-content: center; border-radius: 50%; color: #fff; pointer-events: none;
-  background: rgb(10 10 14 / 0.7); box-shadow: var(--rim); font: 600 13px var(--f-mono); animation: bump 750ms var(--ease) both; }
+  background: rgb(14 14 19 / 0.36); backdrop-filter: var(--hud-blur); box-shadow: var(--rim), 0 18px 44px -20px rgb(0 0 0 / 0.8); font: 600 13px var(--f-mono); animation: bump 750ms var(--ease) both; }
+/* the specular rim, as on the rest of the HUD glass */
+.seek-bump::before { content: ""; position: absolute; inset: 0; border-radius: inherit; padding: 1px; pointer-events: none; background: var(--frost-edge);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite: xor; mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0); }
+/* the glyph is thrown in the direction of the seek, every press */
+.seek-bump svg { animation: bumpThrow 420ms var(--ease-out) both; }
+.seek-bump.back svg { animation-name: bumpThrowBack; }
+@keyframes bumpThrow { from { transform: translateX(-10px); opacity: 0.2; } }
+@keyframes bumpThrowBack { from { transform: translateX(10px); opacity: 0.2; } }
+/* another press in the same direction: already on screen, so it re-pops rather than fading in again */
+.seek-bump.again { animation-name: bumpAgain; }
+.seek-bump.again span { animation: pop var(--base) var(--spring) both; }
+@keyframes bumpAgain { 0% { opacity: 1; transform: scale(1.09); } 26% { transform: none; } 75% { opacity: 1; } 100% { opacity: 0; } }
+@media (prefers-reduced-transparency: reduce) { .seek-bump { backdrop-filter: none; background: var(--pane-solid, #15151c); } }
+:root.reduce-motion .seek-bump { backdrop-filter: none; background: rgb(10 10 14 / 0.86); }
 .seek-bump.back { left: 16%; }
 .seek-bump.fwd { right: 16%; }
 .player.has-sheet .seek-bump.fwd { right: calc(16% + 432px); }
@@ -530,7 +562,16 @@
 .compare-handle { position: absolute; top: 50%; left: var(--at); width: 44px; height: 44px; transform: translate(-50%, -50%); border-radius: 50%; pointer-events: auto; cursor: ew-resize; touch-action: none;
   display: grid; place-items: center; background: rgb(255 255 255 / 0.16); backdrop-filter: blur(14px) saturate(1.6);
   box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.35), inset 0 0 0 1px rgb(255 255 255 / 0.3), 0 10px 30px -10px rgb(0 0 0 / 0.7); }
-.compare-handle span { width: 16px; height: 10px; border-left: 2px solid #fff; border-right: 2px solid #fff; }
+.compare-handle span { width: 16px; height: 10px; border-left: 2px solid #fff; border-right: 2px solid #fff; transition: width var(--base) var(--spring); }
+/* grab: the handle springs, its arrows spread, and the split line catches the film's light */
+.compare-handle { transition: transform var(--base) var(--spring), background-color var(--fast); }
+.compare-handle:hover { transform: translate(-50%, -50%) scale(1.08); background-color: rgb(255 255 255 / 0.22); }
+.compare-handle:active { transform: translate(-50%, -50%) scale(0.94); }
+.compare-handle:is(:hover, :active) span { width: 20px; }
+.compare::before { transition: box-shadow var(--base) var(--ease), background var(--base) var(--ease); }
+.compare:has(.compare-handle:active)::before {
+  background: linear-gradient(180deg, transparent, #fff 12%, #fff 88%, transparent);
+  box-shadow: 0 0 22px color-mix(in oklab, var(--tone) 70%, transparent), 0 0 6px rgb(255 255 255 / 0.6); }
 .compare-handle:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--tone-ink); }
 .compare-tag { position: absolute; top: 72px; padding: 5px 10px; border-radius: 999px; font: 600 10.5px var(--f-mono); letter-spacing: 0.12em; text-transform: uppercase; color: #fff;
   background: rgb(10 10 14 / 0.5); backdrop-filter: blur(12px); box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.16); }

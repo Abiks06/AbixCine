@@ -3,14 +3,20 @@ import { clearAnimeMappingCache, seedAnimeMappings } from "../lib/animeMapping";
 import { episodeMatches, parseEpisode, titleMatches } from "../sources/local";
 import { parseName } from "../lib/library";
 import {
+  checkEpisodeAvailability,
   clampEpisode,
   clampSeason,
+  isTheatricalOnly,
+  isUnairedEpisode,
+  isUnreleasedMedia,
   normalizeTmdbSeasons,
   parseSeasonEpisodeParams,
   reconcileAnimeSeasons,
+  resolveAnilistEpisodeCount,
   resolveNextEpisode,
   resolvePlaybackRequest,
   stitchCourEpisodes,
+  tmdbReleaseWindows,
   type RawAnilistNode,
 } from "../lib/normalizer";
 import { isDone } from "../lib/progress";
@@ -508,3 +514,165 @@ describe("deterministic season reconciliation & canonical normalizer", () => {
   });
 });
 
+describe("unreleased titles and unaired episodes gating", () => {
+  const fixedNow = new Date(2026, 4, 15, 12, 0, 0); // 2026-05-15
+
+  it("identifies unreleased media by future releaseDate or unreleased status", () => {
+    expect(isUnreleasedMedia({ releaseDate: "2026-06-01" }, fixedNow)).toBe(true);
+    expect(isUnreleasedMedia({ releaseDate: "2026-05-15" }, fixedNow)).toBe(false);
+    expect(isUnreleasedMedia({ releaseDate: "2025-12-01" }, fixedNow)).toBe(false);
+    for (const status of ["NOT_YET_RELEASED", "Planned", "In Production", "Post Production", "Rumored"]) {
+      expect(isUnreleasedMedia({ status }, fixedNow)).toBe(true);
+    }
+    expect(isUnreleasedMedia({ status: "Released", releaseDate: "2024-01-01" }, fixedNow)).toBe(false);
+  });
+
+  it("flags unaired episodes by future airDate or episode number past airedCount", () => {
+    expect(isUnairedEpisode({ number: 5, airDate: "2026-05-20" }, { now: fixedNow })).toBe(true);
+    expect(isUnairedEpisode({ number: 5, airDate: "2026-05-15" }, { now: fixedNow })).toBe(false);
+    expect(isUnairedEpisode({ number: 6 }, { airedCount: 5, now: fixedNow })).toBe(true);
+    expect(isUnairedEpisode({ number: 5 }, { airedCount: 5, now: fixedNow })).toBe(false);
+  });
+
+  it("clamps AniList airing episode counts to aired episodes even when total episodes is known", () => {
+    const airing: RawAnilistNode = {
+      id: 9001,
+      format: "TV",
+      status: "RELEASING",
+      episodes: 12,
+      nextAiringEpisode: { episode: 5, airingAt: Math.floor(new Date(2026, 4, 22).getTime() / 1000) },
+    };
+    expect(resolveAnilistEpisodeCount(airing, fixedNow)).toBe(4);
+
+    // Once airingAt has passed, that episode counts as aired (still capped by total episodes).
+    const justAired: RawAnilistNode = {
+      id: 9002,
+      format: "TV",
+      status: "RELEASING",
+      episodes: 12,
+      nextAiringEpisode: { episode: 5, airingAt: Math.floor(new Date(2026, 4, 15, 10, 0).getTime() / 1000) },
+    };
+    expect(resolveAnilistEpisodeCount(justAired, fixedNow)).toBe(5);
+
+    expect(resolveAnilistEpisodeCount({ id: 9003, format: "TV", status: "NOT_YET_RELEASED", episodes: 12 }, fixedNow)).toBe(0);
+    expect(
+      resolveAnilistEpisodeCount(
+        { id: 9004, format: "TV", status: "RELEASING", episodes: 12, startDate: { year: 2026, month: 6, day: 1 } },
+        fixedNow,
+      ),
+    ).toBe(0);
+  });
+
+  it("moves future TMDB seasons to upcomingSeasons, skips future specials, and clamps airing seasons", () => {
+    const out = normalizeTmdbSeasons(
+      [
+        { season_number: 0, name: "Specials", episode_count: 2, air_date: "2026-07-01" },
+        { season_number: 1, name: "Season 1", episode_count: 10, air_date: "2026-04-01" },
+        { season_number: 2, name: "Season 2", episode_count: 8, air_date: "2026-10-01" },
+      ],
+      "tmdb:tv:1234",
+      1234,
+      {
+        status: "Returning Series",
+        lastEpisode: { season: 1, episode: 4, airDate: "2026-05-08" },
+        nextEpisode: { season: 1, episode: 5, airDate: "2026-05-22" },
+        now: fixedNow,
+      },
+    );
+    expect(out.specials).toHaveLength(0);
+    expect(out.seasons).toHaveLength(1);
+    expect(out.seasons[0]).toMatchObject({ number: 1, episodeCount: 4, status: "airing" });
+    expect(out.upcomingSeasons).toHaveLength(1);
+    expect(out.upcomingSeasons[0]).toMatchObject({ number: 2, episodeCount: 0, plannedEpisodeCount: 8, status: "upcoming" });
+  });
+
+  it("gates unreleased films, unreleased shows, unaired episodes, and nonexistent episodes in checkEpisodeAvailability", () => {
+    const unreleasedFilm: MediaDetail = {
+      key: "tmdb:movie:777",
+      kind: "movie",
+      title: "Future Film",
+      overview: "",
+      genres: [],
+      releaseDate: "2026-08-01",
+      status: "Post Production",
+      cast: [],
+      crew: [],
+      related: [],
+    };
+    expect(checkEpisodeAvailability(unreleasedFilm, undefined, undefined, fixedNow)).toMatchObject({
+      playable: false,
+      reason: "unreleased_film",
+    });
+    expect(resolvePlaybackRequest(unreleasedFilm, undefined, undefined, undefined, fixedNow)).toBeNull();
+
+    const airingShow: MediaDetail = {
+      key: "tmdb:tv:888",
+      kind: "tv",
+      title: "Ongoing Show",
+      overview: "",
+      genres: [],
+      status: "Returning Series",
+      nextEpisode: { season: 1, episode: 5, airDate: "2026-05-22" },
+      seasons: [{ number: 1, name: "Season 1", episodeCount: 4, plannedEpisodeCount: 10, status: "airing" }],
+      upcomingSeasons: [{ number: 2, name: "Season 2", episodeCount: 0, plannedEpisodeCount: 8, airDate: "2026-10-01", status: "upcoming" }],
+      cast: [],
+      crew: [],
+      related: [],
+    };
+    expect(checkEpisodeAvailability(airingShow, 1, 4, fixedNow)).toEqual({ playable: true });
+    expect(checkEpisodeAvailability(airingShow, 1, 5, fixedNow)).toMatchObject({ playable: false, reason: "unaired_episode" });
+    expect(checkEpisodeAvailability(airingShow, 1, 99, fixedNow)).toMatchObject({ playable: false, reason: "missing_episode" });
+    expect(checkEpisodeAvailability(airingShow, 2, 1, fixedNow)).toMatchObject({ playable: false, reason: "unaired_season" });
+    expect(resolveNextEpisode(airingShow, 1, 4, undefined, fixedNow)).toBeNull();
+
+    const unstartedShow: MediaDetail = {
+      key: "tmdb:tv:889",
+      kind: "tv",
+      title: "Upcoming Series",
+      overview: "",
+      genres: [],
+      status: "Planned",
+      releaseDate: "2026-09-01",
+      seasons: [],
+      upcomingSeasons: [{ number: 1, name: "Season 1", episodeCount: 0, plannedEpisodeCount: 10, airDate: "2026-09-01", status: "upcoming" }],
+      cast: [],
+      crew: [],
+      related: [],
+    };
+    expect(checkEpisodeAvailability(unstartedShow, 1, 1, fixedNow)).toMatchObject({ playable: false, reason: "unreleased_series" });
+  });
+});
+
+describe("theatrical vs digital release windows (BUG-08)", () => {
+  const now = new Date(2026, 10, 19, 12); // 2026-11-19 local
+  const film = (extra: Partial<MediaDetail>): MediaDetail => ({
+    key: "tmdb:movie:1", kind: "movie", title: "F", overview: "", genres: [], cast: [], crew: [], related: [], status: "Released", ...extra,
+  });
+
+  it("splits TMDB release types into theatrical and digital dates", () => {
+    expect(
+      tmdbReleaseWindows([
+        { iso_3166_1: "US", release_dates: [{ type: 3, release_date: "2026-10-30T00:00:00.000Z" }, { type: 4, release_date: "2026-12-20T00:00:00.000Z" }] },
+        { iso_3166_1: "FR", release_dates: [{ type: 1, release_date: "2026-05-20T00:00:00.000Z" }, { type: 5, release_date: "2027-01-10T00:00:00.000Z" }] },
+        { iso_3166_1: "XX", release_dates: [{ type: 4, release_date: "garbage" }, { release_date: "2020-01-01" }] },
+      ]),
+    ).toEqual({ theatrical: "2026-05-20", digital: "2026-12-20" });
+    expect(tmdbReleaseWindows(undefined)).toEqual({ theatrical: undefined, digital: undefined });
+  });
+
+  it("flags films in cinemas with a future digital date", () => {
+    expect(isTheatricalOnly(film({ releaseDate: "2026-10-30", theatricalReleaseDate: "2026-10-30", digitalReleaseDate: "2026-12-20" }), now)).toBe(true);
+    expect(isTheatricalOnly(film({ releaseDate: "2026-10-30", theatricalReleaseDate: "2026-10-30", digitalReleaseDate: "2026-11-10" }), now)).toBe(false);
+  });
+
+  it("assumes a recent premiere with no digital date is still theatrical, an old one is not", () => {
+    expect(isTheatricalOnly(film({ releaseDate: "2026-11-01", theatricalReleaseDate: "2026-11-01" }), now)).toBe(true);
+    expect(isTheatricalOnly(film({ releaseDate: "2026-06-01", theatricalReleaseDate: "2026-06-01" }), now)).toBe(false);
+  });
+
+  it("never flags unreleased films, series, or records without release types", () => {
+    expect(isTheatricalOnly(film({ releaseDate: "2027-01-01", theatricalReleaseDate: "2027-01-01" }), now)).toBe(false);
+    expect(isTheatricalOnly(film({ kind: "tv", releaseDate: "2026-11-01", theatricalReleaseDate: "2026-11-01" }), now)).toBe(false);
+    expect(isTheatricalOnly(film({ releaseDate: "2026-11-01" }), now)).toBe(false);
+  });
+});

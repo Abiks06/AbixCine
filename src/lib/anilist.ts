@@ -2,6 +2,7 @@ import { whenAnimeMappingsHydrated } from "./animeMapping";
 import { cached, cacheReady, peekCache, seedCache } from "./cache";
 import { stripHtml } from "./format";
 import {
+  isUnreleasedMedia,
   normalizeEpisodes,
   reconcileAnimeSeasons,
   resolveAnilistEpisodeCount,
@@ -84,8 +85,11 @@ async function gql<T = unknown>(query: string, variables: Record<string, unknown
   return req;
 }
 
-const FIELDS = `id idMal title { romaji english native } description(asHtml: false) seasonYear averageScore genres
+const FIELDS = `id idMal title { romaji english native } description(asHtml: false) seasonYear startDate { year month day } averageScore genres
   coverImage { extraLarge color } bannerImage episodes duration format status`;
+
+const isoDate = (d?: { year?: number | null; month?: number | null; day?: number | null } | null) =>
+  d?.year ? `${d.year}-${String(d.month ?? 1).padStart(2, "0")}-${String(d.day ?? 1).padStart(2, "0")}` : undefined;
 
 function toMedia(m: AnilistMediaItem): Media {
   return {
@@ -97,6 +101,8 @@ function toMedia(m: AnilistMediaItem): Media {
     originalTitle: m.title?.romaji ?? undefined,
     overview: stripHtml(m.description ?? ""),
     year: m.seasonYear ?? m.startDate?.year ?? undefined,
+    releaseDate: isoDate(m.startDate),
+    status: m.status ?? undefined,
     rating: m.averageScore ? m.averageScore / 10 : undefined,
     poster: m.coverImage?.extraLarge ?? undefined,
     backdrop: m.bannerImage ?? undefined,
@@ -122,13 +128,13 @@ function currentSeason() {
 
 export async function loadAnimeFeed(f: (typeof ANIME_FEEDS)[number], _i?: number): Promise<Media[]> {
   const airing = "airing" in f && f.airing;
-  return cached(`anilist:feed:${f.id}`, 3 * HOUR, async () => {
+  return cached(`anilist:feed:v2:${f.id}`, 3 * HOUR, async () => {
     const { season, year } = currentSeason();
     const d = await gql<{ Page?: { media?: AnilistMediaItem[] } }>(
-      `query($sort:[MediaSort],$season:MediaSeason,$year:Int){ Page(perPage:24){ media(type:ANIME,sort:$sort,isAdult:false,season:$season,seasonYear:$year){ ${FIELDS} } } }`,
+      `query($sort:[MediaSort],$season:MediaSeason,$year:Int){ Page(perPage:24){ media(type:ANIME,sort:$sort,status_not_in:[NOT_YET_RELEASED,CANCELLED],isAdult:false,season:$season,seasonYear:$year){ ${FIELDS} } } }`,
       { sort: [f.sort], ...(airing ? { season, year } : {}) },
     );
-    return (d.Page?.media ?? []).map(toMedia);
+    return (d.Page?.media ?? []).map(toMedia).filter((m) => !isUnreleasedMedia(m));
   });
 }
 
@@ -162,7 +168,7 @@ export async function searchAnime(q: string): Promise<Media[]> {
   try {
     return await cached(`anilist:search:v2:${cleanQ}`, 30 * 60_000, async () => {
       const d = await gql<{ Page?: { media?: AnilistMediaItem[] } }>(
-        `query($q:String){ Page(perPage:25){ media(type:ANIME,search:$q,isAdult:false,sort:SEARCH_MATCH){ ${FIELDS} startDate { year month day } nextAiringEpisode { episode } relations { edges { relationType node { id format } } } } } }`,
+        `query($q:String){ Page(perPage:25){ media(type:ANIME,search:$q,isAdult:false,sort:SEARCH_MATCH){ ${FIELDS} nextAiringEpisode { episode } relations { edges { relationType node { id format } } } } } }`,
         { q: q.trim() },
       );
       const list: AnilistMediaItem[] = d.Page?.media ?? [];
@@ -236,7 +242,7 @@ const relQuery = (depth: number) => {
   return q;
 };
 
-const FRANCHISE_CACHE_PREFIX = "anilist:franchise:v2:";
+const FRANCHISE_CACHE_PREFIX = "anilist:franchise:v3:";
 const STREAMING_EPS_CACHE_PREFIX = "anilist:streaming-eps:v1:";
 
 /**
@@ -318,18 +324,16 @@ export async function animeSeasons(key: string): Promise<AnimeSeason[]> {
 
 const STAFF_ROLE = /^(Director|Original Creator|Original Story|Series Composition|Music|Character Design|Script|Chief Director|Animation Director)/;
 const titleCase = (s: string) => s.replace(/_/g, " ").toLowerCase().replace(/^\w/, (c) => c.toUpperCase());
-const isoDate = (d?: { year?: number | null; month?: number | null; day?: number | null } | null) =>
-  d?.year ? `${d.year}-${String(d.month ?? 1).padStart(2, "0")}-${String(d.day ?? 1).padStart(2, "0")}` : undefined;
 
 export async function anilistDetail(key: string): Promise<MediaDetail> {
   const id = Number(key.split(":")[1]);
   if (!id || !Number.isFinite(id)) throw new Error(`Invalid AniList key: ${key}`);
 
-  return cached(`anilist:detail:v4:${id}`, 3 * HOUR, async () => {
+  return cached(`anilist:detail:v5:${id}`, 3 * HOUR, async () => {
     const d = await gql<{ Media?: AnilistDetailItem }>(
       `query($id:Int){ Media(id:$id,type:ANIME){ ${FIELDS} nextAiringEpisode { episode airingAt }
         trailer { id site }
-        source season seasonYear startDate { year month day } endDate { year month day } popularity
+        source season seasonYear endDate { year month day } popularity
         streamingEpisodes { title thumbnail }
         studios(isMain:true){ nodes { name } }
         staff(perPage:12,sort:RELEVANCE){ edges { role node { name { full } image { medium } } } }
@@ -368,7 +372,6 @@ export async function anilistDetail(key: string): Promise<MediaDetail> {
         .filter((e): e is typeof e & { node: { name: { full: string }; image?: { medium?: string | null } | null }; role: string } => Boolean(e?.node?.name?.full && e.role && STAFF_ROLE.test(e.role)))
         .map((e) => ({ name: e.node.name.full, job: e.role.replace(/\s*\(.*\)$/, ""), photo: e.node.image?.medium ?? undefined })),
       companies: (m.studios?.nodes ?? []).map((n) => n.name).filter((n): n is string => Boolean(n)),
-      releaseDate: isoDate(m.startDate),
       endDate: isoDate(m.endDate),
       source: m.source ? titleCase(m.source) : undefined,
       seasonLabel: m.season && m.seasonYear ? `${titleCase(m.season)} ${m.seasonYear}` : undefined,

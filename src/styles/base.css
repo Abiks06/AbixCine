@@ -13,6 +13,12 @@
 @property --l1 { syntax: "<color>"; inherits: false; initial-value: #2b3410; }
 @property --l2 { syntax: "<color>"; inherits: false; initial-value: #10242a; }
 @property --sweep { syntax: "<angle>"; inherits: false; initial-value: 0deg; }
+/* Registered so they interpolate: when the stage light changes title, the chrome glides to the new
+   hue alongside the room instead of snapping a frame ahead of it. They change once per slide or
+   route, never on scroll or pointer, so the root-wide restyle stays off every hot path. */
+@property --tone { syntax: "<color>"; inherits: true; initial-value: oklch(0.9 0.2 128); }
+@property --tone-ink { syntax: "<color>"; inherits: true; initial-value: oklch(0.93 0.15 128); }
+@property --tone-deep { syntax: "<color>"; inherits: true; initial-value: oklch(0.24 0.05 128); }
 
 :root {
   color-scheme: dark;
@@ -73,11 +79,12 @@
   /* lit top edge, hairline, and a faint shadowed underside: the edge of a pane of frosted glass */
   --rim: inset 0 1px 0 rgb(255 255 255 / 0.15), inset 0 0 0 1px rgb(255 255 255 / 0.075), inset 0 -1px 0 rgb(0 0 0 / 0.2);
   --float: 0 30px 80px -30px rgb(0 0 0 / 0.85), 0 2px 10px rgb(0 0 0 / 0.3);
+  transition: --tone var(--slow) var(--ease), --tone-ink var(--slow) var(--ease), --tone-deep var(--slow) var(--ease);
 }
 
 *, *::before, *::after { box-sizing: border-box; }
 html, body, #root { height: 100%; margin: 0; }
-body { background: var(--bg); color: var(--fg); font: 14px/1.5 var(--f-ui); -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; overflow: hidden; user-select: none; }
+body { background: var(--bg); color: var(--fg); font: 14px/1.5 var(--f-ui); -webkit-font-smoothing: antialiased; overflow: hidden; user-select: none; }
 input, textarea, code { user-select: text; }
 a { color: inherit; text-decoration: none; }
 button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; padding: 0; }
@@ -115,13 +122,13 @@ kbd { font: 500 10.5px/1.5 var(--f-mono); color: var(--fg2); padding: 1px 6px; b
    still gives the room some colour, and a white one can't lift it past the point where tertiary
    text set straight on the room drops under 4.5:1. Fixed behind the scroller: it repaints only
    when the light changes, never on scroll. */
-.light { position: absolute; inset: 0; z-index: 0; pointer-events: none; overflow: hidden;
+.light { position: absolute; inset: 0; z-index: 0; pointer-events: none; overflow: hidden; contain: strict;
   transition: --l1 var(--amb) var(--ease), --l2 var(--amb) var(--ease);
   background:
     radial-gradient(60% 55% at 12% -6%, color-mix(in oklab, var(--l1) 46%, transparent), transparent 72%),
     radial-gradient(52% 60% at 100% 104%, color-mix(in oklab, var(--l2) 46%, transparent), transparent 72%),
     var(--bg); }
-.light::before, .light::after { content: ""; position: absolute; inset: -8%; background: center / cover no-repeat; filter: blur(46px) contrast(0.58) saturate(2.3) brightness(0.5); opacity: 0; transition: opacity var(--amb) var(--ease); }
+.light::before, .light::after { content: ""; position: absolute; inset: -8%; background: center / cover no-repeat; filter: blur(36px) contrast(0.58) saturate(2.2) brightness(0.5); opacity: 0; transition: opacity var(--amb) var(--ease); will-change: opacity; }
 .light::before { background-image: var(--art-a, none); }
 .light::after { background-image: var(--art-b, none); }
 .light[data-art="a"]::before, .light[data-art="b"]::after { opacity: 0.44; }
@@ -229,6 +236,18 @@ kbd { font: 500 10.5px/1.5 var(--f-mono); color: var(--fg2); padding: 1px 6px; b
 .btn.play:hover:not(:disabled)::after { transform: translateX(130%); transition: transform 720ms var(--ease); }
 .btn.play:hover:not(:disabled) { box-shadow: 0 14px 44px -12px var(--glow), inset 0 -2px 0 rgb(0 0 0 / 0.1); transform: translateY(-1px); }
 .btn.play:active:not(:disabled) { transform: scale(0.965); }
+/* the stage's Play leans toward the pointer (lib/pointerLight.ts); `translate` composes with the
+   hover lift and press scale above, and springs home once the pointer leaves */
+:is(.hero, .tp-top) .btn.play { translate: var(--mag-x, 0px) var(--mag-y, 0px);
+  transition: transform var(--fast) var(--ease), background var(--fast), box-shadow var(--base), color var(--fast), translate var(--emph) var(--spring); }
+:is(.hero, .tp-top) .btn.play.mag { transition: transform var(--fast) var(--ease), background var(--fast), box-shadow var(--base), color var(--fast), translate 90ms linear; }
+
+/* My List: a halo rings out from the button when a title is added (lib/burst.ts adds .burst) */
+.burst { animation: listBurst 640ms var(--ease-out); }
+@keyframes listBurst {
+  0% { box-shadow: 0 0 0 0 color-mix(in oklab, var(--tone) 70%, transparent), 0 0 0 0 color-mix(in oklab, var(--tone) 40%, transparent); }
+  100% { box-shadow: 0 0 0 14px transparent, 0 0 0 26px transparent; }
+}
 /* secondary: a plate that needs no blur to read */
 .btn.glass, .btn-glass { background: rgb(255 255 255 / 0.09); box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.13), inset 0 1px 0 rgb(255 255 255 / 0.08); color: var(--fg); }
 .btn.glass:hover:not(:disabled), .btn-glass:hover:not(:disabled) { background: rgb(255 255 255 / 0.16); box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.24); }
@@ -383,6 +402,46 @@ button.chip:hover:not(.on):not(:disabled) { color: var(--fg); background: rgb(25
 ::view-transition-old(root), ::view-transition-new(root) { animation-duration: 280ms; animation-timing-function: var(--ease); }
 ::view-transition-group(hero) { animation-duration: 460ms; animation-timing-function: var(--ease-out); z-index: 10; }
 ::view-transition-old(hero), ::view-transition-new(hero) { height: 100%; object-fit: cover; }
+/* Depth by direction: going somewhere new, the next page comes up from just behind the glass while
+   the old one falls slightly toward you; Back plays it the other way. A 1.5% scale, nothing more. */
+:root[data-nav="forward"]::view-transition-old(root) { animation-name: vt-out-fwd; }
+:root[data-nav="forward"]::view-transition-new(root) { animation-name: vt-in-fwd; }
+:root[data-nav="back"]::view-transition-old(root) { animation-name: vt-out-back; }
+:root[data-nav="back"]::view-transition-new(root) { animation-name: vt-in-back; }
+@keyframes vt-out-fwd { to { opacity: 0; transform: scale(1.015); } }
+@keyframes vt-in-fwd { from { opacity: 0; transform: scale(0.985); } }
+@keyframes vt-out-back { to { opacity: 0; transform: scale(0.985); } }
+@keyframes vt-in-back { from { opacity: 0; transform: scale(1.015); } }
+/* The hero's title treatment flies into the title page's (Hero tags it on the way out). */
+::view-transition-group(hero-title) { animation-duration: 460ms; animation-timing-function: var(--ease-out); z-index: 11; }
+::view-transition-old(hero-title), ::view-transition-new(hero-title) { height: 100%; width: auto; object-fit: contain; object-position: left bottom; }
+
+/* The top bar holds still while pages change under it. Only the live (new) bar is shown, so the
+   dock pill glides to its new tab rather than crossfading with a ghost of the old one. */
+.top { view-transition-name: topbar; }
+::view-transition-group(topbar) { z-index: 20; animation: none; }
+::view-transition-old(topbar):not(:only-child) { display: none; }
+::view-transition-new(topbar):not(:only-child) { animation: none; }
+/* Into or out of the player there is only one bar (the watch page has none): it fades, not cuts. */
+::view-transition-old(topbar):only-child, ::view-transition-new(topbar):only-child { animation-duration: 280ms; animation-timing-function: var(--ease); }
+
+/* ---------- range sliders ---------- */
+/* Glass track, filled with the tone up to --v (set inline, 0–100%), and a knob that grows on grab.
+   --mark (optional) draws a notch, e.g. the 100% point on the 0–200% volume boost. */
+input[type="range"] { -webkit-appearance: none; appearance: none; height: 18px; margin: 0; background: none; cursor: pointer; accent-color: initial; }
+input[type="range"]::-webkit-slider-runnable-track { height: 4px; border-radius: 99px;
+  background:
+    linear-gradient(90deg, transparent calc(var(--mark, -10%) - 1px), rgb(255 255 255 / 0.55) calc(var(--mark, -10%) - 1px) calc(var(--mark, -10%) + 1px), transparent calc(var(--mark, -10%) + 1px)),
+    linear-gradient(90deg, color-mix(in oklab, var(--tone) 70%, #fff) 0 var(--v, 0%), rgb(255 255 255 / 0.14) var(--v, 0%));
+  box-shadow: inset 0 1px 1px rgb(0 0 0 / 0.45), 0 1px 0 rgb(255 255 255 / 0.06); }
+input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; margin-top: -5px; border-radius: 50%; background: #fff;
+  box-shadow: 0 0 0 0 color-mix(in oklab, var(--tone) 40%, transparent), 0 2px 6px rgb(0 0 0 / 0.5); transition: transform var(--fast) var(--ease), box-shadow var(--base) var(--ease); }
+input[type="range"]:hover::-webkit-slider-thumb { transform: scale(1.15); box-shadow: 0 0 0 5px color-mix(in oklab, var(--tone) 26%, transparent), 0 2px 6px rgb(0 0 0 / 0.5); }
+input[type="range"]:active::-webkit-slider-thumb { transform: scale(1.3); }
+input[type="range"]:focus-visible { outline: none; }
+input[type="range"]:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--tone-ink); }
+input[type="range"]:disabled { cursor: default; }
+input[type="range"]:disabled::-webkit-slider-thumb { background: var(--fg3); transform: none; box-shadow: none; }
 
 /* ---------- compact windows (the app's minimum is 960 × 600) ---------- */
 @media (max-width: 1320px) {
@@ -400,11 +459,13 @@ button.chip:hover:not(.on):not(:disabled) { color: var(--fg); background: rgb(25
    except the things that mean "busy", and view transitions cut instead of morphing. */
 :root.reduce-motion *, :root.reduce-motion *::before, :root.reduce-motion *::after { animation-duration: 1ms !important; animation-iteration-count: 1 !important; animation-delay: 0ms !important; transition-duration: 1ms !important; scroll-behavior: auto !important; }
 :root.reduce-motion .spin, :root.reduce-motion .mini-spin, :root.reduce-motion .pload-ring, :root.reduce-motion .smart-refresh.spinning svg { animation: spin 1.6s linear infinite !important; }
+:root.reduce-motion { transition: none; }
 :root.reduce-motion::view-transition-group(*), :root.reduce-motion::view-transition-old(*), :root.reduce-motion::view-transition-new(*) { animation: none !important; }
 :root.reduce-motion .dock, :root.reduce-motion .menu, :root.reduce-motion .toast, :root.reduce-motion .palette, :root.reduce-motion .psheet { backdrop-filter: none; background: #0d0d13f2; }
 /* Player HUD and launch-card glass: drop only the blur, these panels keep their own (mostly opaque) fills. */
 :root.reduce-motion .ptop-actions, :root.reduce-motion .pbot, :root.reduce-motion .cc-btn, :root.reduce-motion .smart, :root.reduce-motion .race-grid-wrap, :root.reduce-motion .auth-card { backdrop-filter: none !important; }
 @media (prefers-reduced-motion: reduce) {
+  :root { transition: none; }
   *, *::before, *::after { animation-duration: 1ms !important; animation-iteration-count: 1 !important; animation-delay: 0ms !important; transition-duration: 1ms !important; scroll-behavior: auto !important; }
   .spin, .mini-spin, .pload-ring, .smart-refresh.spinning svg { animation: spin 1.6s linear infinite !important; }
   ::view-transition-group(*), ::view-transition-old(*), ::view-transition-new(*) { animation: none !important; }

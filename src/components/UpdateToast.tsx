@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { RELEASES_URL, dismissUpdate, installUpdate, isDismissed, startUpdateChecks, useUpdate } from "../lib/updater";
+import { openExternal } from "./TrailerModal";
 
 /** Bottom-right card when a new version is out: release notes, then a one-click update. */
 export function UpdateToast() {
@@ -34,7 +35,7 @@ export function UpdateToast() {
         <div className="ut-h"><i />Update couldn't install automatically</div>
         <p>Windows may have blocked the background installer. Download the setup file directly to update.</p>
         <div className="ut-acts">
-          <a className="btn play sm" href={RELEASES_URL} target="_blank" rel="noreferrer">Download installer</a>
+          <button type="button" className="btn play sm" onClick={() => openExternal(RELEASES_URL)}>Download installer</button>
           <button className="btn glass sm" onClick={dismissUpdate}>Dismiss</button>
         </div>
       </div>

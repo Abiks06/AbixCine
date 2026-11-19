@@ -284,7 +284,7 @@ const COMPOUND_LOCALE_PAIRS = new Map<string, [string, string]>([
 ]);
 
 function unwrapProxyTarget(raw: string): string {
-  if (!/^(?:https?:\/\/abxs\.localhost|abxs:\/\/localhost)\/p\?/i.test(raw)) return raw;
+  if (!/^(?:https?:\/\/abxs\.localhost|abxs:\/\/localhost|http:\/\/127\.0\.0\.1:\d+\/[0-9a-f]{32})\/p\?/i.test(raw)) return raw;
   try {
     const qs = new URL(raw.replace(/^abxs:\/\//i, "http://")).searchParams;
     const u = qs.get("u");

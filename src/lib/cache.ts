@@ -15,7 +15,7 @@ const inflight = new Map<string, Promise<unknown>>();
 const LEGACY_PREFIX = "abx.cache.";
 const IDB_PREFIX = "cache:";
 /** How long to wait for fresh data before showing the stale copy (the refresh still lands in the cache). */
-const STALE_WAIT_MS = 1500;
+const STALE_WAIT_MS = 250;
 /** Longest `cached()` waits for the disk copy to load at boot before going to the network. */
 const HYDRATE_WAIT_MS = 400;
 const MAX_DISK = 600;

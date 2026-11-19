@@ -45,7 +45,18 @@ Notes on Render's free plan: the web service sleeps after 15 minutes idle (first
 
 ## Install, release and updates
 
-**Install:** download `AbixCine_<version>_x64-setup.exe` from the [latest release](https://github.com/Abiks06/AbixCine/releases/latest) and run it. It installs per-user (no admin prompt), adds Start menu and desktop shortcuts, and fetches the WebView2 runtime if the PC lacks it.
+**Install:** download `AbixCine_<version>_x64-setup.exe` from the [latest release](https://github.com/Abiks06/AbixCine/releases/latest) and run it. It installs per-user (no admin prompt), adds Start menu and desktop shortcuts, and fetches the WebView2 runtime if the PC lacks it. Each release also carries:
+
+- `AbixCine_<version>_x64_en-US.msi` — for machines where `.exe` installers are blocked or deployed by IT (per-machine, needs admin).
+- `AbixCine_<version>_x64-portable.zip` — unzip and run `abixcine.exe`; needs the WebView2 runtime (built into Windows 11) and doesn't self-update.
+
+Releases are Authenticode-signed when the signing secrets described at the top of `.github/workflows/release.yml` are configured (Azure Trusted Signing or a `.pfx` certificate). An unsigned build will trip these, so tell testers:
+
+- In **Edge / Chrome**, choose **Keep → Keep anyway** if the `.exe` download is flagged as uncommon.
+- In **Windows Defender SmartScreen**, click **More info → Run anyway**.
+- On **Windows 11** PCs with **Smart App Control** set to *On*, Windows blocks unsigned internet downloads with no "Run anyway" bypass.
+
+**If it won't start:** AbixCine logs every launch, startup failure and crash to `%LOCALAPPDATA%\app.abixcine.desktop\startup.log`, and shows a message box instead of vanishing (e.g. when WebView2 is missing). If a launch never reaches the first screen, the next one starts in *safe graphics mode* (WebView2 GPU off) and says so in the app, with a button to go back to the GPU; `abixcine.exe --safe-mode` forces it for one launch.
 
 **Updates:** the app checks the latest GitHub release on launch and every six hours. When a newer signed build exists, a prompt offers *Update and restart*; Settings → About has a manual check. Updates are verified against the public key in `src-tauri/tauri.conf.json`, so only builds signed with the project key install.
 
@@ -65,7 +76,7 @@ cd src-tauri; cargo check; cd ..        # refreshes Cargo.lock
 git commit -am "v1.0.1"; git tag v1.0.1; git push; git push --tags
 ```
 
-The workflow needs two repository secrets: `TAURI_SIGNING_PRIVATE_KEY` (the contents of `~/.tauri/abixcine.key`) and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. Keep the key safe: losing it means existing installs can't verify future updates.
+The workflow needs two repository secrets: `TAURI_SIGNING_PRIVATE_KEY` (the contents of `~/.tauri/abixcine.key`) and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. Keep the key safe: losing it means existing installs can't verify future updates. That key only signs updates; Windows code signing is separate and optional (see the workflow header). The release is created as a draft, checked (signatures, when signing is on), given the portable zip, and only then published.
 
 ## API
 

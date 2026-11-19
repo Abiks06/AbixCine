@@ -29,6 +29,11 @@ export interface ScanError {
 /** Folders that failed on the last scan (unplugged drive, permissions). */
 export const scanErrors = () => index?.errors ?? [];
 
+/** Forget the directory scan cache so the next lookup re-walks the library folders. */
+export function clearLocalScanCache() {
+  index = null;
+}
+
 /** Scan the library folders (Rust side walks the disk) with a 5 minute cache. */
 let scanning: { key: string; p: Promise<LibFile[]> } | null = null;
 export async function scanLibrary(paths: string[], force = false): Promise<LibFile[]> {
@@ -182,6 +187,51 @@ const fileYear = (name: string) => {
 };
 const DUB_RX = /\b(dub|dubbed|eng(lish)?[ ._-]?dub)\b/i;
 const DUAL_RX = /\b(dual[ ._-]?audio|multi[ ._-]?audio)\b/i;
+const SUB_RX = /\b(sub|subbed|raw|jpn|japanese)\b/i;
+
+const SUB_PROBE_CACHE = new Map<string, EmbeddedSubtitle[]>();
+const MAX_SUB_PROBE_CACHE = 500;
+const SUB_PROBE_TIMEOUT_MS = 1500;
+
+async function probeEmbeddedSubtitles(file: LibFile, signal?: AbortSignal): Promise<EmbeddedSubtitle[]> {
+  const cacheKey = `${file.path}|${file.size}`;
+  const hit = SUB_PROBE_CACHE.get(cacheKey);
+  if (hit) {
+    SUB_PROBE_CACHE.delete(cacheKey);
+    SUB_PROBE_CACHE.set(cacheKey, hit);
+    return hit;
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timed = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), SUB_PROBE_TIMEOUT_MS);
+  });
+  const aborted = signal
+    ? new Promise<"aborted">((resolve) => {
+        if (signal.aborted) return resolve("aborted");
+        signal.addEventListener("abort", () => resolve("aborted"), { once: true });
+      })
+    : null;
+  try {
+    const call = invoke<EmbeddedSubtitle[]>("probe_local_subtitles", { path: file.path }).then(
+      (r) => ({ ok: true as const, value: r }),
+      () => ({ ok: false as const }),
+    );
+    const racers: Promise<unknown>[] = [call, timed];
+    if (aborted) racers.push(aborted);
+    const winner = await Promise.race(racers);
+    if (winner === "timeout" || winner === "aborted") return [];
+    const res = winner as { ok: true; value: EmbeddedSubtitle[] } | { ok: false };
+    if (!res.ok || !Array.isArray(res.value)) return [];
+    if (SUB_PROBE_CACHE.size >= MAX_SUB_PROBE_CACHE) {
+      const oldest = SUB_PROBE_CACHE.keys().next().value;
+      if (oldest !== undefined) SUB_PROBE_CACHE.delete(oldest);
+    }
+    SUB_PROBE_CACHE.set(cacheKey, res.value);
+    return res.value;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /** What audio a file (or its folder) carries, from common release naming. */
 export function audioOf(path: string): "sub" | "dub" | "dual" {
@@ -193,13 +243,14 @@ export const localProvider: SourceProvider = {
   id: "local",
   name: "Local library",
   category: "local",
-  priority: 30,
+  priority: 60,
   isEnabled: (s) => s.libraryPaths.length > 0,
   async find(req, s, signal) {
     if (signal?.aborted) return [];
     const files = await scanLibrary(s.libraryPaths);
     if (signal?.aborted) return [];
-    const matched: { file: LibFile; audio: "sub" | "dub" | "dual" }[] = [];
+    const matched: { file: LibFile; audio?: "sub" | "dub" | "dual" }[] = [];
+    const dubFallbacks: { file: LibFile }[] = [];
     for (const f of files) {
       // Match against the file name plus its parent folders, since many libraries are "Show/Season 1/01.mkv".
       // Only folders inside the library count: the library's own location ("D:\\Home\\…") is not a title.
@@ -215,20 +266,26 @@ export const localProvider: SourceProvider = {
         const y = fileYear(hay);
         if (y && req.media.year && Math.abs(y - req.media.year) > 1) continue;
       }
-      // One anime entry, two audio tracks: keep files that carry the audio the user picked.
+      // One anime entry, two audio tracks: keep explicit audio matches first, and fall back to
+      // untagged local files (e.g. dual/embedded-audio MKVs) if a dub is requested with no explicit dub file.
       const audio = audioOf(hay);
-      if (req.audio && audio !== "dual" && audio !== req.audio) continue;
-      matched.push({ file: f, audio });
+      const untagged = !DUAL_RX.test(hay) && !DUB_RX.test(hay) && !SUB_RX.test(hay);
+      if (req.audio && audio !== "dual" && audio !== req.audio) {
+        if (req.audio === "dub" && untagged) dubFallbacks.push({ file: f });
+        continue;
+      }
+      matched.push({ file: f, audio: req.audio ? audio : undefined });
     }
+    const chosen = matched.length ? matched : dubFallbacks.map(({ file }) => ({ file, audio: undefined }));
 
     const canProbe = isTauri();
     return Promise.all(
-      matched.map(async ({ file: f, audio }): Promise<StreamCandidate> => {
+      chosen.map(async ({ file: f, audio }): Promise<StreamCandidate> => {
         const isHls = f.path.toLowerCase().endsWith(".m3u8");
         const sidecars = f.subs?.map((p) => sidecarTrack(p, f.name)) ?? [];
         const rawEmbedded =
           canProbe && !isHls && !signal?.aborted
-            ? await invoke<EmbeddedSubtitle[]>("probe_local_subtitles", { path: f.path }).catch(() => [])
+            ? await probeEmbeddedSubtitles(f, signal)
             : [];
         const embedded = Array.isArray(rawEmbedded)
           ? rawEmbedded
@@ -239,12 +296,13 @@ export const localProvider: SourceProvider = {
         return {
           providerId: "local",
           providerName: "Local library",
-          label: f.name + (req.audio ? (audio === "dual" ? " · dual audio" : ` · ${audio}`) : ""),
+          label: f.name + (audio ? (audio === "dual" ? " · dual audio" : ` · ${audio}`) : ""),
           url: convertFileSrc(f.path),
           kind: isHls ? "hls" : "file",
+          via: "direct",
           ...(isHls ? {} : { localPath: f.path }),
           quality: qualityOf(f.name),
-          audio: req.audio ? audio : undefined,
+          ...(audio ? { audio } : {}),
           ...(f.subs !== undefined || subtitles.length ? { subtitles } : {}),
         };
       }),

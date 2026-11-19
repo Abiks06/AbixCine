@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
-import { getDetail } from "../lib/catalog";
+import { useSlidingIndicator } from "../lib/useSlidingIndicator";
+import { getDetail, isUnreleasedMedia } from "../lib/catalog";
 import { fmtRuntime } from "../lib/format";
 import type { Media } from "../lib/types";
 import { isFilm } from "../lib/types";
@@ -32,6 +33,7 @@ function cutoffs(now: Date) {
  * series by one episode, with the end time worked out from the clock.
  */
 export function FitsTonight({ pool, loading }: { pool: Media[]; loading?: boolean }) {
+  const finishInd = useSlidingIndicator();
   const [now, setNow] = useState(() => new Date());
   const opts = useMemo(() => cutoffs(now), [now.getHours() * 60 + now.getMinutes()]); // eslint-disable-line react-hooks/exhaustive-deps
   const [sel, setSel] = useState(0);
@@ -61,7 +63,13 @@ export function FitsTonight({ pool, loading }: { pool: Media[]; loading?: boolea
     const jobs = pool.slice(0, 18).map((m) =>
       getDetail(m.key)
         .then((d) => {
-          if (!live || !d.runtime) return;
+          if (!live || !d.runtime || isUnreleasedMedia(d)) return;
+          if (!isFilm(d)) {
+            const hasAired =
+              [...(d.seasons ?? []), ...(d.specials ?? [])].some((s) => s.episodeCount > 0 && s.status !== "upcoming") ||
+              ((d.episodeCount ?? 0) > 0 && !isUnreleasedMedia(d));
+            if (!hasAired) return;
+          }
           batch[m.key] = d.runtime;
           flushTimer ??= setTimeout(flush, 150);
         })
@@ -81,7 +89,7 @@ export function FitsTonight({ pool, loading }: { pool: Media[]; loading?: boolea
 
   const max = opts[Math.min(sel, opts.length - 1)].max;
   const fits = pool
-    .filter((m, i, a) => runtimes[m.key] && runtimes[m.key] <= max && a.findIndex((x) => x.key === m.key) === i)
+    .filter((m, i, a) => !isUnreleasedMedia(m) && runtimes[m.key] && runtimes[m.key] <= max && a.findIndex((x) => x.key === m.key) === i)
     .sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0))
     .slice(0, 10);
   // The shelf holds its place from the first frame: a section that appeared after 18 lookups
@@ -97,7 +105,7 @@ export function FitsTonight({ pool, loading }: { pool: Media[]; loading?: boolea
         right={
           <div className="fit">
             <span className="fit-now">It’s {clock(now)} · finish</span>
-            <div className="seg-pills" role="radiogroup" aria-label="Finish by">
+            <div className="seg-pills" role="radiogroup" aria-label="Finish by" ref={finishInd}>
               {opts.map((o, i) => (
                 <button key={o.label} role="radio" aria-checked={i === sel} className={i === sel ? "on" : ""} onClick={() => setSel(i)}>
                   {o.label}

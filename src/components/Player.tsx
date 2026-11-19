@@ -1,24 +1,25 @@
 import type Hls from "hls.js";
 import type shaka from "shaka-player";
-import { convertFileSrc, invoke, isTauri } from "@tauri-apps/api/core";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { invoke, isTauri } from "@tauri-apps/api/core";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useSlidingIndicators } from "../lib/useSlidingIndicator";
 import { fmtTime } from "../lib/format";
-import { ENHANCE_MODES, startEnhancer, upscalerAvailable, type EnhanceMode, type Enhancer, type EnhancerStats } from "../lib/enhance";
+import { ENHANCE_MODES, upscalerAvailable } from "../lib/enhance";
+import { useEnhance } from "./player/useEnhance";
+import { usePlayerShortcuts } from "./player/shortcuts";
+import { useMediaSession } from "./player/useMediaSession";
+import { useTrickplay } from "./player/useTrickplay";
+import { useSubtitles } from "./player/useSubtitles";
+import { useStreamEngine } from "./player/useStreamEngine";
+import { useFullscreen, useIdleChrome, usePip } from "./player/useChrome";
 import { fetchSkipSegments, mergeSkipRanges, type SkipSegments } from "../lib/skipSegments";
-import { createHlsSideLoader } from "../lib/hlsSideSubs";
-import { TrickplayEngine } from "../lib/trickplay";
 import { TranscriptSheet } from "./TranscriptSheet";
 import { hasAudioFx, loadAudioFx, releaseAudioFx, resumeAudioFx, saveAudioFx, setAudioFx, type AudioFx } from "../lib/audioFx";
-import { createHoverStore, createPlayhead, Scrubber, TimeReadout, useHover, usePlayhead } from "./Playhead";
+import { createHoverStore, createPlayhead, Scrubber, TimeReadout, usePlayhead } from "./Playhead";
 import {
-  EMBED_KEYS,
-  NAV_KEYS,
   UP_NEXT_AT,
-  classifyKeyTarget,
   friendlyFailure,
   inUpNextWindow,
-  isKeyboardFocused,
   loadSessionMute,
   loadingStage,
   nextSpeed,
@@ -30,59 +31,20 @@ import {
   type WheelState,
 } from "../lib/playerControls";
 import { DashCueCollector } from "../lib/dashCues";
-import {
-  SUB_PREF_EVENT,
-  activeCuesAt,
-  langLabel,
-  nextCueBoundaryAfter,
-  cuesToVtt,
-  decodeSubtitle,
-  langBase,
-  loadSubPref,
-  loadSubTrackMemory,
-  normalizeSubPref,
-  parseSubtitles,
-  pickBestSubtitleIndex,
-  preferredAudioTrackIndex,
-  saveSubPref,
-  saveSubTrackMemory,
-  shouldAutoEnableSubtitles,
-  type CueAlign,
-  type SubPref,
-  type SubtitleCue,
-} from "../lib/subtitles";
-import {
-  fetchAndParseSubtitle,
-  searchOnlineSubtitles,
-  type OnlineSubtitleResult,
-} from "../lib/subtitleProviders";
-import { getSettings, updateSettings, type Audio } from "../lib/settings";
-import type { Episode } from "../lib/types";
-import type { StreamCandidate, SubtitleFormat } from "../sources/types";
-import { isUrlTokenExpired, native, proxyUrl, unwrapProxyUrl } from "../sources/native";
-import type { SessionSnapshot, SourceSession } from "../sources/session";
-import { SourceBoard } from "./SourceBoard";
+import { langBase } from "../lib/subtitles";
+import { type Audio, updateSettings, useSettings } from "../lib/settings";
+import type { StreamCandidate } from "../sources/types";
+import type { SourceSession } from "../sources/session";
 import { AudioToggle } from "./AudioToggle";
 import { Icon } from "./Icon";
 import { loadShowSpeed, saveShowSpeed, showKeyFor } from "../lib/showSpeed";
 import { SubtitleOverlay } from "./SubtitleOverlay";
-import { SubtitleSheet, type UnifiedSubTrack } from "./SubtitleSheet";
+import { SubtitleSheet } from "./SubtitleSheet";
+import { MAX_VOL, SHORTCUTS, SLOW_MS, SPEEDS, TIME_LEFT_KEY, bufferedAhead, candKey, readEmbedMessage, withStart, type Sheet, type EpisodeNav, type PlayerMedia } from "./player/shared";
+import { EpisodeSheet, ServerSheet, UpNext } from "./player/sheets";
+import { Ambilight } from "./player/Ambilight";
 
-/** What the player needs to show the episode list and move between episodes. */
-export interface EpisodeNav {
-  seasons?: { number: number; name: string; episodeCount: number }[];
-  season?: number;
-  episode: number;
-  /** Absolute episode count for anime (no seasons). */
-  count?: number;
-  loadSeason?: (season: number) => Promise<Episode[]>;
-  /** Anime: titles/stills for the whole run (merged into the numbered list). */
-  loadAll?: () => Promise<Episode[]>;
-  go: (season: number | undefined, episode: number) => void;
-  fallbackStill?: string;
-  /** "S1 · E5 · Title" of the next one, for the Up next card. */
-  nextLabel?: string;
-}
+export type { EpisodeNav };
 
 interface Props {
   /** The shared source session: the one list of servers, and where playback results are reported. */
@@ -97,6 +59,8 @@ interface Props {
   onNext?: () => void;
   autoNext?: boolean;
   onBack: () => void;
+  /** Open the title info page directly from the player. */
+  onInfo?: () => void;
   /** Re-run the source search when every candidate has died. */
   onRetry?: () => void;
   nextLabel?: string;
@@ -106,191 +70,18 @@ interface Props {
   episodes?: EpisodeNav;
   season?: number;
   episode?: number;
-  media?: {
-    key?: string;
-    /** Franchise key when one anime series spans several catalog entries. */
-    canonicalKey?: string;
-    tmdbId?: number;
-    imdbId?: string;
-    malId?: number;
-    anilistId?: number;
-    title: string;
-    logo?: string;
-    overview?: string;
-    year?: number;
-    rating?: number;
-    backdrop?: string;
-    kind?: string;
-  };
+  media?: PlayerMedia;
 }
 
-interface ExtractedSubtitleResult {
-  format: "ass" | "vtt";
-  content: string;
-  path: string;
-}
+/** The toast's level bar for a volume, notched at 100% on the 0–200% boost range. */
+const volMeter = (n: number) => ({ v: n / MAX_VOL, mark: 1 / MAX_VOL });
 
-interface TrackCueCache {
-  cues?: SubtitleCue[];
-  raw?: string;
-  format?: SubtitleFormat;
-  loading?: boolean;
-  error?: string;
-}
-
-type Sheet = "servers" | "episodes" | "subtitles" | "transcript" | "audio" | "picture";
-
-const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2];
-const MAX_VOL = 2; // Up to 200% pre-amp boost via Web Audio + brickwall safety limiter
-const TIME_LEFT_KEY = "abx.timeLeft";
-/** Controls fade this long after the last pointer move or key press (while playing). */
-const IDLE_MS = 2800;
-/** A connect or rebuffer that runs this long offers the next server instead of only spinning. */
-const SLOW_MS = 8000;
-const SHORTCUTS: [string, string][] = [
-  ["Space / K", "Play or pause"],
-  ["← / →", "Back or forward 5s (Shift: 30s)"],
-  ["J / L", "Back or forward 10s"],
-  ["0 – 9", "Jump to 0% – 90%"],
-  ["↑ / ↓ · wheel", "Volume"],
-  ["M", "Mute"],
-  ["< / >", "Slower or faster"],
-  [", / .", "Step a frame (paused)"],
-  ["C · Shift+C", "Subtitles on/off · Cycle track"],
-  ["[ / ]", "Subtitle timing ±0.5s (Shift: ±0.1s)"],
-  ["S · E", "Servers · Episodes"],
-  ["N", "Next episode"],
-  ["F · double-click", "Fullscreen (F11 too)"],
-  ["P", "Picture-in-picture"],
-  ["?", "This list"],
-  ["Esc", "Close panel, leave fullscreen, go back"],
-];
-/** Pointer over these keeps the controls up: they don't fade from under a resting cursor. */
-const HOLD_CHROME = ".ptop-actions, .ptop > .pbtn, .pbot, .upnext, .skip-btn, .psheet, .perr-card, .pload-next";
-const ENHANCE_KEY = "abx.enhance.v1";
-const SUB_FILE_EXT_RX = /\.(srt|vtt|ass|ssa)$/i;
-const SUB_LANG_HINT_RX = /(?:^|[._ -])(en|eng|english|ja|jpn|japanese|fr|fra|fre|french|es|spa|spanish|de|deu|ger|german|pt|pt-br|por|portuguese|it|ita|italian|ar|ara|arabic|ko|kor|korean|zh|chi|zho|chinese|ru|rus|russian|hi|hin|tr|tur|pl|pol|nl|nld)(?:[._ -]|$)/i;
-
-function inferUserSubLang(filename: string): string {
-  const stem = filename.replace(/\.[^.]+$/, "");
-  const m = stem.match(SUB_LANG_HINT_RX);
-  return m ? langBase(m[1]) : "und";
-}
-
-/**
- * Converted cue lists, per text track. The cue engine runs every 60 ms while subtitles are on;
- * rebuilding (and re-parsing every styled cue of) the whole track each time cost real CPU, and the
- * fresh array also defeated activeCuesAt's index cache, which is keyed on the array itself.
- * Rebuilt only when the track's cue list actually changes (HLS appends cues as segments load).
- */
-const trackCueMemo = new WeakMap<TextTrack, { sig: string; prefix: string; cues: SubtitleCue[] }>();
-
-function textTrackToCues(track: TextTrack, prefix: string): { cues: SubtitleCue[]; usingActiveFallback: boolean } {
-  const full = track.cues;
-  const usingActiveFallback = !(full && full.length > 0);
-  if (!usingActiveFallback && full) {
-    const sig = `${full.length}:${full[0].startTime}:${full[full.length - 1].endTime}`;
-    const hit = trackCueMemo.get(track);
-    if (hit && hit.sig === sig && hit.prefix === prefix) return { cues: hit.cues, usingActiveFallback };
-    const built = convertCues(full, prefix);
-    trackCueMemo.set(track, { sig, prefix, cues: built });
-    return { cues: built, usingActiveFallback };
-  }
-  const list = track.activeCues;
-  if (!list || list.length === 0) return { cues: [], usingActiveFallback };
-  return { cues: convertCues(list, prefix), usingActiveFallback };
-}
-
-function convertCues(list: TextTrackCueList, prefix: string): SubtitleCue[] {
-  const out: SubtitleCue[] = [];
-  for (let i = 0; i < list.length; i++) {
-    const c = list[i] as VTTCue | (TextTrackCue & { text?: string });
-    const rawText = "text" in c && typeof c.text === "string" ? c.text : "";
-    const vc = c as Partial<VTTCue>;
-    const horiz = vc.align === "left" || vc.align === "start" ? 0 : vc.align === "right" || vc.align === "end" ? 2 : 1;
-    const vert = typeof vc.line === "number" ? (vc.line >= 0 && vc.line <= 25 ? 7 : vc.line > 25 && vc.line <= 65 ? 4 : 1) : 1;
-    const align = (vert + horiz) as CueAlign;
-    if (rawText.includes("<")) {
-      const parsed = parseSubtitles(`WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n${rawText}`, "vtt");
-      const first = parsed.cues[0];
-      out.push({
-        id: `${prefix}-${i}-${c.startTime}-${c.endTime}`,
-        start: c.startTime,
-        end: c.endTime,
-        text: first?.text ?? rawText,
-        spans: first?.spans ?? [{ text: rawText }],
-        align,
-      });
-    } else {
-      out.push({
-        id: `${prefix}-${i}-${c.startTime}-${c.endTime}`,
-        start: c.startTime,
-        end: c.endTime,
-        text: rawText,
-        spans: [{ text: rawText }],
-        align,
-      });
-    }
-  }
-  return out;
-}
-
-function cueSignature(cues: readonly SubtitleCue[]): string {
-  if (!cues.length) return "";
-  return cues.map((c) => `${c.id}:${c.text}:${c.align}`).join("|");
-}
-
-const candKey = (c: { url: string; pageUrl?: string }): string => c.pageUrl ?? c.url;
-/** Append a "start at" parameter so an embed resumes where we left off. */
-function withStart(url: string, param: string | undefined, at: number) {
-  if (!param || at < 5) return url;
-  try {
-    const u = new URL(url);
-    u.searchParams.set(param, String(Math.floor(at)));
-    return u.toString();
-  } catch {
-    return url;
-  }
-}
-
-/**
- * Embed players report progress with postMessage in a few shapes:
- * { type: "PLAYER_EVENT", data: { event, currentTime, duration } }, a JSON string with
- * { timestamp, duration }, or { event: "time", time, duration }. Read any of them.
- */
-function readEmbedMessage(raw: unknown): { time?: number; duration?: number; ended?: boolean } | null {
-  let d: unknown = raw;
-  if (typeof d === "string") {
-    try {
-      d = JSON.parse(d);
-    } catch {
-      return null;
-    }
-  }
-  if (!d || typeof d !== "object") return null;
-  const obj = d as Record<string, unknown>;
-  const p = obj.data && typeof obj.data === "object" ? (obj.data as Record<string, unknown>) : obj;
-  const ev = String(p.event ?? obj.event ?? p.type ?? "").toLowerCase();
-  const num = (...v: unknown[]) => v.map(Number).find((n) => Number.isFinite(n) && n >= 0);
-  const time = num(p.currentTime, p.time, p.timestamp);
-  const duration = num(p.duration);
-  const ended = ev === "ended" || ev === "complete";
-  if (!ended && (time == null || !duration || duration < 60 || time > duration + 5)) return null;
-  return { time, duration, ended };
-}
-
-function loadEnhance(): EnhanceMode {
-  try {
-    const v = localStorage.getItem(ENHANCE_KEY) as EnhanceMode | null;
-    return v && ENHANCE_MODES.some((m) => m.id === v) ? v : "off";
-  } catch {
-    return "off";
-  }
-}
-
-export function Player({ session, initialSource, title, subtitle, startAt, onProgress, onEnded, onNext, autoNext, nextLabel, onBack, onRetry, audio, onAudio, originalLanguage, episodes, media, season, episode }: Props) {
+export function Player({ session, initialSource, title, subtitle, startAt, onProgress, onEnded, onNext, autoNext, nextLabel, onBack, onInfo, onRetry, audio, onAudio, originalLanguage, episodes, media, season, episode }: Props) {
   const wrap = useRef<HTMLDivElement>(null);
   const video = useRef<HTMLVideoElement>(null);
+  // The side sheet's tabs and every segmented picker inside it (subtitle sheet included) glide.
+  const sheetInd = useSlidingIndicators<HTMLElement>(".ps-tabs, .seg3");
+  const cinemaGlow = !!useSettings().cinemaGlow;
   const canvas = useRef<HTMLCanvasElement>(null);
   const hlsRef = useRef<Hls | null>(null);
   /** The HLS stream's first presentation timestamp (s), for aligning side-loaded subtitle segments. */
@@ -360,10 +151,8 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
   const [fatal, setFatal] = useState<{ why: string; server?: string } | null>(null);
   /** The video reached its end (Up next stays up then, with autoplay off). */
   const [ended, setEnded] = useState(false);
-  const [pipOn, setPipOn] = useState(false);
   const [preparingLocal, setPreparingLocal] = useState(false);
   const [preparingTorrent, setPreparingTorrent] = useState(false);
-  const [idle, setIdle] = useState(false);
   const activeTorrentIdRef = useRef<number | null>(null);
   const stopActiveTorrent = useCallback(() => {
     const id = activeTorrentIdRef.current;
@@ -379,22 +168,17 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
    * it doesn't re-enter on every wheel notch); `out` plays the exit before it unmounts. Keyed on the
    * text it used to re-run nothing when the same message came twice, and went silent.
    */
-  const [toast, setToast] = useState<{ msg: string; id: number; out: boolean } | null>(null);
-  const [isFull, setIsFull] = useState(false);
-  const isFullRef = useRef(false);
-  isFullRef.current = isFull;
+  // `meter`: a continuous setting (volume, speed) shows its level as a bar; `mark` notches a reference point.
+  const [toast, setToast] = useState<{ msg: string; id: number; out: boolean; meter?: { v: number; mark?: number } } | null>(null);
   const [levels, setLevels] = useState<{ height: number }[]>([]);
   const [level, setLevel] = useState(-1);
   const [activeLevel, setActiveLevel] = useState(-1);
   const [videoHeight, setVideoHeight] = useState<number | undefined>(undefined);
   // The seek-bar hover point is a store too (components/Playhead.tsx): only the scrubber follows it.
   const hoverStore = useMemo(() => createHoverStore(), []);
-  // Scrub previews (lib/trickplay): the engine opens on the first hover of a stream.
-  const trickRef = useRef<TrickplayEngine | null>(null);
-  const [thumb, setThumb] = useState<string | null>(null);
-  const hoverBucket = useHover(hoverStore, (p) => (p ? Math.floor(p.t / 5) : -1));
   /** The ±seconds badge that appears on the side you skipped towards; repeated presses add up. */
-  const [bump, setBump] = useState<{ total: number; n: number } | null>(null);
+  // `again`: this press added to a running seek (+10s → +20s), so the disc re-pops instead of re-entering.
+  const [bump, setBump] = useState<{ total: number; n: number; again?: boolean } | null>(null);
   const bumpTimer = useRef<number>();
   const [timeLeft, setTimeLeft] = useState(() => localStorage.getItem(TIME_LEFT_KEY) === "1");
   const [keysOpen, setKeysOpen] = useState(false);
@@ -429,9 +213,9 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
   const refreshCtlRef = useRef<AbortController | null>(null);
   const activeSessionRef = useRef(0);
   const failedSessionRef = useRef(-1);
-  const flash = (msg: string) => {
+  const flash = (msg: string, meter?: { v: number; mark?: number }) => {
     if (!mountedRef.current) return;
-    setToast((prev) => ({ msg, id: prev && !prev.out ? prev.id : (prev?.id ?? 0) + 1, out: false }));
+    setToast((prev) => ({ msg, meter, id: prev && !prev.out ? prev.id : (prev?.id ?? 0) + 1, out: false }));
     clearTimeout(toastTimer.current);
     toastTimer.current = window.setTimeout(() => {
       setToast((prev) => (prev ? { ...prev, out: true } : prev));
@@ -544,1086 +328,67 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     });
   }, [session]);
 
-  /* -------------------------------------------------------------- subtitles */
-
-  const [pref, setPref] = useState<SubPref>(() => loadSubPref());
-  const prefRef = useRef(pref);
-  prefRef.current = pref;
-
-  const patchPref = useCallback((patch: Partial<SubPref>) => {
-    const syncedPatch: Partial<SubPref> =
-      patch.on !== undefined && patch.mode === undefined
-        ? { ...patch, mode: patch.on ? (prefRef.current.mode === "off" ? "on" : prefRef.current.mode) : "off" }
-        : patch;
-    const next = normalizeSubPref({ ...prefRef.current, ...syncedPatch });
-    prefRef.current = next;
-    setPref(next);
-    saveSubPref(next);
-    updateSettings({ subtitlePref: next });
-  }, []);
-
-  useEffect(() => {
-    const syncFromStorage = () => setPref(loadSubPref());
-    const onStorage = (e: StorageEvent) => {
-      if (!e.key || e.key === "abx.subs.v1") syncFromStorage();
-    };
-    window.addEventListener(SUB_PREF_EVENT, syncFromStorage);
-    window.addEventListener("storage", onStorage);
-    return () => {
-      window.removeEventListener(SUB_PREF_EVENT, syncFromStorage);
-      window.removeEventListener("storage", onStorage);
-    };
-  }, []);
-
-  const epSeason = season ?? episodes?.season;
-  const epNumber = episode ?? episodes?.episode;
-  const epRef = useRef<{ season?: number; episode?: number }>({});
-  epRef.current = { season: epSeason ?? undefined, episode: epNumber ?? undefined };
-  const subMemoryKey = useMemo(() => {
-    const base =
-      media?.key ||
-      (media?.tmdbId ? `tmdb:${media.kind ?? "media"}:${media.tmdbId}` : "") ||
-      (media?.imdbId ? `imdb:${media.imdbId}` : "") ||
-      cur?.localPath ||
-      title;
-    if (!base) return "";
-    return epNumber != null ? `${base}:s${epSeason ?? 0}e${epNumber}` : base;
-  }, [media?.key, media?.tmdbId, media?.imdbId, media?.kind, cur?.localPath, title, epSeason, epNumber]);
-  const subMemoryKeyRef = useRef(subMemoryKey);
-  subMemoryKeyRef.current = subMemoryKey;
-
-  const persistTrackMemory = useCallback((entry: {
-    selectedLang?: string;
-    selectedLabel?: string;
-    secondaryLang?: string;
-    offsetSec?: number;
-    secondaryOffsetSec?: number;
-    enabled?: boolean;
-  }) => {
-    const key = subMemoryKeyRef.current;
-    if (!key) return;
-    saveSubTrackMemory(key, entry);
-  }, []);
-
-  const dragDepthRef = useRef(0);
-  const [dragOverSub, setDragOverSub] = useState(false);
-
-  const activeCurUrl = cur?.url ?? "";
-  const activeCurUrlRef = useRef(activeCurUrl);
-  activeCurUrlRef.current = activeCurUrl;
-  // Which stream this is, independent of its URL: a refreshed CDN token on the same server keeps
-  // its identity, so the viewer's subtitle, audio and pause choices must survive it.
-  const streamIdentity = cur ? `${activeKey}::${cur.localPath ?? ""}` : "";
-  const streamIdentityRef = useRef(streamIdentity);
-  streamIdentityRef.current = streamIdentity;
-  const subsIdentityRef = useRef("");
-  const attachIdentityRef = useRef("");
-  /** Set when a refresh replaced the URL of a paused stream, so the new one doesn't autoplay. */
-  const keepPausedRef = useRef(false);
-
-  const [hlsReady, setHlsReady] = useState(false);
-  const [hlsSubsState, setHlsSubsState] = useState<{ url: string; tracks: UnifiedSubTrack[] }>({ url: "", tracks: [] });
-  const [nativeSubsState, setNativeSubsState] = useState<{ url: string; tracks: UnifiedSubTrack[] }>({ url: "", tracks: [] });
-  const [onlineSubsState, setOnlineSubsState] = useState<{ url: string; tracks: UnifiedSubTrack[] }>({ url: "", tracks: [] });
-  const [addedSubs, setAddedSubs] = useState<UnifiedSubTrack[]>([]);
-  const [trackDataState, setTrackDataState] = useState<{ url: string; data: Record<string, TrackCueCache> }>({ url: "", data: {} });
-
-  const hlsSubs = hlsSubsState.url === activeCurUrl ? hlsSubsState.tracks : [];
-  const nativeSubs = nativeSubsState.url === activeCurUrl ? nativeSubsState.tracks : [];
-  const onlineSubs = onlineSubsState.url === activeCurUrl ? onlineSubsState.tracks : [];
-  const trackData = trackDataState.url === activeCurUrl ? trackDataState.data : {};
-
-  const setHlsSubs = useCallback((tracks: UnifiedSubTrack[]) => {
-    setHlsSubsState({ url: activeCurUrlRef.current, tracks });
-  }, []);
-  const setNativeSubs = useCallback((tracks: UnifiedSubTrack[]) => {
-    const url = activeCurUrlRef.current;
-    setNativeSubsState((prev) => {
-      if (
-        prev.url === url &&
-        prev.tracks.length === tracks.length &&
-        prev.tracks.every(
-          (t, i) =>
-            t.id === tracks[i].id &&
-            t.label === tracks[i].label &&
-            t.lang === tracks[i].lang &&
-            t.nativeTrack === tracks[i].nativeTrack,
-        )
-      ) {
-        return prev;
-      }
-      return { url, tracks };
-    });
-  }, []);
-  const appendOnlineSub = useCallback((url: string, track: UnifiedSubTrack) => {
-    setOnlineSubsState((prev) => {
-      const list = prev.url === url ? prev.tracks : [];
-      return list.some((t) => t.id === track.id) ? { url, tracks: list } : { url, tracks: [...list, track] };
-    });
-  }, []);
-  const patchTrackData = useCallback((url: string, id: string, entry: TrackCueCache) => {
-    setTrackDataState((prev) => ({
-      url,
-      data: prev.url === url ? { ...prev.data, [id]: entry } : { [id]: entry },
-    }));
-  }, []);
-
-  const trackDataRef = useRef(trackData);
-  trackDataRef.current = trackData;
-  const trackCtlsRef = useRef(new Map<string, AbortController>());
-  const sourceGenRef = useRef(0);
-
-  const candidateSubs = useMemo<UnifiedSubTrack[]>(() => {
-    const list = cur?.subtitles;
-    if (!list?.length || isEmbed) return [];
-    const counts = new Map<string, number>();
-    return list.map((s, i) => {
-      const baseLabel = s.label || s.lang || `Track ${i + 1}`;
-      const n = (counts.get(baseLabel) ?? 0) + 1;
-      counts.set(baseLabel, n);
-      const label = n > 1 ? `${baseLabel} ${n}` : baseLabel;
-      const origin: UnifiedSubTrack["origin"] =
-        s.source ?? (s.streamIndex != null || s.url.startsWith("embedded://") ? "embedded" : cur?.providerId === "local" ? "sidecar" : "stream");
-      return {
-        id: `cand-${i}`,
-        label,
-        lang: s.lang || "und",
-        origin,
-        format: s.format,
-        isDefault: s.isDefault,
-        isForced: s.isForced,
-        isHearingImpaired: s.isHearingImpaired,
-        url: s.url,
-        streamIndex: s.streamIndex,
-      };
-    });
-  }, [cur?.url, cur?.subtitles, cur?.providerId, isEmbed]);
-
-  const subTracks = useMemo<UnifiedSubTrack[]>(() => {
-    const raw = [...hlsSubs, ...nativeSubs, ...candidateSubs, ...onlineSubs, ...addedSubs];
-    return raw.map((t) => {
-      const d = trackData[t.id];
-      return d ? { ...t, ...d } : t;
-    });
-  }, [hlsSubs, nativeSubs, candidateSubs, onlineSubs, addedSubs, trackData]);
-  const subTracksRef = useRef(subTracks);
-  subTracksRef.current = subTracks;
-
-  const trackStructureKey = useMemo(
-    () => [...hlsSubs, ...nativeSubs, ...candidateSubs, ...onlineSubs, ...addedSubs].map((t) => t.id).join("|"),
-    [hlsSubs, nativeSubs, candidateSubs, onlineSubs, addedSubs],
-  );
-
-  const [selectedSub, setSelectedSub] = useState<string | null>(null);
-  const selectedSubRef = useRef<string | null>(null);
-  selectedSubRef.current = selectedSub;
-  const [secondarySub, setSecondarySub] = useState<string | null>(null);
-  const secondarySubRef = useRef<string | null>(null);
-  secondarySubRef.current = secondarySub;
-
-  const [audioTracks, setAudioTracks] = useState<{ id: number; label: string; lang: string }[]>([]);
-  const [selectedAudioTrack, setSelectedAudioTrack] = useState<number>(-1);
-  const manualAudio = useRef(false);
-  const pendingSub = useRef<string | null>(null);
-  const pendingSecondary = useRef<string | null>(null);
-  /** Once the viewer picks a track on this source, stop auto-choosing for them. */
-  const manualSub = useRef(false);
-  const manualSecondary = useRef(false);
-  const lastActiveSubRef = useRef<{ prim: string; sec: string | null } | null>(null);
-
-  const [offset, setOffset] = useState(() => (subMemoryKey ? loadSubTrackMemory(subMemoryKey)?.offsetSec ?? 0 : 0));
-  const offsetRef = useRef(offset);
-  offsetRef.current = offset;
-  // The second (dual) subtitle often comes from another release with its own timing.
-  const [secOffset, setSecOffset] = useState(() => (subMemoryKey ? loadSubTrackMemory(subMemoryKey)?.secondaryOffsetSec ?? 0 : 0));
-  const secOffsetRef = useRef(secOffset);
-  secOffsetRef.current = secOffset;
-  const [timingShiftUnsupported, setTimingShiftUnsupported] = useState(false);
-  const timingShiftUnsupportedRef = useRef(false);
-
-  const [activePrimaryCues, setActivePrimaryCues] = useState<SubtitleCue[]>([]);
-  const [activeSecondaryCues, setActiveSecondaryCues] = useState<SubtitleCue[]>([]);
-  const lastSigRef = useRef({ prim: "", sec: "" });
-
-  const [onlineResults, setOnlineResults] = useState<OnlineSubtitleResult[]>([]);
-  const [onlineLoading, setOnlineLoading] = useState(false);
-  const [onlineSearched, setOnlineSearched] = useState(false);
-  const [onlineError, setOnlineError] = useState<string | null>(null);
-  const [loadingOnlineId, setLoadingOnlineId] = useState<string | null>(null);
-  const [loadedOnlineMap, setLoadedOnlineMap] = useState<Map<string, string>>(() => new Map());
-  const searchCtlRef = useRef<AbortController | null>(null);
-  const loadOnlineCtlsRef = useRef(new Set<AbortController>());
-  const autoFetchedRef = useRef(new Set<string>());
-  const [savingTrackId, setSavingTrackId] = useState<string | null>(null);
-  const [savedTrackIds, setSavedTrackIds] = useState<Set<string>>(() => new Set());
-
-  const ensureTrackLoaded = useCallback(async (track: UnifiedSubTrack) => {
-    if (track.origin === "hls" || track.origin === "native" || track.origin === "user") return;
-    if (track.cues) return;
-    const existing = trackDataRef.current[track.id];
-    if (existing?.cues || existing?.loading) return;
-    const activeUrl = activeCurUrlRef.current;
-
-    if (track.origin === "embedded" && track.streamIndex != null) {
-      const localPath = curRef.current?.localPath;
-      if (!localPath) {
-        patchTrackData(activeUrl, track.id, { loading: false, error: "Local file path unavailable" });
-        return;
-      }
-      const ctl = new AbortController();
-      trackCtlsRef.current.set(track.id, ctl);
-      const gen = sourceGenRef.current;
-      patchTrackData(activeUrl, track.id, { loading: true, error: undefined });
-      try {
-        const res = await invoke<ExtractedSubtitleResult>("extract_local_subtitle", {
-          path: localPath,
-          streamIndex: track.streamIndex,
-        });
-        if (ctl.signal.aborted || gen !== sourceGenRef.current || !mountedRef.current) return;
-        const parsed = parseSubtitles(res.content, res.format);
-        patchTrackData(activeUrl, track.id, { cues: parsed.cues, raw: res.content, format: parsed.format, loading: false, error: undefined });
-      } catch (e) {
-        if (ctl.signal.aborted || gen !== sourceGenRef.current || !mountedRef.current) return;
-        const msg = e instanceof Error ? e.message : String(e);
-        patchTrackData(activeUrl, track.id, { loading: false, error: msg });
-        if (selectedSubRef.current === track.id || secondarySubRef.current === track.id) {
-          flash(`Couldn't extract subtitle: ${msg}`);
-        }
-      } finally {
-        if (trackCtlsRef.current.get(track.id) === ctl) trackCtlsRef.current.delete(track.id);
-      }
-      return;
-    }
-
-    const url = track.url;
-    if (!url || url.startsWith("embedded://")) return;
-    const ctl = new AbortController();
-    trackCtlsRef.current.set(track.id, ctl);
-    const gen = sourceGenRef.current;
-    patchTrackData(activeUrl, track.id, { loading: true, error: undefined });
-    try {
-      const parsed = await fetchAndParseSubtitle(url, { formatHint: track.format, signal: ctl.signal });
-      if (ctl.signal.aborted || gen !== sourceGenRef.current || !mountedRef.current) return;
-      patchTrackData(activeUrl, track.id, { cues: parsed.cues, raw: parsed.raw, format: parsed.format, loading: false, error: undefined });
-    } catch (e) {
-      if (ctl.signal.aborted || (e instanceof DOMException && e.name === "AbortError")) return;
-      if (gen !== sourceGenRef.current || !mountedRef.current) return;
-      const msg = e instanceof Error ? e.message : String(e);
-      patchTrackData(activeUrl, track.id, { loading: false, error: msg });
-      if (selectedSubRef.current === track.id || secondarySubRef.current === track.id) {
-        flash(`Couldn't load subtitle: ${msg}`);
-      }
-    } finally {
-      if (trackCtlsRef.current.get(track.id) === ctl) trackCtlsRef.current.delete(track.id);
-    }
-  }, [patchTrackData]);
-
-  const applySubPair = useCallback((primId: string | null, secId: string | null) => {
-    const list = subTracksRef.current;
-    const prim = primId ? list.find((x) => x.id === primId) : undefined;
-    const safeSecId = secId && (!prim || secId !== prim.id) ? secId : null;
-    const sec = safeSecId ? list.find((x) => x.id === safeSecId) : undefined;
-
-    const finalPrim = prim ? prim.id : null;
-    const finalSec = sec ? sec.id : null;
-    selectedSubRef.current = finalPrim;
-    secondarySubRef.current = finalSec;
-    setSelectedSub(finalPrim);
-    setSecondarySub(finalSec);
-
-    const v = video.current;
-    const hls = hlsRef.current;
-    if (hls) {
-      hls.subtitleDisplay = false;
-      const activeHlsIdx =
-        prim?.origin === "hls" && prim.hlsIndex != null
-          ? prim.hlsIndex
-          : sec?.origin === "hls" && sec.hlsIndex != null
-            ? sec.hlsIndex
-            : -1;
-      hls.subtitleTrack = activeHlsIdx;
-    }
-    const shk = shakaRef.current;
-    if (shk) {
-      // Shaka streams one text track at a time: the main subtitle's, else the second's.
-      const dashSel = prim?.origin === "dash" ? prim : sec?.origin === "dash" ? sec : undefined;
-      if (dashSubIdRef.current !== (dashSel?.id ?? null)) dashCollectorRef.current?.reset();
-      dashSubIdRef.current = dashSel?.id ?? null;
-      const tt = dashSel?.dashTrackId != null ? shk.getTextTracks().find((t) => t.id === dashSel.dashTrackId) : undefined;
-      // Shaka 5: selecting a track turns text on; null turns it off (no more visibility toggle).
-      shk.selectTextTrack(tt ?? null);
-    }
-
-    if (v) {
-      for (let i = 0; i < v.textTracks.length; i++) {
-        const tt = v.textTracks[i];
-        const isNativeSelected =
-          (prim?.origin === "native" && prim.nativeTrack === tt) ||
-          (sec?.origin === "native" && sec.nativeTrack === tt);
-        if (!hls) {
-          tt.mode = isNativeSelected ? "hidden" : "disabled";
-        } else if (tt.mode === "showing") {
-          tt.mode = "hidden";
-        }
-      }
-    }
-
-    if (prim) void ensureTrackLoaded(prim);
-    if (sec) void ensureTrackLoaded(sec);
-  }, [ensureTrackLoaded]);
-
-  const chooseSub = useCallback((id: string | null) => {
-    manualSub.current = true;
-    const list = subTracksRef.current;
-    const t = id ? list.find((x) => x.id === id) : undefined;
-    const curSec = secondarySubRef.current;
-    const nextSec = !t ? null : curSec === t.id ? null : curSec;
-    if (curSec && !nextSec) manualSecondary.current = true;
-    if (t) lastActiveSubRef.current = { prim: t.id, sec: nextSec };
-    applySubPair(t ? t.id : null, nextSec);
-    const baseLang = t ? langBase(t.lang) : undefined;
-    persistTrackMemory(
-      t
-        ? { enabled: true, selectedLang: baseLang, selectedLabel: t.label }
-        : { enabled: false },
-    );
-    flash(`Subtitles: ${t ? t.label : "Off"}`);
-  }, [applySubPair, persistTrackMemory]);
-
-  const chooseSecondary = useCallback((id: string | null) => {
-    manualSecondary.current = true;
-    const list = subTracksRef.current;
-    const t = id ? list.find((x) => x.id === id) : undefined;
-    if (t && t.id === selectedSubRef.current) return;
-    if (selectedSubRef.current) {
-      lastActiveSubRef.current = { prim: selectedSubRef.current, sec: t ? t.id : null };
-    }
-    applySubPair(selectedSubRef.current, t ? t.id : null);
-    const baseLang = t ? langBase(t.lang) : "";
-    persistTrackMemory({ secondaryLang: baseLang && baseLang !== "und" ? baseLang : "" });
-    flash(t ? `Dual subtitle: ${t.label}` : "Dual subtitle off");
-  }, [applySubPair, persistTrackMemory]);
-
-  const findPreferredSub = useCallback((list: UnifiedSubTrack[], p: SubPref) => {
-    if (!list.length) return undefined;
-    const idx = pickBestSubtitleIndex(list, p, originalLanguage);
-    return idx >= 0 ? list[idx] : list[0];
-  }, [originalLanguage]);
-
-  const findSecondaryForLang = useCallback((list: UnifiedSubTrack[], wantLang: string, p: SubPref, primaryId: string | null) => {
-    const base = langBase(wantLang);
-    if (!base || base === "und") return undefined;
-    const matching = list.filter((t) => t.id !== primaryId && langBase(t.lang) === base);
-    if (!matching.length) return undefined;
-    const idx = pickBestSubtitleIndex(matching, { ...p, lang: base }, originalLanguage);
-    return idx >= 0 ? matching[idx] : matching[0];
-  }, [originalLanguage]);
-
-  // Reset subtitle selection/caches whenever switching streams so auto-pick runs cleanly for the new source.
-  useEffect(() => {
-    sourceGenRef.current++;
-    searchCtlRef.current?.abort();
-    searchCtlRef.current = null;
-    loadOnlineCtlsRef.current.forEach((ctl) => ctl.abort());
-    loadOnlineCtlsRef.current.clear();
-    trackCtlsRef.current.forEach((ctl) => ctl.abort());
-    trackCtlsRef.current.clear();
-
-    // Same stream with a fresh URL (token refresh): keep what the viewer chose, the online
-    // subtitles they loaded and the cues already parsed. Only a different stream starts over.
-    const sameStream = !!streamIdentityRef.current && subsIdentityRef.current === streamIdentityRef.current;
-    subsIdentityRef.current = streamIdentityRef.current;
-
-    setHlsReady(false);
-    setHlsSubsState({ url: activeCurUrl, tracks: [] });
-    setNativeSubsState({ url: activeCurUrl, tracks: [] });
-    if (sameStream) {
-      setOnlineSubsState((prev) => ({ url: activeCurUrl, tracks: prev.tracks }));
-      setTrackDataState((prev) => ({ url: activeCurUrl, data: prev.data }));
-    } else {
-      setOnlineSubsState({ url: activeCurUrl, tracks: [] });
-      setTrackDataState({ url: activeCurUrl, data: {} });
-    }
-    setOnlineResults([]);
-    setOnlineLoading(false);
-    setOnlineSearched(false);
-    setOnlineError(null);
-    setLoadingOnlineId(null);
-    setSavingTrackId(null);
-    setSavedTrackIds(new Set());
-    if (sameStream) return;
-    setLoadedOnlineMap(new Map());
-    manualSub.current = false;
-    manualSecondary.current = false;
-    lastActiveSubRef.current = null;
-    selectedSubRef.current = null;
-    secondarySubRef.current = null;
-    setSelectedSub(null);
-    setSecondarySub(null);
-    lastSigRef.current = { prim: "", sec: "" };
-    setActivePrimaryCues([]);
-    setActiveSecondaryCues([]);
-    timingShiftUnsupportedRef.current = false;
-    setTimingShiftUnsupported(false);
-    const restoredMemory = subMemoryKeyRef.current ? loadSubTrackMemory(subMemoryKeyRef.current) : null;
-    const restoredOffset = restoredMemory?.offsetSec ?? 0;
-    offsetRef.current = restoredOffset;
-    setOffset(restoredOffset);
-    const restoredSecOffset = restoredMemory?.secondaryOffsetSec ?? 0;
-    secOffsetRef.current = restoredSecOffset;
-    setSecOffset(restoredSecOffset);
-  }, [activeCurUrl]);
-
-  // Apply pending user-loaded tracks or auto-pick best primary + optional dual track when available tracks change.
-  useEffect(() => {
-    const list = subTracksRef.current;
-    if (pendingSub.current && list.some((t) => t.id === pendingSub.current)) {
-      const id = pendingSub.current;
-      pendingSub.current = null;
-      chooseSub(id);
-      return;
-    }
-    if (pendingSecondary.current && list.some((t) => t.id === pendingSecondary.current)) {
-      const secId = pendingSecondary.current;
-      pendingSecondary.current = null;
-      chooseSecondary(secId);
-      return;
-    }
-    if (manualSub.current) return;
-
-    const p = prefRef.current;
-    const mem = subMemoryKey ? loadSubTrackMemory(subMemoryKey) : null;
-    const wantOn =
-      mem?.enabled !== undefined
-        ? mem.enabled
-        : shouldAutoEnableSubtitles(p, audio, originalLanguage);
-
-    if (!wantOn || !list.length) {
-      applySubPair(null, null);
-      return;
-    }
-
-    let prim: UnifiedSubTrack | undefined;
-    if (mem?.selectedLabel) {
-      prim = list.find((t) => t.label === mem.selectedLabel);
-    }
-    if (!prim && mem?.selectedLang && mem.selectedLang !== "und") {
-      prim = list.find((t) => langBase(t.lang) === langBase(mem.selectedLang) && !t.isForced)
-        ?? list.find((t) => langBase(t.lang) === langBase(mem.selectedLang));
-    }
-    if (!prim) {
-      prim = findPreferredSub(list, p);
-    }
-
-    let sec: UnifiedSubTrack | undefined;
-    if (!manualSecondary.current && prim && list.length > 1) {
-      const wantSecLang = mem?.secondaryLang !== undefined ? mem.secondaryLang : p.secondaryLang;
-      if (wantSecLang) {
-        sec = findSecondaryForLang(list, wantSecLang, p, prim.id);
-      }
-    }
-
-    applySubPair(prim?.id ?? null, sec?.id ?? null);
-  }, [activeCurUrl, trackStructureKey, subMemoryKey, audio, originalLanguage, applySubPair, chooseSub, chooseSecondary, findPreferredSub, findSecondaryForLang]);
-
-  // Reset user-dropped files when moving to another title or episode, while keeping them across server switches.
-  useEffect(() => {
-    setAddedSubs([]);
-  }, [subMemoryKey]);
-
-  const toggleSub = useCallback(() => {
-    const list = subTracksRef.current;
-    if (!list.length) {
-      flash("No subtitles loaded — open Subtitles to search or drop a file");
-      return;
-    }
-    if (selectedSubRef.current || secondarySubRef.current) {
-      if (selectedSubRef.current) {
-        lastActiveSubRef.current = { prim: selectedSubRef.current, sec: secondarySubRef.current };
-      }
-      chooseSub(null);
-      return;
-    }
-    const last = lastActiveSubRef.current;
-    if (last && list.some((t) => t.id === last.prim)) {
-      manualSub.current = true;
-      const sec = last.sec && list.some((t) => t.id === last.sec && t.id !== last.prim) ? last.sec : null;
-      applySubPair(last.prim, sec);
-      const t = list.find((x) => x.id === last.prim);
-      const baseLang = t ? langBase(t.lang) : undefined;
-      persistTrackMemory({ enabled: true, selectedLang: baseLang, selectedLabel: t?.label });
-      flash(`Subtitles: ${t?.label ?? "On"}`);
-      return;
-    }
-    chooseSub(findPreferredSub(list, prefRef.current)?.id ?? null);
-  }, [applySubPair, chooseSub, findPreferredSub, persistTrackMemory]);
-
-  const cycleSub = useCallback(() => {
-    const list = subTracksRef.current;
-    if (!list.length) {
-      flash("No subtitle tracks loaded");
-      return;
-    }
-    const curId = selectedSubRef.current;
-    if (!curId) {
-      chooseSub(list[0].id);
-      return;
-    }
-    const i = list.findIndex((t) => t.id === curId);
-    const next = i >= 0 && i + 1 < list.length ? list[i + 1].id : null;
-    chooseSub(next);
-  }, [chooseSub]);
-
-  const addSubtitleFiles = useCallback(async (files: FileList | File[]) => {
-    const all = Array.from(files);
-    const valid = all.filter((f) => SUB_FILE_EXT_RX.test(f.name));
-    if (!valid.length) {
-      flash("Drop an .srt, .vtt, .ass, or .ssa subtitle file");
-      return;
-    }
-    let firstId: string | null = null;
-    const loadedTracks: UnifiedSubTrack[] = [];
-    for (const file of valid) {
-      try {
-        const buf = await file.arrayBuffer();
-        const raw = decodeSubtitle(buf);
-        const extMatch = file.name.match(SUB_FILE_EXT_RX);
-        const hint = extMatch ? (extMatch[1].toLowerCase() as SubtitleFormat) : undefined;
-        const parsed = parseSubtitles(raw, hint);
-        const id = `added-${crypto.randomUUID()}`;
-        const lang = inferUserSubLang(file.name);
-        if (!firstId) firstId = id;
-        loadedTracks.push({
-          id,
-          label: file.name,
-          lang,
-          origin: "user",
-          format: hint ?? parsed.format,
-          raw,
-          cues: parsed.cues,
-        });
-      } catch (e) {
-        flash(`Couldn't load ${file.name}: ${e instanceof Error ? e.message : "invalid file"}`);
-      }
-    }
-    if (loadedTracks.length && mountedRef.current) {
-      if (firstId) pendingSub.current = firstId;
-      setAddedSubs((curList) => [...curList, ...loadedTracks]);
-      flash(loadedTracks.length === 1 ? `Loaded subtitle: ${loadedTracks[0].label}` : `Loaded ${loadedTracks.length} subtitle files`);
-    }
-  }, []);
-
-  const nudge = useCallback((delta: number) => {
-    if (timingShiftUnsupportedRef.current) {
-      flash("Timing offset isn't supported on active-cue-only tracks");
-      return;
-    }
-    const n = Math.round((offsetRef.current + delta) * 10) / 10;
-    offsetRef.current = n;
-    setOffset(n);
-    persistTrackMemory({ offsetSec: n });
-    flash(`Subtitle timing ${n > 0 ? "+" : ""}${n.toFixed(1)}s`);
-  }, [persistTrackMemory]);
-
-  const resetOffset = useCallback(() => {
-    if (timingShiftUnsupportedRef.current) {
-      flash("Timing offset isn't supported on active-cue-only tracks");
-      return;
-    }
-    offsetRef.current = 0;
-    setOffset(0);
-    persistTrackMemory({ offsetSec: 0 });
-    flash("Subtitle timing reset (0.0s)");
-  }, [persistTrackMemory]);
-
-  const nudgeSecondary = useCallback((delta: number) => {
-    const n = Math.round((secOffsetRef.current + delta) * 10) / 10;
-    secOffsetRef.current = n;
-    setSecOffset(n);
-    persistTrackMemory({ secondaryOffsetSec: n });
-    flash(`Second subtitle timing ${n > 0 ? "+" : ""}${n.toFixed(1)}s`);
-  }, [persistTrackMemory]);
-
-  const resetSecondaryOffset = useCallback(() => {
-    secOffsetRef.current = 0;
-    setSecOffset(0);
-    persistTrackMemory({ secondaryOffsetSec: 0 });
-    flash("Second subtitle timing reset (0.0s)");
-  }, [persistTrackMemory]);
-
-  const readOptionalSubdlApiKey = useCallback((): string | undefined => {
-    try {
-      const raw = getSettings().subdlApiKey;
-      return typeof raw === "string" && raw.trim() ? raw.trim() : undefined;
-    } catch {
-      return undefined;
-    }
-  }, []);
-
-  const searchOnline = useCallback(async (rawTitle: string, lang: string) => {
-    searchCtlRef.current?.abort();
-    const ctl = new AbortController();
-    searchCtlRef.current = ctl;
-    const gen = sourceGenRef.current;
-
-    const qTitle = (rawTitle || media?.title || title || "").trim();
-    const qLang = lang || prefRef.current.lang || "en";
-    const kind: "movie" | "tv" | "anime" | undefined =
-      media?.kind === "tv" || media?.kind === "anime" || media?.kind === "movie"
-        ? media.kind
-        : epNumber != null
-          ? "tv"
-          : undefined;
-
-    setOnlineLoading(true);
-    setOnlineError(null);
-    try {
-      const results = await searchOnlineSubtitles(
-        {
-          tmdbId: media?.tmdbId,
-          imdbId: media?.imdbId,
-          title: qTitle || undefined,
-          year: media?.year,
-          kind,
-          season: epSeason,
-          episode: epNumber,
-          languages: [qLang],
-          preferHearingImpaired: prefRef.current.preferHearingImpaired,
-          localPath: curRef.current?.localPath,
-          subdlApiKey: readOptionalSubdlApiKey(),
-        },
-        ctl.signal,
-      );
-      if (ctl.signal.aborted || gen !== sourceGenRef.current || !mountedRef.current) return;
-      setOnlineResults(results);
-      setOnlineSearched(true);
-    } catch (e) {
-      if (ctl.signal.aborted || (e instanceof DOMException && e.name === "AbortError")) return;
-      if (gen !== sourceGenRef.current || !mountedRef.current) return;
-      setOnlineError(e instanceof Error ? e.message : "Failed to search online subtitles");
-      setOnlineSearched(true);
-    } finally {
-      if (!ctl.signal.aborted && gen === sourceGenRef.current && mountedRef.current) {
-        setOnlineLoading(false);
-      }
-    }
-  }, [media?.tmdbId, media?.imdbId, media?.title, media?.year, media?.kind, title, epSeason, epNumber, readOptionalSubdlApiKey]);
-
-  const loadOnlineResult = useCallback(async (res: OnlineSubtitleResult, asSecondary: boolean) => {
-    const existingTrackId = loadedOnlineMap.get(res.id);
-    if (existingTrackId && subTracksRef.current.some((t) => t.id === existingTrackId)) {
-      if (asSecondary) chooseSecondary(existingTrackId);
-      else chooseSub(existingTrackId);
-      return;
-    }
-
-    const ctl = new AbortController();
-    loadOnlineCtlsRef.current.add(ctl);
-    const gen = sourceGenRef.current;
-    const activeUrl = activeCurUrlRef.current;
-    setLoadingOnlineId(res.id);
-    try {
-      const parsed = await fetchAndParseSubtitle(res.url, { formatHint: res.format, signal: ctl.signal, episode: epRef.current });
-      if (ctl.signal.aborted || gen !== sourceGenRef.current || !mountedRef.current) return;
-      const trackId = `online-${res.id}`;
-      const label = res.release ? `${res.langName || res.lang} · ${res.release}` : (res.langName || res.lang);
-      const track: UnifiedSubTrack = {
-        id: trackId,
-        label,
-        lang: res.lang,
-        origin: "online",
-        format: res.format,
-        url: res.url,
-        provider: res.provider,
-        release: res.release,
-        isHearingImpaired: res.hearingImpaired,
-        isForced: res.forced,
-      };
-
-      patchTrackData(activeUrl, trackId, { cues: parsed.cues, raw: parsed.raw, format: res.format ?? parsed.format, loading: false });
-      setLoadedOnlineMap((prev) => {
-        const next = new Map(prev);
-        next.set(res.id, trackId);
-        return next;
-      });
-      if (asSecondary) pendingSecondary.current = trackId;
-      else pendingSub.current = trackId;
-      appendOnlineSub(activeUrl, track);
-    } catch (e) {
-      if (ctl.signal.aborted || (e instanceof DOMException && e.name === "AbortError")) return;
-      if (mountedRef.current) {
-        flash(`Online subtitle failed: ${e instanceof Error ? e.message : "download error"}`);
-      }
-    } finally {
-      loadOnlineCtlsRef.current.delete(ctl);
-      if (!ctl.signal.aborted && gen === sourceGenRef.current && mountedRef.current) {
-        setLoadingOnlineId((curId) => (curId === res.id ? null : curId));
-      }
-    }
-  }, [loadedOnlineMap, chooseSub, chooseSecondary, patchTrackData, appendOnlineSub]);
-
-  const canSaveSidecar = Boolean(!isEmbed && cur?.localPath && isTauri());
-
-  const saveSidecar = useCallback(async (track: UnifiedSubTrack) => {
-    const videoPath = curRef.current?.localPath;
-    if (!videoPath || savingTrackId) return;
-    setSavingTrackId(track.id);
-    try {
-      const cached = trackDataRef.current[track.id];
-      let content = cached?.raw ?? track.raw;
-      let ext: SubtitleFormat | undefined = cached?.format ?? track.format;
-      if (!content && (cached?.cues?.length || track.cues?.length)) {
-        content = cuesToVtt(cached?.cues ?? track.cues ?? []);
-        ext = "vtt";
-      }
-      if (!content && track.url) {
-        const parsed = await fetchAndParseSubtitle(track.url, { formatHint: track.format });
-        content = parsed.raw;
-        ext = parsed.format;
-      }
-      if (!content) {
-        flash("No subtitle content available to save");
-        return;
-      }
-      const safeExt = ext === "ass" || ext === "ssa" || ext === "vtt" ? ext : "srt";
-      const baseName = videoPath.split(/[\\/]/).pop() ?? "video";
-      const stem =
-        baseName
-          .replace(/\.[^.]+$/, "")
-          .replace(/[\/\\:*?"<>|\x00]/g, "_")
-          .replace(/\.{2,}/g, ".") || "subtitle";
-      const lang = langBase(track.lang);
-      const filename = lang && lang !== "und" ? `${stem}.${lang}.${safeExt}` : `${stem}.${safeExt}`;
-      await invoke<string>("save_sidecar_subtitle", {
-        videoPath,
-        filename,
-        content,
-      });
-      if (!mountedRef.current) return;
-      setSavedTrackIds((prev) => {
-        const next = new Set(prev);
-        next.add(track.id);
-        return next;
-      });
-      flash(`Saved ${filename} next to video`);
-    } catch (e) {
-      if (mountedRef.current) {
-        flash(`Save failed: ${e instanceof Error ? e.message : String(e)}`);
-      }
-    } finally {
-      if (mountedRef.current) setSavingTrackId(null);
-    }
-  }, [savingTrackId]);
-
-  // Optional auto-fetch online subtitles when enabled, subtitles aren't off, and candidate lacks user's language.
-  useEffect(() => {
-    const mem = subMemoryKey ? loadSubTrackMemory(subMemoryKey) : null;
-    if (!cur || isEmbed || !pref.autoFetchOnline) return;
-    if (mem?.enabled === false || (pref.mode === "off" && mem?.enabled !== true)) return;
-    if ((cur.kind === "hls" || cur.kind === "dash") && !hlsReady) return;
-    const wantLang = langBase(pref.lang || "en");
-    const fetchKey = `${cur.url}::${wantLang}`;
-    if (autoFetchedRef.current.has(fetchKey)) return;
-    if (manualSub.current) return;
-
-    const ctl = new AbortController();
-    const gen = sourceGenRef.current;
-    const activeUrl = activeCurUrlRef.current;
-    const timer = window.setTimeout(async () => {
-      if (ctl.signal.aborted || gen !== sourceGenRef.current || !mountedRef.current) return;
-      if (manualSub.current) return;
-      const list = subTracksRef.current;
-      const hasMatchingLang = list.some((t) => langBase(t.lang) === wantLang && !t.isForced);
-      if (hasMatchingLang) {
-        autoFetchedRef.current.add(fetchKey);
-        return;
-      }
-      const qTitle = (media?.title || title || "").trim();
-      const localPath = curRef.current?.localPath;
-      if (!qTitle && !media?.tmdbId && !media?.imdbId && !localPath) return;
-      autoFetchedRef.current.add(fetchKey);
-      const kind: "movie" | "tv" | "anime" | undefined =
-        media?.kind === "tv" || media?.kind === "anime" || media?.kind === "movie"
-          ? media.kind
-          : epNumber != null
-            ? "tv"
-            : undefined;
-      try {
-        const results = await searchOnlineSubtitles(
-          {
-            tmdbId: media?.tmdbId,
-            imdbId: media?.imdbId,
-            title: qTitle || undefined,
-            year: media?.year,
-            kind,
-            season: epSeason,
-            episode: epNumber,
-            languages: [wantLang],
-            preferHearingImpaired: prefRef.current.preferHearingImpaired,
-            localPath,
-            subdlApiKey: readOptionalSubdlApiKey(),
-          },
-          ctl.signal,
-        );
-        if (ctl.signal.aborted || gen !== sourceGenRef.current || !mountedRef.current || !results.length) return;
-        setOnlineResults(results);
-        setOnlineSearched(true);
-        const top = results[0];
-        const parsed = await fetchAndParseSubtitle(top.url, { formatHint: top.format, signal: ctl.signal, episode: epRef.current });
-        if (ctl.signal.aborted || gen !== sourceGenRef.current || !mountedRef.current || manualSub.current) return;
-        const trackId = `online-${top.id}`;
-        const label = top.release ? `${top.langName || top.lang} · ${top.release}` : (top.langName || top.lang);
-        const track: UnifiedSubTrack = {
-          id: trackId,
-          label,
-          lang: top.lang,
-          origin: "online",
-          format: top.format,
-          url: top.url,
-          provider: top.provider,
-          release: top.release,
-          isHearingImpaired: top.hearingImpaired,
-          isForced: top.forced,
-        };
-        patchTrackData(activeUrl, trackId, { cues: parsed.cues, raw: parsed.raw, format: top.format ?? parsed.format, loading: false });
-        setLoadedOnlineMap((prev) => {
-          const next = new Map(prev);
-          next.set(top.id, trackId);
-          return next;
-        });
-        pendingSub.current = trackId;
-        appendOnlineSub(activeUrl, track);
-        flash(`Auto-loaded ${top.langName || wantLang} subtitle`);
-      } catch {
-        /* ignore background auto-fetch errors */
-      }
-    }, 650);
-
-    return () => {
-      window.clearTimeout(timer);
-      ctl.abort();
-    };
-  }, [cur?.url, cur?.localPath, cur?.kind, isEmbed, hlsReady, subMemoryKey, pref.autoFetchOnline, pref.mode, pref.lang, media?.tmdbId, media?.imdbId, media?.title, media?.year, media?.kind, title, epSeason, epNumber, patchTrackData, appendOnlineSub, readOptionalSubdlApiKey]);
-
-  const findHlsTextTrack = useCallback((v: HTMLVideoElement, track: UnifiedSubTrack, activeHlsIndex: number): TextTrack | null => {
-    const vTracks = Array.from(v.textTracks).filter((t) => t.kind === "subtitles" || t.kind === "captions");
-    if (!vTracks.length) return null;
-    const base = langBase(track.lang);
-    return (
-      vTracks.find((t) => t.label === track.label && (base === "und" || langBase(t.language) === base)) ??
-      vTracks.find((t) => track.hlsIndex === activeHlsIndex && (t.mode === "hidden" || t.mode === "showing")) ??
-      vTracks.find((t) => t.label === track.label) ??
-      (track.hlsIndex != null && vTracks.length === hlsSubs.length ? vTracks[track.hlsIndex] : null) ??
-      null
-    );
-  }, [hlsSubs.length]);
-
-  const evaluateCues = useCallback(() => {
-    const v = video.current;
-    if (!v || isEmbed) {
-      if (lastSigRef.current.prim || lastSigRef.current.sec) {
-        lastSigRef.current = { prim: "", sec: "" };
-        setActivePrimaryCues([]);
-        setActiveSecondaryCues([]);
-      }
-      if (timingShiftUnsupportedRef.current) {
-        timingShiftUnsupportedRef.current = false;
-        setTimingShiftUnsupported(false);
-      }
-      return;
-    }
-
-    const list = subTracksRef.current;
-    const primTrack = selectedSubRef.current ? list.find((t) => t.id === selectedSubRef.current) : undefined;
-    const secTrack = secondarySubRef.current ? list.find((t) => t.id === secondarySubRef.current) : undefined;
-    const tSec = v.currentTime || 0;
-    const hls = hlsRef.current;
-
-    const resolve = (track: UnifiedSubTrack | undefined, offSec: number): { cues: SubtitleCue[]; activeFallback: boolean } => {
-      if (!track) return { cues: [], activeFallback: false };
-      const cached = trackDataRef.current[track.id]?.cues ?? track.cues;
-      if (cached) return { cues: activeCuesAt(cached, tSec, offSec), activeFallback: false };
-      if (track.origin === "native" && track.nativeTrack) {
-        if (track.nativeTrack.mode !== "hidden") track.nativeTrack.mode = "hidden";
-        const { cues, usingActiveFallback } = textTrackToCues(track.nativeTrack, track.id);
-        return { cues: usingActiveFallback ? cues : activeCuesAt(cues, tSec, offSec), activeFallback: usingActiveFallback };
-      }
-      if (track.origin === "hls" && hls) {
-        const tt = findHlsTextTrack(v, track, hls.subtitleTrack);
-        if (!tt) return { cues: [], activeFallback: false };
-        if (tt.mode === "disabled" && track.hlsIndex === hls.subtitleTrack) tt.mode = "hidden";
-        if (tt.mode === "showing") tt.mode = "hidden";
-        const { cues, usingActiveFallback } = textTrackToCues(tt, track.id);
-        return { cues: usingActiveFallback ? cues : activeCuesAt(cues, tSec, offSec), activeFallback: usingActiveFallback };
-      }
-      return { cues: [], activeFallback: false };
-    };
-
-    const primRes = resolve(primTrack, offsetRef.current);
-    const secRes = resolve(secTrack, secOffsetRef.current);
-    const nextPrim = primRes.cues;
-    const nextSec = secRes.cues;
-    const nextUnsupported = primTrack ? primRes.activeFallback : secTrack ? secRes.activeFallback : false;
-    if (nextUnsupported !== timingShiftUnsupportedRef.current) {
-      timingShiftUnsupportedRef.current = nextUnsupported;
-      setTimingShiftUnsupported(nextUnsupported);
-    }
-
-    const primSig = cueSignature(nextPrim);
-    const secSig = cueSignature(nextSec);
-
-    if (primSig !== lastSigRef.current.prim) {
-      lastSigRef.current.prim = primSig;
-      setActivePrimaryCues(nextPrim);
-    }
-    if (secSig !== lastSigRef.current.sec) {
-      lastSigRef.current.sec = secSig;
-      setActiveSecondaryCues(nextSec);
-    }
-  }, [isEmbed, findHlsTextTrack]);
-  const evaluateCuesRef = useRef(evaluateCues);
-  evaluateCuesRef.current = evaluateCues;
-
-  // Unified Cue Engine: syncs <video>.textTracks, cuechange events, seeked, and active playback cadence.
-  useEffect(() => {
-    const v = video.current;
-    if (!v || isEmbed) return;
-    let boundPrimary: TextTrack | null = null;
-    let boundSecondary: TextTrack | null = null;
-    const run = () => evaluateCuesRef.current();
-
-    const syncTextTrackBindings = () => {
-      const primTrack = selectedSubRef.current ? subTracksRef.current.find((t) => t.id === selectedSubRef.current) : undefined;
-      const secTrack = secondarySubRef.current ? subTracksRef.current.find((t) => t.id === secondarySubRef.current) : undefined;
-      const hls = hlsRef.current;
-
-      const resolveTt = (t: UnifiedSubTrack | undefined): TextTrack | null => {
-        if (!t) return null;
-        if (t.origin === "native" && t.nativeTrack) return t.nativeTrack;
-        if (t.origin === "hls" && hls) return findHlsTextTrack(v, t, hls.subtitleTrack);
-        return null;
-      };
-
-      const nextP = resolveTt(primTrack);
-      const nextS = resolveTt(secTrack);
-      for (let i = 0; i < v.textTracks.length; i++) {
-        const tt = v.textTracks[i];
-        const isActive = tt === nextP || tt === nextS;
-        if (tt.mode === "showing") {
-          tt.mode = isActive || hls ? "hidden" : "disabled";
-        } else if (!hls && !isActive && tt.mode !== "disabled") {
-          tt.mode = "disabled";
-        } else if (!hls && isActive && tt.mode !== "hidden") {
-          tt.mode = "hidden";
-        }
-      }
-      if (nextP !== boundPrimary) {
-        boundPrimary?.removeEventListener("cuechange", run);
-        boundPrimary = nextP;
-        boundPrimary?.addEventListener("cuechange", run);
-      }
-      if (nextS !== boundSecondary) {
-        boundSecondary?.removeEventListener("cuechange", run);
-        boundSecondary = nextS;
-        boundSecondary?.addEventListener("cuechange", run);
-      }
-      run();
-    };
-
-    v.textTracks.addEventListener("change", syncTextTrackBindings);
-    v.textTracks.addEventListener("addtrack", syncTextTrackBindings);
-    v.addEventListener("timeupdate", run);
-    v.addEventListener("seeked", run);
-    v.addEventListener("playing", run);
-    v.addEventListener("pause", run);
-    syncTextTrackBindings();
-
-    return () => {
-      v.textTracks.removeEventListener("change", syncTextTrackBindings);
-      v.textTracks.removeEventListener("addtrack", syncTextTrackBindings);
-      v.removeEventListener("timeupdate", run);
-      v.removeEventListener("seeked", run);
-      v.removeEventListener("playing", run);
-      v.removeEventListener("pause", run);
-      boundPrimary?.removeEventListener("cuechange", run);
-      boundSecondary?.removeEventListener("cuechange", run);
-    };
-  }, [cur?.url, isEmbed, selectedSub, secondarySub, findHlsTextTrack]);
-
-  // Cue sync while playing. Tracks with parsed cues (files, online and stream subtitles) sleep
-  // until the next cue boundary instead of waking every 60 ms; HLS / native text tracks, whose cue
-  // lists grow as segments load, keep the 60 ms cadence. Seeks and speed changes resync at once.
-  useEffect(() => {
-    const v = video.current;
-    if (isEmbed || !playing || !v || (!selectedSub && !secondarySub)) return;
-    let timer: number | undefined;
-    let alive = true;
-    const delayMs = (): number => {
-      const list = subTracksRef.current;
-      const ids = [selectedSubRef.current, secondarySubRef.current].filter((id): id is string => !!id);
-      const t = v.currentTime || 0;
-      let boundary = Infinity;
-      for (const id of ids) {
-        const track = list.find((x) => x.id === id);
-        const cues = track ? trackDataRef.current[track.id]?.cues ?? track.cues : undefined;
-        if (!cues) return 60; // live text track: keep polling
-        const off = id === selectedSubRef.current ? offsetRef.current : secOffsetRef.current;
-        boundary = Math.min(boundary, nextCueBoundaryAfter(cues, t, off));
-      }
-      if (!Number.isFinite(boundary)) return 250;
-      const ms = ((boundary - t) * 1000) / (v.playbackRate || 1);
-      return Math.min(250, Math.max(16, ms + 2));
-    };
-    const tick = () => {
-      if (!alive) return;
-      evaluateCuesRef.current();
-      timer = window.setTimeout(tick, delayMs());
-    };
-    const resync = () => {
-      window.clearTimeout(timer);
-      tick();
-    };
-    tick();
-    v.addEventListener("seeked", resync);
-    v.addEventListener("ratechange", resync);
-    return () => {
-      alive = false;
-      window.clearTimeout(timer);
-      v.removeEventListener("seeked", resync);
-      v.removeEventListener("ratechange", resync);
-    };
-  }, [isEmbed, playing, selectedSub, secondarySub, offset, secOffset, trackData]);
-
-  // Scrub previews: one engine per stream, opened lazily on hover.
-  useEffect(() => {
-    setThumb(null);
-    return () => {
-      trickRef.current?.dispose();
-      trickRef.current = null;
-    };
-  }, [cur?.url, retrySeq]);
-  useEffect(() => {
-    if (hoverBucket < 0) return;
-    const c = curRef.current;
-    const v = video.current;
-    if (!c || !v || isEmbed || /^magnet:/i.test(c.url)) return;
-    const kind = c.kind === "hls" ? "hls" : c.kind === "file" ? "file" : null;
-    if (!kind) return;
-    // Files play from what the player actually loaded (a converted copy, a torrent's local URL).
-    const src = kind === "file" ? v.currentSrc || c.url : c.url;
-    if (!src) return;
-    let live = true;
-    const t = window.setTimeout(() => {
-      trickRef.current ??= new TrickplayEngine(kind, src);
-      void trickRef.current.frameAt(hoverBucket * 5 + 2.5).then((url) => {
-        if (live && url) setThumb(url);
-      });
-    }, 90);
-    return () => {
-      live = false;
-      window.clearTimeout(t);
-    };
-  }, [hoverBucket, isEmbed]);
+  // Subtitles (player/useSubtitles.ts), lifted as one block so its hooks keep their order.
+  const {
+    activeCurUrlRef,
+    activePrimaryCues,
+    activeSecondaryCues,
+    addSubtitleFiles,
+    attachIdentityRef,
+    audioTracks,
+    canSaveSidecar,
+    chooseSecondary,
+    chooseSub,
+    dragDepthRef,
+    dragOverSub,
+    epNumber,
+    epSeason,
+    evaluateCuesRef,
+    keepPausedRef,
+    lastActiveSubRef,
+    loadOnlineResult,
+    loadedOnlineMap,
+    loadingOnlineId,
+    manualAudio,
+    nudge,
+    nudgeSecondary,
+    offset,
+    offsetRef,
+    onlineError,
+    onlineLoading,
+    onlineResults,
+    onlineSearched,
+    patchPref,
+    patchTrackData,
+    pref,
+    resetOffset,
+    resetSecondaryOffset,
+    saveSidecar,
+    savedTrackIds,
+    savingTrackId,
+    searchOnline,
+    secOffset,
+    secondarySub,
+    secondarySubRef,
+    selectedAudioTrack,
+    selectedSub,
+    selectedSubRef,
+    setAudioTracks,
+    setDragOverSub,
+    setHlsReady,
+    setHlsSubs,
+    setNativeSubs,
+    setSelectedAudioTrack,
+    streamIdentityRef,
+    subTracks,
+    timingShiftUnsupported,
+    toggleSub,
+    trackData,
+    cycleSub,
+  } = useSubtitles({ media, flash, cur, mountedRef, isEmbed, title, originalLanguage, video, hlsRef, curRef, playing, episodes, dashSubIdRef, audio, shakaRef, season, initPtsRef, episode, dashCollectorRef, activeKey });
+
+  // Scrub previews (player/useTrickplay.ts).
+  const thumb = useTrickplay({ video, curRef, hoverStore, sourceUrl: cur?.url, retrySeq, isEmbed });
 
   // Sound effects and >100% pre-amp boost follow the <video> element, which is replaced per
   // stream: apply them to each new one when needed, and release the old one's nodes when it goes.
@@ -1642,807 +407,73 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     };
   }, [cur?.url, retrySeq]);
 
-  // Dual subtitles from two HLS tracks: hls.js loads only one subtitle track, so the other is
-  // fetched beside it (lib/hlsSideSubs) and handed to the cue engine as parsed cues.
-  const sideHlsTrack = useMemo(() => {
-    const prim = selectedSub ? hlsSubs.find((t) => t.id === selectedSub) : undefined;
-    const sec = secondarySub ? hlsSubs.find((t) => t.id === secondarySub) : undefined;
-    // hls.js serves the primary's HLS track when it has one (see applySubPair); the other is ours.
-    if (prim?.hlsIndex != null && sec?.hlsIndex != null && prim.hlsIndex !== sec.hlsIndex) return sec;
-    return undefined;
-  }, [selectedSub, secondarySub, hlsSubs]);
-  useEffect(() => {
-    const v = video.current;
-    const hls = hlsRef.current;
-    const track = sideHlsTrack;
-    if (!v || !hls || !track || track.hlsIndex == null) return;
-    const playlistUrl = hls.subtitleTracks[track.hlsIndex]?.url;
-    if (!playlistUrl) return;
-    const activeUrl = activeCurUrlRef.current;
-    patchTrackData(activeUrl, track.id, { loading: true });
-    const loader = createHlsSideLoader({
-      playlistUrl,
-      getInitPtsSec: () => initPtsRef.current,
-      onCues: (cues) => {
-        if (activeCurUrlRef.current !== activeUrl) return;
-        patchTrackData(activeUrl, track.id, { cues, format: "vtt", loading: false });
-      },
-    });
-    const onTime = () => loader.ensure(v.currentTime);
-    onTime();
-    v.addEventListener("timeupdate", onTime);
-    v.addEventListener("seeked", onTime);
-    return () => {
-      loader.dispose();
-      v.removeEventListener("timeupdate", onTime);
-      v.removeEventListener("seeked", onTime);
-    };
-  }, [sideHlsTrack, activeCurUrl, patchTrackData]);
-
-  // Re-evaluate immediately when offset, selection, or cached parsed cues change (even while paused).
-  useEffect(() => {
-    evaluateCues();
-  }, [selectedSub, secondarySub, offset, secOffset, trackData, evaluateCues]);
-
-  // Cleanup any in-flight subtitle requests on unmount.
-  useEffect(() => () => {
-    sourceGenRef.current++;
-    searchCtlRef.current?.abort();
-    loadOnlineCtlsRef.current.forEach((c) => c.abort());
-    loadOnlineCtlsRef.current.clear();
-    trackCtlsRef.current.forEach((c) => c.abort());
-    trackCtlsRef.current.clear();
-  }, []);
-
-  /* ----------------------------------------------------------------- audio */
-
-  const destroyAttachedPlayers = () => {
-    hlsRef.current?.destroy();
-    hlsRef.current = null;
-    const sp = shakaRef.current;
-    shakaRef.current = null;
-    dashHeightsRef.current = [];
-    if (sp) void sp.destroy().catch(() => {});
-  };
-  /**
-   * Leaving the player (or moving to a web player, which drops the <video>): stop the element's own
-   * download too. A detached video with a plain file or torrent URL keeps fetching until it is
-   * garbage-collected. A switch between our own streams skips this: the next attach resets it.
-   */
-  const releaseMediaIfUnmounted = (v: HTMLVideoElement) => {
-    if (mountedRef.current && v.isConnected) return;
-    try {
-      v.pause();
-      v.removeAttribute("src");
-      v.load();
-    } catch {
-      /* already gone */
-    }
-  };
-
-  /** On a dual-audio stream, play the track that matches sub (Japanese) or dub (English). */
-  const pickAudioTrack = () => {
-    if (manualAudio.current) return;
-    const hls = hlsRef.current;
-    if (hls && hls.audioTracks.length > 1) {
-      const i = preferredAudioTrackIndex(hls.audioTracks, audio, originalLanguage);
-      if (i >= 0) {
-        if (i !== hls.audioTrack) hls.audioTrack = i;
-        setSelectedAudioTrack(i);
-      }
-      return;
-    }
-    const sp = shakaRef.current;
-    if (sp) {
-      const dashAudio = sp.getAudioTracks();
-      if (dashAudio.length > 1) {
-        const i = preferredAudioTrackIndex(
-          dashAudio.map((t) => ({ name: t.label ?? undefined, lang: t.language })),
-          audio,
-          originalLanguage,
-        );
-        if (i >= 0 && dashAudio[i]) {
-          if (!dashAudio[i].active) sp.selectAudioTrack(dashAudio[i]);
-          setSelectedAudioTrack(i);
-        }
-      }
-      return;
-    }
-    const tracks = (video.current as (HTMLVideoElement & { audioTracks?: ArrayLike<{ language?: string; enabled: boolean }> }) | null)?.audioTracks;
-    if (tracks && tracks.length > 1) {
-      const found = preferredAudioTrackIndex(Array.from(tracks, (track) => ({ lang: track.language })), audio, originalLanguage);
-      if (found >= 0) {
-        for (let i = 0; i < tracks.length; i++) tracks[i].enabled = i === found;
-        setSelectedAudioTrack(found);
-      } else {
-        setSelectedAudioTrack(Array.from(tracks).findIndex((track) => track.enabled));
-      }
-    }
-  };
-  const chooseAudioTrack = (id: number) => {
-    const hls = hlsRef.current;
-    const sp = shakaRef.current;
-    if (localAudioModeRef.current && curRef.current?.localPath) {
-      if (id === selectedAudioTrack) return;
-      // Prepare (or reuse) the copy with this track, and pick up where the viewer was.
-      const v = video.current;
-      manualAudio.current = true;
-      localAudioRef.current = id;
-      if (v && v.currentTime > 1) resumeAt.current = v.currentTime;
-      keepPausedRef.current = Boolean(v?.paused && v.currentTime > 1);
-      setSelectedAudioTrack(id);
-      flash(`Audio: ${audioTracks.find((t) => t.id === id)?.label ?? `Track ${id + 1}`} · preparing…`);
-      setRetrySeq((n) => n + 1);
-      return;
-    }
-    if (hls?.audioTracks[id]) {
-      manualAudio.current = true;
-      hls.audioTrack = id;
-    } else if (sp) {
-      const dashAudio = sp.getAudioTracks();
-      if (!dashAudio[id]) return;
-      manualAudio.current = true;
-      sp.selectAudioTrack(dashAudio[id]);
-    } else {
-      const tracks = (video.current as (HTMLVideoElement & { audioTracks?: ArrayLike<{ enabled: boolean }> }) | null)?.audioTracks;
-      if (!tracks?.[id]) return;
-      manualAudio.current = true;
-      for (let i = 0; i < tracks.length; i++) tracks[i].enabled = i === id;
-    }
-    setSelectedAudioTrack(id);
-    flash(`Audio: ${audioTracks.find((t) => t.id === id)?.label ?? `Track ${id + 1}`}`);
-  };
-
-  // WebViews that expose embedded tracks can switch them directly; HLS tracks are handled above.
-  useEffect(() => {
-    const v = video.current;
-    if (!v || cur?.kind !== "file") return;
-
-    type NativeAudioTrack = { label?: string; language?: string; enabled: boolean };
-    type NativeAudioTrackList = ArrayLike<NativeAudioTrack> & EventTarget;
-    const nativeVideo = v as HTMLVideoElement & { audioTracks?: NativeAudioTrackList };
-    let audioList: NativeAudioTrackList | undefined;
-
-    const refreshAudio = () => {
-      // The list comes from the file itself (probe_local_audio): the WebView's empty one mustn't replace it.
-      if (localAudioModeRef.current) return;
-      const next = nativeVideo.audioTracks;
-      if (next !== audioList) {
-        audioList?.removeEventListener("addtrack", refreshAudio);
-        audioList?.removeEventListener("removetrack", refreshAudio);
-        audioList?.removeEventListener("change", refreshAudio);
-        audioList = next;
-        audioList?.addEventListener("addtrack", refreshAudio);
-        audioList?.addEventListener("removetrack", refreshAudio);
-        audioList?.addEventListener("change", refreshAudio);
-      }
-      const tracks = Array.from(audioList ?? []);
-      setAudioTracks(tracks.map((track, i) => ({
-        id: i,
-        label: track.label || track.language || `Track ${i + 1}`,
-        lang: track.language || "und",
-      })));
-      const enabled = tracks.findIndex((track) => track.enabled);
-      setSelectedAudioTrack(enabled);
-      if (!manualAudio.current && tracks.length > 1) pickAudioTrack();
-    };
-
-    const refreshSubtitles = () => {
-      if (hlsRef.current) {
-        for (let i = 0; i < v.textTracks.length; i++) {
-          if (v.textTracks[i].mode === "showing") v.textTracks[i].mode = "hidden";
-        }
-        return;
-      }
-      const activeCur = curRef.current;
-      const hasEmbeddedCandidate =
-        activeCur?.providerId === "local" &&
-        Boolean(activeCur.subtitles?.some((t) => t.source === "embedded" || t.streamIndex != null || t.url.startsWith("embedded://")));
-      if (hasEmbeddedCandidate) {
-        for (let i = 0; i < v.textTracks.length; i++) {
-          if (v.textTracks[i].mode !== "disabled") v.textTracks[i].mode = "disabled";
-        }
-        setNativeSubs([]);
-        return;
-      }
-      const currentPrim = selectedSubRef.current;
-      const currentSec = secondarySubRef.current;
-      const tracks: UnifiedSubTrack[] = [];
-      for (let i = 0; i < v.textTracks.length; i++) {
-        const track = v.textTracks[i];
-        if (track.kind !== "subtitles" && track.kind !== "captions") continue;
-        const id = `native-sub-${i}`;
-        const isSelected = id === currentPrim || id === currentSec;
-        if (track.mode === "showing") {
-          track.mode = isSelected ? "hidden" : "disabled";
-        } else if (!isSelected && track.mode !== "disabled") {
-          track.mode = "disabled";
-        }
-        tracks.push({
-          id,
-          label: track.label || track.language || `Track ${i + 1}`,
-          lang: track.language || "und",
-          origin: "native" as const,
-          nativeTrack: track,
-        });
-      }
-      setNativeSubs(tracks);
-    };
-
-    v.addEventListener("loadedmetadata", refreshAudio);
-    v.textTracks.addEventListener("addtrack", refreshSubtitles);
-    v.textTracks.addEventListener("removetrack", refreshSubtitles);
-    v.textTracks.addEventListener("change", refreshSubtitles);
-    refreshAudio();
-    refreshSubtitles();
-    return () => {
-      v.removeEventListener("loadedmetadata", refreshAudio);
-      v.textTracks.removeEventListener("addtrack", refreshSubtitles);
-      v.textTracks.removeEventListener("removetrack", refreshSubtitles);
-      v.textTracks.removeEventListener("change", refreshSubtitles);
-      audioList?.removeEventListener("addtrack", refreshAudio);
-      audioList?.removeEventListener("removetrack", refreshAudio);
-      audioList?.removeEventListener("change", refreshAudio);
-    };
-  }, [cur?.url]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  /* --------------------------------------------------------------- watchdog */
-
-  // A server that passed its checks can still fail to start or stall for good mid-episode.
-  // Then move on to the next one at the same spot instead of spinning forever.
-  const START_TIMEOUT = 20_000;
-  const STALL_TIMEOUT = 15_000;
-  const armStall = useCallback(() => {
-    clearStall();
-    const v = video.current;
-    if (!v || (v.paused && started.current)) return;
-    stallTimer.current = window.setTimeout(() => {
-      const vv = video.current;
-      // Still not playing, not paused by the viewer, and no data arriving.
-      if (vv && !(vv.paused && started.current) && vv.readyState < 3) failover(started.current ? "stalled" : "didn't start");
-    }, started.current ? STALL_TIMEOUT : START_TIMEOUT);
-  }, [clearStall, failover]);
-  const armStallRef = useRef(armStall);
-  armStallRef.current = armStall;
-  useEffect(() => {
-    if (!cur || cur.kind === "embed" || preparingLocal || preparingTorrent) return;
-    started.current = false;
-    setHasStarted(false);
-    armStall();
-    return clearStall;
-  }, [cur?.url, cur?.kind, preparingLocal, preparingTorrent, retrySeq, armStall, clearStall]);
-
-  /* ---------------------------------------------------------- attach source */
-
-  const lastRefreshedAtRef = useRef(new Map<string, number>());
-
-  useEffect(() => {
-    const c = curRef.current;
-    if (!c) return;
-    activeSessionRef.current += 1;
-    attachStartRef.current = performance.now();
-    started.current = false;
-    setHasStarted(false);
-    setPlaying(false);
-    setLiveStreamId(null);
-    setRecovering(false);
-    setFatal(null);
-    setEnded(false);
-    setPreparingLocal(false);
-    setPreparingTorrent(false);
-    stopActiveTorrent();
-    setAudioTracks([]);
-    // A token refresh of the same stream keeps the viewer's audio pick (re-applied once tracks list).
-    const sameStream = !!streamIdentityRef.current && attachIdentityRef.current === streamIdentityRef.current;
-    attachIdentityRef.current = streamIdentityRef.current;
-    if (!sameStream) {
-      setSelectedAudioTrack(-1);
-      manualAudio.current = false;
-      keepPausedRef.current = false;
-      localAudioRef.current = null;
-    }
-    localAudioModeRef.current = false;
-    setLevels([]);
-    setLevel(-1);
-    setActiveLevel(-1);
-    setVideoHeight(undefined);
-    setTime(0);
-    setDur(0);
-    destroyAttachedPlayers();
-    refreshCtlRef.current?.abort();
-    refreshCtlRef.current = null;
-    if (c.kind === "embed") {
-      setWaiting(true);
-      embedPos.current = { time: resumeAt.current, duration: 0 };
-      setEmbedClock({ time: 0, duration: 0 });
-      return;
-    }
-    const v = video.current;
-    if (!v) return;
-    setWaiting(true);
-    // Reset any previous stream immediately so the upscaler never reads stale readyState/dimensions
-    // while hls.js or local media preparation loads asynchronously, and enforce anonymous CORS.
-    v.pause();
-    v.removeAttribute("src");
-    v.crossOrigin = "anonymous";
-    v.load();
-
-    const seekAndPlay = () => {
-      if (resumeAt.current > 0 && resumeAt.current < (v.duration || Infinity) - 5) v.currentTime = resumeAt.current;
-      pickAudioTrack();
-      // A refreshed link for a paused video stays paused at the same spot.
-      if (keepPausedRef.current) {
-        keepPausedRef.current = false;
-        return;
-      }
-      v.play().catch(() => {});
-    };
-    let cancelled = false;
-    const refreshExpiredStream = (
-      target: StreamCandidate,
-      fallbackMsg: string,
-      httpCode: number | undefined,
-      disposeCurrent: () => void,
-    ) => {
-      const targetId = candKey(target);
-      lastRefreshedAtRef.current.set(targetId, Date.now());
-      if (v.currentTime > 1) resumeAt.current = v.currentTime;
-      keepPausedRef.current = v.paused && v.currentTime > 1;
-      saveNowRef.current();
-      clearStall();
-      setWaiting(true);
-      flash(`Refreshing ${target.providerName} stream link…`);
-
-      disposeCurrent();
-
-      refreshCtlRef.current?.abort();
-      const refreshCtl = new AbortController();
-      refreshCtlRef.current = refreshCtl;
-
-      void session
-        .refresh(targetId, refreshCtl.signal)
-        .then((refreshed) => {
-          if (cancelled || refreshCtl.signal.aborted || !mountedRef.current) return;
-          if (refreshCtlRef.current === refreshCtl) refreshCtlRef.current = null;
-          if (!refreshed?.probe?.ok) {
-            failover(refreshed?.probe?.error ?? (httpCode ? `HTTP ${httpCode}` : fallbackMsg));
-            return;
-          }
-          if (refreshed.url === target.url) {
-            attachStream(refreshed);
-            armStallRef.current();
-          }
-        })
-        .catch((err: unknown) => {
-          if (cancelled || refreshCtl.signal.aborted || !mountedRef.current) return;
-          if (refreshCtlRef.current === refreshCtl) refreshCtlRef.current = null;
-          failover(err instanceof Error ? err.message : "stream token refresh failed");
-        });
-    };
-    const loadFile = (url: string) => {
-      if (cancelled) return;
-      v.crossOrigin = "anonymous";
-      v.src = url;
-      v.addEventListener("loadedmetadata", seekAndPlay, { once: true });
-    };
-    const attachHls = (H: typeof Hls, streamUrl: string, target: StreamCandidate) => {
-      if (cancelled) return;
-      v.crossOrigin = "anonymous";
-      if (!H.isSupported()) {
-        v.src = streamUrl;
-        v.addEventListener("loadedmetadata", seekAndPlay, { once: true });
-        return;
-      }
-      const hls = new H({
-        enableWorker: true,
-        lowLatencyMode: false,
-        maxBufferLength: 60,
-        backBufferLength: 30,
-        xhrSetup: (xhr) => {
-          xhr.withCredentials = false;
-        },
-      });
-      hlsRef.current = hls;
-      hls.subtitleDisplay = false;
-      let recoveries = 0;
-      let lastRecoveryAt = 0;
-      let midStreamRefreshing = false;
-      let lastNetErrCode: number | undefined;
-      initPtsRef.current = null;
-      hls.on(H.Events.INIT_PTS_FOUND, (_, d) => {
-        if (initPtsRef.current == null && d.initPTS != null && d.timescale) initPtsRef.current = d.initPTS / d.timescale;
-      });
-      hls.on(H.Events.MANIFEST_PARSED, (_, d) => {
-        if (cancelled) return;
-        lastNetErrCode = undefined;
-        setHlsReady(true);
-        setLevels(d.levels.map((l) => ({ height: l.height })));
-        seekAndPlay();
-      });
-      hls.on(H.Events.FRAG_LOADED, () => {
-        lastNetErrCode = undefined;
-        // Repairs are for a burst of trouble: after 15 s of healthy playback the budget is restored,
-        // so three isolated hiccups across a long film don't add up to a failover.
-        if (recoveries && performance.now() - lastRecoveryAt > 15_000) recoveries = 0;
-      });
-      hls.on(H.Events.LEVEL_SWITCHED, (_, d) => {
-        setActiveLevel(d.level);
-      });
-      hls.on(H.Events.AUDIO_TRACKS_UPDATED, (_, d) => {
-        setAudioTracks((d.audioTracks ?? []).map((t, i) => ({
-          id: i,
-          label: t.name || t.lang || `Track ${i + 1}`,
-          lang: t.lang ?? "und",
-        })));
-        setSelectedAudioTrack(hls.audioTrack);
-        pickAudioTrack();
-      });
-      hls.on(H.Events.AUDIO_TRACK_SWITCHED, (_, d) => setSelectedAudioTrack(d.id));
-      hls.on(H.Events.SUBTITLE_TRACKS_UPDATED, (_, d) => {
-        setHlsSubs(
-          (d.subtitleTracks ?? []).map((t, i) => ({
-            id: `hls-${i}`,
-            label: t.name || t.lang || `Track ${i + 1}`,
-            lang: t.lang ?? "und",
-            origin: "hls" as const,
-            isDefault: Boolean(t.default),
-            isForced: Boolean(t.forced),
-            hlsIndex: i,
-          })),
-        );
-      });
-      hls.on(H.Events.SUBTITLE_FRAG_PROCESSED, () => {
-        evaluateCuesRef.current();
-      });
-      hls.on(H.Events.ERROR, (_, d) => {
-        if (cancelled) return;
-        const netStatus =
-          d.networkDetails && typeof d.networkDetails === "object" && "status" in d.networkDetails
-            ? Number((d.networkDetails as { status?: number }).status)
-            : undefined;
-        const code = d.response?.code ?? (netStatus && Number.isFinite(netStatus) && netStatus > 0 ? netStatus : undefined);
-        if (d.type === H.ErrorTypes.NETWORK_ERROR && code) {
-          lastNetErrCode = code;
-        }
-        if (!d.fatal) return;
-
-        // Media errors get two local repair attempts (the second also swaps the audio codec), then the next source.
-        if (d.type === H.ErrorTypes.MEDIA_ERROR && recoveries < 2) {
-          lastRecoveryAt = performance.now();
-          if (recoveries++ === 1) hls.swapAudioCodec();
-          hls.recoverMediaError();
-          return;
-        }
-
-        const httpCode = code ?? (d.type === H.ErrorTypes.NETWORK_ERROR ? lastNetErrCode : undefined);
-        const isAuthOrExpired =
-          httpCode === 401 ||
-          httpCode === 403 ||
-          httpCode === 410 ||
-          isUrlTokenExpired(target.url) ||
-          (typeof d.url === "string" && isUrlTokenExpired(d.url));
-        const targetId = candKey(target);
-        const lastRefresh = lastRefreshedAtRef.current.get(targetId) ?? 0;
-
-        if (
-          d.type === H.ErrorTypes.NETWORK_ERROR &&
-          isAuthOrExpired &&
-          target.pageUrl &&
-          !midStreamRefreshing &&
-          Date.now() - lastRefresh >= 60_000
-        ) {
-          midStreamRefreshing = true;
-          refreshExpiredStream(target, d.details, httpCode, () => {
-            if (hlsRef.current === hls) hlsRef.current = null;
-            hls.destroy();
-          });
-          return;
-        }
-
-        failover(httpCode ? `${d.details} (${httpCode})` : d.details);
-      });
-      hls.loadSource(streamUrl);
-      hls.attachMedia(v);
-    };
-    const attachDash = (shakaMod: typeof shaka, streamUrl: string, target: StreamCandidate) => {
-      if (cancelled) return;
-      v.crossOrigin = "anonymous";
-      shakaMod.polyfill?.installAll?.();
-      if (!shakaMod.Player.isBrowserSupported()) {
-        failover("DASH playback is not supported in this browser");
-        return;
-      }
-      const player = new shakaMod.Player();
-      shakaRef.current = player;
-      const collector = new DashCueCollector((cues) => {
-        const id = dashSubIdRef.current;
-        if (cancelled || !id || shakaRef.current !== player) return;
-        patchTrackData(activeCurUrlRef.current, id, { cues, format: "vtt", loading: false });
-      });
-      dashCollectorRef.current = collector;
-      dashSubIdRef.current = null;
-      player.configure({
-        streaming: {
-          bufferingGoal: 60,
-          rebufferingGoal: 2,
-          bufferBehind: 30,
-        },
-        abr: { enabled: true },
-        // Shaka parses the DASH text tracks; our renderer draws them (styling, dual subs, timing).
-        textDisplayFactory: () => collector as unknown as shaka.extern.TextDisplayer,
-      });
-
-      const syncDashTracks = () => {
-        if (cancelled || shakaRef.current !== player) return;
-        const variants = player.getVariantTracks();
-        const heights = Array.from(
-          new Set(variants.map((t) => t.height ?? 0).filter((h) => h > 0)),
-        ).sort((a, b) => a - b);
-        dashHeightsRef.current = heights;
-        setLevels(heights.map((height) => ({ height })));
-        const activeVar = variants.find((t) => t.active);
-        setActiveLevel(activeVar?.height ? heights.indexOf(activeVar.height) : -1);
-
-        const dashAudio = player.getAudioTracks();
-        setAudioTracks(
-          dashAudio.map((t, i) => ({
-            id: i,
-            label: t.label || t.language || `Track ${i + 1}`,
-            lang: t.language || "und",
-          })),
-        );
-        const activeAudioIdx = dashAudio.findIndex((t) => t.active);
-        if (activeAudioIdx >= 0) setSelectedAudioTrack(activeAudioIdx);
-
-        setHlsSubs(
-          player.getTextTracks().map((t, i) => ({
-            id: `dash-${t.id}`,
-            label: t.label || t.language || `Track ${i + 1}`,
-            lang: t.language || "und",
-            origin: "dash" as const,
-            isDefault: Boolean(t.primary),
-            isForced: Boolean(t.forced),
-            dashTrackId: t.id,
-          })),
-        );
-      };
-
-      player.addEventListener("trackschanged", () => {
-        syncDashTracks();
-        pickAudioTrack();
-      });
-      player.addEventListener("adaptation", () => {
-        if (cancelled || shakaRef.current !== player) return;
-        const activeVar = player.getVariantTracks().find((t) => t.active);
-        const heights = dashHeightsRef.current;
-        setActiveLevel(activeVar?.height ? heights.indexOf(activeVar.height) : -1);
-      });
-
-      let dashDead = false;
-      const handleDashError = (rawErr: unknown, fromEvent: boolean) => {
-        if (cancelled || dashDead) return;
-        const err = rawErr as Partial<shaka.util.Error> | undefined;
-        const code = typeof err?.code === "number" ? err.code : undefined;
-        if (code === shakaMod.util.Error.Code.LOAD_INTERRUPTED) return;
-        if (fromEvent && err?.severity !== shakaMod.util.Error.Severity.CRITICAL) return;
-
-        const errData = Array.isArray(err?.data) ? (err.data as unknown[]) : undefined;
-        const httpCode =
-          code === shakaMod.util.Error.Code.BAD_HTTP_STATUS && errData && typeof errData[1] === "number"
-            ? errData[1]
-            : undefined;
-        const errUrl = errData && typeof errData[0] === "string" ? errData[0] : undefined;
-        const isAuthOrExpired =
-          httpCode === 401 ||
-          httpCode === 403 ||
-          httpCode === 410 ||
-          isUrlTokenExpired(target.url) ||
-          (errUrl ? isUrlTokenExpired(errUrl) : false);
-        const targetId = candKey(target);
-        const lastRefresh = lastRefreshedAtRef.current.get(targetId) ?? 0;
-
-        dashDead = true;
-        if (
-          isAuthOrExpired &&
-          target.pageUrl &&
-          Date.now() - lastRefresh >= 60_000
-        ) {
-          refreshExpiredStream(target, `DASH error ${code ?? "unknown"}`, httpCode, () => {
-            if (shakaRef.current === player) {
-              shakaRef.current = null;
-              dashHeightsRef.current = [];
-            }
-            void player.destroy().catch(() => {});
-          });
-          return;
-        }
-        failover(httpCode ? `DASH error ${code ?? "network"} (${httpCode})` : `DASH error ${code ?? "playback"}`);
-      };
-
-      player.addEventListener("error", (ev) => {
-        handleDashError((ev as Event & { detail?: unknown }).detail, true);
-      });
-
-      void (async () => {
-        try {
-          await player.attach(v);
-          if (cancelled || shakaRef.current !== player) {
-            await player.destroy().catch(() => {});
-            return;
-          }
-          await player.load(streamUrl);
-          if (cancelled || shakaRef.current !== player) return;
-          setHlsReady(true);
-          syncDashTracks();
-          seekAndPlay();
-        } catch (err: unknown) {
-          handleDashError(err, false);
-        }
-      })();
-    };
-    const attachStream = (target: StreamCandidate) => {
-      // hls.js (~600 kB) and shaka-player are dynamically loaded only for HLS / DASH streams.
-      if (target.kind === "hls") {
-        import("hls.js").then((m) => attachHls(m.default, target.url, target), () => !cancelled && failover("player failed to load"));
-      } else if (target.kind === "dash") {
-        const isAlreadyProxied = unwrapProxyUrl(target.url).proxied;
-        const isLocalProxy = /^https?:\/\/(?:127\.0\.0\.1|localhost)(?::|\/|$)/i.test(target.url);
-        const dashUrl =
-          native && !isAlreadyProxied && !isLocalProxy && /^https?:/i.test(target.url) && (target.headers || target.pageUrl)
-            ? proxyUrl(target.url, target.headers, target.pageUrl)
-            : target.url;
-        import("shaka-player").then(
-          (m) => attachDash(((m as { default?: typeof shaka }).default ?? m) as typeof shaka, dashUrl, target),
-          () => !cancelled && failover("DASH player failed to load"),
-        );
-      } else if (/^magnet:/i.test(target.url.trim())) {
-        const magnetUri = target.url.trim();
-        if (!isTauri()) {
-          setWaiting(false);
-          failover("torrent playback requires the desktop app");
-          return;
-        }
-        setPreparingTorrent(true);
-        const rawFileIdx = (target as { fileIdx?: unknown }).fileIdx;
-        const fileIdx = typeof rawFileIdx === "number" && Number.isFinite(rawFileIdx) ? rawFileIdx : null;
-        void (async () => {
-          try {
-            const supported = await invoke<boolean>("torrent_is_supported").catch(() => false);
-            if (cancelled) return;
-            if (!supported) {
-              setPreparingTorrent(false);
-              setWaiting(false);
-              failover("torrent streaming is not enabled in this build");
-              return;
-            }
-            const info = await invoke<unknown>("torrent_start_stream", {
-              magnetOrHash: magnetUri,
-              fileIdx,
-            });
-            const rec = info && typeof info === "object" ? (info as Record<string, unknown>) : null;
-            const streamId = rec && typeof rec.id === "number" && Number.isFinite(rec.id) ? rec.id : null;
-            const streamUrl =
-              typeof info === "string"
-                ? info.trim()
-                : typeof rec?.url === "string"
-                  ? rec.url.trim()
-                  : typeof rec?.streamUrl === "string"
-                    ? rec.streamUrl.trim()
-                    : typeof rec?.stream_url === "string"
-                      ? rec.stream_url.trim()
-                      : "";
-            if (cancelled) {
-              if (streamId != null) {
-                void invoke("torrent_stop", { id: streamId }).catch(() => {});
-              }
-              return;
-            }
-            if (!/^https?:\/\//i.test(streamUrl)) {
-              if (streamId != null) {
-                void invoke("torrent_stop", { id: streamId }).catch(() => {});
-              }
-              setPreparingTorrent(false);
-              setWaiting(false);
-              failover("torrent stream returned an invalid URL");
-              return;
-            }
-            activeTorrentIdRef.current = streamId;
-            setPreparingTorrent(false);
-            loadFile(streamUrl);
-          } catch (error: unknown) {
-            if (cancelled) return;
-            setPreparingTorrent(false);
-            setWaiting(false);
-            failover(`torrent stream failed: ${error instanceof Error ? error.message : String(error)}`);
-          }
-        })();
-      } else if (target.localPath) {
-        setPreparingLocal(true);
-        const localPath = target.localPath;
-        const audioIndex = localAudioRef.current;
-        invoke<string>("prepare_local_media", { path: localPath, ...(audioIndex != null ? { audioIndex } : {}) })
-          .then((path) => {
-            if (cancelled) return;
-            setPreparingLocal(false);
-            loadFile(convertFileSrc(path));
-            // Offer the file's audio tracks (WebView2 can't list or switch them itself).
-            invoke<{ index: number; codec: string; channels?: number; language?: string; title?: string; isDefault: boolean }[]>(
-              "probe_local_audio",
-              { path: localPath },
-            )
-              .then((list) => {
-                if (cancelled || list.length < 2) return;
-                localAudioModeRef.current = true;
-                setAudioTracks(
-                  list.map((a) => {
-                    const ch = a.channels === 6 ? " 5.1" : a.channels === 8 ? " 7.1" : a.channels === 1 ? " mono" : "";
-                    const base = a.title || (a.language ? langLabel(a.language) : `Track ${a.index + 1}`);
-                    return { id: a.index, label: `${base}${ch}`, lang: a.language ?? "und" };
-                  }),
-                );
-                setSelectedAudioTrack(audioIndex ?? Math.max(0, list.findIndex((a) => a.isDefault)));
-              })
-              .catch(() => {});
-          })
-          .catch((error: unknown) => {
-            if (cancelled) return;
-            setPreparingLocal(false);
-            setWaiting(false);
-            failover(`audio conversion failed: ${error instanceof Error ? error.message : String(error)}`);
-          });
-      } else {
-        loadFile(target.url);
-      }
-    };
-    // Re-validate and refresh stale/expired stream URLs before playback.
-    const candidateId = candKey(c);
-    const lastPreRefresh = lastRefreshedAtRef.current.get(candidateId) ?? 0;
-    if (c.pageUrl && isUrlTokenExpired(c.url) && Date.now() - lastPreRefresh >= 60_000) {
-      lastRefreshedAtRef.current.set(candidateId, Date.now());
-      const refreshCtl = new AbortController();
-      refreshCtlRef.current = refreshCtl;
-      // The session swaps in the fresh link, which re-runs this effect with the new URL.
-      void session
-        .refresh(candidateId, refreshCtl.signal)
-        .then((refreshed) => {
-          if (cancelled || refreshCtl.signal.aborted || !mountedRef.current) return;
-          if (refreshCtlRef.current === refreshCtl) refreshCtlRef.current = null;
-          if (!refreshed?.probe?.ok) {
-            failover(refreshed?.probe?.error ?? "expired stream");
-            return;
-          }
-          if (refreshed.url === c.url) {
-            attachStream(refreshed);
-          }
-        })
-        .catch((err: unknown) => {
-          if (cancelled || refreshCtl.signal.aborted || !mountedRef.current) return;
-          if (refreshCtlRef.current === refreshCtl) refreshCtlRef.current = null;
-          failover(err instanceof Error ? err.message : "expired stream refresh failed");
-        });
-      return () => {
-        cancelled = true;
-        refreshCtl.abort();
-        if (refreshCtlRef.current === refreshCtl) refreshCtlRef.current = null;
-        v.removeEventListener("loadedmetadata", seekAndPlay);
-        if (v.currentTime > 1) resumeAt.current = v.currentTime;
-        stopActiveTorrent();
-        destroyAttachedPlayers();
-        releaseMediaIfUnmounted(v);
-      };
-    }
-    attachStream(c);
-    return () => {
-      cancelled = true;
-      refreshCtlRef.current?.abort();
-      refreshCtlRef.current = null;
-      v.removeEventListener("loadedmetadata", seekAndPlay);
-      if (v.currentTime > 1) resumeAt.current = v.currentTime;
-      stopActiveTorrent();
-      destroyAttachedPlayers();
-      releaseMediaIfUnmounted(v);
-    };
-  }, [cur?.url, cur?.kind, cur?.localPath, retrySeq, failover, clearStall, stopActiveTorrent]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Stream engine (player/useStreamEngine.ts): attach, audio tracks, watchdog. One block, same hook order.
+  const { armStall, chooseAudioTrack } = useStreamEngine({
+    activeCurUrlRef,
+    activeSessionRef,
+    activeTorrentIdRef,
+    attachIdentityRef,
+    attachStartRef,
+    audio,
+    audioTracks,
+    clearStall,
+    cur,
+    curRef,
+    dashCollectorRef,
+    dashHeightsRef,
+    dashSubIdRef,
+    embedPos,
+    evaluateCuesRef,
+    failover,
+    flash,
+    hlsRef,
+    initPtsRef,
+    keepPausedRef,
+    localAudioModeRef,
+    localAudioRef,
+    manualAudio,
+    mountedRef,
+    originalLanguage,
+    patchTrackData,
+    preparingLocal,
+    preparingTorrent,
+    refreshCtlRef,
+    resumeAt,
+    retrySeq,
+    saveNowRef,
+    secondarySubRef,
+    selectedAudioTrack,
+    selectedSubRef,
+    session,
+    setActiveLevel,
+    setAudioTracks,
+    setDur,
+    setEmbedClock,
+    setEnded,
+    setFatal,
+    setHasStarted,
+    setHlsReady,
+    setHlsSubs,
+    setLevel,
+    setLevels,
+    setLiveStreamId,
+    setNativeSubs,
+    setPlaying,
+    setPreparingLocal,
+    setPreparingTorrent,
+    setRecovering,
+    setRetrySeq,
+    setSelectedAudioTrack,
+    setTime,
+    setVideoHeight,
+    setWaiting,
+    shakaRef,
+    stallTimer,
+    started,
+    stopActiveTorrent,
+    streamIdentityRef,
+    video,
+  });
 
   /* ------------------------------------------------------------------ embeds */
 
@@ -2483,8 +514,14 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
 
   /* ------------------------------------------------------------ enhancement */
 
-  const [enhance, setEnhance] = useState<EnhanceMode>(loadEnhance);
-  const [enhancing, setEnhancing] = useState<"idle" | "starting" | "on" | "error">("idle");
+  const { enhance, pickEnhance, enhancing, enhError, enhStats, compareAt, setCompareAt, comparing, onCompareDrag, vivid, setVivid } = useEnhance({
+    video,
+    canvas,
+    sourceUrl: cur?.url,
+    isEmbed,
+    preparingLocal,
+    flash,
+  });
   const toggleAudioFx = (k: keyof AudioFx) => {
     // Worked out here, not inside the state updater: updaters must be pure (StrictMode runs them
     // twice, which rebuilt the audio graph and fired the toast twice).
@@ -2496,96 +533,6 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     // Applied inside the click (a user gesture), so a new AudioContext starts running.
     if (v && !isEmbed && !setAudioFx(v, { ...next, boost })) flash("Sound effects aren't available in this player");
   };
-  /**
-   * Before/after: the upscaled canvas sits exactly over the video, so clipping it shows the original
-   * on the left of the line and Anime4K on the right, live, at no GPU cost. null = off.
-   */
-  const [compareAt, setCompareAt] = useState<number | null>(null);
-  const comparing = compareAt != null && enhancing === "on";
-  const onCompareDrag = (e: React.PointerEvent<HTMLDivElement>) => {
-    const box = canvas.current?.parentElement?.getBoundingClientRect();
-    if (!box || !box.width) return;
-    if (e.type === "pointerdown") e.currentTarget.setPointerCapture(e.pointerId);
-    else if (!e.currentTarget.hasPointerCapture(e.pointerId)) return;
-    setCompareAt(Math.max(2, Math.min(98, ((e.clientX - box.left) / box.width) * 100)));
-  };
-  const [enhError, setEnhError] = useState<string | null>(null);
-  const [enhStats, setEnhStats] = useState<EnhancerStats | null>(null);
-  /** Embeds get a CSS colour/contrast lift instead: their pixels are cross-origin. */
-  const [vivid, setVivid] = useState(() => localStorage.getItem("abx.vivid") === "1");
-  const pickEnhance = (m: EnhanceMode) => {
-    setEnhError(null);
-    setEnhance(m);
-    try { localStorage.setItem(ENHANCE_KEY, m); } catch { /* ignore */ }
-  };
-  useEffect(() => {
-    try { localStorage.setItem("abx.vivid", vivid ? "1" : "0"); } catch { /* ignore */ }
-  }, [vivid]);
-
-  useEffect(() => {
-    const v = video.current, c = canvas.current;
-    if (enhance === "off" || isEmbed || preparingLocal || !v || !c) {
-      setEnhancing("idle");
-      setEnhError(null);
-      setEnhStats(null);
-      return;
-    }
-    const ac = new AbortController();
-    let stopped = false;
-    let eng: Enhancer | null = null;
-    setEnhancing("starting");
-    setEnhError(null);
-    startEnhancer(v, c, enhance, {
-      signal: ac.signal,
-      // The governor stepped down because the GPU couldn't keep up: say so, and stop if it reached "off".
-      onDowngrade: (to, why) => {
-        if (stopped) return;
-        if (to === "off") {
-          eng?.stop();
-          eng = null;
-          setEnhancing("error");
-          setEnhError("GPU couldn't keep up at this resolution — switched to native video");
-          setEnhStats(null);
-          flash("Enhancement turned off: this GPU can't keep up at this size");
-          return;
-        }
-        flash(`Enhancement eased to ${ENHANCE_MODES.find((m) => m.id === to)?.name} (${why})`);
-      },
-      // Hardware context loss, uncaptured shader error, or CORS taint: fall back to native <video>.
-      onFallback: (why) => {
-        if (stopped) return;
-        eng?.stop();
-        eng = null;
-        setEnhancing("error");
-        setEnhError(why);
-        setEnhStats(null);
-        flash(why);
-      },
-    })
-      .then((e) => {
-        if (stopped || ac.signal.aborted) return e.stop();
-        eng = e;
-        setEnhancing("on");
-        setEnhStats(e.stats());
-      })
-      .catch((err) => {
-        if (stopped || ac.signal.aborted) return;
-        const msg = err?.message ?? String(err);
-        setEnhancing("error");
-        setEnhError(msg);
-        setEnhStats(null);
-        flash(`Enhancement fallback (native video): ${msg}`);
-      });
-    // Live stats for the Picture panel (GPU time per frame, chain, skipped frames).
-    const statTimer = window.setInterval(() => eng && setEnhStats(eng.stats()), 1000);
-    return () => {
-      stopped = true;
-      ac.abort();
-      clearInterval(statTimer);
-      eng?.stop();
-      setEnhStats(null);
-    };
-  }, [enhance, cur?.url, isEmbed, preparingLocal]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* ------------------------------------------------------------- the rest */
 
@@ -2621,43 +568,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     return () => clearInterval(t);
   }, [onProgress]);
 
-  // Auto-hide controls. They stay up while the pointer rests on them or one of them has keyboard
-  // focus: nothing fades out from under a still cursor or from under the Tab key.
-  const idleTimer = useRef<number>();
-  const overChromeRef = useRef(false);
-  const lastPointerRef = useRef({ x: Number.NaN, y: Number.NaN });
-  const poke = () => {
-    setIdle(false);
-    clearTimeout(idleTimer.current);
-    const later = () => {
-      const a = document.activeElement;
-      const keyboardOnControls = !!a && !!wrap.current?.contains(a) && !!a.closest?.(HOLD_CHROME) && isKeyboardFocused(a);
-      if (overChromeRef.current || keyboardOnControls) {
-        idleTimer.current = window.setTimeout(later, IDLE_MS);
-        return;
-      }
-      setIdle(true);
-    };
-    idleTimer.current = window.setTimeout(later, IDLE_MS);
-  };
-  /**
-   * Pointer activity over the player. Chromium also sends mousemoves without any movement (when
-   * the layout changes under a still cursor, e.g. as the controls fade): those must not count, or
-   * the controls could keep waking themselves up.
-   */
-  const onPointerActivity = (e: React.MouseEvent) => {
-    overChromeRef.current = !!(e.target as Element | null)?.closest?.(HOLD_CHROME);
-    const last = lastPointerRef.current;
-    if (e.clientX === last.x && e.clientY === last.y) return;
-    lastPointerRef.current = { x: e.clientX, y: e.clientY };
-    poke();
-  };
-  useEffect(() => () => clearTimeout(idleTimer.current), []);
-  // Starting or resuming playback shows the controls for a moment before they fade (they used to
-  // vanish the instant a slow stream finally started, if the mouse had been still meanwhile).
-  useEffect(() => {
-    poke();
-  }, [playing]); // eslint-disable-line react-hooks/exhaustive-deps
+  const { idle, poke, onPointerActivity, overChromeRef } = useIdleChrome(wrap, playing);
 
   const toggle = () => {
     const v = video.current;
@@ -2675,7 +586,10 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     const v = video.current;
     if (!v || curRef.current?.kind === "embed" || !v.duration) return;
     seekTo(v.currentTime + d);
-    setBump((b) => ({ total: b && Math.sign(b.total) === Math.sign(d) ? b.total + d : d, n: (b?.n ?? 0) + 1 }));
+    setBump((b) => {
+      const again = !!b && Math.sign(b.total) === Math.sign(d);
+      return { total: again ? b!.total + d : d, n: (b?.n ?? 0) + 1, again };
+    });
     clearTimeout(bumpTimer.current);
     bumpTimer.current = window.setTimeout(() => setBump(null), 750);
   };
@@ -2695,7 +609,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     // Worked out here rather than inside the state updater: updaters must be pure (StrictMode
     // runs them twice, which fired the toast twice).
     const n = setVolumeLevel(volRef.current + d);
-    flash(`Volume ${Math.round(n * 100)}%${n > 1.001 ? " (Boost)" : ""}`);
+    flash(`Volume ${Math.round(n * 100)}%${n > 1.001 ? " (Boost)" : ""}`, volMeter(n));
   };
   /**
    * Mute / unmute. Unmuting a slider that was dragged all the way down brings back the last level
@@ -2706,16 +620,17 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     if (muted || !audible) {
       const n = audible ? volRef.current : setVolumeLevel(lastAudibleVolRef.current || 1);
       setMuted(false);
-      if (announce) flash(`Sound on · ${Math.round(n * 100)}%`);
+      if (announce) flash(`Sound on · ${Math.round(n * 100)}%`, volMeter(n));
     } else {
       setMuted(true);
-      if (announce) flash("Muted");
+      if (announce) flash("Muted", volMeter(0));
     }
   };
   const changeSpeed = (dir: 1 | -1) => {
     const n = nextSpeed(SPEEDS, speed, dir);
     setSpeed(n);
-    flash(n === 1 ? "Normal speed" : `Speed ${n}×`);
+    const last = Math.max(1, SPEEDS.length - 1);
+    flash(n === 1 ? "Normal speed" : `Speed ${n}×`, { v: SPEEDS.indexOf(n) / last, mark: SPEEDS.indexOf(1) / last });
   };
   // Volume from the mouse wheel, over the picture or the volume control.
   const onWheelVolume = (e: React.WheelEvent) => {
@@ -2724,88 +639,20 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     const steps = wheelVolumeSteps(wheelRef.current, e.deltaY, e.deltaMode, performance.now());
     if (steps) changeVol(steps * 0.05);
   };
-  const pipOk = typeof document !== "undefined" && document.pictureInPictureEnabled;
-  const togglePip = async () => {
-    const v = video.current;
-    if (!v || curRef.current?.kind === "embed") return;
-    try {
-      if (document.pictureInPictureElement) await document.exitPictureInPicture();
-      else await v.requestPictureInPicture();
-    } catch {
-      flash("Picture-in-picture isn't available for this stream");
-    }
-  };
+  const { pipOk, pipOn, togglePip } = usePip(video, isEmbed, flash);
 
-  // Fullscreen: in the desktop app the window itself goes fullscreen (WebView2's element
-  // fullscreen only fills the webview); in a browser, the player element does.
-  const win = useMemo(() => (isTauri() ? getCurrentWindow() : null), []);
-  const setFull = async (on: boolean) => {
-    try {
-      if (win) {
-        // Noted before the await, so a quick second press (F, then F again) toggles back instead of
-        // repeating the same request off the not-yet-updated state.
-        isFullRef.current = on;
-        await win.setFullscreen(on);
-        setIsFull(on);
-      } else if (on) await wrap.current?.requestFullscreen();
-      else if (document.fullscreenElement) await document.exitFullscreen();
-    } catch {
-      if (win) void win.isFullscreen().then((f) => mountedRef.current && setIsFull(f)).catch(() => {});
-    }
-  };
-  const toggleFull = () => void setFull(!isFullRef.current);
-  useEffect(() => {
-    if (win) return;
-    const f = () => setIsFull(!!document.fullscreenElement);
-    document.addEventListener("fullscreenchange", f);
-    return () => document.removeEventListener("fullscreenchange", f);
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
-  // The player remounts on every episode; pick up the window's state so fullscreen carries over.
-  // (Leaving the watch screen altogether exits fullscreen: see the app shell.)
-  useEffect(() => {
-    if (!win) return;
-    let live = true;
-    let off: (() => void) | undefined;
-    const sync = () => win.isFullscreen().then((f) => live && setIsFull(f)).catch(() => {});
-    void sync();
-    // Fullscreen can change without us (F11, a snap layout, another screen): follow the window.
-    win
-      .onResized(() => void sync())
-      .then((un) => (live ? (off = un) : un()))
-      .catch(() => {});
-    return () => {
-      live = false;
-      off?.();
-    };
-  }, [win]);
-  // Picture-in-picture must not outlive the player that owns the video.
-  useEffect(
-    () => () => {
-      if (document.pictureInPictureElement) void document.exitPictureInPicture().catch(() => {});
-    },
-    [],
-  );
-  // The PiP button shows whether the picture is popped out (closing the PiP window counts too).
-  useEffect(() => {
-    const v = video.current;
-    if (!v || isEmbed) {
-      setPipOn(false);
-      return;
-    }
-    const sync = () => setPipOn(document.pictureInPictureElement === v);
-    sync();
-    v.addEventListener("enterpictureinpicture", sync);
-    v.addEventListener("leavepictureinpicture", sync);
-    return () => {
-      v.removeEventListener("enterpictureinpicture", sync);
-      v.removeEventListener("leavepictureinpicture", sync);
-    };
-  }, [isEmbed]);
+  const { isFull, setFull, toggleFull } = useFullscreen(wrap, mountedRef);
   const leave = () => {
     // The 5-second progress timer may not have fired yet: save where you actually stopped.
     saveNow();
     if (isFull) void setFull(false);
     onBack();
+  };
+  const goInfo = () => {
+    if (!onInfo) return;
+    saveNow();
+    if (isFull) void setFull(false);
+    onInfo();
   };
 
   /**
@@ -2927,143 +774,37 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
   // With autoplay off the card used to vanish exactly at the end (0.5 s left), when it's needed most.
   const showUpNext = upNextVisible({ hasNext: !!onNext, dismissed: upNextDismissed, remaining, duration: clock.duration, ended });
 
-  // Keyboard shortcuts (bound once via ref so timeupdate ticks don't re-bind the window listener).
-  const onKeyRef = useRef<(e: KeyboardEvent) => void>();
-  onKeyRef.current = (e: KeyboardEvent) => {
-    const el = e.target as HTMLElement | null;
-    const target = classifyKeyTarget(el);
-    // Typing belongs to the field. Escape still closes the panel the field is in, instead of
-    // trapping you in the subtitle search box.
-    if (target === "text") {
-      if (e.key === "Escape" && sheet && el?.closest?.(".psheet")) {
-        e.preventDefault();
-        el.blur();
-        setSheet(null);
-      }
-      return;
-    }
-    // Ctrl+K and friends belong to the app, not the player (Ctrl+K used to pause as well).
-    if (e.ctrlKey || e.metaKey || e.altKey) return;
-    // A modal on top (the command palette) owns the keyboard until it closes. The player's own
-    // shortcuts card is handled just below (Escape / ? close it).
-    if (document.querySelector('[aria-modal="true"]:not(.pkeys)')) return;
-    // Letters work with Caps Lock on.
-    const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
-    // Holding a key repeats seeks and volume steps, never a toggle: a held F used to flick in and
-    // out of fullscreen, a held N skipped several episodes.
-    const repeatable = k === "ArrowLeft" || k === "ArrowRight" || k === "ArrowUp" || k === "ArrowDown" || k === "j" || k === "l" || k === "," || k === "." || k === "[" || k === "]" || k === "{" || k === "}";
-    if (e.repeat && !repeatable) {
-      if (k === " " && target !== "control") e.preventDefault();
-      return;
-    }
-    // The shortcuts card is modal too: Escape or ? closes it, and nothing else leaks through to
-    // the video underneath (closing it with Space used to pause as well).
-    if (keysOpen) {
-      e.preventDefault();
-      if (k === "Escape" || k === "?") setKeysOpen(false);
-      return;
-    }
-    // A slider keeps its arrows (the volume slider: our handler on top doubled every step), and so
-    // does the side panel, whose lists and tabs move and scroll with them.
-    if (NAV_KEYS.has(k) && (target === "range" || el?.closest?.(".psheet"))) return;
-    // A control reached from the keyboard keeps its own Space/Enter: Space on a focused "Next
-    // server" presses that button. One that was only clicked keeps focus too; then Space is the
-    // film's again (it used to toggle fullscreen again after a click on Fullscreen).
-    if (target === "control" && (k === " " || k === "Enter")) {
-      if (k === "Enter" || isKeyboardFocused(el)) return;
-      e.preventDefault();
-      el?.blur();
-    }
-    // A web player plays in a sealed frame: only the keys that drive our own chrome apply.
-    if (isEmbed && !EMBED_KEYS.has(k)) return;
-    poke();
-    // Speed: Shift+comma / Shift+period by physical key, so it works on layouts where < and > live elsewhere.
-    if (e.shiftKey && (e.code === "Comma" || e.code === "Period")) {
-      changeSpeed(e.code === "Period" ? 1 : -1);
-      return;
-    }
-    if (k >= "0" && k <= "9" && k.length === 1) {
-      const v = video.current;
-      if (v?.duration) seekTo((Number(k) / 10) * v.duration);
-      return;
-    }
-    switch (k) {
-      case " ": case "k": e.preventDefault(); toggle(); break;
-      case "ArrowLeft": e.preventDefault(); seek(e.shiftKey ? -30 : -5); break;
-      case "ArrowRight": e.preventDefault(); seek(e.shiftKey ? 30 : 5); break;
-      case "j": seek(-10); break;
-      case "l": seek(10); break;
-      case "ArrowUp": e.preventDefault(); changeVol(0.1); break;
-      case "ArrowDown": e.preventDefault(); changeVol(-0.1); break;
-      case "m": toggleMute(true); break;
-      case "c":
-        if (e.shiftKey) cycleSub();
-        else toggleSub();
-        break;
-      case "s": setSheet((x) => (x === "servers" ? null : "servers")); break;
-      case "e": if (episodes) setSheet((x) => (x === "episodes" ? null : "episodes")); break;
-      case "[": case "{":
-        if (selectedSubRef.current || secondarySubRef.current) nudge(e.shiftKey || k === "{" ? -0.1 : -0.5);
-        break;
-      case "]": case "}":
-        if (selectedSubRef.current || secondarySubRef.current) nudge(e.shiftKey || k === "}" ? 0.1 : 0.5);
-        break;
-      case "<": changeSpeed(-1); break;
-      case ">": changeSpeed(1); break;
-      case ",": case ".": {
-        // Frame step, the way editors do it: only while paused.
-        const v = video.current;
-        if (v && v.paused && !isEmbed) seekTo(v.currentTime + (k === "." ? 1 : -1) / 24);
-        break;
-      }
-      case "f": toggleFull(); break;
-      // The Windows fullscreen key, for people who reach for it out of habit.
-      case "F11": e.preventDefault(); toggleFull(); break;
-      case "p": void togglePip(); break;
-      case "n": goNext(); break;
-      case "?": setKeysOpen((x) => !x); break;
-      case "Escape":
-        if (sheet) setSheet(null);
-        else if (isFull) void setFull(false);
-        else leave();
-        break;
-    }
-  };
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => onKeyRef.current?.(e);
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  // Keyboard shortcuts (player/shortcuts.ts), bound once; this render's actions are read through a ref.
+  usePlayerShortcuts({
+    video,
+    sheet,
+    setSheet,
+    keysOpen,
+    setKeysOpen,
+    isEmbed,
+    isFull,
+    hasEpisodes: !!episodes,
+    hasSubtitle: () => !!(selectedSubRef.current || secondarySubRef.current),
+    poke,
+    toggle,
+    seek,
+    seekTo,
+    changeVol,
+    toggleMute,
+    changeSpeed,
+    toggleSub,
+    cycleSub,
+    nudge,
+    toggleFull,
+    setFull,
+    togglePip,
+    goNext,
+    goInfo,
+    leave,
+  });
 
-  // Hardware media keys, headset buttons and the Windows media flyout.
-  const nextRef = useRef(onNext);
-  nextRef.current = onNext;
-  const hasNext = !!onNext;
-  useEffect(() => {
-    const ms = navigator.mediaSession;
-    if (!ms || typeof MediaMetadata === "undefined") return;
-    ms.metadata = new MediaMetadata({
-      title: subtitle ? `${title} · ${subtitle}` : title,
-      artist: "AbixCine",
-      artwork: media?.backdrop ? [{ src: media.backdrop }] : [],
-    });
-    const set = (a: MediaSessionAction, h: MediaSessionActionHandler | null) => {
-      try {
-        ms.setActionHandler(a, h);
-      } catch {
-        /* action not supported here */
-      }
-    };
-    set("play", () => void video.current?.play().catch(() => {}));
-    set("pause", () => video.current?.pause());
-    set("seekbackward", () => seek(-10));
-    set("seekforward", () => seek(10));
-    set("nexttrack", hasNext ? () => goNextRef.current() : null);
-    return () => {
-      (["play", "pause", "seekbackward", "seekforward", "nexttrack"] as MediaSessionAction[]).forEach((a) => set(a, null));
-      ms.metadata = null;
-    };
-  }, [title, subtitle, media?.backdrop, hasNext]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Hardware media keys, headset buttons and the Windows media flyout (player/useMediaSession.ts).
+  useMediaSession({ video, title, subtitle, artwork: media?.backdrop, hasNext: !!onNext, seek, goNext: () => goNextRef.current() });
 
   // Stable callbacks for the side sheet, so its lists don't re-render with every playhead tick.
   const latest = useRef({ switchTo, saveNow, episodes });
@@ -3305,6 +1046,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
           />
         ) : (
           <>
+            {cinemaGlow && <Ambilight video={video} playing={playing} />}
             <video
               ref={video}
               playsInline
@@ -3391,6 +1133,9 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
                   tabIndex={0}
                   onPointerDown={onCompareDrag}
                   onPointerMove={onCompareDrag}
+                  // Double-click puts the divider back in the middle. It snaps rather than glides: the
+                  // split itself is the canvas clip-path above, set from the same number, and must match.
+                  onDoubleClick={() => setCompareAt(50)}
                   onKeyDown={(e) => {
                     if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
                       e.preventDefault();
@@ -3451,10 +1196,17 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
       <div className="chrome">
         <header className="ptop">
           <button className="pbtn round" onClick={leave} aria-label="Back" title="Back (Esc)"><Icon name="back" size={20} /></button>
-          <div className="ptitle">
-            {media?.logo ? <img className="plogo" src={media.logo} alt={title} /> : <div className="pt">{title}</div>}
-            <div className="ps">{[subtitle, media?.year].filter(Boolean).join(" · ")}</div>
-          </div>
+          {onInfo ? (
+            <button type="button" className="ptitle ptitle-btn" onClick={goInfo} title="Title details (I)" aria-label={`Open title details for ${title}`}>
+              {media?.logo ? <img className="plogo" src={media.logo} alt={title} /> : <div className="pt">{title}</div>}
+              <div className="ps">{[subtitle, media?.year].filter(Boolean).join(" · ")}</div>
+            </button>
+          ) : (
+            <div className="ptitle">
+              {media?.logo ? <img className="plogo" src={media.logo} alt={title} /> : <div className="pt">{title}</div>}
+              <div className="ps">{[subtitle, media?.year].filter(Boolean).join(" · ")}</div>
+            </div>
+          )}
           <div className="ptop-actions">
             {isEmbed && audio && onAudio && <AudioToggle compact value={audio} onChange={changeAudio} />}
             <button className={`server-pill ${sheet === "servers" ? "on" : ""}`} onClick={() => openSheet("servers")} title="Servers (S)">
@@ -3471,6 +1223,11 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
             {episodes && (
               <button className={`pbtn ${sheet === "episodes" ? "on" : ""}`} onClick={() => openSheet("episodes")} title="Episodes (E)">
                 <Icon name="tv" size={17} /><span>Episodes</span>
+              </button>
+            )}
+            {onInfo && (
+              <button className="pbtn" onClick={goInfo} aria-label="Title details" title="Title details (I)">
+                <Icon name="info" size={17} /><span>Info</span>
               </button>
             )}
             {isEmbed && (
@@ -3523,7 +1280,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
                     max={MAX_VOL}
                     step={0.05}
                     value={muted ? 0 : vol}
-                    style={{ ["--v" as any]: `${((muted ? 0 : vol) / MAX_VOL) * 100}%` }}
+                    style={{ ["--v" as any]: `${((muted ? 0 : vol) / MAX_VOL) * 100}%`, ["--mark" as any]: `${(1 / MAX_VOL) * 100}%` }}
                     onChange={(e) => setVolumeLevel(Number(e.target.value))}
                     aria-label="Volume"
                   />
@@ -3619,13 +1376,18 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
               <button type="button" className="btn glass sm" onClick={() => setSheet("servers")}>
                 <Icon name="layers" size={15} /> All servers
               </button>
+              {onInfo && (
+                <button type="button" className="btn glass sm" onClick={goInfo}>
+                  <Icon name="info" size={15} /> Title details
+                </button>
+              )}
             </div>
           </div>
         </div>
       )}
 
       {/* inert while closed: off-screen controls must not take focus or be read out. */}
-      <aside className={`psheet ${sheet ? "open" : ""}`} aria-hidden={!sheet} {...(sheet ? {} : { inert: "" })}>
+      <aside ref={sheetInd} className={`psheet ${sheet ? "open" : ""}`} aria-hidden={!sheet} {...(sheet ? {} : { inert: "" })}>
         <div className="ps-head">
           <div className="ps-tabs" role="tablist">
             <button role="tab" className={sheet === "servers" ? "on" : ""} onClick={() => setSheet("servers")}>Servers</button>
@@ -3729,7 +1491,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
                           className={!muted && Math.abs(vol - lvl) < 0.03 ? "on" : ""}
                           onClick={() => {
                             const n = setVolumeLevel(lvl);
-                            flash(`Volume ${Math.round(n * 100)}%${n > 1.001 ? " (Boost)" : ""}`);
+                            flash(`Volume ${Math.round(n * 100)}%${n > 1.001 ? " (Boost)" : ""}`, volMeter(n));
                           }}
                         >
                           {Math.round(lvl * 100)}%
@@ -3826,6 +1588,15 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
               </div>
               {!isEmbed && (
                 <div className="ps-block">
+                  <div className="ps-label">Room</div>
+                  <button className={`opt ${cinemaGlow ? "on" : ""}`} onClick={() => updateSettings({ cinemaGlow: !cinemaGlow })} aria-pressed={cinemaGlow}>
+                    <span>Cinema glow</span>
+                    <small>The black bars around a widescreen or 4:3 picture take the colour of its edges</small>
+                  </button>
+                </div>
+              )}
+              {!isEmbed && (
+                <div className="ps-block">
                   <div className="ps-label">Sound</div>
                   <div className="opt-list">
                     <button className={`opt ${audioFx.night ? "on" : ""}`} onClick={() => toggleAudioFx("night")} aria-pressed={audioFx.night}>
@@ -3895,7 +1666,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
       </aside>
 
       {bump && (
-        <div className={`seek-bump ${bump.total > 0 ? "fwd" : "back"}`} key={bump.n} aria-hidden>
+        <div className={`seek-bump ${bump.total > 0 ? "fwd" : "back"} ${bump.again ? "again" : ""}`} key={bump.n} aria-hidden>
           <Icon name={bump.total > 0 ? "fwd" : "rew"} size={22} />
           <span>{bump.total > 0 ? "+" : "−"}{Math.abs(bump.total)}s</span>
         </div>
@@ -3933,209 +1704,14 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
         <div className={`ptoast ${toast.out ? "out" : ""}`} key={toast.id} role="status" aria-live="polite">
           <i className="dot" />
           {toast.msg}
-        </div>
-      )}
-    </div>
-  );
-}
-
-/** End of the buffered range the playhead is in (not the last range, which may be far ahead after a seek). */
-function bufferedAhead(v: HTMLVideoElement) {
-  const t = v.currentTime;
-  for (let i = 0; i < v.buffered.length; i++) if (v.buffered.start(i) <= t + 0.5 && v.buffered.end(i) >= t) return v.buffered.end(i);
-  return t;
-}
-
-/* ------------------------------------------------------------------ servers */
-
-const ServerSheet = memo(function ServerSheet({
-  snap,
-  playingKey,
-  busyKey,
-  busyNote,
-  onPick,
-  onCheckAll,
-  onStop,
-  onRefreshList,
-}: {
-  snap: SessionSnapshot;
-  /** The stream on screen, once it is actually playing. */
-  playingKey?: string;
-  busyKey: string | null;
-  busyNote: string;
-  onPick: (c: StreamCandidate) => void;
-  onCheckAll: () => void;
-  onStop: () => void;
-  onRefreshList?: () => void;
-}) {
-  const checkingMore = snap.busy && snap.checking.size > 0;
-  return (
-    <div className="ps-section">
-      <p className="ps-note">Every server plays in AbixCine's own player, so there are no ads. Switching keeps your place, and a server you pick here stays this show's server.</p>
-      {(snap.waiting > 0 || checkingMore || onRefreshList) && (
-        <div className="srv-actions">
-          {(snap.waiting > 0 || checkingMore) && (
-            <button
-              type="button"
-              className={`srv-act ${checkingMore ? "busy" : ""}`}
-              onClick={checkingMore ? onStop : onCheckAll}
-              title={checkingMore ? "Stop checking" : "Check the servers on standby without interrupting playback"}
-            >
-              {checkingMore ? (
-                <>
-                  <span className="mini-spin" />
-                  <span>Checking {snap.checking.size}… stop</span>
-                </>
-              ) : (
-                <>
-                  <Icon name="layers" size={14} />
-                  <span>Check standby servers ({snap.waiting})</span>
-                </>
-              )}
-            </button>
-          )}
-          {onRefreshList && (
-            <button type="button" className="srv-act" onClick={onRefreshList} title="Throw the list away and look for servers again">
-              <Icon name="refresh" size={14} />
-              <span>Look again</span>
-            </button>
+          {toast.meter && (
+            <span className="pt-meter" aria-hidden style={toast.meter.mark != null ? { ["--mark" as string]: `${toast.meter.mark * 100}%` } : undefined}>
+              <i style={{ transform: `scaleX(${Math.max(0, Math.min(1, toast.meter.v))})` }} />
+            </span>
           )}
         </div>
       )}
-      <SourceBoard snap={snap} playingKey={playingKey} busyKey={busyKey} busyNote={busyNote} onPick={onPick} />
-    </div>
-  );
-});
-
-/* ----------------------------------------------------------------- episodes */
-
-const PAGE = 50;
-
-const EpisodeSheet = memo(function EpisodeSheet({ nav, onPick }: { nav: EpisodeNav; onPick: (s: number | undefined, e: number) => void }) {
-  const validSeasons = useMemo(() => (nav.seasons ?? []).filter((s) => s.episodeCount > 0), [nav.seasons]);
-  const initialSeason = useMemo(() => {
-    if (!validSeasons.length) return nav.season;
-    if (nav.season != null && validSeasons.some((s) => s.number === nav.season)) return nav.season;
-    return validSeasons[0].number;
-  }, [validSeasons, nav.season]);
-
-  const [season, setSeason] = useState(initialSeason);
-  const [eps, setEps] = useState<Episode[] | null>(null);
-  const curRef = useRef<HTMLButtonElement>(null);
-  const total = nav.count ?? 0;
-  const safeNavEp = Number.isFinite(nav.episode) && nav.episode >= 1 ? Math.floor(nav.episode) : 1;
-  // Long-running anime (1000+ episodes) is paged in blocks of 50 around the current one.
-  const [page, setPage] = useState(() => Math.max(0, Math.floor((safeNavEp - 1) / PAGE)));
-  const [known, setKnown] = useState<Map<number, Episode>>(new Map());
-  useEffect(() => {
-    if (season != null || !nav.loadAll) return;
-    let live = true;
-    nav.loadAll().then((list) => live && setKnown(new Map(list.map((e) => [e.number, e])))).catch(() => {});
-    return () => {
-      live = false;
-    };
-  }, [season, nav.loadAll]);
-
-  useEffect(() => {
-    if (season == null || !nav.loadSeason) return setEps(null);
-    let live = true;
-    setEps(null);
-    nav.loadSeason(season).then((r) => live && setEps(r)).catch(() => live && setEps([]));
-    return () => {
-      live = false;
-    };
-  }, [season, nav.loadSeason]);
-  useEffect(() => {
-    curRef.current?.scrollIntoView({ block: "center" });
-  }, [eps, page]);
-
-  const fullList: Episode[] =
-    season != null
-      ? eps ?? []
-      : Array.from({ length: Math.max(0, total) }, (_, i) => known.get(i + 1) ?? { season: 0, number: i + 1, title: `Episode ${i + 1}` });
-  const pages = Math.max(1, Math.ceil(fullList.length / PAGE));
-  const safePage = Math.max(0, Math.min(page, pages - 1));
-  const list = fullList.length > PAGE ? fullList.slice(safePage * PAGE, (safePage + 1) * PAGE) : fullList;
-
-  return (
-    <div className="ps-section">
-      {validSeasons.length > 1 && (
-        <div className="season-strip">
-          {validSeasons.map((s) => (
-            <button
-              key={s.number}
-              className={s.number === season ? "on" : ""}
-              onClick={() => {
-                setSeason(s.number);
-                setPage(0);
-              }}
-            >
-              {s.number === 0 ? "Specials" : s.name.length <= 10 ? s.name : `S${s.number}`}
-            </button>
-          ))}
-        </div>
-      )}
-      {pages > 1 && (
-        <div className="season-strip">
-          {Array.from({ length: pages }, (_, p) => (
-            <button key={p} className={p === safePage ? "on" : ""} onClick={() => setPage(p)}>
-              {p * PAGE + 1}–{Math.min(fullList.length, (p + 1) * PAGE)}
-            </button>
-          ))}
-        </div>
-      )}
-      <div className="ep-list">
-        {season != null && !eps && Array.from({ length: 5 }, (_, i) => <div key={i} className="ep-row skeleton" />)}
-        {season != null && eps && list.length === 0 && <p className="ps-note">No episodes available for this season.</p>}
-        {list.map((e, i) => {
-          const isCur = e.number === safeNavEp && (season ?? undefined) === nav.season;
-          const still = e.still ?? nav.fallbackStill;
-          return (
-            <button
-              key={e.number}
-              ref={isCur ? curRef : undefined}
-              className={`ep-row ${isCur ? "cur" : ""}`}
-              style={{ ["--i" as any]: Math.min(i, 10) }}
-              onClick={() => !isCur && onPick(season, e.number)}
-            >
-              <span className="ep-th">
-                {still ? <img src={still} alt="" loading="lazy" /> : null}
-                <b>{e.number}</b>
-                {isCur && <span className="eq small" aria-label="Playing"><i /><i /><i /><i /></span>}
-              </span>
-              <span className="ep-tx">
-                <span className="ep-t">{e.title}</span>
-                <span className="ep-d">{[e.runtime ? `${e.runtime}m` : null, e.overview].filter(Boolean).join(" · ")}</span>
-              </span>
-            </button>
-          );
-        })}
-      </div>
-    </div>
-  );
-});
-
-/* ------------------------------------------------------------------ up next */
-
-function UpNext({ label, still, seconds, auto, onPlay, onDismiss }: { label: string; still?: string; seconds: number; auto: boolean; onPlay: () => void; onDismiss: () => void }) {
-  return (
-    <div className="upnext" onClick={(e) => e.stopPropagation()}>
-      <div className="un-th" style={still ? { backgroundImage: `url(${still})` } : undefined}>
-        <button className="un-play" onClick={onPlay} aria-label="Play next episode">
-          <svg viewBox="0 0 36 36" className="un-ring" aria-hidden>
-            <circle cx="18" cy="18" r="16" style={{ ["--p" as any]: auto ? Math.max(0, Math.min(1, seconds / UP_NEXT_AT)) : 1 }} />
-          </svg>
-          <Icon name="play" size={16} />
-        </button>
-      </div>
-      <div className="un-tx">
-        <small>{auto ? `Up next in ${seconds}s` : "Up next"}</small>
-        <strong>{label}</strong>
-        <div className="un-acts">
-          <button className="btn play sm" onClick={onPlay}>Play now</button>
-          <button className="btn glass sm" onClick={onDismiss}>Keep watching</button>
-        </div>
-      </div>
     </div>
   );
 }
+
