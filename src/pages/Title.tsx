@@ -1,13 +1,29 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { isTauri } from "@tauri-apps/api/core";
 import { useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { AudioToggle } from "../components/AudioToggle";
 import { Ambient } from "../components/Ambient";
 import { Art, sized } from "../components/Art";
 import { Card, CardSkeleton, kindLabel } from "../components/Card";
+import { DownloadMenu } from "../components/DownloadMenu";
 import { Icon } from "../components/Icon";
 import { SmartSource } from "../components/SmartSource";
 import { TitleArt } from "../components/TitleArt";
 import { TrailerModal } from "../components/TrailerModal";
+import {
+  batchEpisodeKey,
+  cancelBatchDownloads,
+  queueEpisodeDownload,
+  queueSeasonDownloads,
+  selectMissingEpisodes,
+  useBatchDownloads,
+} from "../lib/batchDownload";
+import {
+  hasDownloadedEpisode,
+  pauseDownload,
+  resumeDownload,
+  useDownloads,
+} from "../lib/downloads";
 import { isYouTubeId } from "../lib/trailer";
 import {
   checkEpisodeAvailability,
@@ -34,7 +50,7 @@ import { useSlidingIndicator } from "../lib/useSlidingIndicator";
 import { burst } from "../lib/burst";
 import { toggleList, useSaved } from "../lib/watchlist";
 
-type Tab = "episodes" | "cast" | "details" | "more";
+type Tab = "episodes" | "showcase" | "cast" | "details" | "more";
 type EpView = "list" | "grid";
 
 const VIEW_KEY = "abx.epview";
@@ -49,6 +65,10 @@ const loadView = (): EpView | null => {
 };
 const nice = (status: string) => status.replace(/_/g, " ").toLowerCase().replace(/^\w/, (c) => c.toUpperCase());
 
+function fmtClock(d: Date) {
+  return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
 export function Title() {
   const tabInd = useSlidingIndicator();
   const seasonInd = useSlidingIndicator();
@@ -61,10 +81,7 @@ export function Title() {
   const loc = useLocation();
 
   const { data: detail, error, reload } = useAsync(() => getDetail(key), [key]);
-  // The card that brought you here hands over what it already knew, so the stage paints on the
-  // first frame (and the artwork can morph into it) while cast, seasons and servers arrive.
   const seed = (loc.state as { seed?: Media } | null)?.seed;
-  // Arrived from the hero's Details: the title art takes the hero's name and morphs out of it.
   const morphTitle = (loc.state as { morph?: string } | null)?.morph === "title";
   const d: MediaDetail | undefined = useMemo(
     () => detail ?? (seed && seed.key === key ? { ...seed, cast: [], crew: [], related: [] } : undefined),
@@ -72,7 +89,6 @@ export function Title() {
   );
   const ready = !!detail;
 
-  // Every key this show's progress may have been saved under: its own, the franchise root, each season and cour.
   const progressKeys = useMemo(() => {
     if (!d) return [key];
     const out = new Set<string>([key, d.key, ...(d.canonicalKey ? [d.canonicalKey] : [])]);
@@ -83,13 +99,11 @@ export function Title() {
     return [...out];
   }, [d, key]);
   const latest = useMatchedProgress(progressKeys);
-  useProgressStore(); // episode tiles read their own entries: re-render when any of them moves
+  useProgressStore();
 
-  // Map a saved entry across the show or its cours to a canonical (season, episode) pair.
   const matchedProgress = useMemo(() => {
     if (!d || !latest) return undefined;
     const allSeasons = [...(d.seasons ?? []), ...(d.specials ?? [])];
-    // Recorded against a specific cour without a canonical season: place it inside its season.
     if (latest.season == null && allSeasons.length > 0) {
       for (const s of allSeasons) {
         const cour = s.cours?.find((c) => c.key === latest.media.key);
@@ -109,12 +123,10 @@ export function Title() {
     return avail.playable ? matchedProgress : undefined;
   }, [detail, matchedProgress]);
 
-  // Per-title view state resets when the title changes (this component stays mounted across titles).
   const [pickedSeason, setPickedSeason] = useState<number | null>(null);
-  const [tab, setTab] = useState<Tab>("episodes");
+  const [tab, setTab] = useState<Tab | null>(null);
   const [jump, setJump] = useState("");
   const [page, setPage] = useState(0);
-  // Long-running shows have more episode ranges than fit: keep the lit one in view (e.g. on resume).
   const stripRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const strip = stripRef.current;
@@ -126,11 +138,10 @@ export function Title() {
   }, [page, key]);
   useEffect(() => {
     setPickedSeason(null);
-    setTab("episodes");
+    setTab(null);
     setJump("");
   }, [key]);
 
-  // Active canonical season, strictly clamped to playable seasons / specials.
   const activeSeasonObj: CanonicalSeason | undefined = useMemo(() => {
     if (!d || isFilm(d)) return undefined;
     const preferred = pickedSeason ?? routeParams.season ?? validProgress?.season ?? d.initialSeason;
@@ -144,7 +155,10 @@ export function Title() {
     [detail?.key, activeSeasonObj?.number],
   );
 
-  useSettings(); // re-render when the audio preference changes
+  useSettings();
+  const dl = useDownloads();
+  const batch = useBatchDownloads();
+  const desktop = isTauri();
   const saved = useSaved(key, d?.canonicalKey, d?.key);
   const [swap, setSwap] = useState(false);
   const [trailerOpen, setTrailerOpen] = useState(false);
@@ -161,13 +175,9 @@ export function Title() {
   const anime = key.startsWith("anilist:") || d?.kind === "anime";
   const audio = anime ? audioFor(canonicalKey, [key, d?.key]) : undefined;
 
-  // An AniList film is still looked up as anime (episode 1 behind the scenes), but it is a film:
-  // no episode list, "Play" not "Play E1", and its runtime rather than "1 episode".
   const film = d ? isFilm(d) : key.includes(":movie:");
   const isSeries = !film;
   const unreleasedFilm = film && ready && isUnreleasedMedia(d);
-  // Out in cinemas but not on digital/disc anywhere yet: servers almost never have it, so don't
-  // race every server automatically — say why, and let the viewer check anyway (local files, etc.).
   const theatricalOnly = film && ready && !unreleasedFilm && isTheatricalOnly(d);
   const [checkAnyway, setCheckAnyway] = useState(false);
   useEffect(() => setCheckAnyway(false), [key]);
@@ -179,7 +189,6 @@ export function Title() {
   );
   const showEpisodesTab = isSeries && (!ready || hasPlayableEps || (d?.upcomingSeasons?.length ?? 0) > 0);
 
-  // What pressing Play would start: clamped resume point, else the first episode of the active season, else the film.
   const startS = useMemo(() => {
     if (!d || isFilm(d)) return undefined;
     if (validProgress?.season != null) {
@@ -196,7 +205,6 @@ export function Title() {
 
   const canPlay = ready && ((film && !unreleasedFilm) || hasPlayableEps);
 
-  // Only the real record drives the source lookup, and only when the film/episode is released.
   const req = useMemo(
     () => (detail && canPlay && (!theatricalOnly || checkAnyway) ? resolvePlaybackRequest(detail, startS, startE, audio) : null),
     [detail, canPlay, theatricalOnly, checkAnyway, startS, startE, audio],
@@ -260,13 +268,21 @@ export function Title() {
             : "";
 
   const what = film ? "this film" : startE != null ? `${startS != null ? (startS === 0 ? "Specials " : `S${startS} `) : ""}E${startE}` : "this film";
-  const tabs: [Tab, string][] = [
-    ...(showEpisodesTab ? [["episodes", "Episodes"] as [Tab, string]] : []),
-    ["cast", anime ? "Characters & crew" : "Cast & crew"],
-    ["details", "Details"],
-    ["more", "More like this"],
-  ];
-  const curTab = showEpisodesTab || tab !== "episodes" ? tab : "cast";
+  const tabs: [Tab, string][] = showEpisodesTab
+    ? [
+        ["episodes", "Episodes"],
+        ["cast", anime ? "Characters & crew" : "Cast & crew"],
+        ["details", "Technical sheet"],
+        ["more", "More like this"],
+      ]
+    : [
+        ["showcase", "Cast & related"],
+        ["cast", anime ? "Full characters & crew" : "Full cast & crew"],
+        ["details", "Technical sheet"],
+        ["more", "More like this"],
+      ];
+  const defaultTab: Tab = showEpisodesTab ? "episodes" : "showcase";
+  const curTab: Tab = tab && tabs.some(([id]) => id === tab) ? tab : defaultTab;
 
   const changeAudio = (a: "sub" | "dub") => {
     setSwap(true);
@@ -297,6 +313,25 @@ export function Title() {
     (d.upcomingSeasons?.length ?? 0) > 0;
   const resumePct = validProgress && !validProgress.upNext && validProgress.duration > 0 ? Math.min(1, validProgress.position / validProgress.duration) : null;
 
+  const endsAt = d.runtime && !unreleasedFilm ? fmtClock(new Date(Date.now() + d.runtime * 60_000)) : null;
+
+  // Creative credits for the Monograph spread
+  const findCrew = (re: RegExp) => d.crew.filter((c) => re.test(c.job));
+  const directorLead = findCrew(film || anime ? /^(Chief )?Director$/i : /^Creator$/i)[0];
+  const writerLead = findCrew(/Screenplay|Writer|Story|Novel|Series Composition|Script|Original Creator/i)[0];
+  const dpLead = findCrew(/Director of Photography|Cinematography/i)[0];
+  const musicLead = findCrew(/Music|Composer/i)[0];
+  const creativeSlate = [
+    directorLead && { role: film || anime ? "Director" : "Created by", person: directorLead },
+    writerLead && { role: "Written by", person: writerLead },
+    dpLead && { role: "Cinematography", person: dpLead },
+    musicLead && { role: "Score", person: musicLead },
+  ].filter(Boolean) as { role: string; person: { name: string; job: string; photo?: string } }[];
+
+  const hasRoi = film && !!d.budget && !!d.revenue;
+  const roiRatio = hasRoi ? d.revenue! / d.budget! : 0;
+  const maxMoney = hasRoi ? Math.max(d.budget!, d.revenue!) : 1;
+
   return (
     <div className="tp">
       <Ambient media={d} />
@@ -304,26 +339,73 @@ export function Title() {
         <Art media={d} variant="backdrop" hd priority />
         <div className="tp-scrim" />
       </div>
+
       <div className="pad tp-body">
-        <button className="back" onClick={() => (((window.history.state as { idx?: number } | null)?.idx ?? 0) > 0 ? nav(-1) : nav("/"))}><Icon name="back" size={18} /> Back</button>
+        <button className="back" onClick={() => (((window.history.state as { idx?: number } | null)?.idx ?? 0) > 0 ? nav(-1) : nav("/"))}>
+          <Icon name="back" size={16} /> Back
+        </button>
+
+        {/* 3-zone theatrical gallery masthead */}
         <div className="tp-top">
+          <div className="tp-poster-col">
+            <div className="tp-poster gate-frame">
+              <Art media={d} variant="poster" size="lg" priority />
+              <span className="gate-brackets" aria-hidden><i /></span>
+            </div>
+            {(d.year || d.certification || d.format) && (
+              <div className="tp-poster-foot">
+                <span>{d.year ?? ""}</span>
+                {d.certification && <span className="cert">{d.certification}</span>}
+                {d.format && <span>{d.format}</span>}
+              </div>
+            )}
+          </div>
+
           <div className="tp-info">
             <div className="kicker">
               <b>{kindLabel(d.kind, d.format)}</b>
               {d.genres.length > 0 && <><i /><span>{d.genres.slice(0, 3).join(" · ")}</span></>}
+              {d.seasonLabel && <><i /><span>{d.seasonLabel}</span></>}
             </div>
+
             <TitleArt media={d} vtName={morphTitle ? "hero-title" : undefined} />
-            {d.tagline && <div className="tagline">{d.tagline}</div>}
-            <div className="specs">
-              {d.rating ? <span className="star">★ {d.rating.toFixed(1)} <small>{key.startsWith("anilist:") ? "AniList" : "TMDB"}</small></span> : null}
-              {d.year ? <span>{d.year}</span> : null}
-              {d.certification && <span className="cert">{d.certification}</span>}
-              {length && <span>{length}</span>}
-              {!film && d.runtime ? <span>{d.runtime}m per ep</span> : null}
-              {d.status && <span>{nice(d.status)}</span>}
-              {anime && <span className="hi">Sub · Dub</span>}
+            {d.originalTitle && d.originalTitle !== d.title && <div className="tp-orig">{d.originalTitle}</div>}
+            {d.tagline && <div className="tagline">“{d.tagline}”</div>}
+
+            <div className="tp-telemetry">
+              {d.rating ? (
+                <div className="tp-gauge" title={`Rated ${d.rating.toFixed(1)}/10 on ${key.startsWith("anilist:") ? "AniList" : "TMDB"}`}>
+                  <svg viewBox="0 0 40 40" aria-hidden>
+                    <circle className="gauge-track" cx="20" cy="20" r="16" />
+                    <circle className="gauge-arc" cx="20" cy="20" r="16" style={{ ["--p" as string]: Math.min(1, Math.max(0.04, d.rating / 10)) }} />
+                  </svg>
+                  <div className="tp-gauge-val">
+                    <b>{d.rating.toFixed(1)}</b>
+                  </div>
+                  <div className="tp-gauge-meta">
+                    <span>{key.startsWith("anilist:") ? "AniList" : "TMDB"}</span>
+                    {d.voteCount ? <small>{d.voteCount >= 1000 ? `${(d.voteCount / 1000).toFixed(1)}k votes` : `${d.voteCount} votes`}</small> : null}
+                  </div>
+                </div>
+              ) : null}
+
+              {endsAt && (
+                <div className="tp-end-stamp">
+                  <span>{film ? "FINISHES" : "1 EP ENDS"}</span>
+                  <b>{endsAt}</b>
+                </div>
+              )}
+
+              <div className="specs">
+                {d.year ? <span>{d.year}</span> : null}
+                {d.certification && <span className="cert">{d.certification}</span>}
+                {length && <span>{length}</span>}
+                {!film && d.runtime ? <span>{d.runtime}m/ep</span> : null}
+                {d.status && <span>{nice(d.status)}</span>}
+                {anime && <span className="hi">Sub · Dub</span>}
+              </div>
             </div>
-            <p className="desc">{d.overview}</p>
+
             {unreleasedFilm && (
               <div className="airing"><Icon name="clock" size={14} /> {d.releaseDate ? `Releases ${fmtDate(d.releaseDate)}` : "Not released yet"}</div>
             )}
@@ -336,6 +418,7 @@ export function Title() {
             {d.nextAiring && (
               <div className="airing"><Icon name="clock" size={14} /> Episode {d.nextAiring.episode} airs {new Date(d.nextAiring.at).toLocaleString(undefined, { weekday: "long", hour: "numeric", minute: "2-digit" })}</div>
             )}
+
             <div className="acts">
               {canPlay ? (
                 <button className="btn play" onClick={() => watch(startS, startE)}><Icon name="play" size={16} /> {playLabel}</button>
@@ -345,11 +428,13 @@ export function Title() {
               <button className={`btn glass ${saved ? "on" : ""}`} onClick={(e) => { if (!saved) burst(e.currentTarget); toggleList(d); }} aria-pressed={saved}>
                 <Icon name={saved ? "check" : "bookmark"} size={17} /> {saved ? "In My List" : "My List"}
               </button>
+              {req && <DownloadMenu req={req} detail={d} what={what} />}
               {audio && <AudioToggle value={audio} onChange={changeAudio} />}
               {isYouTubeId(d.trailerYouTubeId) && (
                 <button type="button" className="btn glass" onClick={() => setTrailerOpen(true)} aria-haspopup="dialog"><Icon name="film" size={17} /> Trailer</button>
               )}
             </div>
+
             {resumePct != null && validProgress && (
               <div className="resume">
                 <div className="resume-bar"><i style={{ transform: `scaleX(${resumePct})` }} /></div>
@@ -357,8 +442,9 @@ export function Title() {
               </div>
             )}
           </div>
+
           {req ? (
-            <SmartSource req={req} what={what} onPlay={(srv) => watch(startS, startE, srv)} />
+            <SmartSource req={req} detail={d} what={what} onPlay={(srv) => watch(startS, startE, srv)} />
           ) : (
             <aside className="smart">
               <div className="h"><span><Icon name="layers" size={16} /> Servers</span></div>
@@ -386,6 +472,100 @@ export function Title() {
           )}
         </div>
 
+        {/* Always-visible Monograph Editorial Spread */}
+        {(d.overview || creativeSlate.length > 0 || ready) && (
+          <section className="tp-monograph" aria-label="Editorial monograph">
+            <div className="tp-story">
+              <p className="overline">Synopsis // Monograph</p>
+              {d.overview ? <p className="tp-synopsis">{d.overview}</p> : <p className="muted">No synopsis listed.</p>}
+
+              {creativeSlate.length > 0 && (
+                <div className="tp-slate">
+                  {creativeSlate.map(({ role, person }) => (
+                    <div key={`${role}-${person.name}`} className="tp-credit">
+                      <span className="tp-credit-av" style={person.photo ? { backgroundImage: `url(${person.photo})` } : undefined}>
+                        {!person.photo && person.name[0]}
+                      </span>
+                      <div>
+                        <small>{role}</small>
+                        <strong>{person.name}</strong>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <aside className="tp-telemetry-card">
+              <p className="overline">Production &amp; Release</p>
+
+              {hasRoi && (
+                <div className="tp-roi">
+                  <div className="tp-roi-head">
+                    <span>Box Office Performance</span>
+                    <b>{roiRatio.toFixed(1)}× budget</b>
+                  </div>
+                  <div className="tp-roi-bars">
+                    <div className="tp-roi-row">
+                      <span>Budget</span>
+                      <div className="tp-roi-track"><i style={{ width: `${Math.max(8, Math.round((d.budget! / maxMoney) * 100))}%` }} /></div>
+                      <b>{fmtMoney(d.budget)}</b>
+                    </div>
+                    <div className="tp-roi-row rev">
+                      <span>Revenue</span>
+                      <div className="tp-roi-track"><i style={{ width: `${Math.max(8, Math.round((d.revenue! / maxMoney) * 100))}%` }} /></div>
+                      <b>{fmtMoney(d.revenue)}</b>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              <div className="tp-timeline">
+                {film ? (
+                  <>
+                    {d.theatricalReleaseDate && (
+                      <div><span>Theatrical</span><b>{fmtDate(d.theatricalReleaseDate)}</b></div>
+                    )}
+                    {d.digitalReleaseDate ? (
+                      <div><span>{isFutureIsoDate(d.digitalReleaseDate) ? "Digital release" : "On digital"}</span><b>{fmtDate(d.digitalReleaseDate)}</b></div>
+                    ) : d.releaseDate ? (
+                      <div><span>{isUnreleasedMedia(d) ? "Releases" : "Released"}</span><b>{fmtDate(d.releaseDate)}</b></div>
+                    ) : null}
+                  </>
+                ) : (
+                  <>
+                    {d.releaseDate && <div><span>First aired</span><b>{fmtDate(d.releaseDate)}</b></div>}
+                    {d.endDate && <div><span>Last aired</span><b>{fmtDate(d.endDate)}</b></div>}
+                    {d.nextEpisode && (
+                      <div><span>Next episode</span><b>S{d.nextEpisode.season}·E{d.nextEpisode.episode}</b></div>
+                    )}
+                  </>
+                )}
+                {(d.companies?.length || d.networks?.length) && (
+                  <div>
+                    <span>{anime ? "Studio" : film ? "Studio" : "Network"}</span>
+                    <b>{(anime ? d.companies : d.networks?.length ? d.networks : d.companies)?.slice(0, 2).join(", ")}</b>
+                  </div>
+                )}
+                {d.originalLanguage && (
+                  <div><span>Language</span><b>{languageName(d.originalLanguage)}</b></div>
+                )}
+                {d.collection && (
+                  <div><span>Collection</span><b>{d.collection}</b></div>
+                )}
+              </div>
+
+              {(d.imdbId || d.homepage) && (
+                <div className="tp-ext">
+                  {d.imdbId && <a className="btn glass sm" href={`https://www.imdb.com/title/${d.imdbId}/`} target="_blank" rel="noreferrer">IMDb <Icon name="arrowUR" size={13} /></a>}
+                  {d.homepage && <a className="btn glass sm" href={d.homepage} target="_blank" rel="noreferrer">Official site <Icon name="arrowUR" size={13} /></a>}
+                </div>
+              )}
+            </aside>
+          </section>
+        )}
+
+        {/* Interactive Lower Explorer */}
         <div className="tabbar" role="tablist" ref={tabInd}>
           {tabs.map(([id, label]) => (
             <button key={id} role="tab" aria-selected={curTab === id} className={curTab === id ? "on" : ""} onClick={() => setTab(id)}>{label}</button>
@@ -418,13 +598,110 @@ export function Title() {
                 <button className={view !== "grid" ? "on" : ""} aria-pressed={view !== "grid"} title="Editorial list" aria-label="Editorial list" onClick={() => chooseView("list")}><Icon name="rows" size={15} /></button>
                 <button className={view === "grid" ? "on" : ""} aria-pressed={view === "grid"} title="Compact grid" aria-label="Compact grid" onClick={() => chooseView("grid")}><Icon name="grid" size={15} /></button>
               </div>
+              {desktop && epList.length > 0 && (() => {
+                const missingEps = selectMissingEpisodes(epList, {
+                  canonicalKey,
+                  season,
+                  audio,
+                  items: dl.items,
+                  jobs: dl.jobs,
+                  airedCount,
+                  seriesStatus: d.status,
+                });
+                const batchForSeason = batch.active && batch.canonicalKey === canonicalKey && batch.season === season;
+                if (batchForSeason) {
+                  return (
+                    <button
+                      type="button"
+                      className="btn glass sm ep-season-dl active"
+                      onClick={cancelBatchDownloads}
+                      title="Cancel season download queue"
+                    >
+                      <span className="mini-spin" />
+                      <span>
+                        E{batch.currentEp ?? "…"} ({batch.queued}/{batch.total}) · Stop
+                      </span>
+                    </button>
+                  );
+                }
+                if (missingEps.length === 0) {
+                  return (
+                    <span className="ep-season-done" title={`All aired episodes in Season ${season} are saved or queued`}>
+                      <Icon name="check" size={13} /> S{season} offline
+                    </span>
+                  );
+                }
+                return (
+                  <button
+                    type="button"
+                    className="btn glass sm ep-season-dl"
+                    onClick={() => void queueSeasonDownloads(d, season, epList, audio, airedCount, dl.items, dl.jobs)}
+                    title={`Queue ${missingEps.length} episode${missingEps.length === 1 ? "" : "s"} for offline download`}
+                  >
+                    <Icon name="download" size={14} />
+                    <span>
+                      {missingEps.length < epList.length
+                        ? `Download S${season} (${missingEps.length})`
+                        : `Download S${season}`}
+                    </span>
+                  </button>
+                );
+              })()}
             </div>
           )}
         </div>
 
         <div className="tp-section" key={curTab}>
+          {curTab === "showcase" && (
+            <div className="tp-showcase">
+              {(!ready || d.cast.length > 0) && (
+                <div className="tp-showcase-block">
+                  <div className="tp-subhead">
+                    <h3>Principal <em>{anime ? "characters" : "cast"}</em></h3>
+                    {d.cast.length > 10 && (
+                      <button type="button" className="more" onClick={() => setTab("cast")}>
+                        View all {d.cast.length} <Icon name="arrowUR" size={13} />
+                      </button>
+                    )}
+                  </div>
+                  <div className="people">
+                    {!ready && Array.from({ length: 6 }, (_, i) => <div key={i} className="person"><div className="person-img sk" /></div>)}
+                    {d.cast.slice(0, 10).map((c, i) => (
+                      <div key={c.name + i} className="person" style={{ ["--i" as string]: Math.min(i, 10) }}>
+                        <div className="person-img" style={c.photo ? { backgroundImage: `url(${c.photo})` } : undefined}>{!c.photo && c.name[0]}</div>
+                        <div className="person-name">{c.name}</div>
+                        {c.character && <div className="person-role">{c.character}</div>}
+                        {c.actor && <div className="person-role">CV {c.actor}</div>}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {(!ready || d.related.length > 0) && (
+                <div className="tp-showcase-block">
+                  <div className="tp-subhead">
+                    <h3>Related <em>cinema</em></h3>
+                    {d.related.length > 8 && (
+                      <button type="button" className="more" onClick={() => setTab("more")}>
+                        View all {d.related.length} <Icon name="arrowUR" size={13} />
+                      </button>
+                    )}
+                  </div>
+                  <div className="grid">
+                    {!ready && Array.from({ length: 4 }, (_, i) => <CardSkeleton key={i} />)}
+                    {d.related.slice(0, 8).map((m, i) => <Card key={m.key} media={m} index={i} />)}
+                  </div>
+                </div>
+              )}
+
+              {ready && d.cast.length === 0 && d.related.length === 0 && (
+                <Details d={d} anime={anime} />
+              )}
+            </div>
+          )}
+
           {curTab === "episodes" && (() => {
-            // Long anime runs (One Piece is past 1,100) are paged in blocks of 50.
             const paged = epList.length > PAGE;
             const pages = Math.max(1, Math.ceil(epList.length / PAGE));
             const safePage = Math.max(0, Math.min(page, pages - 1));
@@ -444,7 +721,6 @@ export function Title() {
             }
 
             const hasStills = shown.some((e) => e.still) || !!d.backdrop;
-            // Stills and synopses read best as a list; a long run without them is a wall, so it gets tiles.
             const layout = !hasStills ? "compact" : (view ?? (epList.length > 30 ? "grid" : "list")) === "list" ? "list" : "";
 
             return (
@@ -483,9 +759,7 @@ export function Title() {
                   {waiting && Array.from({ length: 6 }, (_, i) => <div key={i} className="ep-card skeleton" />)}
                   {!waiting && shown.map((e, i) => {
                     const unaired = isUnairedEpisode(e, { airedCount, seriesStatus: d.status });
-                    // Episodes without their own still (often unaired ones) get the show's art, dimmed.
-                    // Tiles are ~300px wide: the full-size backdrop (up to `original`) was decoded 50 times over.
-                    const still = e.still ?? sized(d.backdrop, "w300");
+                    const still = e.still ?? sized(d.backdrop, "w780");
                     const fallback = e.airDate
                       ? new Date(`${e.airDate}T12:00:00`).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })
                       : audio ? (audio === "dub" ? "English dub" : "Japanese audio · English subtitles") : "";
@@ -520,11 +794,37 @@ export function Title() {
                     const isCur = upNext === e.number && (validProgress?.season ?? season) === season;
                     const watched = !!p && p.duration > 0 && p.position / p.duration > 0.92;
                     const left = p && p.duration > 0 && !watched ? Math.max(1, Math.round((p.duration - p.position) / 60)) : null;
-                    return (
-                      <button key={e.number} className={`ep-card ${isCur ? "cur" : ""} ${watched ? "seen" : ""}`} style={{ ["--i" as string]: Math.min(i, 8) }} onClick={() => watch(season, e.number)}>
+
+                    const epSaved = desktop && hasDownloadedEpisode(canonicalKey, season, e.number, audio, dl.items);
+                    const epJob = desktop
+                      ? dl.jobs.find(
+                          (j) =>
+                            !j.isFilm &&
+                            j.status !== "cancelled" &&
+                            j.status !== "completed" &&
+                            (j.canonicalKey === canonicalKey || j.mediaKey === canonicalKey) &&
+                            (j.season == null || j.season === season) &&
+                            j.episode === e.number &&
+                            (!audio || !j.audio || j.audio === "dual" || j.audio === audio),
+                        )
+                      : undefined;
+                    const epBusy =
+                      epJob && (epJob.status === "queued" || epJob.status === "downloading" || epJob.status === "remuxing");
+                    const epPaused = epJob?.status === "paused";
+                    const epFailed = epJob?.status === "failed";
+                    const epResolving = desktop && batch.pendingKeys.has(batchEpisodeKey(canonicalKey, season, e.number, audio));
+
+                    const cardEl = (
+                      <button
+                        key={desktop ? undefined : e.number}
+                        className={`ep-card ${isCur ? "cur" : ""} ${watched ? "seen" : ""}`}
+                        style={{ ["--i" as string]: Math.min(i, 8) }}
+                        onClick={() => watch(season, e.number)}
+                      >
                         <div className="ec-th">
                           {still && <img src={still} alt="" loading="lazy" decoding="async" className={e.still ? "" : "dim"} />}
                           <span className="ec-num">{e.number}</span>
+                          {epSaved && <span className="ec-offline" title="Saved offline"><Icon name="download" size={11} /></span>}
                           {isCur && <span className="ec-ribbon">{p && p.position > 30 ? "Resume" : "Up next"}</span>}
                           {watched && <span className="ec-seen" aria-label="Watched"><Icon name="check" size={12} /></span>}
                           {e.runtime ? <span className="ec-rt">{e.runtime}m</span> : null}
@@ -536,6 +836,58 @@ export function Title() {
                           <div className="ec-d">{layout === "list" ? [left != null ? `${left}m left` : null, e.overview || fallback].filter(Boolean).join(" · ") : left != null ? `${left}m left` : e.overview || fallback}</div>
                         </div>
                       </button>
+                    );
+
+                    if (!desktop) return cardEl;
+
+                    const epDlLabel = epBusy
+                      ? epJob.status === "remuxing"
+                        ? "Saving to folder…"
+                        : `Pause E${e.number} (${Math.round(epJob.percent)}%)`
+                      : epPaused
+                        ? `Resume E${e.number}`
+                        : epFailed
+                          ? `Retry E${e.number}`
+                          : epResolving
+                            ? `Finding stream for E${e.number}…`
+                            : epSaved
+                              ? `E${e.number} saved offline`
+                              : `Download E${e.number}`;
+
+                    return (
+                      <div key={e.number} className="ep-slot">
+                        {cardEl}
+                        <button
+                          type="button"
+                          className={`ep-dl ${epBusy || epResolving ? "busy" : ""} ${epPaused ? "paused" : ""} ${epSaved ? "saved" : ""}`}
+                          title={epDlLabel}
+                          aria-label={epDlLabel}
+                          disabled={epJob?.status === "remuxing" || epResolving || (epSaved && !epBusy && !epPaused)}
+                          onClick={() => {
+                            if (epBusy && epJob) {
+                              void pauseDownload(epJob.id);
+                            } else if ((epPaused || epFailed) && epJob) {
+                              void resumeDownload(epJob.id);
+                            } else if (!epSaved && !epResolving) {
+                              void queueEpisodeDownload(d, season, e, audio);
+                            }
+                          }}
+                        >
+                          {epResolving ? (
+                            <span className="mini-spin" />
+                          ) : epBusy ? (
+                            <span>{epJob.status === "remuxing" ? "…" : `${Math.round(epJob.percent)}%`}</span>
+                          ) : epPaused ? (
+                            <Icon name="play" size={12} />
+                          ) : epFailed ? (
+                            <Icon name="refresh" size={12} />
+                          ) : epSaved ? (
+                            <Icon name="check" size={13} />
+                          ) : (
+                            <Icon name="download" size={13} />
+                          )}
+                        </button>
+                      </div>
                     );
                   })}
                 </div>
@@ -589,7 +941,7 @@ export function Title() {
   );
 }
 
-/** Everything else worth knowing, as a fact sheet. Rows with no data are left out. */
+/** Technical colophon fact sheet. Rows with no data are left out. */
 function Details({ d, anime }: { d: MediaDetail; anime: boolean }) {
   const people = (jobs: RegExp) => [...new Set(d.crew.filter((c) => jobs.test(c.job)).map((c) => c.name))].join(", ");
   const ep = (e?: MediaDetail["lastEpisode"]) => (e ? `S${e.season} · E${e.episode}${e.name ? ` · ${e.name}` : ""}${e.airDate ? ` (${fmtDate(e.airDate)})` : ""}` : "");

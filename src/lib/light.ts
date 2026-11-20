@@ -1,4 +1,6 @@
 import { sized } from "../components/Art";
+import { getSettings } from "./settings";
+import { isLightTheme, resolveTheme } from "./themes";
 import type { Media } from "./types";
 
 /**
@@ -67,11 +69,20 @@ const oklch = (l: number, c: number, h: number) => `oklch(${f(l)} ${f(c)} ${f(h,
  * Grey artwork keeps a whisper of chroma rather than inventing a colour it doesn't have.
  */
 export function tonesFrom(h1: number, c1: number, h2 = (h1 + 40) % 360, c2 = c1): Tones {
-  const vivid = clamp(c1 * 1.25, 0.035, 0.17);
-  const soft = clamp(c2 * 1.1, 0.03, 0.13);
+  const vivid = clamp(c1 * 1.3, 0.045, 0.18);
+  const soft = clamp(c2 * 1.12, 0.035, 0.14);
+  if (isLightTheme(resolveTheme(getSettings().theme))) {
+    return {
+      tone: oklch(0.56, vivid, h1),
+      ink: oklch(0.42, Math.min(vivid, 0.16), h1),
+      deep: oklch(0.92, Math.min(vivid, 0.04), h1),
+      l1: oklch(0.76, Math.min(vivid, 0.09), h1),
+      l2: oklch(0.80, Math.min(soft, 0.08), h2),
+    };
+  }
   return {
     tone: oklch(0.83, vivid, h1),
-    ink: oklch(0.91, Math.min(vivid, 0.115), h1),
+    ink: oklch(0.92, Math.min(vivid, 0.125), h1),
     deep: oklch(0.24, Math.min(vivid, 0.055), h1),
     l1: oklch(0.4, Math.min(vivid, 0.12), h1),
     l2: oklch(0.3, Math.min(soft, 0.1), h2),
@@ -205,11 +216,20 @@ function remember(src: string | undefined, tones: Tones) {
     /* storage full or blocked: the room just starts dark next time */
   }
 }
+const dynamicEnabled = () => getSettings().dynamicLight !== false;
+
 function setRootTones(t: Tones) {
   const r = document.documentElement.style;
   r.setProperty("--tone", t.tone);
   r.setProperty("--tone-ink", t.ink);
   r.setProperty("--tone-deep", t.deep);
+}
+function clearRootTones() {
+  const r = document.documentElement.style;
+  r.removeProperty("--tone");
+  r.removeProperty("--tone-ink");
+  r.removeProperty("--tone-deep");
+  paintLight(undefined);
 }
 function restoreRoom() {
   if (typeof window === "undefined") return;
@@ -221,11 +241,12 @@ function restoreRoom() {
   } catch {
     return;
   }
+  if (!dynamicEnabled()) return;
   setRootTones(restored.tones);
   // The room element mounts with the app; wait a few frames for it, unless a page lit it first.
   let tries = 0;
   const paint = () => {
-    if (base) return;
+    if (base || !dynamicEnabled()) return;
     if (!document.querySelector(".light")) {
       if (++tries < 120) requestAnimationFrame(paint);
       return;
@@ -237,10 +258,37 @@ function restoreRoom() {
 }
 restoreRoom();
 
+let cachedLightMode: boolean | undefined;
 let previewToken = 0;
 function clearPreview() {
   previewToken++;
+  if (!dynamicEnabled()) {
+    paintLight(undefined);
+    return;
+  }
   paintLight(baseTones ?? restored?.tones);
+}
+
+/** Re-sync ambient lighting and accent tones when the user switches theme or toggles dynamic light. */
+export function syncThemeLight() {
+  const light = isLightTheme(resolveTheme(getSettings().theme));
+  if (cachedLightMode !== undefined && cachedLightMode !== light) {
+    cache.clear();
+    baseTones = undefined;
+  }
+  cachedLightMode = light;
+  if (!dynamicEnabled()) {
+    clearRootTones();
+    return;
+  }
+  if (base) {
+    const cur = base;
+    base = undefined;
+    setStageLight(cur);
+  } else if (restored?.tones) {
+    setRootTones(restored.tones);
+    paintLight(restored.tones);
+  }
 }
 
 /** The title a page is "about" (hero slide, title page, player). Sets the app-wide tones. */
@@ -257,9 +305,10 @@ export function setStageLight(m: Media | undefined) {
   tonesFor(m).then((tones) => {
     if (t !== token) return;
     baseTones = tones;
+    remember(src, tones);
+    if (!dynamicEnabled()) return;
     setRootTones(tones);
     paintLight(tones);
-    remember(src, tones);
   });
 }
 
@@ -269,13 +318,15 @@ export function setStageLight(m: Media | undefined) {
  */
 let hoverTimer: ReturnType<typeof setTimeout> | undefined;
 export function previewLight(m: Media | null) {
+  if (!dynamicEnabled()) return;
   clearTimeout(hoverTimer);
   hoverTimer = setTimeout(
     () => {
+      if (!dynamicEnabled()) return;
       if (!m) return clearPreview();
       const t = ++previewToken;
       tonesFor(m).then((tones) => {
-        if (t === previewToken) paintLight(tones);
+        if (t === previewToken && dynamicEnabled()) paintLight(tones);
       });
     },
     m ? 160 : 80,

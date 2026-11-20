@@ -1,6 +1,5 @@
 /* =========================================================
-   Trailer modal: the YouTube trailer, played in place on a frosted pane.
-   Reuses the Frost tokens (grain / light / sheen / edge / bloom) from frost.css.
+   Trailer modal: matte obsidian cinema projection frame.
    ========================================================= */
 
 .trailer-scrim {
@@ -10,12 +9,11 @@
   display: grid;
   place-items: center;
   padding: clamp(16px, 4vw, 56px);
-  background: radial-gradient(80% 70% at 50% 40%, rgb(4 4 7 / 0.5), rgb(4 4 7 / 0.82));
-  backdrop-filter: blur(10px) saturate(1.2);
-  animation: trailerScrimIn 240ms var(--ease) both;
+  background: rgb(4 4 6 / 0.84);
+  animation: trailerScrimIn 200ms var(--ease) both;
 }
 .trailer-scrim.closing {
-  animation: trailerScrimOut 170ms var(--ease) forwards;
+  animation: trailerScrimOut 160ms var(--ease) forwards;
   pointer-events: none;
 }
 
@@ -27,30 +25,15 @@
   flex-direction: column;
   gap: 10px;
   padding: 10px 12px 12px;
-  border-radius: var(--r-xl);
-  background-color: var(--frost-fill-dense);
-  background-image: var(--frost-grain), var(--frost-light), var(--frost-sheen);
-  backdrop-filter: var(--frost-blur);
-  box-shadow: var(--rim), var(--frost-bloom), 0 60px 140px rgb(0 0 0 / 0.7);
+  border-radius: var(--r-lg);
+  background: var(--s0);
+  border: 1px solid var(--line-2);
+  box-shadow: var(--float);
   transform-origin: 50% 55%;
-  animation: trailerIn 360ms var(--ease-out) both;
-}
-/* the light-catching rim, same recipe as the other frost panes */
-.trailer-pane::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  z-index: -1;
-  border-radius: inherit;
-  padding: 1px;
-  background: var(--frost-edge);
-  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-  -webkit-mask-composite: xor;
-  mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0);
-  pointer-events: none;
+  animation: trailerIn 300ms var(--ease-out) both;
 }
 .trailer-scrim.closing .trailer-pane {
-  animation: trailerOut 170ms var(--ease) forwards;
+  animation: trailerOut 160ms var(--ease) forwards;
 }
 
 .trailer-head {
@@ -58,7 +41,7 @@
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding-left: 8px;
+  padding-left: 4px;
   min-height: 36px;
 }
 .trailer-title {
@@ -67,8 +50,12 @@
   gap: 9px;
   min-width: 0;
   color: var(--fg2);
-  font: 600 14px var(--f-ui);
-  letter-spacing: -0.005em;
+  font: 600 13.5px var(--f-mono);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.trailer-title > svg {
+  color: var(--tone-ink);
 }
 .trailer-title > span {
   overflow: hidden;
@@ -86,10 +73,10 @@
   position: relative;
   aspect-ratio: 16 / 9;
   width: 100%;
-  border-radius: calc(var(--r-xl) - 10px);
+  border-radius: var(--r-sm);
   overflow: hidden;
   background: #000;
-  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.06);
+  border: 1px solid var(--line);
 }
 .trailer-frame iframe {
   position: absolute;
@@ -120,20 +107,16 @@
   padding: 24px;
   text-align: center;
 }
-.trailer-fail p {
-  margin: 0;
-}
+.trailer-fail p { margin: 0; }
 .trailer-fail-t {
   color: var(--fg);
   font: 600 17px var(--f-ui);
 }
-.trailer-fail .btn {
-  margin-top: 8px;
-}
+.trailer-fail .btn { margin-top: 8px; }
 
 .trailer-hint {
   margin: 0;
-  padding: 0 8px 2px;
+  padding: 0 4px 2px;
   color: var(--fg3);
   font-size: 13px;
 }
@@ -145,28 +128,11 @@
 
 @keyframes trailerScrimIn { from { opacity: 0; } }
 @keyframes trailerScrimOut { to { opacity: 0; } }
-@keyframes trailerIn { from { opacity: 0; transform: scale(0.94) translateY(14px); } }
-@keyframes trailerOut { to { opacity: 0; transform: scale(0.97) translateY(6px); } }
+@keyframes trailerIn { from { opacity: 0; transform: scale(0.96) translateY(10px); } }
+@keyframes trailerOut { to { opacity: 0; transform: scale(0.98) translateY(4px); } }
 
-/* Reduced motion: a plain fade, and no live blur under translucent fills. */
-:root.reduce-motion .trailer-scrim,
-:root.reduce-motion .trailer-pane {
-  backdrop-filter: none;
-}
-:root.reduce-motion .trailer-pane {
-  background-color: #0d0d13f2;
-  animation-name: trailerScrimIn;
-}
+:root.reduce-motion .trailer-pane { animation-name: trailerScrimIn; }
 @media (prefers-reduced-motion: reduce) {
-  .trailer-scrim,
-  .trailer-pane {
-    backdrop-filter: none;
-  }
-  .trailer-pane {
-    background-color: #0d0d13f2;
-    animation: trailerScrimIn 160ms linear both;
-  }
-  .trailer-scrim.closing .trailer-pane {
-    animation: trailerScrimOut 120ms linear forwards;
-  }
+  .trailer-pane { animation: trailerScrimIn 160ms linear both; }
+  .trailer-scrim.closing .trailer-pane { animation: trailerScrimOut 120ms linear forwards; }
 }

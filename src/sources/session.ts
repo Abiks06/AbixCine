@@ -1,4 +1,5 @@
 import { getSettings, type Settings } from "../lib/settings";
+import { onDownloadsChanged } from "../lib/downloads";
 import { reqKey, type PlaybackRequest } from "../lib/types";
 import {
   isCircuitOpen,
@@ -152,12 +153,14 @@ const CAPTURE_CHECK_CAP_MS = 35_000;
 /** Errors that mean "we stopped asking", not "the stream is broken". */
 const SOFT_CONFIRM_ERRORS = /^(?:timeout|AbortError)$/i;
 
+const isLocalProvider = (id?: string) => id === "local" || id === "downloads";
+const isOffline = () => typeof navigator !== "undefined" && navigator.onLine === false;
 const isEmbed = (c: StreamCandidate) => c.kind === "embed";
 const isMagnet = (c: StreamCandidate) => /^magnet:/i.test(c.url);
 /** Probably a different title: plays, but nowhere near the catalog runtime. */
 const isSuspect = (c: StreamCandidate) => c.identity?.status === "mismatch";
 /** Ready, not another title, and not already token-expired. */
-const isUsable = (c: StreamCandidate) => !!c.probe?.ok && !isSuspect(c) && (c.providerId === "local" || !isUrlTokenExpired(c.url));
+const isUsable = (c: StreamCandidate) => !!c.probe?.ok && !isSuspect(c) && (isLocalProvider(c.providerId) || !isUrlTokenExpired(c.url));
 /** The stream behind the proxy: two servers capturing the same CDN playlist are one stream. */
 const streamOf = (c: StreamCandidate) => (c.kind === "embed" ? c.pageUrl ?? c.url : unwrapProxyUrl(c.url).url);
 const isAbxsProxied = (url: string) => /^(?:https?:\/\/abxs\.localhost(?:[/:?]|$)|abxs:\/\/)/i.test(url);
@@ -383,7 +386,7 @@ export class SourceSession {
   isFresh() {
     if (this.disposed) return false;
     if (Date.now() - this.createdAt > SESSION_FRESH_MS) return false;
-    return ![...this.cands.values()].some((c) => c.probe?.ok && c.providerId !== "local" && isStaleStreamUrl(c.url));
+    return ![...this.cands.values()].some((c) => c.probe?.ok && !isLocalProvider(c.providerId) && isStaleStreamUrl(c.url));
   }
 
   dispose() {
@@ -407,10 +410,16 @@ export class SourceSession {
     this.t0 = performance.now();
 
     const pinned = lastPick(this.req);
+    const offline = isOffline();
     const runnable: SourceProvider[] = [];
     this.skippedCircuit.clear();
     for (const p of this.providers) {
-      const bypassCircuit = p.id === "local" || p.id === "jellyfin" || (pinned?.manual && pinned.providerId === p.id);
+      if (offline && p.category !== "local" && p.id !== "jellyfin") {
+        const lane = this.lanes.get(p.id);
+        if (lane) this.lanes.set(p.id, { ...lane, status: "empty" });
+        continue;
+      }
+      const bypassCircuit = isLocalProvider(p.id) || p.id === "jellyfin" || (pinned?.manual && pinned.providerId === p.id);
       if (!bypassCircuit && isCircuitOpen(p.id)) {
         this.skippedCircuit.add(p.id);
         const lane = this.lanes.get(p.id);
@@ -443,7 +452,7 @@ export class SourceSession {
     if (n > this.target) {
       this.target = n;
       if (this.started) {
-        const pickedIsLocal = !!(this.pickKey && this.cands.get(this.pickKey)?.providerId === "local");
+        const pickedIsLocal = !!(this.pickKey && isLocalProvider(this.cands.get(this.pickKey)?.providerId));
         if (pickedIsLocal && n < Number.MAX_SAFE_INTEGER) {
           this.cancelSurplus();
         } else {
@@ -634,7 +643,7 @@ export class SourceSession {
   }
 
   private hasQueuedLocal() {
-    return this.directQueue.some((k) => this.cands.get(k)?.providerId === "local");
+    return this.directQueue.some((k) => isLocalProvider(this.cands.get(k)?.providerId));
   }
 
   private takeBest(queue: string[], eligible?: (c: StreamCandidate) => boolean) {
@@ -680,7 +689,7 @@ export class SourceSession {
         });
       const key = this.takeBest(
         this.directQueue,
-        onlyLocal ? (c) => c.providerId === "local" : fair ? underShare : undefined,
+        onlyLocal ? (c) => isLocalProvider(c.providerId) : fair ? underShare : undefined,
       );
       if (!key) break;
       const pid = this.cands.get(key)?.providerId;
@@ -698,7 +707,7 @@ export class SourceSession {
     // compete with it. After a Local pick, skip automatic embed backups completely.
     const ready = this.readyCount();
     if (!this.pickKey && ready > 0) return;
-    if (this.pickKey && this.cands.get(this.pickKey)?.providerId === "local" && this.target < Number.MAX_SAFE_INTEGER) return;
+    if (this.pickKey && isLocalProvider(this.cands.get(this.pickKey)?.providerId) && this.target < Number.MAX_SAFE_INTEGER) return;
     if (!this.captureOpen && this.directSettled()) this.captureOpen = true;
     if (this.captureOpen && !this.backupsHeld) {
       // Racing for a first stream: several pages at once. Filling backups: no more than are still needed.
@@ -717,7 +726,7 @@ export class SourceSession {
     if (this.captureOpen || this.pickKey) return undefined;
     const pinned = lastPick(this.req);
     if (!pinned) return undefined;
-    if (this.lanes.get("local")?.status === "searching" && !pinned.manual) return undefined;
+    if ((this.lanes.get("local")?.status === "searching" || this.lanes.get("downloads")?.status === "searching") && !pinned.manual) return undefined;
     return this.captureQueue.find((k) => this.cands.get(k)?.providerId === pinned.providerId);
   }
 
@@ -776,12 +785,12 @@ export class SourceSession {
           this.learn(r);
           this.put({ ...r, lookupMs: r.lookupMs ?? c.lookupMs });
           if (r.probe?.ok) this.startIdentity(key);
-          if (r.probe?.ok && r.providerId === "local") {
+          if (r.probe?.ok && isLocalProvider(r.providerId)) {
             this.cancelSurplus();
             const confirmCand = this.confirming ? this.cands.get(this.confirming) : undefined;
-            if (confirmCand && confirmCand.providerId !== "local") this.cancelPendingCommit();
+            if (confirmCand && !isLocalProvider(confirmCand.providerId)) this.cancelPendingCommit();
             const curPick = this.pickKey ? this.cands.get(this.pickKey) : undefined;
-            if (curPick && curPick.providerId !== "local" && !this.playedKey && !this.manual.has(this.pickKey!)) {
+            if (curPick && !isLocalProvider(curPick.providerId) && !this.playedKey && !this.manual.has(this.pickKey!)) {
               this.pickKey = undefined;
               this.setPick(key);
             }
@@ -843,7 +852,7 @@ export class SourceSession {
       !!c.probe?.ok &&
       !c.identity &&
       (c.kind === "hls" || c.kind === "dash") &&
-      c.providerId !== "local" &&
+      !isLocalProvider(c.providerId) &&
       c.providerId !== "manual" &&
       !isMagnet(c)
     );
@@ -907,12 +916,12 @@ export class SourceSession {
     return false;
   }
 
-  /** Local library is still scanning or probing on this PC: hold off before locking an online stream. */
+  /** Local library or saved downloads are still scanning or probing on this PC: hold off before locking an online stream. */
   private localPending(best: StreamCandidate) {
-    if (best.providerId === "local") return false;
-    if (this.lanes.get("local")?.status === "searching") return true;
-    for (const k of this.directQueue) if (this.cands.get(k)?.providerId === "local") return true;
-    for (const k of this.inflight.keys()) if (this.cands.get(k)?.providerId === "local") return true;
+    if (isLocalProvider(best.providerId)) return false;
+    if (this.lanes.get("local")?.status === "searching" || this.lanes.get("downloads")?.status === "searching") return true;
+    for (const k of this.directQueue) if (isLocalProvider(this.cands.get(k)?.providerId)) return true;
+    for (const k of this.inflight.keys()) if (isLocalProvider(this.cands.get(k)?.providerId)) return true;
     return false;
   }
 
@@ -982,7 +991,7 @@ export class SourceSession {
   /** Does the would-be pick still need its first segment fetched for real? */
   private needsConfirm(c: StreamCandidate) {
     if (this.confirmed.has(candKey(c))) return false;
-    if (c.providerId === "local" || c.providerId === "manual" || isEmbed(c) || isMagnet(c)) return false;
+    if (isLocalProvider(c.providerId) || c.providerId === "manual" || isEmbed(c) || isMagnet(c)) return false;
     if (c.kind === "file") return false;
     if (c.via === "sniffed" && isAbxsProxied(c.url) && !isUrlTokenExpired(c.url)) return false;
     return c.kind === "hls";
@@ -1051,7 +1060,7 @@ export class SourceSession {
     this.hedgeTimer = undefined;
     // Backups wait a moment so the stream that's about to start gets the bandwidth.
     // Local files play directly from disk, so never spin up background embed captures for them.
-    const pickedIsLocal = this.cands.get(key)?.providerId === "local";
+    const pickedIsLocal = isLocalProvider(this.cands.get(key)?.providerId);
     if (!pickedIsLocal && !this.backgroundStopped && this.readyCount() < this.target && this.captureQueue.length) {
       this.backupsHeld = true;
       this.captureOpen = true;
@@ -1316,7 +1325,7 @@ let epoch = 0;
 export const sessionKey = (req: PlaybackRequest, s: Settings = getSettings()) =>
   // The resolved request (cour episode, absolute number, mapped ids) is part of the identity: a
   // session started from the provisional request must not be reused once the real one is known.
-  `${reqKey(req)}|${JSON.stringify([req.courEpisode ?? null, req.absolute ?? null, req.media.malId ?? null, req.media.anilistId ?? null, req.media.tmdbId ?? null])}|${JSON.stringify([s.libraryPaths, s.jellyfin.enabled && s.jellyfin.url, s.disabledSources, s.enabledExtras, s.preferredQuality])}|${epoch}`;
+  `${reqKey(req)}|${JSON.stringify([req.courEpisode ?? null, req.absolute ?? null, req.media.malId ?? null, req.media.anilistId ?? null, req.media.tmdbId ?? null])}|${JSON.stringify([s.downloadsPath ?? "", s.libraryPaths, s.jellyfin.enabled && s.jellyfin.url, s.disabledSources, s.enabledExtras, s.preferredQuality])}|${epoch}`;
 
 /** The live session for a request, or a new one when there is none or it has gone stale. */
 export function acquireSession(req: PlaybackRequest): SourceSession {
@@ -1343,4 +1352,8 @@ export function invalidateSessions() {
     s.invalidate();
     sessions.delete(k);
   }
+}
+
+if (typeof window !== "undefined") {
+  onDownloadsChanged(() => invalidateSessions());
 }

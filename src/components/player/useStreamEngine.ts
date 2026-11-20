@@ -294,7 +294,7 @@ export function useStreamEngine(ctx: StreamEngineContext) {
       }
       const activeCur = curRef.current;
       const hasEmbeddedCandidate =
-        activeCur?.providerId === "local" &&
+        (activeCur?.providerId === "local" || activeCur?.providerId === "downloads") &&
         Boolean(activeCur.subtitles?.some((t) => t.source === "embedded" || t.streamIndex != null || t.url.startsWith("embedded://")));
       if (hasEmbeddedCandidate) {
         for (let i = 0; i < v.textTracks.length; i++) {

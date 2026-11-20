@@ -1,6 +1,7 @@
 import { memo, type MouseEvent, type ReactNode } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { encodeKey, getDetail, isUnreleasedMedia } from "../lib/catalog";
+import { openDossier, registerMedia } from "../lib/dossier";
 import { previewLight } from "../lib/light";
 import { playHref } from "../lib/play";
 import type { Move } from "../lib/ranks";
@@ -47,6 +48,8 @@ interface Props {
   variant?: CardVariant;
   rank?: number;
   move?: Move;
+  /** Optional 35mm contact sheet frame index (e.g. "F01"). */
+  frameLabel?: string;
   /** Overlay inside the artwork (end-time chip, etc.). */
   extra?: ReactNode;
   sub?: ReactNode;
@@ -63,11 +66,6 @@ interface Props {
   onOpen?: () => void;
 }
 
-/**
- * Hovering a card fetches its details in the background, so the title page opens instantly.
- * At most two lookups run at once and the newest hover goes first, so a sweep along a shelf
- * never queues a request per card.
- */
 const warmed = new Set<string>();
 const queue: string[] = [];
 let warming = 0;
@@ -88,7 +86,6 @@ function warm(key: string) {
   if (warmed.has(key)) return;
   if ((navigator as { connection?: { saveData?: boolean } }).connection?.saveData) return;
   clearTimeout(warmTimer);
-  // A short dwell, so sweeping the mouse across a row doesn't fire a request per card.
   warmTimer = setTimeout(() => {
     warmed.add(key);
     queue.push(key);
@@ -97,8 +94,30 @@ function warm(key: string) {
   }, 150);
 }
 
-/** Memoised: a shelf of cards shouldn't re-render because the hero above it changed slide. */
-export const Card = memo(function Card({ media, index = 0, variant = "landscape", rank, move, extra, sub, right, label, progress, to, infoTo, onRemove, removeLabel, onOpen }: Props) {
+/**
+ * Memoised gallery card: unobstructed artwork at rest with structured metadata underneath.
+ * Hovering or focusing reveals a smooth darkroom detail curtain with brief synopsis/metadata
+ * and docked quick controls while keeping buttons strictly siblings of the anchor link.
+ */
+export const Card = memo(function Card({
+  media,
+  index = 0,
+  variant = "landscape",
+  rank,
+  move,
+  frameLabel,
+  extra,
+  sub,
+  right,
+  label,
+  progress,
+  to,
+  infoTo,
+  onRemove,
+  removeLabel,
+  onOpen,
+}: Props) {
+  registerMedia(media);
   const saved = useSaved(media.key);
   const nav = useNavigate();
   const port = variant !== "landscape";
@@ -108,8 +127,15 @@ export const Card = memo(function Card({ media, index = 0, variant = "landscape"
     warm(media.key);
   };
   const aside = right ?? (rank != null && move ? <MoveBadge move={move} /> : media.rating ? <span className="star">★ {media.rating.toFixed(1)}</span> : null);
+  const teaser = media.overview?.trim();
+  const microLine = [kindLabel(media.kind, media.format), media.year, media.genres.slice(0, 2).join(" · ")].filter(Boolean).join(" · ");
+
   const card = (
-    <article className={`card ${port ? "port" : ""}`} style={{ ["--i" as string]: Math.min(index, 8) }}>
+    <article
+      className={`card ${port ? "port" : ""}`}
+      style={{ ["--i" as string]: Math.min(index, 8) }}
+      data-media-key={media.key}
+    >
       <Link
         to={to ?? `/title/${encodeKey(media.key)}`}
         state={to ? { from: "app" } : seedState(media)}
@@ -125,37 +151,41 @@ export const Card = memo(function Card({ media, index = 0, variant = "landscape"
         onMouseLeave={() => previewLight(null)}
         onBlur={() => previewLight(null)}
       >
-        <div className="art-wrap">
+        <div className="art-wrap gate-frame">
           <Art media={media} variant={port ? "poster" : "backdrop"} size="md" />
-          {!port && <div className="card-shade" />}
-          {!port && <span className="card-title">{label ?? media.title}</span>}
+          <span className="gate-brackets" aria-hidden><i /></span>
+          <div className="card-curtain" aria-hidden>
+            <div className="cc-meta">{microLine}</div>
+            {teaser && <p className="cc-desc">{teaser}</p>}
+          </div>
           {extra}
-          {progress != null && <div className="prog"><i style={{ transform: `scaleX(${Math.min(1, Math.max(0.02, progress / 100))})` }} /></div>}
+          {progress != null && (
+            <div className="prog"><i style={{ transform: `scaleX(${Math.min(1, Math.max(0.02, progress / 100))})` }} /></div>
+          )}
         </div>
         <div className="card-info">
-          {port && (
-            <div className="card-name">
-              <span>{label ?? media.title}</span>
-              {aside}
-            </div>
-          )}
+          <div className="card-name">
+            {frameLabel && <span className="card-frame-no">{frameLabel}</span>}
+            <span className="card-name-tx">{label ?? media.title}</span>
+            {aside}
+          </div>
           <div className="card-sub">
             {sub ?? (
               <>
                 <span className="badge">{kindLabel(media.kind, media.format)}</span>
-                {media.year}
+                {media.year && <span>{media.year}</span>}
                 {unreleased ? (
-                  <span className="badge dim">Coming soon</span>
+                  <span className="badge dim">Soon</span>
                 ) : (
-                  media.kind === "anime" && <span className="badge dim">Sub · Dub</span>
+                  media.kind === "anime" ? <span className="badge dim">Sub·Dub</span> : media.genres[0] && <span className="card-genre">{media.genres[0]}</span>
                 )}
               </>
             )}
-            {!port && aside}
           </div>
         </div>
       </Link>
-      {/* Siblings of the link, not children: a button inside an anchor is invalid and unreachable by keyboard. */}
+
+      {/* Siblings of the link, never nested inside it */}
       <div className="card-acts">
         {onRemove ? (
           <button className="act dismiss" aria-label={removeLabel ?? "Remove"} title={removeLabel ?? "Remove"} onClick={onRemove}>
@@ -171,32 +201,50 @@ export const Card = memo(function Card({ media, index = 0, variant = "landscape"
               nav(to ?? playHref(media), { viewTransition: true, state: { from: "app" } });
             }}
           >
-            <Icon name="play" size={13} />
+            <Icon name="play" size={12} />
           </button>
         ) : null}
+        <button
+          className="act inspect"
+          aria-label={`Quick inspect ${media.title}`}
+          title="Quick dossier (I)"
+          onClick={() => openDossier(media)}
+        >
+          <Icon name="layers" size={12} />
+        </button>
         {infoTo && (
           <button
             className="act info"
             aria-label={`Details for ${media.title}`}
-            title="Title details"
+            title="Full dossier"
             onClick={() => {
               onOpen?.();
               nav(infoTo, { viewTransition: true, state: seedState(media) });
             }}
           >
-            <Icon name="info" size={14} />
+            <Icon name="info" size={13} />
           </button>
         )}
-        <button className={`act save ${saved ? "on" : ""}`} aria-label={saved ? "Remove from My List" : "Add to My List"} title={saved ? "In My List" : "Add to My List"} aria-pressed={saved} onClick={(e) => { if (!saved) burst(e.currentTarget); toggleList(media); }}>
-          <Icon name={saved ? "check" : "plus"} size={15} />
+        <button
+          className={`act save ${saved ? "on" : ""}`}
+          aria-label={saved ? "Remove from My List" : "Add to My List"}
+          title={saved ? "In My List" : "Add to My List"}
+          aria-pressed={saved}
+          onClick={(e) => {
+            if (!saved) burst(e.currentTarget);
+            toggleList(media);
+          }}
+        >
+          <Icon name={saved ? "check" : "plus"} size={13} />
         </button>
       </div>
     </article>
   );
+
   if (rank == null) return card;
   return (
     <div className={`rank ${rank >= 10 ? "r10" : ""}`} style={{ ["--i" as string]: Math.min(index, 8) }}>
-      <span className="rank-n" aria-hidden>{rank}</span>
+      <span className="rank-n" aria-hidden>{String(rank).padStart(2, "0")}</span>
       {card}
     </div>
   );

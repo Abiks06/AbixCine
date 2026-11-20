@@ -9,12 +9,17 @@ import App from "./App";
 import "./styles/base.css";
 import "./styles/browse.css";
 import "./styles/player.css";
-import "./styles/frost.css";
+import "./styles/archival.css";
 import "./styles/trailer.css";
 import "./styles/sources.css";
 import { installPointerLight } from "./lib/pointerLight";
 import { installGamepad } from "./lib/gamepad";
 import { kick as retryScrobbles } from "./lib/scrobble";
+import { getSettings } from "./lib/settings";
+import { applyThemeToDom, resolveTheme } from "./lib/themes";
+
+const initialSettings = getSettings();
+applyThemeToDom(resolveTheme(initialSettings.theme), initialSettings.dynamicLight !== false);
 
 installPointerLight();
 installGamepad();

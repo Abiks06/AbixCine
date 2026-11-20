@@ -2,13 +2,28 @@ import type { ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { Icon } from "./Icon";
 
-/** A shelf's header: display title, a mono caption under it, and room on the right for controls. */
-export function SectionHead({ eyebrow, title, to, right }: { eyebrow?: string; title: string; to?: string; right?: ReactNode }) {
+/** A section header: mono kicker above an editorial display title (optional italic serif accent) and right tools. */
+export function SectionHead({
+  eyebrow,
+  title,
+  accentWord,
+  to,
+  right,
+}: {
+  eyebrow?: string;
+  title: string;
+  accentWord?: string;
+  to?: string;
+  right?: ReactNode;
+}) {
   return (
     <header className="shelf-head">
       <div className="shelf-title">
-        <h2>{title}</h2>
-        {eyebrow && <p>{eyebrow}</p>}
+        {eyebrow && <p className="shelf-eyebrow">{eyebrow}</p>}
+        <h2>
+          {title}
+          {accentWord && <> <em>{accentWord}</em></>}
+        </h2>
       </div>
       <div className="shelf-tools">
         {right}

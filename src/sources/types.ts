@@ -624,6 +624,8 @@ export interface StreamCandidate {
   providerName: string;
   label: string;
   url: string;
+  /** Optional dedicated download URL (e.g. Jellyfin original file endpoint when playback uses transcoded HLS). */
+  downloadUrl?: string;
   kind: StreamKind;
   /** Vertical resolution if known (from filename, manifest, or server metadata). */
   quality?: number;

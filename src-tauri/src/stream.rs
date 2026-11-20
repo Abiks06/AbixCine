@@ -97,7 +97,7 @@ pub(crate) fn is_url_token_expired_at(raw_url: &str, now_ms: u64) -> bool {
     false
 }
 
-fn find_next_uri_attr(s: &str) -> Option<usize> {
+pub(crate) fn find_next_uri_attr(s: &str) -> Option<usize> {
     let mut offset = 0;
     while let Some(rel) = s[offset..].find("URI=\"") {
         let idx = offset + rel;
@@ -373,7 +373,7 @@ fn origin_of(uri: &str) -> Option<String> {
     }
 }
 
-fn apply(mut rb: reqwest::RequestBuilder, h: &Hdrs) -> reqwest::RequestBuilder {
+pub(crate) fn apply(mut rb: reqwest::RequestBuilder, h: &Hdrs) -> reqwest::RequestBuilder {
     let referer = h.referer.as_deref().filter(|s| !s.is_empty());
     if let Some(r) = referer {
         rb = rb.header(header::REFERER, r);
@@ -479,7 +479,7 @@ fn is_unproxyable_uri(uri: &str) -> bool {
     lower.starts_with("data:") || lower.starts_with("skd:") || lower.starts_with("blob:")
 }
 
-fn resolve(base_url: &url::Url, reference: &str) -> String {
+pub(crate) fn resolve(base_url: &url::Url, reference: &str) -> String {
     base_url.join(reference.trim()).map(|u| u.to_string()).unwrap_or_else(|_| reference.trim().to_string())
 }
 
@@ -1506,7 +1506,7 @@ fn targets_local_network(u: &url::Url) -> bool {
     matches!(literal_class(u), Some(AddrClass::Private | AddrClass::Loopback))
 }
 
-fn check_target_host(u: &url::Url) -> Result<(), String> {
+pub(crate) fn check_target_host(u: &url::Url) -> Result<(), String> {
     match u.host() {
         None => Err("URL has no host".into()),
         Some(url::Host::Domain(d)) if is_app_internal_name(d) => Err(format!("Blocked internal host: {d}")),
@@ -1516,7 +1516,7 @@ fn check_target_host(u: &url::Url) -> Result<(), String> {
 }
 
 /// May a redirect go from `from` to `to`? Same rules as the first URL, plus no public → local pivot.
-fn redirect_allowed(from: &url::Url, to: &url::Url) -> Result<(), &'static str> {
+pub(crate) fn redirect_allowed(from: &url::Url, to: &url::Url) -> Result<(), &'static str> {
     if !matches!(to.scheme(), "http" | "https") {
         return Err("redirect to a non-http(s) URL");
     }
@@ -1550,7 +1550,7 @@ pub(crate) fn is_vpn_or_tun_addr(ip: std::net::IpAddr) -> bool {
 /// DNS with the rebinding guard: a public name may only resolve to public addresses (plus
 /// CGNAT/TUN/ULA addresses mapped by local VPN resolvers); LAN-style names may also resolve to
 /// private/loopback ones. Forbidden ranges are never returned.
-struct GuardedResolver;
+pub(crate) struct GuardedResolver;
 
 impl reqwest::dns::Resolve for GuardedResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
@@ -1574,7 +1574,7 @@ impl reqwest::dns::Resolve for GuardedResolver {
     }
 }
 
-fn validate_http_url(raw_url: &str) -> Result<url::Url, String> {
+pub(crate) fn validate_http_url(raw_url: &str) -> Result<url::Url, String> {
     let parsed = url::Url::parse(raw_url).map_err(|e| format!("Invalid URL: {e}"))?;
     match parsed.scheme() {
         "http" | "https" => {}

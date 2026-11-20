@@ -30,6 +30,7 @@ interface AnilistMediaItem extends RawAnilistNode {
   genres?: string[] | null;
   coverImage?: { extraLarge?: string | null; color?: string | null } | null;
   bannerImage?: string | null;
+  nextAiringEpisode?: { episode: number; airingAt: number } | null;
   relations?: { edges?: { relationType?: string | null; node?: { id: number; format?: string | null } | null }[] | null } | null;
 }
 
@@ -86,7 +87,7 @@ async function gql<T = unknown>(query: string, variables: Record<string, unknown
 }
 
 const FIELDS = `id idMal title { romaji english native } description(asHtml: false) seasonYear startDate { year month day } averageScore genres
-  coverImage { extraLarge color } bannerImage episodes duration format status`;
+  coverImage { extraLarge color } bannerImage nextAiringEpisode { episode airingAt } episodes duration format status`;
 
 const isoDate = (d?: { year?: number | null; month?: number | null; day?: number | null } | null) =>
   d?.year ? `${d.year}-${String(d.month ?? 1).padStart(2, "0")}-${String(d.day ?? 1).padStart(2, "0")}` : undefined;
@@ -108,6 +109,9 @@ function toMedia(m: AnilistMediaItem): Media {
     backdrop: m.bannerImage ?? undefined,
     genres: m.genres ?? [],
     color: m.coverImage?.color ?? undefined,
+    ...(m.nextAiringEpisode && typeof m.nextAiringEpisode.airingAt === "number"
+      ? { nextAiring: { episode: m.nextAiringEpisode.episode, at: m.nextAiringEpisode.airingAt * 1000 } }
+      : {}),
     ...(m.format ? { format: m.format } : {}),
   };
 }
@@ -128,11 +132,31 @@ function currentSeason() {
 
 export async function loadAnimeFeed(f: (typeof ANIME_FEEDS)[number], _i?: number): Promise<Media[]> {
   const airing = "airing" in f && f.airing;
-  return cached(`anilist:feed:v2:${f.id}`, 3 * HOUR, async () => {
+  return cached(`anilist:feed:v3:${f.id}`, 3 * HOUR, async () => {
     const { season, year } = currentSeason();
+    if (airing) {
+      const [seasonal, releasing] = await Promise.all([
+        gql<{ Page?: { media?: AnilistMediaItem[] } }>(
+          `query($sort:[MediaSort],$season:MediaSeason,$year:Int){ Page(perPage:36){ media(type:ANIME,sort:$sort,status_not_in:[NOT_YET_RELEASED,CANCELLED],isAdult:false,season:$season,seasonYear:$year){ ${FIELDS} } } }`,
+          { sort: [f.sort], season, year },
+        ).catch(() => ({ Page: { media: [] as AnilistMediaItem[] } })),
+        gql<{ Page?: { media?: AnilistMediaItem[] } }>(
+          `query{ Page(perPage:30){ media(type:ANIME,status:RELEASING,sort:[TRENDING_DESC,POPULARITY_DESC],isAdult:false){ ${FIELDS} } } }`,
+        ).catch(() => ({ Page: { media: [] as AnilistMediaItem[] } })),
+      ]);
+      const seen = new Set<string>();
+      const merged: Media[] = [];
+      for (const raw of [...(seasonal.Page?.media ?? []), ...(releasing.Page?.media ?? [])]) {
+        const item = toMedia(raw);
+        if (isUnreleasedMedia(item) || seen.has(item.key)) continue;
+        seen.add(item.key);
+        merged.push(item);
+      }
+      return merged;
+    }
     const d = await gql<{ Page?: { media?: AnilistMediaItem[] } }>(
-      `query($sort:[MediaSort],$season:MediaSeason,$year:Int){ Page(perPage:24){ media(type:ANIME,sort:$sort,status_not_in:[NOT_YET_RELEASED,CANCELLED],isAdult:false,season:$season,seasonYear:$year){ ${FIELDS} } } }`,
-      { sort: [f.sort], ...(airing ? { season, year } : {}) },
+      `query($sort:[MediaSort]){ Page(perPage:36){ media(type:ANIME,sort:$sort,status_not_in:[NOT_YET_RELEASED,CANCELLED],isAdult:false){ ${FIELDS} } } }`,
+      { sort: [f.sort] },
     );
     return (d.Page?.media ?? []).map(toMedia).filter((m) => !isUnreleasedMedia(m));
   });

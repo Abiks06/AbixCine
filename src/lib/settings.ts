@@ -1,6 +1,7 @@
 import { useSyncExternalStore } from "react";
 import { push, registerSync, fetchSync } from "./account";
 import { clearSubTrackMemory } from "./subtitles";
+import type { ThemeId } from "./themes";
 
 export type Audio = "sub" | "dub";
 
@@ -24,6 +25,8 @@ export interface SyncedSubtitlePref {
 export interface Settings {
   tmdbKey: string;
   libraryPaths: string[];
+  /** Device-only dedicated folder for downloaded offline titles (auto-sorted into subfolders). */
+  downloadsPath?: string;
   jellyfin: { url: string; apiKey: string; enabled: boolean };
   preferredQuality: number; // 2160 | 1080 | 720 | 480
   autoplayNext: boolean;
@@ -44,6 +47,10 @@ export interface Settings {
   tvMode?: "off" | "auto" | "on";
   /** Cinema glow: the letterbox bars take the colour of the picture's edges. Device only. */
   cinemaGlow?: boolean;
+  /** Visual archive color grade theme. */
+  theme?: ThemeId;
+  /** Adapt accent highlights dynamically from the focused show's poster/backdrop. */
+  dynamicLight?: boolean;
 }
 
 /** Settings that follow the account. Library folders and server credentials stay on this device. */
@@ -56,6 +63,8 @@ const SYNCED: (keyof Settings)[] = [
   "disabledSources",
   "enabledExtras",
   "subtitlePref",
+  "theme",
+  "dynamicLight",
 ];
 
 const EXTRA_IDS = ["vidsrccc", "vidsrcto", "2embed", "multiembed", "embedsu", "vidsrcrip", "frembed"];
@@ -71,6 +80,8 @@ const DEFAULTS: Settings = {
   audioByTitle: {},
   disabledSources: [],
   enabledExtras: EXTRA_IDS,
+  theme: "noir",
+  dynamicLight: true,
 };
 
 const KEY = "abx.settings.v1";

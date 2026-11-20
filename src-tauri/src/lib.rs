@@ -1,5 +1,6 @@
 use serde::Serialize;
 mod diagnostics;
+mod downloads;
 mod gateway;
 mod shield;
 mod stream;
@@ -11,6 +12,7 @@ use std::sync::{Mutex, OnceLock};
 use tauri::Manager;
 
 static LIBRARY_ROOTS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+static DOWNLOADS_ROOT: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 static MEDIA_PREPARE_LOCK: Mutex<()> = Mutex::new(());
 static ACTIVE_MEDIA_PIDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
 
@@ -18,10 +20,10 @@ fn active_media_pids() -> &'static Mutex<HashSet<u32>> {
     ACTIVE_MEDIA_PIDS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-struct ActivePidGuard(u32);
+pub(crate) struct ActivePidGuard(u32);
 
 impl ActivePidGuard {
-    fn new(pid: u32) -> Self {
+    pub(crate) fn new(pid: u32) -> Self {
         let mut set = active_media_pids().lock().unwrap_or_else(|e| e.into_inner());
         set.insert(pid);
         Self(pid)
@@ -401,7 +403,7 @@ fn bundled_ffmpeg_dirs(app: &tauri::AppHandle) -> Vec<PathBuf> {
     }
 }
 
-fn ffmpeg_tool(app: &tauri::AppHandle, name: &str) -> Result<PathBuf, String> {
+pub(crate) fn ffmpeg_tool(app: &tauri::AppHandle, name: &str) -> Result<PathBuf, String> {
     let bin_name = platform_tool_name(name);
     let bundle_dirs = bundled_ffmpeg_dirs(app);
     let path_env = std::env::var_os("PATH");
@@ -413,7 +415,7 @@ fn ffprobe_tool(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     ffmpeg_tool(app, "ffprobe")
 }
 
-fn background_command(program: &Path) -> std::process::Command {
+pub(crate) fn background_command(program: &Path) -> std::process::Command {
     let mut cmd = std::process::Command::new(program);
     #[cfg(windows)]
     {
@@ -424,7 +426,7 @@ fn background_command(program: &Path) -> std::process::Command {
     cmd
 }
 
-fn run_background_output(cmd: &mut std::process::Command) -> std::io::Result<std::process::Output> {
+pub(crate) fn run_background_output(cmd: &mut std::process::Command) -> std::io::Result<std::process::Output> {
     use std::process::Stdio;
     let child = cmd
         .stdin(Stdio::null())
@@ -433,6 +435,19 @@ fn run_background_output(cmd: &mut std::process::Command) -> std::io::Result<std
         .spawn()?;
     let _guard = ActivePidGuard::new(child.id());
     child.wait_with_output()
+}
+
+pub(crate) fn register_downloads_root(app: &tauri::AppHandle, dir: &Path) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("Could not create downloads folder: {e}"))?;
+    let canonical = std::fs::canonicalize(dir).map_err(|e| e.to_string())?;
+    app.asset_protocol_scope()
+        .allow_directory(&canonical, true)
+        .map_err(|e| e.to_string())?;
+    *DOWNLOADS_ROOT
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .map_err(|e| e.to_string())? = Some(canonical.clone());
+    Ok(canonical)
 }
 
 fn ensure_in_allowed_roots(path: &Path, allowed_roots: &[PathBuf]) -> Result<PathBuf, String> {
@@ -444,11 +459,21 @@ fn ensure_in_allowed_roots(path: &Path, allowed_roots: &[PathBuf]) -> Result<Pat
 }
 
 fn ensure_in_library_roots(path: &Path) -> Result<PathBuf, String> {
-    let allowed_roots = LIBRARY_ROOTS
+    let mut allowed_roots = LIBRARY_ROOTS
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
         .map_err(|e| e.to_string())?
         .clone();
+    if let Some(dl_root) = DOWNLOADS_ROOT
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone()
+    {
+        if !allowed_roots.contains(&dl_root) {
+            allowed_roots.push(dl_root);
+        }
+    }
     ensure_in_allowed_roots(path, &allowed_roots)
 }
 
@@ -1639,6 +1664,7 @@ pub(crate) fn debug_env_string(name: &str) -> Result<String, std::env::VarError>
 }
 
 fn cleanup_before_exit(app: &tauri::AppHandle) {
+    downloads::pause_all_on_exit();
     shield::close_all_sniff_windows(app);
     let pids: Vec<u32> = {
         let mut set = active_media_pids().lock().unwrap_or_else(|e| e.into_inner());
@@ -1855,6 +1881,15 @@ pub fn run() {
             torrent::torrent_start_stream,
             torrent::torrent_status,
             torrent::torrent_stop,
+            downloads::download_default_dir,
+            downloads::download_init_root,
+            downloads::download_start,
+            downloads::download_pause,
+            downloads::download_resume,
+            downloads::download_cancel,
+            downloads::download_remove,
+            downloads::download_list,
+            downloads::download_open_folder,
             prepare_for_update_exit,
             diagnostics::app_ready,
             gateway::stream_gateway,

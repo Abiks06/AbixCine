@@ -1,11 +1,14 @@
 import { isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link, NavLink, useLocation, useNavigate } from "react-router-dom";
 import { leaveGuest, signOut, useAuth } from "../lib/account";
-import { useSettings, type Settings } from "../lib/settings";
+import { useOnlineStatus } from "../lib/online";
+import { updateSettings, useSettings, type Settings } from "../lib/settings";
+import { THEMES, resolveTheme } from "../lib/themes";
 import { availableSources } from "../sources/embeds";
 import { Avatar } from "./Avatar";
+import { DownloadsPopover } from "./DownloadsPopover";
 import { Icon } from "./Icon";
 import { LogoMark, Wordmark } from "./Logo";
 
@@ -16,13 +19,32 @@ export const folderLabel = (p: string) => {
 };
 
 const NAV = [
-  { to: "/", label: "Home", icon: "home" },
-  { to: "/movies", label: "Films", icon: "film" },
-  { to: "/series", label: "Series", icon: "tv" },
-  { to: "/anime", label: "Anime", icon: "spark" },
-  { to: "/library", label: "Your drive", icon: "drive" },
-  { to: "/list", label: "My List", icon: "bookmark" },
-];
+  { to: "/", code: "01", label: "Home", full: "Programme", icon: "home" },
+  { to: "/movies", code: "02", label: "Films", full: "Films", icon: "film" },
+  { to: "/series", code: "03", label: "Series", full: "Series", icon: "tv" },
+  { to: "/anime", code: "04", label: "Anime", full: "Anime", icon: "spark" },
+  { to: "/library", code: "05", label: "Vault", full: "Your drive", icon: "drive" },
+  { to: "/list", code: "06", label: "List", full: "My List", icon: "bookmark" },
+] as const;
+
+function routeEdition(path: string): string {
+  if (path === "/") return "PROGRAMME";
+  if (path.startsWith("/movies")) return "FILMS · CATALOG";
+  if (path.startsWith("/series")) return "SERIES · INDEX";
+  if (path.startsWith("/anime")) return "ANIME · SIMULCAST";
+  if (path.startsWith("/library")) return "VAULT · LOCAL FIRST";
+  if (path.startsWith("/list")) return "MY LIST";
+  if (path.startsWith("/search")) return "ARCHIVE SEARCH";
+  if (path.startsWith("/settings")) return "PROJECTION CONSOLE";
+  if (path.startsWith("/title/")) return "FILM MONOGRAPH";
+  return "ABIXCINE";
+}
+
+function fmtClock(d: Date) {
+  const day = d.toLocaleDateString(undefined, { weekday: "short" }).toUpperCase();
+  const time = d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false });
+  return `${day} ${time}`;
+}
 
 /**
  * How many servers will answer a Play press. The registry (every extractor) is a large module the
@@ -38,8 +60,6 @@ function useServerCount(s: Settings) {
       import("../sources/registry")
         .then((r) => live && setExact(r.PROVIDERS.filter((p) => p.isEnabled(s)).length))
         .catch(() => {});
-    // Once loaded (by Watch, Settings or an earlier count) recounting is free; the first load
-    // waits for idle time so the 166 KB registry stays off the startup path.
     if (exact !== null) {
       void count();
       return () => {
@@ -62,10 +82,9 @@ function useServerCount(s: Settings) {
 }
 
 const appWindow = () => (isTauri() ? getCurrentWindow() : null);
-// The dev design preview draws the window buttons too, so it lays out exactly like the desktop app.
 const showWindowButtons = () => isTauri() || (import.meta.env.DEV && location.search.includes("preview"));
 
-/** Minimise / maximise / close for the borderless window. Shared by the title bar and sign-in. */
+/** Minimise / maximise / close for the borderless window. Shared by the utility bar and sign-in. */
 export function WindowButtons() {
   const w = useMemo(appWindow, []);
   if (!showWindowButtons()) return null;
@@ -79,91 +98,109 @@ export function WindowButtons() {
 }
 
 /**
- * One bar for the whole shell: brand, a floating dock whose lit pill slides to the current
- * section, a second glass capsule with search, live server status and the account, then the
- * window buttons. Empty stretches of the bar drag the (borderless) window.
+ * Desktop Projection Shell:
+ *   1. Left Architectural Index Rail (68px): aperture mark, numbered section switches (01–06),
+ *      server status telemetry, settings, and account console.
+ *   2. Top 40px Hairline Utility & Drag Bar: edition stamp, live evening clock, server readiness,
+ *      instant Command Indexer trigger, and native Tauri window controls.
  */
 export function TitleBar({ onOpenPalette }: { onOpenPalette: () => void }) {
   const nav = useNavigate();
   const loc = useLocation();
   const { user } = useAuth();
   const s = useSettings();
+  const isOnline = useOnlineStatus();
   const [menu, setMenu] = useState(false);
+  const [themesOpen, setThemesOpen] = useState(false);
+  const [now, setNow] = useState(() => new Date());
   const w = useMemo(appWindow, []);
   const showWin = showWindowButtons();
-
-  // The pill: measured from the active link, re-measured when the dock reflows (labels collapse on narrow windows).
-  const dock = useRef<HTMLElement>(null);
-  const [pill, setPill] = useState<{ x: number; w: number } | null>(null);
-  useLayoutEffect(() => {
-    const el = dock.current;
-    if (!el) return;
-    const place = () => {
-      const a = el.querySelector<HTMLElement>("a.active");
-      setPill((p) => {
-        const next = a ? { x: a.offsetLeft, w: a.offsetWidth } : null;
-        return p?.x === next?.x && p?.w === next?.w ? p : next;
-      });
-    };
-    place();
-    const ro = new ResizeObserver(place);
-    ro.observe(el);
-    el.querySelectorAll("a").forEach((a) => ro.observe(a));
-    return () => ro.disconnect();
-  }, [loc.pathname]);
+  const activeTheme = resolveTheme(s.theme);
+  const dynamicLight = s.dynamicLight !== false;
 
   useEffect(() => {
-    if (!menu) return;
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setMenu(false);
+    const t = window.setInterval(() => setNow(new Date()), 60_000);
+    return () => window.clearInterval(t);
+  }, []);
+
+  useEffect(() => {
+    if (!menu && !themesOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setMenu(false);
+        setThemesOpen(false);
+      }
+    };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [menu]);
+  }, [menu, themesOpen]);
 
   const online = useServerCount(s);
-  const own = s.libraryPaths.length + (s.jellyfin.enabled ? 1 : 0);
-  const ready = online + own > 0;
-  const status = ready ? [online ? `${online} server${online > 1 ? "s" : ""}` : null, own ? `${own} local` : null].filter(Boolean).join(" · ") : "Servers off";
+  const own = s.libraryPaths.length + (s.downloadsPath ? 1 : 0) + (s.jellyfin.enabled ? 1 : 0);
+  const ready = isOnline ? online + own > 0 : own > 0;
+  const status = !isOnline
+    ? own > 0
+      ? "OFFLINE · LOCAL VAULT"
+      : "OFFLINE"
+    : ready
+      ? [online ? `${online} SERVER${online > 1 ? "S" : ""}` : null, own ? `${own} LOCAL` : null].filter(Boolean).join(" · ")
+      : "SERVERS OFF";
   const go = (to: string) => {
     setMenu(false);
+    setThemesOpen(false);
     nav(to, { viewTransition: true });
   };
 
   return (
-    <header className="top" data-tauri-drag-region onDoubleClick={(e) => (e.target as HTMLElement).hasAttribute("data-tauri-drag-region") && w?.toggleMaximize()}>
-      <Link to="/" className="brand" viewTransition aria-label="AbixCine home">
-        <LogoMark size={28} />
-        <Wordmark />
-      </Link>
+    <>
+      <aside className="rail" aria-label="Primary navigation">
+        <Link to="/" className="rail-brand" viewTransition aria-label="AbixCine home" title="AbixCine">
+          <LogoMark size={28} />
+        </Link>
 
-      <nav className="dock" ref={dock} aria-label="Sections">
-        <span className="dock-pill" style={pill ? { transform: `translateX(${pill.x}px)`, width: pill.w } : { opacity: 0, width: 0 }} />
-        {NAV.map((n) => (
-          <NavLink key={n.to} to={n.to} end={n.to === "/"} className="dock-link" aria-label={n.label} title={n.label} viewTransition>
-            <Icon name={n.icon} size={17} />
-            <span>{n.label}</span>
-          </NavLink>
-        ))}
-      </nav>
+        <nav className="rail-nav" aria-label="Sections">
+          {NAV.map((n) => (
+            <NavLink
+              key={n.to}
+              to={n.to}
+              end={n.to === "/"}
+              className="rail-link"
+              aria-label={n.full}
+              title={`${n.code} · ${n.full}`}
+              viewTransition
+            >
+              <span className="rail-idx">{n.code}</span>
+              <Icon name={n.icon} size={16} />
+              <span className="rail-lbl">{n.label}</span>
+            </NavLink>
+          ))}
+        </nav>
 
-      <div className="top-end" data-tauri-drag-region>
-        {/* The glass is painted by ::before, so this capsule never becomes the containing block of
-            the menu's fixed scrim, nor a backdrop root that would stop the menu's own blur. */}
-        <div className="tools">
-          <button className="top-search" onClick={onOpenPalette} aria-label="Search and commands">
-            <Icon name="search" size={15} />
-            <span>Search</span>
-            <span className="keys"><kbd>Ctrl</kbd><kbd>K</kbd></span>
-          </button>
-          <Link to="/settings#sources" className={`status ${ready ? "" : "off"}`} title={ready ? "Servers that answer when you press play" : "Every server is switched off"} viewTransition>
+        <div className="rail-foot">
+          <Link
+            to="/settings#sources"
+            className={`rail-status ${ready ? "" : "off"}`}
+            title={ready ? `${status} — configure sources` : "Every server is switched off"}
+            viewTransition
+          >
             <i className="dot" />
-            <span>{status}</span>
+            <span>{online + own}</span>
           </Link>
-          <NavLink to="/settings" className="top-icon" aria-label="Settings" title="Settings" viewTransition>
+          <NavLink to="/settings" className="rail-icon" aria-label="Settings" title="Settings" viewTransition>
             <Icon name="gear" size={17} />
           </NavLink>
           {user ? (
             <div className="menu-wrap">
-              <button className="avatar-btn" onClick={() => setMenu((m) => !m)} aria-label="Account" aria-haspopup="menu" aria-expanded={menu}>
+              <button
+                className="avatar-btn"
+                onClick={() => {
+                  setMenu((m) => !m);
+                  setThemesOpen(false);
+                }}
+                aria-label="Account"
+                aria-haspopup="menu"
+                aria-expanded={menu}
+              >
                 <Avatar user={user} size={30} />
               </button>
               {menu && (
@@ -171,7 +208,7 @@ export function TitleBar({ onOpenPalette }: { onOpenPalette: () => void }) {
                   <div className="menu-scrim" onClick={() => setMenu(false)} />
                   <div className="menu" role="menu">
                     <div className="menu-head">
-                      <Avatar user={user} size={40} />
+                      <Avatar user={user} size={38} />
                       <div>
                         <strong>{user.name}</strong>
                         <span>{user.email}</span>
@@ -185,11 +222,118 @@ export function TitleBar({ onOpenPalette }: { onOpenPalette: () => void }) {
               )}
             </div>
           ) : (
-            <button className="btn glass sm" onClick={leaveGuest}>Sign in</button>
+            <button className="rail-signin" onClick={leaveGuest} title="Sign in" aria-label="Sign in">
+              <Icon name="user" size={16} />
+            </button>
           )}
         </div>
-        {showWin ? <WindowButtons /> : <span style={{ width: 14 }} />}
-      </div>
-    </header>
+      </aside>
+
+      <header
+        className="topbar"
+        data-tauri-drag-region
+        onDoubleClick={(e) => (e.target as HTMLElement).hasAttribute("data-tauri-drag-region") && w?.toggleMaximize()}
+      >
+        <div className="topbar-left" data-tauri-drag-region>
+          <Link to="/" viewTransition aria-label="AbixCine">
+            <Wordmark />
+          </Link>
+          <span className="topbar-sep" />
+          <span className="topbar-edition">{routeEdition(loc.pathname)}</span>
+          {!isOnline && (
+            <Link
+              to="/library"
+              className="topbar-offline"
+              title="No internet connection — local files and Downloads Vault still play"
+              viewTransition
+            >
+              <i aria-hidden /> OFFLINE
+            </Link>
+          )}
+          <span className="topbar-meta">
+            <span>·</span>
+            <span>{fmtClock(now)}</span>
+            <span>·</span>
+            <Link to="/settings#sources" className={`topbar-status ${ready ? "" : "off"}`} viewTransition>
+              <i className="dot" />
+              <span>{status}</span>
+            </Link>
+          </span>
+        </div>
+
+        <div className="topbar-right" data-tauri-drag-region>
+          <DownloadsPopover />
+          <div className="theme-studio">
+            <button
+              type="button"
+              className={`topbar-theme ${themesOpen ? "on" : ""}`}
+              onClick={() => {
+                setThemesOpen((o) => !o);
+                setMenu(false);
+              }}
+              aria-haspopup="dialog"
+              aria-expanded={themesOpen}
+              aria-label="Theme studio"
+              title="Color theme & ambient lighting"
+            >
+              <i className="tt-dot" aria-hidden />
+              <Icon name="palette" size={14} />
+            </button>
+            {themesOpen && (
+              <>
+                <div className="menu-scrim" onClick={() => setThemesOpen(false)} />
+                <div className="theme-popover" role="dialog" aria-label="Color theme studio">
+                  <div className="tp-pop-head">
+                    <span>ARCHIVE THEME</span>
+                    <button type="button" className="link-btn" onClick={() => go("/settings#appearance")}>
+                      All options
+                    </button>
+                  </div>
+                  <div className="tp-pop-list">
+                    {THEMES.map((t) => {
+                      const on = activeTheme === t.id;
+                      return (
+                        <button
+                          key={t.id}
+                          type="button"
+                          className={`theme-opt ${on ? "on" : ""}`}
+                          onClick={() => updateSettings({ theme: t.id })}
+                        >
+                          <span className="theme-dots" aria-hidden>
+                            <i style={{ background: t.swatches[0] }} />
+                            <i style={{ background: t.swatches[1] }} />
+                            <i style={{ background: t.swatches[2] }} />
+                          </span>
+                          <span className="theme-copy">
+                            <strong>{t.name}</strong>
+                            <small>{t.tagline}</small>
+                          </span>
+                          {on && <Icon name="check" size={14} className="theme-chk" />}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <label className="theme-dyn">
+                    <span>Dynamic poster accent</span>
+                    <input
+                      type="checkbox"
+                      className="switch"
+                      checked={dynamicLight}
+                      onChange={(e) => updateSettings({ dynamicLight: e.target.checked })}
+                    />
+                  </label>
+                </div>
+              </>
+            )}
+          </div>
+          <button className="topbar-search" onClick={onOpenPalette} aria-label="Search and commands">
+            <Icon name="search" size={14} />
+            <span>Search or jump…</span>
+            <span className="keys"><kbd>Ctrl</kbd><kbd>K</kbd></span>
+          </button>
+          {showWin ? <WindowButtons /> : <span style={{ width: 14 }} />}
+        </div>
+      </header>
+    </>
   );
 }

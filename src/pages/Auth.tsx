@@ -4,12 +4,12 @@ import { LogoMark, Wordmark } from "../components/Logo";
 import { WindowButtons } from "../components/TitleBar";
 import { ApiError, continueAsGuest, errorMessage, getApiBase, hadAccount, isWaking, setApiBase, signIn, signUp, wakeServer } from "../lib/account";
 import { ANIME_FEEDS, loadAnimeFeed } from "../lib/anilist";
+import { setStageLight } from "../lib/light";
+import type { Media } from "../lib/types";
 
-/** Sign in / create account. A slow drifting poster wall sits behind the glass card. */
+/** Split Editorial Theater Lobby: single curated cinema frame on the left, matte check-in console on the right. */
 export function Auth() {
-  // Returning users land on Sign in, first-timers on Sign up.
   const [mode, setMode] = useState<"in" | "up">(() => (hadAccount() ? "in" : "up"));
-  /** Seconds spent waiting for a sleeping server, or null when not waiting. */
   const [waking, setWaking] = useState<number | null>(null);
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
@@ -18,8 +18,8 @@ export function Auth() {
   const [err, setErr] = useState<string | null>(null);
   const [server, setServer] = useState(getApiBase());
   const [showServer, setShowServer] = useState(false);
-  // Real artwork for the wall: AniList is public, so it works before sign-in.
-  const [posters, setPosters] = useState<string[]>([]);
+  const [stills, setStills] = useState<Media[]>([]);
+  const [slide, setSlide] = useState(0);
   const mountedRef = useRef(true);
   const wakeCtlRef = useRef<AbortController | null>(null);
 
@@ -27,7 +27,9 @@ export function Auth() {
     mountedRef.current = true;
     loadAnimeFeed(ANIME_FEEDS[0])
       .then((list) => {
-        if (mountedRef.current) setPosters(list.map((m) => m.poster).filter((p): p is string => !!p));
+        if (!mountedRef.current) return;
+        const featured = list.filter((m) => m.backdrop || m.poster).slice(0, 6);
+        setStills(featured);
       })
       .catch(() => {});
     return () => {
@@ -36,6 +38,17 @@ export function Auth() {
       wakeCtlRef.current = null;
     };
   }, []);
+
+  useEffect(() => {
+    if (stills.length < 2) return;
+    const t = window.setInterval(() => setSlide((n) => (n + 1) % stills.length), 8000);
+    return () => window.clearInterval(t);
+  }, [stills.length]);
+
+  const currentStill = stills[slide % Math.max(1, stills.length)];
+  useEffect(() => {
+    if (currentStill) setStageLight(currentStill);
+  }, [currentStill]);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -56,7 +69,6 @@ export function Auth() {
       if (!isWaking(e)) {
         setErr(errorMessage(e));
       } else {
-        // Free hosting sleeps when idle: wait for it, then try once more, showing the wait.
         setWaking(0);
         const up = await wakeServer((s) => mountedRef.current && !ctl.signal.aborted && setWaking(s), 90_000, ctl.signal);
         if (!mountedRef.current || ctl.signal.aborted) return;
@@ -72,95 +84,113 @@ export function Auth() {
     }
   };
 
-  // 28 tiles; until posters arrive (or offline) they're tinted glass in the brand hues.
-  const wall = Array.from({ length: 49 }, (_, i) => ({ poster: posters.length ? posters[i % posters.length] : undefined, hue: (i * 47) % 360 }));
   return (
     <div className="auth">
-      <div className="auth-wall" aria-hidden>
-        {[0, 1, 2, 3, 4, 5, 6].map((col) => (
-          <div key={col} className="auth-col" style={{ ["--d" as any]: `${col % 2 ? -1 : 1}`, ["--t" as any]: `${60 + col * 9}s` }}>
-            {[...wall.slice(col * 7, col * 7 + 7), ...wall.slice(col * 7, col * 7 + 7)].map((m, i) => (
-              <div key={i} className={`auth-tile ${m.poster ? "img" : ""}`} style={{ ["--h" as any]: m.hue, ...(m.poster ? { backgroundImage: `url(${m.poster})` } : {}) }} />
-            ))}
-          </div>
-        ))}
-      </div>
-      <div className="auth-scrim" />
-      {/* The window is borderless: this strip moves it, and carries its buttons, before sign-in too. */}
       <div className="auth-bar" data-tauri-drag-region>
         <WindowButtons />
       </div>
 
-      <div className="auth-pitch">
-        <h2>Every screen.<br />One <em>cinema.</em></h2>
-        <ul>
-          <li>Films · series · anime</li>
-          <li>No ads, ever</li>
-          <li>Your own files first</li>
-          <li>Sub &amp; dub in one tap</li>
-        </ul>
-      </div>
+      <section className="auth-stage" aria-hidden>
+        <div className="auth-media">
+          {stills.map((m, idx) => {
+            const url = m.backdrop ?? m.poster;
+            return (
+              <div
+                key={m.key}
+                className={`auth-slide ${idx === slide % stills.length ? "on" : ""}`}
+                style={url ? { backgroundImage: `url(${url})` } : undefined}
+              />
+            );
+          })}
+          {!stills.length && <div className="auth-slide on fallback" />}
+        </div>
+        <div className="auth-stage-scrim" />
+        <span className="gate-brackets" aria-hidden><i /></span>
 
-      <form className="auth-card" onSubmit={submit}>
-        {/* Scrolls inside the pane on very short windows, so the pane's rim stays put. */}
-        <div className="auth-scroll">
-          <div className="auth-brand">
-            <LogoMark size={40} />
-            <Wordmark />
+        <div className="auth-pitch">
+          <div className="kicker">
+            <b>ABIXCINE // ARCHIVE</b>
+            <i />
+            <em>Private Screening Room</em>
           </div>
-          <h1>{mode === "up" ? "Create your account" : "Welcome back"}</h1>
-          <p className="muted">{mode === "up" ? "Your progress, list and preferences follow you to every device." : "Pick up right where you left off."}</p>
-
-          <div className="auth-switch seg" role="tablist" aria-label="Account">
-            <span className="seg-thumb" style={{ transform: `translateX(${mode === "up" ? 0 : 100}%)` }} />
-            <button type="button" role="tab" aria-selected={mode === "up"} className={mode === "up" ? "on" : ""} onClick={() => { setMode("up"); setErr(null); }}>Sign up</button>
-            <button type="button" role="tab" aria-selected={mode === "in"} className={mode === "in" ? "on" : ""} onClick={() => { setMode("in"); setErr(null); }}>Sign in</button>
-          </div>
-
-          <div className={`auth-fields ${mode}`}>
-            {mode === "up" && (
-              <label className="in-field">
-                <Icon name="user" size={16} />
-                <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Display name" autoComplete="nickname" />
-              </label>
-            )}
-            <label className="in-field">
-              <Icon name="mail" size={16} />
-              <input type="email" required value={email} onChange={(e) => setEmail(e.target.value)} placeholder="Email" autoComplete="email" />
-            </label>
-            <label className="in-field">
-              <Icon name="lock" size={16} />
-              <input type="password" required minLength={8} value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Password (8+ characters)" autoComplete={mode === "up" ? "new-password" : "current-password"} />
-            </label>
-          </div>
-
-          {err && <div className="auth-err" role="alert">{err}</div>}
-          {waking != null && (
-            <div className="auth-wake" role="status">
-              <span className="mini-spin" /> Waking the AbixCine server… {waking}s
-              <small>Free hosting sleeps after 15 idle minutes. First sign-in of the day can take up to a minute.</small>
+          <h2>Every screen.<br />One <em>cinema.</em></h2>
+          <ul>
+            <li>Films · Series · Anime</li>
+            <li>Local vault first</li>
+            <li>Sub &amp; Dub in one tap</li>
+            <li>Zero ads, ever</li>
+          </ul>
+          {currentStill && (
+            <div className="auth-caption">
+              <span>STILL № {String((slide % stills.length) + 1).padStart(2, "0")}</span>
+              <b>{currentStill.title}</b>
+              {currentStill.year && <span>{currentStill.year}</span>}
             </div>
           )}
-
-          <button className="btn play wide" disabled={busy}>
-            {busy ? <span className="mini-spin" /> : <>{mode === "up" ? "Create account" : "Sign in"} <Icon name="arrowR" size={16} /></>}
-          </button>
-
-          <button type="button" className="btn glass wide guest" onClick={continueAsGuest}>
-            Continue without an account
-          </button>
-          <p className="auth-fine">Your folders and Jellyfin work offline. Progress stays on this PC until you sign in.</p>
-
-          <button type="button" className="link-btn" onClick={() => setShowServer((s) => !s)}>
-            <Icon name="globe" size={13} /> Server: {server.replace(/^https?:\/\//, "")}
-          </button>
-          {showServer && (
-            <label className="in-field">
-              <input value={server} onChange={(e) => setServer(e.target.value)} placeholder="https://abixcine-api.onrender.com" aria-label="Server address" />
-            </label>
-          )}
         </div>
-      </form>
+      </section>
+
+      <div className="auth-panel">
+        <form className="auth-card" onSubmit={submit}>
+          <div className="auth-scroll">
+            <div className="auth-brand">
+              <LogoMark size={36} />
+              <Wordmark />
+            </div>
+            <h1>{mode === "up" ? "Create account" : "Welcome back"}</h1>
+            <p className="muted">{mode === "up" ? "Your watchlist, playback progress, and settings follow you across devices." : "Pick up right where you left off."}</p>
+
+            <div className="auth-switch seg" role="tablist" aria-label="Account">
+              <span className="seg-thumb" style={{ transform: `translateX(${mode === "up" ? 0 : 100}%)` }} />
+              <button type="button" role="tab" aria-selected={mode === "up"} className={mode === "up" ? "on" : ""} onClick={() => { setMode("up"); setErr(null); }}>Sign up</button>
+              <button type="button" role="tab" aria-selected={mode === "in"} className={mode === "in" ? "on" : ""} onClick={() => { setMode("in"); setErr(null); }}>Sign in</button>
+            </div>
+
+            <div className={`auth-fields ${mode}`}>
+              {mode === "up" && (
+                <label className="in-field">
+                  <Icon name="user" size={16} />
+                  <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Display name" autoComplete="nickname" />
+                </label>
+              )}
+              <label className="in-field">
+                <Icon name="mail" size={16} />
+                <input type="email" required value={email} onChange={(e) => setEmail(e.target.value)} placeholder="Email" autoComplete="email" />
+              </label>
+              <label className="in-field">
+                <Icon name="lock" size={16} />
+                <input type="password" required minLength={8} value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Password (8+ characters)" autoComplete={mode === "up" ? "new-password" : "current-password"} />
+              </label>
+            </div>
+
+            {err && <div className="auth-err" role="alert">{err}</div>}
+            {waking != null && (
+              <div className="auth-wake" role="status">
+                <span className="mini-spin" /> Waking the AbixCine server… {waking}s
+                <small>Free hosting sleeps after 15 idle minutes. First sign-in of the day can take up to a minute.</small>
+              </div>
+            )}
+
+            <button className="btn play wide" disabled={busy}>
+              {busy ? <span className="mini-spin" /> : <>{mode === "up" ? "Create account" : "Sign in"} <Icon name="arrowR" size={16} /></>}
+            </button>
+
+            <button type="button" className="btn glass wide guest" onClick={continueAsGuest}>
+              Continue without an account
+            </button>
+            <p className="auth-fine">Your folders and Jellyfin work offline. Progress stays on this PC until you sign in.</p>
+
+            <button type="button" className="link-btn" onClick={() => setShowServer((s) => !s)}>
+              <Icon name="globe" size={13} /> Server: {server.replace(/^https?:\/\//, "")}
+            </button>
+            {showServer && (
+              <label className="in-field">
+                <input value={server} onChange={(e) => setServer(e.target.value)} placeholder="https://abixcine-api.onrender.com" aria-label="Server address" />
+              </label>
+            )}
+          </div>
+        </form>
+      </div>
     </div>
   );
 }

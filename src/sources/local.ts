@@ -239,6 +239,45 @@ export function audioOf(path: string): "sub" | "dub" | "dual" {
   return DUB_RX.test(path) ? "dub" : "sub";
 }
 
+/** Build a playable local StreamCandidate with sidecar and embedded text subtitle probing. */
+export async function buildLocalStreamCandidate(
+  file: LibFile,
+  opts: {
+    providerId: string;
+    providerName: string;
+    label?: string;
+    quality?: number;
+    audio?: "sub" | "dub" | "dual";
+    signal?: AbortSignal;
+  },
+): Promise<StreamCandidate> {
+  const canProbe = isTauri();
+  const isHls = file.path.toLowerCase().endsWith(".m3u8");
+  const sidecars = file.subs?.map((p) => sidecarTrack(p, file.name)) ?? [];
+  const rawEmbedded =
+    canProbe && !isHls && !opts.signal?.aborted
+      ? await probeEmbeddedSubtitles(file, opts.signal)
+      : [];
+  const embedded = Array.isArray(rawEmbedded)
+    ? rawEmbedded
+        .filter((sub) => sub && sub.isText !== false && typeof sub.index === "number")
+        .map(embeddedTrack)
+    : [];
+  const subtitles = [...sidecars, ...embedded];
+  return {
+    providerId: opts.providerId,
+    providerName: opts.providerName,
+    label: opts.label ?? file.name + (opts.audio ? (opts.audio === "dual" ? " · dual audio" : ` · ${opts.audio}`) : ""),
+    url: convertFileSrc(file.path),
+    kind: isHls ? "hls" : "file",
+    via: "direct",
+    ...(isHls ? {} : { localPath: file.path }),
+    quality: opts.quality ?? qualityOf(file.name),
+    ...(opts.audio ? { audio: opts.audio } : {}),
+    ...(file.subs !== undefined || subtitles.length ? { subtitles } : {}),
+  };
+}
+
 export const localProvider: SourceProvider = {
   id: "local",
   name: "Local library",
@@ -253,7 +292,7 @@ export const localProvider: SourceProvider = {
     const dubFallbacks: { file: LibFile }[] = [];
     for (const f of files) {
       // Match against the file name plus its parent folders, since many libraries are "Show/Season 1/01.mkv".
-      // Only folders inside the library count: the library's own location ("D:\\Home\\…") is not a title.
+      // Only folders inside the library count: the library's own location ("D:\Home\…") is not a title.
       const hay = relativeToLibrary(f.path, s.libraryPaths).split(/[\\/]/).slice(-3).join(" ");
       if (!titleMatches(hay, req)) continue;
       const ep = parseEpisode(f.name, f.path);
@@ -278,34 +317,15 @@ export const localProvider: SourceProvider = {
     }
     const chosen = matched.length ? matched : dubFallbacks.map(({ file }) => ({ file, audio: undefined }));
 
-    const canProbe = isTauri();
     return Promise.all(
-      chosen.map(async ({ file: f, audio }): Promise<StreamCandidate> => {
-        const isHls = f.path.toLowerCase().endsWith(".m3u8");
-        const sidecars = f.subs?.map((p) => sidecarTrack(p, f.name)) ?? [];
-        const rawEmbedded =
-          canProbe && !isHls && !signal?.aborted
-            ? await probeEmbeddedSubtitles(f, signal)
-            : [];
-        const embedded = Array.isArray(rawEmbedded)
-          ? rawEmbedded
-              .filter((sub) => sub && sub.isText !== false && typeof sub.index === "number")
-              .map(embeddedTrack)
-          : [];
-        const subtitles = [...sidecars, ...embedded];
-        return {
+      chosen.map(({ file: f, audio }) =>
+        buildLocalStreamCandidate(f, {
           providerId: "local",
           providerName: "Local library",
-          label: f.name + (audio ? (audio === "dual" ? " · dual audio" : ` · ${audio}`) : ""),
-          url: convertFileSrc(f.path),
-          kind: isHls ? "hls" : "file",
-          via: "direct",
-          ...(isHls ? {} : { localPath: f.path }),
-          quality: qualityOf(f.name),
-          ...(audio ? { audio } : {}),
-          ...(f.subs !== undefined || subtitles.length ? { subtitles } : {}),
-        };
-      }),
+          audio,
+          signal,
+        }),
+      ),
     );
   },
 };

@@ -10,7 +10,9 @@ import { Icon } from "../components/Icon";
 import { SubtitleOverlay } from "../components/SubtitleOverlay";
 import { errorMessage, getApiBase, leaveGuest, signOut, updateProfile, useAuth } from "../lib/account";
 import { loadDebridConfig, saveDebridConfig, type DebridProvider } from "../lib/debrid";
+import { clearDownloadsConfig, configureDownloadsRoot, openDownloadsFolder, useDownloads } from "../lib/downloads";
 import { toggleSource, updateSettings, useSettings } from "../lib/settings";
+import { resolveTheme, THEMES } from "../lib/themes";
 import { clearSubtitleSearchCache } from "../lib/subtitleProviders";
 import {
   COMMON_SUB_LANGS,
@@ -97,6 +99,7 @@ const PREVIEW_SECONDARY_CUES: SubtitleCue[] = [
 
 const SECTIONS = [
   { id: "account", label: "Account", icon: "user" },
+  { id: "appearance", label: "Appearance", icon: "palette" },
   { id: "sources", label: "Servers", icon: "layers" },
   { id: "extensions", label: "Addons & plugins", icon: "puzzle" },
   { id: "playback", label: "Playback", icon: "play" },
@@ -143,6 +146,8 @@ export function Settings() {
   const [tmdb, setTmdb] = useState(s.tmdbKey);
   const [jf, setJf] = useState(s.jellyfin);
   const [scan, setScan] = useState<string | null>(null);
+  const dl = useDownloads();
+  const [dlNote, setDlNote] = useState<string | null>(null);
   const [jfTest, setJfTest] = useState<string | null>(null);
   const [name, setName] = useState(user?.name ?? "");
   const [profileMsg, setProfileMsg] = useState<string | null>(null);
@@ -518,6 +523,22 @@ export function Settings() {
       if (mountedRef.current) setScan(`Scan failed: ${e instanceof Error ? e.message : String(e)}`);
     }
   };
+  const chooseDownloadFolder = async () => {
+    setDlNote(null);
+    try {
+      const dir = await open({
+        directory: true,
+        multiple: false,
+        defaultPath: s.downloadsPath ?? dl.defaultDir ?? undefined,
+        title: "Choose or create a Downloads folder",
+      });
+      if (!mountedRef.current || typeof dir !== "string" || !dir.trim()) return;
+      const root = await configureDownloadsRoot(dir);
+      if (mountedRef.current && root) setDlNote("Downloads vault ready");
+    } catch (e: unknown) {
+      if (mountedRef.current) setDlNote(`Couldn't set folder: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
   const testJellyfin = async () => {
     const snap = jf;
     const base = snap.url.trim().replace(/\/$/, "");
@@ -596,6 +617,52 @@ export function Settings() {
           </div>
         </section>
       )}
+
+      <section className="panel" id="appearance">
+        <h2>Appearance &amp; Theme</h2>
+        <p className="muted">Choose a curated screening room palette or let dynamic ambient light calibrate accents from the artwork in focus.</p>
+        <div className="theme-grid" role="radiogroup" aria-label="Color theme">
+          {THEMES.map((t) => {
+            const on = resolveTheme(s.theme) === t.id;
+            return (
+              <button
+                key={t.id}
+                type="button"
+                role="radio"
+                aria-checked={on}
+                className={`theme-card ${on ? "on" : ""}`}
+                onClick={() => updateSettings({ theme: t.id })}
+              >
+                <div className="tc-swatches" aria-hidden>
+                  <span style={{ background: t.swatches[0] }} />
+                  <span style={{ background: t.swatches[1] }} />
+                  <span style={{ background: t.swatches[2] }} />
+                  <span style={{ background: t.swatches[3] }} />
+                </div>
+                <div className="tc-copy">
+                  <div className="tc-head">
+                    <strong>{t.name}</strong>
+                    <span className="badge dim">{t.mode === "light" ? "Light" : "Dark"}</span>
+                  </div>
+                  <small className="muted">{t.tagline}</small>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+        <label className="setting-line toggle" style={{ marginTop: 14 }}>
+          <div>
+            <strong>Dynamic poster light</strong>
+            <span className="muted">Sample accent highlights and soft corner glows from the active film or show. Switch off to keep the theme's signature accent locked.</span>
+          </div>
+          <input
+            type="checkbox"
+            className="switch"
+            checked={s.dynamicLight !== false}
+            onChange={(e) => updateSettings({ dynamicLight: e.target.checked })}
+          />
+        </label>
+      </section>
 
       <section className="panel" id="sources" ref={sourcesRef}>
         <h2>Servers</h2>
@@ -688,6 +755,65 @@ export function Settings() {
             {s.libraryPaths.length > 0 && <button className="btn btn-glass sm" onClick={() => rescan()}>Rescan</button>}
             {scan && <span className="muted">{scan}</span>}
             {!isTauri() && <span className="muted">Folder access works in the desktop app.</span>}
+          </div>
+        </div>
+
+        <div className="source-block">
+          <div className="source-head">
+            <Icon name="download" />
+            <strong>Downloads folder</strong>
+            <span className={`badge ${s.downloadsPath ? "on" : ""}`}>
+              {dl.items.length > 0 ? `${dl.items.length} saved` : s.downloadsPath ? "Ready" : "Not set up"}
+            </span>
+          </div>
+          <p className="muted">
+            Downloaded titles are sorted automatically into <code>Movies/</code>, <code>Series/</code>, and <code>Anime/</code> subfolders and played first as local servers—even when offline.
+          </p>
+          {s.downloadsPath ? (
+            <div className="path-row">
+              <code>{s.downloadsPath}</code>
+              <button
+                type="button"
+                className="icon-btn"
+                aria-label="Disconnect Downloads folder"
+                title="Stop using this Downloads folder (files stay on disk)"
+                onClick={() => {
+                  setDlNote(null);
+                  clearDownloadsConfig();
+                }}
+              >
+                <Icon name="x" size={14} />
+              </button>
+            </div>
+          ) : dl.defaultDir ? (
+            <div className="path-row">
+              <code>Default: {dl.defaultDir}</code>
+            </div>
+          ) : null}
+          <div className="field-row">
+            <button type="button" className="btn btn-ion sm" onClick={() => void chooseDownloadFolder()} disabled={!isTauri()}>
+              <Icon name="folder" size={15} /> {s.downloadsPath ? "Change folder" : "Choose or create folder"}
+            </button>
+            {dl.defaultDir && dl.defaultDir !== s.downloadsPath && (
+              <button
+                type="button"
+                className="btn btn-glass sm"
+                disabled={!isTauri()}
+                onClick={() => {
+                  setDlNote(null);
+                  void configureDownloadsRoot(dl.defaultDir!).then(() => mountedRef.current && setDlNote("Using default folder"));
+                }}
+              >
+                Use default
+              </button>
+            )}
+            {s.downloadsPath && (
+              <button type="button" className="btn btn-glass sm" onClick={() => void openDownloadsFolder(s.downloadsPath)}>
+                Open folder
+              </button>
+            )}
+            {dlNote && <span className="muted">{dlNote}</span>}
+            {!isTauri() && <span className="muted">Offline downloads work in the desktop app.</span>}
           </div>
         </div>
 

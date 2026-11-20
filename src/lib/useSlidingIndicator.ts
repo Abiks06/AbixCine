@@ -3,7 +3,7 @@ import { useCallback, useRef } from "react";
 /**
  * A selector that glides between its options instead of snapping. Put the returned ref on the
  * group; it measures the selected child (`.on` by default) and writes --ind-x / --ind-y / --ind-w /
- * --ind-h on the group, and styles/frost.css draws the pill (or underline) on the group's ::before.
+ * --ind-h on the group, and styles/archival.css draws the indicator on the group's ::before.
  *
  * It watches the group itself, so call sites don't pass dependencies: a class change, a re-render
  * that swaps the children, or a resize all re-measure on the next frame. Offsets are layout

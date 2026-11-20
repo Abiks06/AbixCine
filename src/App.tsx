@@ -3,12 +3,18 @@ import { isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { createHashRouter, Outlet, RouterProvider, useLocation, useNavigationType, useRouteError } from "react-router-dom";
 import { CommandPalette } from "./components/CommandPalette";
+import { DownloadFolderModal } from "./components/DownloadFolderModal";
+import { QuickDossier } from "./components/QuickDossier";
 import { Splash } from "./components/Splash";
 import { TitleBar } from "./components/TitleBar";
 import { Toasts } from "./components/Toasts";
 import { UpdateToast } from "./components/UpdateToast";
 import { bootAccount, useAuth } from "./lib/account";
+import { closeDossier, lookupMedia, openDossier } from "./lib/dossier";
+import { initDownloads } from "./lib/downloads";
+import { syncThemeLight } from "./lib/light";
 import { getSettings, useSettings } from "./lib/settings";
+import { applyThemeToDom, resolveTheme } from "./lib/themes";
 import { installErrorLog, reportAppReady } from "./lib/startup";
 import { installTvMode, setTvMode } from "./lib/tvMode";
 import { Auth } from "./pages/Auth";
@@ -102,11 +108,20 @@ function Shell() {
 
   // First render reached: this launch started fine (see src-tauri/src/diagnostics.rs).
   useEffect(() => reportAppReady(), []);
+  useEffect(() => {
+    void initDownloads();
+  }, []);
 
   // Reduced motion lives on <html>, where it can reach ::view-transition pseudo-elements too.
   useEffect(() => {
     document.documentElement.classList.toggle("reduce-motion", s.reduceMotion);
   }, [s.reduceMotion]);
+
+  // Apply selected cinema color grade & dynamic lighting rule.
+  useEffect(() => {
+    applyThemeToDom(resolveTheme(s.theme), s.dynamicLight !== false);
+    syncThemeLight();
+  }, [s.theme, s.dynamicLight]);
 
   // TV mode (lib/tvMode): larger everything, on its own or while a controller is connected.
   useEffect(() => {
@@ -185,6 +200,10 @@ function Shell() {
   }, [watching]);
 
   useEffect(() => {
+    closeDossier();
+  }, [loc.pathname]);
+
+  useEffect(() => {
     if (!inApp) return;
     const onKey = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
@@ -198,6 +217,15 @@ function Shell() {
       if (e.key === "/" && !typing && !e.ctrlKey && !e.metaKey && !e.altKey && !location.hash.startsWith("#/watch/")) {
         e.preventDefault();
         setPalette(true);
+        return;
+      }
+      if ((e.key === "i" || e.key === "I") && !typing && !e.ctrlKey && !e.metaKey && !e.altKey && !location.hash.startsWith("#/watch/") && !document.querySelector(".palette-scrim")) {
+        const key = t?.closest<HTMLElement>("[data-media-key]")?.dataset.mediaKey;
+        const hit = key ? lookupMedia(key) : undefined;
+        if (hit) {
+          e.preventDefault();
+          openDossier(hit);
+        }
       }
     };
     window.addEventListener("keydown", onKey);
@@ -218,6 +246,8 @@ function Shell() {
               <Outlet />
             </RouteErrorBoundary>
           </main>
+          <QuickDossier />
+          <DownloadFolderModal />
           <CommandPalette open={palette} onClose={() => setPalette(false)} />
           {!watching && <UpdateToast />}
           <Toasts />

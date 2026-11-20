@@ -63,7 +63,7 @@ const slim = (m: Media & { canonicalKey?: string }): Media => ({
   rating: m.rating,
   poster: m.poster,
   backdrop: m.backdrop,
-  genres: [],
+  genres: (m.genres ?? []).slice(0, 3),
   hue: m.hue,
   ...(m.malId ? { malId: m.malId } : {}),
   ...(m.originalLanguage ? { originalLanguage: m.originalLanguage } : {}),

@@ -158,6 +158,7 @@ export const jellyfinProvider: SourceProvider = {
             providerName: "Jellyfin server",
             label: target.Name + (target.Height ? ` · ${target.Height}p` : "") + (t.audio === "dual" ? " · dual audio" : ""),
             url: streamUrl(url, apiKey, target.Id, t.sourceId, t.audioIndex),
+            downloadUrl: `${url.replace(/\/$/, "")}/Items/${target.Id}/Download?api_key=${encodeURIComponent(apiKey)}`,
             kind: "hls",
             via: "direct",
             quality: target.Height || undefined,

@@ -1,4 +1,13 @@
+import { isTauri } from "@tauri-apps/api/core";
 import type { KeyboardEvent } from "react";
+import { isDownloadableCandidate } from "../lib/downloadRank";
+import {
+  findDownloadedEntries,
+  findDownloadJob,
+  pauseDownload,
+  resumeDownload,
+  useDownloads,
+} from "../lib/downloads";
 import { fmtRuntime } from "../sources/identity";
 import { candKey, candLine } from "../sources/registry";
 import type { Lane, SessionSnapshot } from "../sources/session";
@@ -27,6 +36,7 @@ const fmtMs = (ms?: number) => (ms == null || ms <= 0 ? null : ms >= 1000 ? `${(
 
 /** How this stream reaches the screen, in two words or fewer. */
 export function viaLabel(c: StreamCandidate) {
+  if (c.providerId === "downloads") return "Offline";
   if (c.providerId === "local") return "This PC";
   if (c.providerId === "jellyfin") return "Jellyfin";
   if (c.providerId === "manual") return "Link";
@@ -142,6 +152,8 @@ interface Props {
   /** What that row is doing. */
   busyNote?: string;
   onPick: (c: StreamCandidate) => void;
+  /** Trigger download from a downloadable server row (renders sibling action button). */
+  onDownload?: (c: StreamCandidate) => void;
   /** Show at most this many rows, ready ones first. */
   limit?: number;
   /** Group headings (off for the compact title-page card). */
@@ -163,7 +175,10 @@ function moveFocus(e: KeyboardEvent<HTMLDivElement>) {
   rows[next].focus();
 }
 
-export function SourceBoard({ snap, playingKey, busyKey, busyNote = "Checking…", onPick, limit, grouped = true, rows: given }: Props) {
+export function SourceBoard({ snap, playingKey, busyKey, busyNote = "Checking…", onPick, onDownload, limit, grouped = true, rows: given }: Props) {
+  const { jobs, items } = useDownloads();
+  const desktop = isTauri();
+  const savedItems = findDownloadedEntries(snap.req, items);
   const all = given ?? boardRows(snap, playingKey);
   const pickKey = snap.pick ? candKey(snap.pick) : undefined;
   const order: RowState[] = ["playing", "ready", "checking", "searching", "waiting", "failed"];
@@ -175,6 +190,15 @@ export function SourceBoard({ snap, playingKey, busyKey, busyNote = "Checking…
     const busy = r.state === "checking" || r.state === "searching" || (!!busyKey && busyKey === r.id);
     const q = c && (r.state === "ready" || r.state === "playing") ? qualityLabel(c) : null;
     const audio = c ? audioLabel(c) : null;
+    const via = c && (r.state === "ready" || r.state === "playing") ? viaLabel(c) : null;
+    const downloadable = Boolean(onDownload && desktop && c && isDownloadableCandidate(c));
+    const dlJob = downloadable && c ? findDownloadJob(snap.req, c, jobs) : undefined;
+    const dlBusy =
+      dlJob && (dlJob.status === "queued" || dlJob.status === "downloading" || dlJob.status === "remuxing");
+    const dlPaused = dlJob?.status === "paused";
+    const dlFailed = dlJob?.status === "failed";
+    const dlSaved = Boolean(c && savedItems.some((it) => it.providerId === c.providerId));
+
     const title =
       !c
         ? r.note
@@ -189,9 +213,10 @@ export function SourceBoard({ snap, playingKey, busyKey, busyNote = "Checking…
               : r.state === "failed"
                 ? `Try ${r.name} again`
                 : `Check ${r.name} and play`;
-    return (
+
+    const playBtn = (
       <button
-        key={r.id}
+        key={downloadable ? undefined : r.id}
         type="button"
         className={`sb-row ${r.state}${r.suspect ? " suspect" : ""} ${c && candKey(c) === pickKey ? "pick" : ""}`}
         disabled={!c || busy || r.state === "playing"}
@@ -213,7 +238,7 @@ export function SourceBoard({ snap, playingKey, busyKey, busyNote = "Checking…
           {r.suspect ? (
             <b className="warn">Other title?</b>
           ) : (
-            c && (r.state === "ready" || r.state === "playing") && <b className="via">{viaLabel(c)}</b>
+            via && <b className={`via ${via === "Offline" ? "offline" : ""}`}>{via}</b>
           )}
         </span>
         <span className="sb-act">
@@ -228,6 +253,52 @@ export function SourceBoard({ snap, playingKey, busyKey, busyNote = "Checking…
           )}
         </span>
       </button>
+    );
+
+    if (!downloadable || !c || !onDownload) return playBtn;
+
+    const dlLabel = dlBusy
+      ? dlJob.status === "remuxing"
+        ? "Remuxing…"
+        : `Pause download (${Math.round(dlJob.percent)}%)`
+      : dlPaused
+        ? `Resume download (${Math.round(dlJob.percent)}%)`
+        : dlFailed
+          ? `Retry download from ${r.name}`
+          : dlSaved
+            ? `Saved from ${r.name} (click to download again)`
+            : `Download from ${r.name}`;
+
+    return (
+      <div className="sb-item" key={r.id}>
+        {playBtn}
+        <button
+          type="button"
+          className={`sb-dl ${dlBusy ? "busy" : ""} ${dlPaused ? "paused" : ""} ${dlSaved && !dlBusy && !dlPaused ? "saved" : ""}`}
+          title={dlLabel}
+          aria-label={dlLabel}
+          disabled={dlJob?.status === "remuxing"}
+          onClick={() => {
+            if (dlBusy && dlJob) {
+              void pauseDownload(dlJob.id);
+            } else if ((dlPaused || dlFailed) && dlJob) {
+              void resumeDownload(dlJob.id);
+            } else {
+              onDownload(c);
+            }
+          }}
+        >
+          {dlBusy ? (
+            <span className="sb-dl-pct">{dlJob.status === "remuxing" ? "…" : `${Math.round(dlJob.percent)}%`}</span>
+          ) : dlPaused ? (
+            <Icon name="play" size={12} />
+          ) : dlSaved ? (
+            <Icon name="check" size={13} />
+          ) : (
+            <Icon name="download" size={13} />
+          )}
+        </button>
+      </div>
     );
   };
 

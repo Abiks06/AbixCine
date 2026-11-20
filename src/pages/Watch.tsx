@@ -1,5 +1,7 @@
+import { isTauri } from "@tauri-apps/api/core";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { findOfflineDetail, startDownload } from "../lib/downloads";
 import { Player, type EpisodeNav } from "../components/Player";
 import { Art, sized } from "../components/Art";
 import { seedState } from "../components/Card";
@@ -67,6 +69,8 @@ export function Watch() {
   const d: MediaDetail | undefined = useMemo(() => {
     if (detail.data) return detail.data;
     if (!detail.error) return undefined;
+    const offline = findOfflineDetail(key) ?? findOfflineDetail(canonicalKey);
+    if (offline) return offline;
     const m = savedEntry?.media ?? list.find((w) => w.media.key === key || w.media.key === canonicalKey)?.media;
     return m ? { ...m, cast: [], crew: [], related: [] } : undefined;
   }, [detail.data, detail.error, key, canonicalKey, list, savedEntry]);
@@ -409,7 +413,7 @@ export function Watch() {
   const inAudio = audio ? ` in ${audio === "dub" ? "English dub" : "sub"}` : "";
   const fmtMs = (ms?: number) => (ms == null || ms <= 0 ? null : ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${ms} ms`);
   const pct = pick ? 1 : total ? 0.08 + (answered / total) * 0.8 : 0.2;
-  const hasLocal = snap?.lanes.some((l) => l.providerId === "local");
+  const hasLocal = snap?.lanes.some((l) => l.providerId === "local" || l.providerId === "downloads");
 
   return (
     <div className="race-page">
@@ -558,7 +562,14 @@ export function Watch() {
               <span className={`auto ${pick ? "ok" : ""}`}>{pick ? "LOCKED" : snap?.busy ? "LIVE" : "DONE"}</span>
             </span>
           </div>
-          {snap && <SourceBoard snap={snap} busyKey={busyKey} onPick={(c) => void playFrom(c)} />}
+          {snap && (
+            <SourceBoard
+              snap={snap}
+              busyKey={busyKey}
+              onPick={(c) => void playFrom(c)}
+              onDownload={req && isTauri() ? (c) => void startDownload(req, c, d ?? undefined) : undefined}
+            />
+          )}
           <div className="rlog">
             {pick ? (
               <>→ <b>{pick.providerName}</b>{pick.why?.length ? ` · ${pick.why.join(", ")}` : ""}{snap?.busy ? " · backups keep checking" : ""}</>

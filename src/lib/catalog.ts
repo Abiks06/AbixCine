@@ -1,4 +1,5 @@
 import { anilistDetail, animeEpisodes, animeFranchiseNodes } from "./anilist";
+import { findOfflineDetail, findOfflineSeasonEpisodes } from "./downloads";
 import {
   checkEpisodeAvailability,
   clampEpisode,
@@ -106,7 +107,13 @@ export function getDetail(key: string): Promise<MediaDetail> {
     }
 
     return tmdbDetail(cleanKey);
-  })().finally(() => inflightDetail.delete(cleanKey));
+  })()
+    .catch((err) => {
+      const offline = findOfflineDetail(cleanKey);
+      if (offline) return offline;
+      throw err;
+    })
+    .finally(() => inflightDetail.delete(cleanKey));
 
   inflightDetail.set(cleanKey, p);
   return p;
@@ -155,8 +162,10 @@ export async function getSeasonEpisodes(
   if (running) return running;
 
   const task = (async (): Promise<Episode[]> => {
+    const fallbackEps = findOfflineSeasonEpisodes(detail.canonicalKey ?? detail.key, seasonObj.number);
     if (detail.key.startsWith("tmdb:")) {
-      const eps = await tmdbSeason(detail.key, seasonObj.number);
+      const eps = await tmdbSeason(detail.key, seasonObj.number).catch(() => null);
+      if (!eps) return fallbackEps;
       return normalizeEpisodes(eps, seasonObj.number, undefined, detail.runtime, {
         key: detail.key,
       });
@@ -185,7 +194,8 @@ export async function getSeasonEpisodes(
       }),
     );
 
-    return stitchCourEpisodes(seasonObj, new Map(entries), detail.runtime);
+    const stitched = stitchCourEpisodes(seasonObj, new Map(entries), detail.runtime);
+    return stitched.length ? stitched : fallbackEps;
   })().finally(() => inflightSeasonEps.delete(dedupKey));
 
   inflightSeasonEps.set(dedupKey, task);

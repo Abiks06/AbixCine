@@ -1,13 +1,19 @@
 import { useEffect, useMemo, useState } from "react";
-import { useSlidingIndicator } from "../lib/useSlidingIndicator";
-import { getDetail, isUnreleasedMedia } from "../lib/catalog";
+import { Link, useNavigate } from "react-router-dom";
+import { encodeKey, getDetail, isUnreleasedMedia } from "../lib/catalog";
+import { openDossier, registerMedia } from "../lib/dossier";
 import { fmtRuntime } from "../lib/format";
+import { previewLight } from "../lib/light";
+import { playHref } from "../lib/play";
 import type { Media } from "../lib/types";
 import { isFilm } from "../lib/types";
-import { Card, CardSkeleton, kindLabel } from "./Card";
+import { useSlidingIndicator } from "../lib/useSlidingIndicator";
+import { Art } from "./Art";
+import { kindLabel, seedState, tagForMorph } from "./Card";
+import { Icon } from "./Icon";
 import { SectionHead } from "./SectionHead";
 
-const clock = (d: Date) => d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+const clock = (d: Date) => d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false });
 
 /** Cut-offs that still make sense right now: 11 pm and midnight while they're ahead of us, else hours from now. */
 function cutoffs(now: Date) {
@@ -19,9 +25,9 @@ function cutoffs(now: Date) {
   };
   const out: { label: string; max: number }[] = [];
   const to11 = mins(23), to12 = mins(24);
-  if (to11 >= 45 && to11 < 14 * 60) out.push({ label: "Before 11 pm", max: to11 });
-  if (to12 >= 45 && to12 < 15 * 60) out.push({ label: "Before midnight", max: to12 });
-  if (out.length < 2) out.unshift({ label: "Under 2 hours", max: 120 }, { label: "Under 1 hour", max: 60 });
+  if (to11 >= 45 && to11 < 14 * 60) out.push({ label: "Before 23:00", max: to11 });
+  if (to12 >= 45 && to12 < 15 * 60) out.push({ label: "Before 00:00", max: to12 });
+  if (out.length < 2) out.unshift({ label: "Under 2h", max: 120 }, { label: "Under 1h", max: 60 });
   out.splice(2);
   out.sort((a, b) => a.max - b.max);
   out.push({ label: "All night", max: 24 * 60 });
@@ -29,16 +35,16 @@ function cutoffs(now: Date) {
 }
 
 /**
- * "Fits tonight": what you can finish before you need to sleep. Movies by runtime,
- * series by one episode, with the end time worked out from the clock.
+ * "Fits tonight": an interactive Evening Screening Timetable showing what finishes before bedtime,
+ * rendered as perforated cinema screening tickets with proportional runtime bars and tear-off end times.
  */
 export function FitsTonight({ pool, loading }: { pool: Media[]; loading?: boolean }) {
+  const nav = useNavigate();
   const finishInd = useSlidingIndicator();
   const [now, setNow] = useState(() => new Date());
   const opts = useMemo(() => cutoffs(now), [now.getHours() * 60 + now.getMinutes()]); // eslint-disable-line react-hooks/exhaustive-deps
   const [sel, setSel] = useState(0);
   const [runtimes, setRuntimes] = useState<Record<string, number>>({});
-  /** The pool whose runtimes have been looked up (found or not). */
   const [settled, setSettled] = useState("");
   const keys = pool.map((m) => m.key).join("|");
 
@@ -49,8 +55,6 @@ export function FitsTonight({ pool, loading }: { pool: Media[]; loading?: boolea
 
   useEffect(() => {
     let live = true;
-    // Results stream in as they land (the slowest of 18 lookups used to hold the whole shelf),
-    // batched into one update per ~150 ms so it isn't a re-render per title.
     let batch: Record<string, number> = {};
     let flushTimer: ReturnType<typeof setTimeout> | undefined;
     const flush = () => {
@@ -87,24 +91,28 @@ export function FitsTonight({ pool, loading }: { pool: Media[]; loading?: boolea
     };
   }, [keys]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const max = opts[Math.min(sel, opts.length - 1)].max;
+  const activeOpt = opts[Math.min(sel, opts.length - 1)];
+  const max = activeOpt.max;
   const fits = pool
     .filter((m, i, a) => !isUnreleasedMedia(m) && runtimes[m.key] && runtimes[m.key] <= max && a.findIndex((x) => x.key === m.key) === i)
     .sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0))
-    .slice(0, 10);
-  // The shelf holds its place from the first frame: a section that appeared after 18 lookups
-  // used to shove everything below it down by a row.
+    .slice(0, 8);
   const pending = loading || (pool.length > 0 && settled !== keys && !Object.keys(runtimes).length);
   if (!pending && (!pool.length || !Object.keys(runtimes).length)) return null;
 
+  const scaleMax = Math.max(120, Math.min(max, 240));
+  const midClock = clock(new Date(now.getTime() + (scaleMax / 2) * 60000));
+  const endClock = clock(new Date(now.getTime() + scaleMax * 60000));
+
   return (
-    <section className="shelf">
+    <section className="shelf timetable">
       <SectionHead
         eyebrow="Built around your evening"
-        title="Fits tonight"
+        title="Fits"
+        accentWord="tonight"
         right={
           <div className="fit">
-            <span className="fit-now">It’s {clock(now)} · finish</span>
+            <span className="fit-now">NOW {clock(now)} · FINISH</span>
             <div className="seg-pills" role="radiogroup" aria-label="Finish by" ref={finishInd}>
               {opts.map((o, i) => (
                 <button key={o.label} role="radio" aria-checked={i === sel} className={i === sel ? "on" : ""} onClick={() => setSel(i)}>
@@ -115,32 +123,82 @@ export function FitsTonight({ pool, loading }: { pool: Media[]; loading?: boolea
           </div>
         }
       />
-      <div className="track">
-        {pending && Array.from({ length: 6 }, (_, i) => <CardSkeleton key={i} />)}
-        {!pending && fits.length === 0 && <div className="track-empty">Nothing short enough. Try a later finish.</div>}
+
+      <div className="tt-ruler" aria-hidden>
+        <span>START {clock(now)}</span>
+        <span className="tt-rule" />
+        <span>+{Math.round(scaleMax / 2)}M · {midClock}</span>
+        <span className="tt-rule" />
+        <span>CUTOFF · {activeOpt.max >= 24 * 60 ? `+4H (${endClock})` : endClock}</span>
+      </div>
+
+      <div className="tt-grid">
+        {pending && Array.from({ length: 4 }, (_, i) => <div key={i} className="tt-ticket skeleton" />)}
+        {!pending && fits.length === 0 && <div className="track-empty">Nothing short enough for this window. Pick a later cutoff.</div>}
         {fits.map((m, i) => {
+          registerMedia(m);
           const rt = runtimes[m.key];
           const end = clock(new Date(now.getTime() + rt * 60000));
+          const spanPct = Math.min(100, Math.max(14, Math.round((rt / scaleMax) * 100)));
           return (
-            <Card
+            <article
               key={m.key}
-              media={m}
-              index={i}
-              // An end time, not a bar: a bar on a poster reads as "half watched".
-              extra={
-                <div className="fit-end">
-                  <span className="fit-clock" aria-hidden />
-                  {isFilm(m) ? `Ends ${end}` : `One episode · ends ${end}`}
+              className="tt-ticket"
+              style={{ ["--i" as string]: Math.min(i, 7) }}
+              data-media-key={m.key}
+              onMouseEnter={() => previewLight(m)}
+              onMouseLeave={() => previewLight(null)}
+            >
+              <Link
+                to={`/title/${encodeKey(m.key)}`}
+                state={seedState(m)}
+                viewTransition
+                onClick={tagForMorph}
+                className="tt-main"
+              >
+                <div className="tt-th art-wrap">
+                  <Art media={m} variant="backdrop" size="sm" />
                 </div>
-              }
-              sub={
-                <>
-                  <span className="badge">{kindLabel(m.kind)}</span>
-                  {fmtRuntime(rt)}
-                  {!isFilm(m) ? " per episode" : ""}
-                </>
-              }
-            />
+                <div className="tt-copy">
+                  <div className="tt-meta">
+                    <span className="badge">{kindLabel(m.kind, m.format)}</span>
+                    <span>{fmtRuntime(rt)}{!isFilm(m) ? " / ep" : ""}</span>
+                    {m.rating ? <span className="star">★ {m.rating.toFixed(1)}</span> : null}
+                  </div>
+                  <strong className="tt-title">{m.title}</strong>
+                  <div className="tt-bar" title={`Runs ${fmtRuntime(rt)}`}>
+                    <i style={{ width: `${spanPct}%` }} />
+                  </div>
+                </div>
+              </Link>
+
+              <div className="tt-perf" aria-hidden />
+
+              <div className="tt-stub">
+                <span className="tt-end-lbl">ENDS</span>
+                <b className="tt-end-val">{end}</b>
+                <div className="tt-acts">
+                  <button
+                    type="button"
+                    className="tt-btn play"
+                    title={`Play ${m.title}`}
+                    aria-label={`Play ${m.title}`}
+                    onClick={() => nav(playHref(m), { viewTransition: true, state: { from: "app" } })}
+                  >
+                    <Icon name="play" size={12} />
+                  </button>
+                  <button
+                    type="button"
+                    className="tt-btn"
+                    title="Quick dossier"
+                    aria-label={`Quick inspect ${m.title}`}
+                    onClick={() => openDossier(m)}
+                  >
+                    <Icon name="layers" size={12} />
+                  </button>
+                </div>
+              </div>
+            </article>
           );
         })}
       </div>

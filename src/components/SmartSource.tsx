@@ -1,6 +1,8 @@
+import { isTauri } from "@tauri-apps/api/core";
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import type { PlaybackRequest } from "../lib/types";
+import { startDownload } from "../lib/downloads";
+import type { MediaDetail, PlaybackRequest } from "../lib/types";
 import { candKey } from "../sources/registry";
 import { useSourceSession } from "../sources/useSourceSession";
 import { Icon } from "./Icon";
@@ -10,7 +12,17 @@ import { boardRows, qualityLabel, SourceBoard } from "./SourceBoard";
  * Servers card on the title page. It previews the same source session the player will use, so
  * by the time you press Play the stream is usually already found, and nothing is looked up twice.
  */
-export function SmartSource({ req, what, onPlay }: { req: PlaybackRequest; what: string; onPlay: (server?: string) => void }) {
+export function SmartSource({
+  req,
+  what,
+  detail,
+  onPlay,
+}: {
+  req: PlaybackRequest;
+  what: string;
+  detail?: MediaDetail;
+  onPlay: (server?: string) => void;
+}) {
   const { snap, recheck } = useSourceSession(req, 1);
   const [all, setAll] = useState(false);
   const rows = useMemo(() => (snap ? boardRows(snap) : []), [snap]);
@@ -62,7 +74,14 @@ export function SmartSource({ req, what, onPlay }: { req: PlaybackRequest; what:
               `No server has ${what} right now.`
             )}
           </div>
-          <SourceBoard snap={snap} rows={rows} grouped={false} limit={all ? undefined : 5} onPick={(c) => onPlay(candKey(c))} />
+          <SourceBoard
+            snap={snap}
+            rows={rows}
+            grouped={false}
+            limit={all ? undefined : 5}
+            onPick={(c) => onPlay(candKey(c))}
+            onDownload={isTauri() ? (c) => void startDownload(req, c, detail) : undefined}
+          />
           {rows.length > 5 && (
             <button className="smart-more" onClick={() => setAll((x) => !x)}>
               {all ? "Show fewer" : `Show all ${rows.length}`}

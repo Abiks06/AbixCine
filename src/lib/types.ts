@@ -35,6 +35,8 @@ export interface Media {
   releaseDate?: string;
   /** Catalog release status (e.g. "Released", "Returning Series", "NOT_YET_RELEASED", "Planned"). */
   status?: string;
+  /** Next upcoming episode airtime (anime simulcasts & ongoing shows). */
+  nextAiring?: { episode: number; at: number };
 }
 
 /** A feature film, whether it came from TMDB or is an AniList anime film. */
@@ -139,7 +141,6 @@ export interface MediaDetail extends Media {
   /** When this record was fetched, so the UI can say how fresh it is. */
   fetchedAt?: number;
   related: Media[];
-  nextAiring?: { episode: number; at: number };
 }
 
 /** What the player asks the source layer to find. */

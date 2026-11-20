@@ -12,6 +12,7 @@ import {
   reliability,
   serverHealthScore,
 } from "./health";
+import { downloadsProvider } from "./downloads";
 import { kisskhProvider } from "./kisskh";
 import { localProvider } from "./local";
 import { DEFAULT_UA, httpFetch, isUrlTokenExpired, native, normalizeHeaders, proxyUrl, sniff, unwrapProxyUrl } from "./native";
@@ -23,6 +24,7 @@ import { inferSniffedSubtitles, type HedgedProbeOptions, type ManifestValidation
 
 /** All known providers. Register new ones here. */
 export const PROVIDERS: SourceProvider[] = [
+  downloadsProvider,
   localProvider,
   jellyfinProvider,
   animeDirectProvider,
@@ -535,7 +537,7 @@ export async function playCheck(c: StreamCandidate, signal?: AbortSignal): Promi
 export async function probeCandidate(c: StreamCandidate, signal?: AbortSignal): Promise<StreamCandidate> {
   if (c.kind === "embed") return native ? verifyEmbed(c, signal) : { ...c, probe: { ok: true, latencyMs: 0 } };
   const t0 = performance.now();
-  if (c.providerId === "local") {
+  if (c.providerId === "local" || c.providerId === "downloads") {
     const { ctl, cleanup } = linkSignal(signal);
     try {
       const res = await withTimeout(fetch(c.url, { signal: ctl.signal, headers: { Range: "bytes=0-1" } }), PROBE_TIMEOUT, ctl);
@@ -667,7 +669,8 @@ export async function probeHedged(candidates: StreamCandidate[], opts: HedgedPro
 export function score(c: StreamCandidate, preferred: number, priority: number, req: PlaybackRequest): StreamCandidate {
   if (!c.probe) return { ...c, score: -500 + priority, why: [] };
   if (!c.probe.ok) return { ...c, score: -1000 + priority, why: [] };
-  const q = c.probe.quality ?? c.quality ?? (c.providerId === "local" ? preferred : 720);
+  const isLocal = c.providerId === "local" || c.providerId === "downloads";
+  const q = c.probe.quality ?? c.quality ?? (isLocal ? preferred : 720);
   const qScore = q <= preferred ? q / preferred : 1 - (q - preferred) / (preferred * 4);
   const avg = getHealth(c.providerId).latency;
   const ms = avg == null ? c.probe.latencyMs : c.probe.latencyMs * 0.6 + avg * 0.4;
@@ -680,7 +683,7 @@ export function score(c: StreamCandidate, preferred: number, priority: number, r
   const pick = lastPick(req);
   // A server the viewer chose by hand for this show outranks anything the picker merely remembers.
   const memory = pick && pick.providerId === c.providerId && shaky === 0 && !circuitOpen ? (pick.manual ? 32 : 8) : 0;
-  const own = c.via === "direct" || c.via === "sniffed" || c.providerId === "local" || c.providerId === "jellyfin" ? 25 : 0;
+  const own = c.via === "direct" || c.via === "sniffed" || isLocal || c.providerId === "jellyfin" ? 25 : 0;
   const provider = PROVIDERS.find((p) => p.id === c.providerId);
   const originalLanguage = "originalLanguage" in req.media && typeof req.media.originalLanguage === "string"
     ? req.media.originalLanguage.toLowerCase().split(/[-_]/)[0]
@@ -694,14 +697,15 @@ export function score(c: StreamCandidate, preferred: number, priority: number, r
   // Plays, but nowhere near the catalog runtime: probably another title (or a trailer). Below every
   // stream that isn't, whatever its quality or record.
   const otherTitle = c.identity?.status === "mismatch" ? 120 : 0;
-  // User's own local files always beat remote streams unless this exact file failed or mismatched.
-  const localBonus = c.providerId === "local" && !broken && !otherTitle ? 50 : 0;
+  // User's own local & downloaded files always beat remote streams unless this exact file failed or mismatched.
+  const localBonus = isLocal && !broken && !otherTitle ? (c.providerId === "downloads" ? 55 : 50) : 0;
   const why: string[] = [];
   if (otherTitle) why.push("might be a different title");
-  if (c.providerId === "local") why.push("on this PC");
+  if (c.providerId === "downloads") why.push("saved offline");
+  else if (c.providerId === "local") why.push("on this PC");
   else if (c.providerId === "jellyfin") why.push("your server");
-  if (own && c.via !== "direct" && c.providerId !== "local" && c.providerId !== "jellyfin") why.push("ad-free");
-  if (c.via === "direct" && c.providerId !== "local" && c.providerId !== "jellyfin") why.push("direct stream");
+  if (own && c.via !== "direct" && !isLocal && c.providerId !== "jellyfin") why.push("ad-free");
+  if (c.via === "direct" && !isLocal && c.providerId !== "jellyfin") why.push("direct stream");
   if (req.audio && (c.audio === req.audio || c.audio === "dual")) why.push(req.audio === "dub" ? "English dub" : "subtitled");
   if (memory) why.push(pick?.manual ? "your choice for this show" : "played this show before");
   if (languageMiss) why.push("French source for non-French title");
