@@ -1,5 +1,5 @@
 import { isTauri } from "@tauri-apps/api/core";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { useBatchDownloads } from "../lib/batchDownload";
 import { encodeKey } from "../lib/catalog";
@@ -16,6 +16,7 @@ import {
   openDownloadsFolder,
   pauseAllDownloads,
   pauseDownload,
+  refreshDownloads,
   removeDownloadedItem,
   resumeAllDownloads,
   resumeDownload,
@@ -67,6 +68,10 @@ export function DownloadsVault({
   const { jobs, items, root, switchingIds } = useDownloads();
   const batch = useBatchDownloads();
   const nav = useNavigate();
+
+  useEffect(() => {
+    if (desktop && root) void refreshDownloads({ minIntervalMs: 1500 });
+  }, [desktop, root]);
 
   const [kindFilter, setKindFilter] = useState<KindFilter>("all");
   const [expanded, setExpanded] = useState<string | null>(null);

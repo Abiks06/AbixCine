@@ -1,5 +1,5 @@
 import { isTauri } from "@tauri-apps/api/core";
-import { findDownloadedEntries } from "../lib/downloads";
+import { findDownloadedEntries, refreshDownloads } from "../lib/downloads";
 import type { PlaybackRequest } from "../lib/types";
 import { isFilm } from "../lib/types";
 import {
@@ -28,6 +28,10 @@ export const downloadsProvider: SourceProvider = {
   isEnabled: (s) => isTauri() && Boolean(s.downloadsPath),
   async find(req: PlaybackRequest, s, signal) {
     if (signal?.aborted || !s.downloadsPath) return [];
+
+    // Reconcile against disk so files deleted externally in File Explorer are dropped before playback.
+    await refreshDownloads({ minIntervalMs: 1200 }).catch(() => null);
+    if (signal?.aborted) return [];
 
     const exact = findDownloadedEntries(req);
     const seenPaths = new Set<string>();

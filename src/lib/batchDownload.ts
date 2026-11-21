@@ -2,7 +2,7 @@ import { isTauri } from "@tauri-apps/api/core";
 import { useSyncExternalStore } from "react";
 import { acquireSession } from "../sources/session";
 import { isUnairedEpisode, resolvePlaybackRequest } from "./catalog";
-import { rankDownloadOptions } from "./downloadRank";
+import { candidateMeetsTargetQuality, rankDownloadOptions } from "./downloadRank";
 import {
   ensureDownloadFolder,
   hasDownloadedEpisode,
@@ -23,6 +23,7 @@ interface QueuedEpisodeTask {
   season: number;
   episode: Episode;
   audio?: Audio;
+  preferredQuality?: number;
 }
 
 export interface BatchSeasonSummary {
@@ -130,13 +131,22 @@ export function selectMissingEpisodes(
   });
 }
 
-function resolveBestDownloadServer(detail: MediaDetail, season: number | undefined, episode: Episode, audio?: Audio) {
+const QUALITY_WAIT_GRACE_MS = 5500;
+
+function resolveBestDownloadServer(
+  detail: MediaDetail,
+  season: number | undefined,
+  episode: Episode,
+  audio?: Audio,
+  preferredQuality?: number,
+) {
   return new Promise<{ ok: boolean }>((resolve) => {
     const req = resolvePlaybackRequest(detail, season, episode.number, audio);
     if (!req) {
       resolve({ ok: false });
       return;
     }
+    const targetQ = preferredQuality ?? getSettings().preferredQuality;
     const session = acquireSession(req);
     session.retain();
     session.start(2);
@@ -144,18 +154,19 @@ function resolveBestDownloadServer(detail: MediaDetail, season: number | undefin
     let done = false;
     let hardTimer: ReturnType<typeof setTimeout> | undefined;
     let graceTimer: ReturnType<typeof setTimeout> | undefined;
+    let qualityTimer: ReturnType<typeof setTimeout> | undefined;
 
     const finish = (candidateIndex: number) => {
       if (done) return;
       done = true;
       clearTimeout(hardTimer);
       clearTimeout(graceTimer);
+      clearTimeout(qualityTimer);
       unsub();
       activeAbort = null;
 
       const snap = session.getSnapshot();
-      const prefQuality = getSettings().preferredQuality;
-      const ranked = rankDownloadOptions(snap.candidates, prefQuality);
+      const ranked = rankDownloadOptions(snap.candidates, targetQ);
       const chosen = ranked[candidateIndex];
       const backups = ranked.filter((c) => c !== chosen).slice(0, 6);
       session.release();
@@ -167,7 +178,7 @@ function resolveBestDownloadServer(detail: MediaDetail, season: number | undefin
       void startDownload(req, chosen, detail, episode.title, {
         silent: true,
         fallbacks: backups,
-        preferredQuality: prefQuality,
+        preferredQuality: targetQ,
         replaceExisting: true,
       }).then((job) => {
         resolve({ ok: Boolean(job) });
@@ -180,16 +191,23 @@ function resolveBestDownloadServer(detail: MediaDetail, season: number | undefin
         return;
       }
       const snap = session.getSnapshot();
-      const ranked = rankDownloadOptions(snap.candidates, getSettings().preferredQuality);
-      if (ranked.length > 0 && (!snap.busy || ranked.length >= 2 || (snap.pick && ranked.includes(snap.pick)))) {
-        finish(0);
+      const ranked = rankDownloadOptions(snap.candidates, targetQ);
+      if (!snap.busy) {
+        finish(ranked.length > 0 ? 0 : -1);
         return;
       }
-      if (ranked.length > 0 && !graceTimer) {
-        graceTimer = setTimeout(() => finish(0), EXTRA_SETTLE_GRACE_MS);
-      }
-      if (!snap.busy && ranked.length === 0) {
-        finish(-1);
+      if (ranked.length > 0) {
+        const topMeetsTarget = candidateMeetsTargetQuality(ranked[0], targetQ);
+        if (topMeetsTarget && (ranked.length >= 2 || (snap.pick && ranked.includes(snap.pick)))) {
+          finish(0);
+          return;
+        }
+        if (topMeetsTarget) {
+          if (!graceTimer) graceTimer = setTimeout(() => finish(0), EXTRA_SETTLE_GRACE_MS);
+        } else if (!qualityTimer) {
+          // Top candidate so far is below the requested resolution; keep scanning other servers briefly.
+          qualityTimer = setTimeout(() => finish(0), QUALITY_WAIT_GRACE_MS);
+        }
       }
     };
 
@@ -254,7 +272,13 @@ async function drainBatchQueue() {
     batchState = buildStateFromSeasons(task, batchState.pendingKeys);
     emit();
 
-    const { ok } = await resolveBestDownloadServer(task.detail, task.season, task.episode, task.audio);
+    const { ok } = await resolveBestDownloadServer(
+      task.detail,
+      task.season,
+      task.episode,
+      task.audio,
+      task.preferredQuality,
+    );
     const wasAborted = currentTaskAborted;
     currentTask = null;
     currentTaskAborted = false;
@@ -317,6 +341,7 @@ export async function queueEpisodeDownload(
   season: number | undefined,
   episode: Episode,
   audio?: Audio,
+  preferredQuality?: number,
 ): Promise<void> {
   if (!isTauri()) {
     toast("Offline downloads work in the AbixCine desktop app.", { icon: "info" });
@@ -333,7 +358,16 @@ export async function queueEpisodeDownload(
 
   const nextPending = new Set(batchState.pendingKeys);
   nextPending.add(taskKey);
-  batchQueue.push({ taskKey, seasonKey: sKey, canonicalKey: cKey, detail, season: sNum, episode, audio });
+  batchQueue.push({
+    taskKey,
+    seasonKey: sKey,
+    canonicalKey: cKey,
+    detail,
+    season: sNum,
+    episode,
+    audio,
+    preferredQuality,
+  });
 
   const prevS = batchSeasons.get(sKey);
   batchSeasons.set(sKey, {
@@ -360,6 +394,7 @@ export async function queueSeasonDownloads(
   airedCount?: number,
   items?: DownloadedEntry[],
   jobs?: DownloadJob[],
+  preferredQuality?: number,
 ): Promise<void> {
   if (!isTauri()) {
     toast("Offline downloads work in the AbixCine desktop app.", { icon: "info" });
@@ -394,7 +429,16 @@ export async function queueSeasonDownloads(
     const taskKey = batchEpisodeKey(cKey, season, ep.number, audio);
     if (nextPending.has(taskKey)) continue;
     nextPending.add(taskKey);
-    batchQueue.push({ taskKey, seasonKey: sKey, canonicalKey: cKey, detail, season, episode: ep, audio });
+    batchQueue.push({
+      taskKey,
+      seasonKey: sKey,
+      canonicalKey: cKey,
+      detail,
+      season,
+      episode: ep,
+      audio,
+      preferredQuality,
+    });
     added++;
   }
   if (!added) return;

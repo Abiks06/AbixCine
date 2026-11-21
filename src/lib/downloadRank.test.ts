@@ -97,6 +97,41 @@ describe("rankDownloadOptions", () => {
     expect(ranked[1].providerId).toBe("b");
   });
 
+  it("ranks 1080p HLS strictly ahead of 480p/640p or unknown-quality direct files when targeting 1080p", () => {
+    const sd480File = makeCand({
+      providerId: "low480",
+      url: "https://cdn.example/480.mp4",
+      kind: "file",
+      via: "direct",
+      probe: { ok: true, latencyMs: 60, quality: 480 },
+    });
+    const sd640File = makeCand({
+      providerId: "low640",
+      url: "https://cdn.example/640.mp4",
+      kind: "file",
+      via: "direct",
+      probe: { ok: true, latencyMs: 60, quality: 640 },
+    });
+    const unknownFile = makeCand({
+      providerId: "unknown-file",
+      url: "https://cdn.example/unknown.mp4",
+      kind: "file",
+      via: "direct",
+      probe: { ok: true, latencyMs: 50 },
+    });
+    const hdSniffedHls = makeCand({
+      providerId: "hd-hls",
+      url: "https://cdn.example/1080.m3u8",
+      kind: "hls",
+      via: "sniffed",
+      probe: { ok: true, latencyMs: 420, quality: 1080 },
+    });
+
+    const ranked = rankDownloadOptions([sd480File, sd640File, unknownFile, hdSniffedHls], 1080);
+    expect(ranked[0].providerId).toBe("hd-hls");
+    expect(ranked[ranked.length - 1].providerId).toBe("low480");
+  });
+
   it("formats neutral delivery tags without Best/Worst judgements", () => {
     expect(downloadFormatLabel(makeCand({ downloadUrl: "http://jf/Download" }))).toBe("Original");
     expect(downloadFormatLabel(makeCand({ kind: "file", url: "https://cdn/movie.mkv?t=1" }))).toBe("MKV");

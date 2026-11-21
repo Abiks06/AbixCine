@@ -17,7 +17,7 @@ import {
   useDownloads,
 } from "../lib/downloads";
 import { fmtSize } from "../lib/library";
-import { updateSettings, useSettings } from "../lib/settings";
+import { useSettings } from "../lib/settings";
 import type { MediaDetail, PlaybackRequest } from "../lib/types";
 import { candKey } from "../sources/registry";
 import { useSourceSession } from "../sources/useSourceSession";
@@ -44,7 +44,16 @@ export function DownloadMenu({
   const { snap } = useSourceSession(desktop ? req : null, 1);
   const { jobs, items, root, switchingIds } = useDownloads();
   const [open, setOpen] = useState(false);
+  const [overrideQuality, setOverrideQuality] = useState<number | null>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
+
+  const targetQuality = overrideQuality ?? s.preferredQuality;
+  const targetLabel = targetQuality >= 2160 ? "4K" : `${targetQuality}p`;
+  const defaultLabel = s.preferredQuality >= 2160 ? "4K" : `${s.preferredQuality}p`;
+
+  useEffect(() => {
+    setOverrideQuality(null);
+  }, [req.media.key, req.season, req.episode]);
 
   useEffect(() => {
     if (!open) return;
@@ -63,8 +72,8 @@ export function DownloadMenu({
   }, [open]);
 
   const ranked = useMemo(
-    () => (snap ? rankDownloadOptions(snap.candidates, s.preferredQuality) : []),
-    [snap, s.preferredQuality],
+    () => (snap ? rankDownloadOptions(snap.candidates, targetQuality) : []),
+    [snap, targetQuality],
   );
 
   if (!desktop) return null;
@@ -78,7 +87,6 @@ export function DownloadMenu({
   const isPaused = activeJob?.status === "paused";
   const isFailed = activeJob?.status === "failed";
   const pct = activeJob ? Math.round(activeJob.percent) : 0;
-  const preferredLabel = s.preferredQuality >= 2160 ? "4K" : `${s.preferredQuality}p`;
   const activeQNum = activeJob?.resolvedQuality ?? activeJob?.quality ?? activeJob?.preferredQuality;
   const activeQStr = activeQNum ? (activeQNum >= 2160 ? "4K" : `${activeQNum}p`) : null;
   const savedQLabel = saved?.quality ? (saved.quality >= 2160 ? "4K" : `${saved.quality}p`) : null;
@@ -134,17 +142,21 @@ export function DownloadMenu({
             )}
           </div>
 
-          <div className="dl-qbar" aria-label="Target download quality">
+          <div className="dl-qbar" aria-label="Download quality">
             <span className="dl-qbar-lbl">
-              Target quality <small>({preferredLabel})</small>
+              Download quality{" "}
+              <small>
+                ({overrideQuality != null && overrideQuality !== s.preferredQuality ? `${targetLabel} · default ${defaultLabel}` : `default: ${defaultLabel}`})
+              </small>
             </span>
             <div className="dl-qbar-pills">
               {[2160, 1080, 720, 480].map((q) => (
                 <button
                   key={q}
                   type="button"
-                  className={`chip ${s.preferredQuality === q ? "on" : ""}`}
-                  onClick={() => updateSettings({ preferredQuality: q })}
+                  className={`chip ${targetQuality === q ? "on" : ""}`}
+                  onClick={() => setOverrideQuality(q === s.preferredQuality ? null : q)}
+                  title={`Target ${q >= 2160 ? "4K" : `${q}p`} for this download`}
                 >
                   {q >= 2160 ? "4K" : `${q}p`}
                 </button>
@@ -269,7 +281,7 @@ export function DownloadMenu({
                 const top = ranked[0];
                 void startDownload(req, top, detail, episodeTitle, {
                   fallbacks: ranked.slice(1, 7),
-                  preferredQuality: s.preferredQuality,
+                  preferredQuality: targetQuality,
                   replaceExisting: true,
                 });
               }}
@@ -278,7 +290,7 @@ export function DownloadMenu({
               <span>
                 <strong>Quick download · {ranked[0].providerName}</strong>
                 <small>
-                  Up to {preferredLabel}
+                  Target {targetLabel}
                   {ranked.length > 1
                     ? ` · ${Math.min(6, ranked.length - 1)} backup server${Math.min(6, ranked.length - 1) === 1 ? "" : "s"} ready`
                     : ""}
@@ -291,6 +303,8 @@ export function DownloadMenu({
             {ranked.length > 0 ? (
               ranked.map((c) => {
                 const q = qualityLabel(c);
+                const knownQ = c.probe?.quality ?? c.quality;
+                const belowTarget = knownQ != null && knownQ > 0 && knownQ < targetQuality;
                 const audio = audioLabel(c);
                 const fmt = downloadFormatLabel(c);
                 const subCount = c.subtitles?.length ?? 0;
@@ -307,7 +321,7 @@ export function DownloadMenu({
                     onClick={() => {
                       void startDownload(req, c, detail, episodeTitle, {
                         fallbacks: ranked.filter((x) => x !== c).slice(0, 6),
-                        preferredQuality: s.preferredQuality,
+                        preferredQuality: targetQuality,
                         replaceExisting: true,
                       });
                     }}
@@ -320,7 +334,8 @@ export function DownloadMenu({
                       </small>
                     </span>
                     <span className="dl-opt-tags">
-                      {q && <b>{q}</b>}
+                      {q && <b className={belowTarget ? "dl-opt-warn" : undefined} title={belowTarget ? `Below your ${targetLabel} target` : undefined}>{q}</b>}
+                      {belowTarget && <b className="dl-opt-warn">low res</b>}
                       {audio && <b>{audio}</b>}
                     </span>
                     <span className="dl-opt-act">

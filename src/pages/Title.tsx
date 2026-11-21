@@ -27,6 +27,7 @@ import {
   formatQualityTag,
   pauseAllDownloads,
   pauseDownload,
+  refreshDownloads,
   resumeAllDownloads,
   resumeDownload,
   switchDownloadToNextServer,
@@ -148,6 +149,7 @@ export function Title() {
     setPickedSeason(null);
     setTab(null);
     setJump("");
+    setDlQualityOverride(null);
   }, [key]);
 
   const activeSeasonObj: CanonicalSeason | undefined = useMemo(() => {
@@ -163,10 +165,17 @@ export function Title() {
     [detail?.key, activeSeasonObj?.number],
   );
 
-  useSettings();
+  const s = useSettings();
   const dl = useDownloads();
   const batch = useBatchDownloads();
   const desktop = isTauri();
+  const [dlQualityOverride, setDlQualityOverride] = useState<number | null>(null);
+  const dlTargetQuality = dlQualityOverride ?? s.preferredQuality;
+  const dlQualityLabel = dlTargetQuality >= 2160 ? "4K" : `${dlTargetQuality}p`;
+
+  useEffect(() => {
+    if (desktop && dl.root) void refreshDownloads({ minIntervalMs: 1500 });
+  }, [desktop, dl.root, key]);
   const saved = useSaved(key, d?.canonicalKey, d?.key);
   const [swap, setSwap] = useState(false);
   const [trailerOpen, setTrailerOpen] = useState(false);
@@ -627,21 +636,42 @@ export function Title() {
                 });
                 const batchForSeason = getBatchForSeason(batch, canonicalKey, season);
                 const hasLiveSeasonJobs = seasonProgTop.active > 0 || seasonProgTop.paused > 0 || seasonProgTop.failed > 0;
+                const qPicker = (
+                  <select
+                    className="ep-q-pick"
+                    aria-label="Season download quality"
+                    title={`Download quality (${dlQualityLabel}; defaults to your streaming setting)`}
+                    value={dlTargetQuality}
+                    onChange={(ev) => {
+                      const val = Number(ev.target.value);
+                      setDlQualityOverride(val === s.preferredQuality ? null : val);
+                    }}
+                  >
+                    {[2160, 1080, 720, 480].map((q) => (
+                      <option key={q} value={q}>
+                        {q >= 2160 ? "4K" : `${q}p`}
+                      </option>
+                    ))}
+                  </select>
+                );
                 if (batchForSeason || seasonProgTop.active > 0) {
                   return (
-                    <button
-                      type="button"
-                      className="btn glass sm ep-season-dl active"
-                      onClick={() => void cancelAllDownloads({ canonicalKey, season })}
-                      title={`Click to stop & clear all Season ${season} downloads`}
-                    >
-                      <span className="mini-spin" />
-                      <span>
-                        {batchForSeason
-                          ? `Stop S${season} (${batchForSeason.queued}/${batchForSeason.total})`
-                          : `Stop S${season} (${seasonProgTop.completed}/${seasonProgTop.total})`}
-                      </span>
-                    </button>
+                    <>
+                      {qPicker}
+                      <button
+                        type="button"
+                        className="btn glass sm ep-season-dl active"
+                        onClick={() => void cancelAllDownloads({ canonicalKey, season })}
+                        title={`Click to stop & clear all Season ${season} downloads`}
+                      >
+                        <span className="mini-spin" />
+                        <span>
+                          {batchForSeason
+                            ? `Stop S${season} (${batchForSeason.queued}/${batchForSeason.total})`
+                            : `Stop S${season} (${seasonProgTop.completed}/${seasonProgTop.total})`}
+                        </span>
+                      </button>
+                    </>
                   );
                 }
                 if (missingEps.length === 0 && !hasLiveSeasonJobs) {
@@ -653,31 +683,48 @@ export function Title() {
                 }
                 if (missingEps.length === 0 && hasLiveSeasonJobs) {
                   return (
-                    <button
-                      type="button"
-                      className="btn glass sm ep-season-dl active"
-                      onClick={() => void cancelAllDownloads({ canonicalKey, season })}
-                      title={`Stop & clear Season ${season} paused/failed queue`}
-                    >
-                      <Icon name="x" size={14} />
-                      <span>Stop S{season} ({seasonProgTop.paused + seasonProgTop.failed})</span>
-                    </button>
+                    <>
+                      {qPicker}
+                      <button
+                        type="button"
+                        className="btn glass sm ep-season-dl active"
+                        onClick={() => void cancelAllDownloads({ canonicalKey, season })}
+                        title={`Stop & clear Season ${season} paused/failed queue`}
+                      >
+                        <Icon name="x" size={14} />
+                        <span>Stop S{season} ({seasonProgTop.paused + seasonProgTop.failed})</span>
+                      </button>
+                    </>
                   );
                 }
                 return (
-                  <button
-                    type="button"
-                    className="btn glass sm ep-season-dl"
-                    onClick={() => void queueSeasonDownloads(d, season, epList, audio, airedCount, dl.items, dl.jobs)}
-                    title={`Queue ${missingEps.length} episode${missingEps.length === 1 ? "" : "s"} for offline download`}
-                  >
-                    <Icon name="download" size={14} />
-                    <span>
-                      {missingEps.length < epList.length
-                        ? `Download S${season} (${missingEps.length})`
-                        : `Download S${season}`}
-                    </span>
-                  </button>
+                  <>
+                    {qPicker}
+                    <button
+                      type="button"
+                      className="btn glass sm ep-season-dl"
+                      onClick={() =>
+                        void queueSeasonDownloads(
+                          d,
+                          season,
+                          epList,
+                          audio,
+                          airedCount,
+                          dl.items,
+                          dl.jobs,
+                          dlTargetQuality,
+                        )
+                      }
+                      title={`Queue ${missingEps.length} episode${missingEps.length === 1 ? "" : "s"} in ${dlQualityLabel} for offline download`}
+                    >
+                      <Icon name="download" size={14} />
+                      <span>
+                        {missingEps.length < epList.length
+                          ? `Download S${season} (${missingEps.length})`
+                          : `Download S${season}`}
+                      </span>
+                    </button>
+                  </>
                 );
               })()}
             </div>
@@ -984,7 +1031,7 @@ export function Title() {
                             ? `Finding stream for E${e.number}…`
                             : epSaved
                               ? `E${e.number} saved offline${savedQTag ? ` (${savedQTag})` : ""}`
-                              : `Download E${e.number}`;
+                              : `Download E${e.number} (${dlQualityLabel})`;
 
                     return (
                       <div key={e.number} className="ep-slot">
@@ -1003,7 +1050,7 @@ export function Title() {
                             } else if (epPaused && epJob) {
                               void resumeDownload(epJob.id);
                             } else if (!epSaved && !epResolving) {
-                              void queueEpisodeDownload(d, season, e, audio);
+                              void queueEpisodeDownload(d, season, e, audio, dlTargetQuality);
                             }
                           }}
                         >

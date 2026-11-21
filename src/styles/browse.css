@@ -2163,6 +2163,10 @@ p.muted.drive-note { margin: 0; max-width: 64ch; line-height: 1.6; }
 .dl-opt-main small { font: 500 10px var(--f-mono); color: var(--fg3); }
 .dl-opt-tags { display: inline-flex; gap: 4px; }
 .dl-opt-tags b { font: 600 9px var(--f-mono); padding: 2px 5px; border-radius: var(--r-xs); background: var(--s2); color: var(--fg2); }
+.dl-opt-tags b.dl-opt-warn {
+  background: color-mix(in oklab, var(--warn) 16%, var(--s2));
+  color: var(--warn);
+}
 .dl-opt-act { display: grid; place-items: center; color: var(--tone-ink); font: 600 10px var(--f-mono); }
 .dl-pop-empty { padding: 10px 4px; font-size: 12px; line-height: 1.5; color: var(--fg3); }
 
@@ -2241,6 +2245,20 @@ p.muted.drive-note { margin: 0; max-width: 64ch; line-height: 1.6; }
 .dl-modal-acts { display: flex; align-items: center; justify-content: flex-end; gap: 10px; flex-wrap: wrap; margin-top: 4px; }
 
 /* ---------- episode & season offline downloads ---------- */
+.ep-q-pick {
+  height: 30px;
+  padding: 0 8px;
+  border-radius: var(--r-xs);
+  border: 1px solid var(--line-2);
+  background: color-mix(in oklab, var(--s1) 82%, transparent);
+  color: var(--fg);
+  font: 600 11.5px var(--f-mono);
+  cursor: pointer;
+  outline: 0;
+  transition: border-color var(--fast), background var(--fast);
+}
+.ep-q-pick:hover, .ep-q-pick:focus-visible { border-color: var(--tone-ink); }
+.ep-q-pick option { background: var(--bg2); color: var(--fg); }
 .ep-season-dl { gap: 6px; transition: border-color var(--fast), color var(--fast), background var(--fast); }
 .ep-season-dl.active {
   border-color: color-mix(in oklab, var(--tone) 48%, var(--line-2));

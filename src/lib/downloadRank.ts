@@ -19,35 +19,53 @@ export function isDownloadableCandidate(c: StreamCandidate): boolean {
   return c.kind === "file" || c.kind === "hls" || Boolean(c.downloadUrl);
 }
 
+/** Check whether a candidate's known resolution meets or exceeds the requested target quality. */
+export function candidateMeetsTargetQuality(c: StreamCandidate, preferredQuality = 1080): boolean {
+  const q = c.probe?.quality ?? c.quality;
+  return q != null && q >= preferredQuality;
+}
+
 /**
- * Implicit quality & reliability score for ordering downloadable server options
- * from best to worst without presenting explicit judgement badges.
+ * Quality-first server scoring for offline downloads.
+ * Resolution fit against the target quality always dominates so a low-res 480p/640p direct file
+ * never outranks a verified 1080p HLS stream; delivery method breaks ties at equal resolution.
  */
 export function downloadScore(c: StreamCandidate, preferredQuality = 1080): number {
   let pts = 0;
 
-  // 1. Source delivery method (original file / direct HTTP beats multi-segment HLS)
-  if (c.downloadUrl || c.kind === "file") {
-    pts += c.providerId === "jellyfin" ? 130 : 120;
-  } else if (c.kind === "hls") {
-    pts += c.via === "direct" ? 85 : 65;
+  // 1. Resolution fit against the requested target quality (primary signal)
+  const q = c.probe?.quality ?? c.quality;
+  if (q != null && q > 0) {
+    if (q >= preferredQuality) {
+      // Meets or exceeds target; slight preference for exact match over oversized 4K when targeting 1080p
+      const overPenalty = Math.min(22, ((q - preferredQuality) / Math.max(preferredQuality, 1)) * 16);
+      pts += 180 - overPenalty;
+    } else {
+      // Steep drop for below-target streams so 480p/640p never beats 1080p/720p
+      pts += Math.pow(q / Math.max(preferredQuality, 1), 1.8) * 160;
+    }
+  } else {
+    // Unknown resolution: cautious mid score — below verified HD, above known 480p/640p
+    pts += c.kind === "hls" ? 94 : 68;
   }
 
-  // 2. Resolution fit against the user's preferred quality ceiling
-  const q = c.probe?.quality ?? c.quality ?? 720;
-  const qRatio = q <= preferredQuality ? q / Math.max(preferredQuality, 1) : 1 - (q - preferredQuality) / (preferredQuality * 4);
-  pts += Math.max(0, Math.min(1.05, qRatio)) * 45;
+  // 2. Source delivery method (tie-breaker at equal resolution: Original > Direct file > Direct HLS > Sniffed HLS)
+  if (c.downloadUrl || c.kind === "file") {
+    pts += c.providerId === "jellyfin" ? 28 : 20;
+  } else if (c.kind === "hls") {
+    pts += c.via === "direct" ? 12 : 4;
+  }
 
   // 3. Measured server speed + subtitle availability + dual-audio richness
   const latencyMs = c.probe?.latencyMs ?? 1200;
-  const speedPts = (1 - Math.min(latencyMs, 8000) / 8000) * 18;
+  const speedPts = (1 - Math.min(latencyMs, 8000) / 8000) * 14;
   pts += speedPts;
 
   const subCount = Math.min(4, c.subtitles?.length ?? 0);
-  pts += subCount * 2.5;
-  if (c.audio === "dual") pts += 4;
+  pts += subCount * 1.5;
+  if (c.audio === "dual") pts += 3;
   if (c.score != null && Number.isFinite(c.score)) {
-    pts += Math.max(-20, Math.min(20, c.score * 0.15));
+    pts += Math.max(-12, Math.min(12, c.score * 0.1));
   }
 
   return pts;

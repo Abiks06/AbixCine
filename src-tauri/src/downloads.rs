@@ -684,6 +684,28 @@ fn parse_attr_list(raw: &str) -> HashMap<String, String> {
     map
 }
 
+fn infer_height_from_hint(name_attr: Option<&str>, uri: &str) -> Option<u32> {
+    let hay = format!("{} {}", name_attr.unwrap_or(""), uri).to_ascii_lowercase();
+    for (needle, h) in [
+        ("2160p", 2160),
+        ("2160", 2160),
+        ("4k", 2160),
+        ("1440p", 1440),
+        ("1080p", 1080),
+        ("1080", 1080),
+        ("720p", 720),
+        ("720", 720),
+        ("640p", 640),
+        ("480p", 480),
+        ("360p", 360),
+    ] {
+        if hay.contains(needle) {
+            return Some(h);
+        }
+    }
+    None
+}
+
 pub(crate) fn parse_master_playlist(text: &str, base_url: &str) -> Result<(Vec<HlsVariant>, Vec<HlsAudioRendition>), String> {
     let base = url::Url::parse(base_url).map_err(|e| format!("Invalid master playlist URL: {e}"))?;
     let mut variants = Vec::new();
@@ -725,11 +747,15 @@ pub(crate) fn parse_master_playlist(text: &str, base_url: &str) -> Result<(Vec<H
                 .or_else(|| attrs.get("AVERAGE-BANDWIDTH"))
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(0);
-            let height = attrs.get("RESOLUTION").and_then(|r| {
-                r.split('x')
-                    .nth(1)
-                    .and_then(|h| h.trim().parse::<u32>().ok())
-            });
+            let height = attrs
+                .get("RESOLUTION")
+                .and_then(|r| {
+                    let mut parts = r.split(['x', 'X']);
+                    let w = parts.next().and_then(|s| s.trim().parse::<u32>().ok());
+                    let h = parts.next().and_then(|s| s.trim().parse::<u32>().ok());
+                    normalize_video_resolution(w, h).or(h)
+                })
+                .or_else(|| infer_height_from_hint(attrs.get("NAME").map(String::as_str), line));
             let audio_group = attrs.get("AUDIO").cloned();
             variants.push(HlsVariant {
                 uri: stream::resolve(&base, line),
@@ -788,6 +814,9 @@ pub(crate) fn normalize_video_resolution(width: Option<u32>, height: Option<u32>
     if w >= 1240 || h >= 700 {
         return Some(720);
     }
+    if h >= 560 {
+        return Some(h);
+    }
     if w >= 820 || h >= 460 {
         return Some(480);
     }
@@ -795,6 +824,49 @@ pub(crate) fn normalize_video_resolution(width: Option<u32>, height: Option<u32>
         return Some(h);
     }
     None
+}
+
+fn has_better_untried_fallback(job: &DownloadJob, actual_h: u32) -> bool {
+    job.fallbacks.iter().any(|fb| {
+        fb.url != job.url
+            && !job.tried_providers.iter().any(|p| p == &fb.provider_id)
+            && stream::validate_http_url(&fb.url).is_ok()
+            && fb.quality.map_or(true, |q| q > actual_h)
+    })
+}
+
+fn fallback_from_job(job: &DownloadJob, verified_quality: Option<u32>) -> DownloadFallbackSource {
+    DownloadFallbackSource {
+        provider_id: job.provider_id.clone(),
+        provider_name: job.provider_name.clone(),
+        url: job.url.clone(),
+        kind: job.kind.clone(),
+        headers: job.headers.clone(),
+        quality: verified_quality.or(job.resolved_quality).or(job.quality),
+        subtitles: job.subtitles.clone(),
+    }
+}
+
+fn apply_deferred_low_res_fallback(job: &mut DownloadJob, src: DownloadFallbackSource, actual_h: u32) {
+    job.provider_id = src.provider_id;
+    job.provider_name = src.provider_name;
+    job.url = src.url;
+    job.kind = src.kind;
+    job.headers = src.headers;
+    job.quality = Some(actual_h);
+    job.resolved_quality = Some(actual_h);
+    job.quality_verified = true;
+    job.video_codec = None;
+    job.subtitles = src.subtitles;
+    job.bytes_downloaded = 0;
+    job.total_bytes = None;
+    job.segments_done = None;
+    job.segments_total = None;
+    job.speed_bps = 0;
+    job.eta_sec = None;
+    job.percent = 0.0;
+    job.error = None;
+    job.file_path = None;
 }
 
 pub(crate) fn friendly_video_codec(raw: &str) -> Option<String> {
@@ -1585,6 +1657,53 @@ impl ManagerState {
         DownloadManager::persist_locked(self);
         (to_clean, active_views)
     }
+
+    /// Prunes entries whose media files were externally deleted (e.g., via File Explorer).
+    /// Skips pruning when the entire Downloads root directory is offline/unplugged.
+    fn reconcile_missing_files_locked(&mut self) -> (Vec<DownloadedEntry>, Option<PathBuf>, bool) {
+        let Some(root) = self.root.clone() else {
+            return (Vec::new(), None, false);
+        };
+        if !root.is_dir() {
+            return (Vec::new(), None, false);
+        }
+
+        let mut kept = Vec::with_capacity(self.items.len());
+        let mut removed = Vec::new();
+        let mut changed = false;
+
+        for mut it in self.items.drain(..) {
+            if Path::new(&it.file_path).is_file() {
+                let prev_subs = it.subtitle_paths.len();
+                it.subtitle_paths.retain(|sp| Path::new(sp).is_file());
+                if it.subtitle_paths.len() != prev_subs {
+                    changed = true;
+                }
+                kept.push(it);
+            } else {
+                removed.push(it);
+                changed = true;
+            }
+        }
+        self.items = kept;
+
+        if !removed.is_empty() {
+            let removed_ids: HashSet<&str> = removed.iter().map(|r| r.id.as_str()).collect();
+            let removed_paths: HashSet<&str> = removed.iter().map(|r| r.file_path.as_str()).collect();
+            self.jobs.retain(|j| {
+                if j.status != DownloadStatus::Completed {
+                    return true;
+                }
+                !removed_ids.contains(j.id.as_str())
+                    && !j.file_path.as_deref().is_some_and(|p| removed_paths.contains(p))
+            });
+        }
+
+        if changed {
+            DownloadManager::persist_locked(self);
+        }
+        (removed, Some(root), changed)
+    }
 }
 
 pub(crate) struct DownloadManager {
@@ -1613,6 +1732,25 @@ impl DownloadManager {
             jobs: g.jobs.iter().map(DownloadJobView::from).collect(),
             items: g.items.clone(),
         }
+    }
+
+    fn reconcile_snapshot(&self) -> DownloadSnapshot {
+        let (removed, root_opt, remaining) = {
+            let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let (removed, root_opt, _changed) = g.reconcile_missing_files_locked();
+            let remaining = if removed.is_empty() {
+                Vec::new()
+            } else {
+                g.items.clone()
+            };
+            (removed, root_opt, remaining)
+        };
+        if let Some(ref root) = root_opt {
+            for entry in &removed {
+                remove_orphaned_artwork(root, &remaining, entry);
+            }
+        }
+        self.snapshot()
     }
 
     fn persist_locked(g: &ManagerState) {
@@ -2363,6 +2501,8 @@ impl DownloadManager {
 
     async fn run_job(&self, mut job: DownloadJob, sig: JobSignals) {
         let root = PathBuf::from(&job.root);
+        let mut best_low_res: Option<(u32, DownloadFallbackSource)> = None;
+        let mut allow_below_target = false;
         loop {
             self.update_job(&job.id, true, |j| {
                 j.status = DownloadStatus::Downloading;
@@ -2377,7 +2517,7 @@ impl DownloadManager {
             });
 
             let outcome = if job.kind == "hls" {
-                self.run_hls_job(&mut job, &root, &sig).await
+                self.run_hls_job(&mut job, &root, &sig, allow_below_target).await
             } else {
                 self.run_direct_job(&job, &root, &sig).await
             };
@@ -2530,6 +2670,64 @@ impl DownloadManager {
                     }
                     break;
                 }
+                Err(JobStop::LowQuality { actual_height, target }) => {
+                    let candidate_fb = fallback_from_job(&job, Some(actual_height));
+                    if best_low_res.as_ref().map_or(true, |(best_h, _)| actual_height > *best_h) {
+                        best_low_res = Some((actual_height, candidate_fb));
+                    }
+                    let reason = format!("only {actual_height}p available (want {target}p)");
+                    let (next_job_opt, view_opt) = {
+                        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut next_j = None;
+                        let mut next_v = None;
+                        if let Some(j) = g.jobs.iter_mut().find(|j| j.id == job.id) {
+                            if let Some((old_name, new_name)) = advance_job_to_next_fallback(j, &reason) {
+                                j.status = DownloadStatus::Downloading;
+                                j.stage = Some(format!(
+                                    "{old_name} was {actual_height}p — checking {new_name} for {target}p…"
+                                ));
+                                j.updated_at = now_ms();
+                                next_v = Some(DownloadJobView::from(&*j));
+                                next_j = Some(j.clone());
+                            }
+                        }
+                        if next_j.is_some() {
+                            Self::persist_locked(&g);
+                        }
+                        (next_j, next_v)
+                    };
+                    cleanup_job_artifacts(&job);
+                    if let Some(next_job) = next_job_opt {
+                        if let Some(v) = view_opt {
+                            self.emit_job(&v);
+                        }
+                        job = next_job;
+                        continue;
+                    }
+                    if let Some((best_h, best_src)) = best_low_res.take() {
+                        let view = {
+                            let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut out = None;
+                            if let Some(j) = g.jobs.iter_mut().find(|j| j.id == job.id) {
+                                apply_deferred_low_res_fallback(j, best_src, best_h);
+                                j.status = DownloadStatus::Downloading;
+                                j.stage = Some(format!("Using best available ({} · {best_h}p)…", j.provider_name));
+                                j.updated_at = now_ms();
+                                out = Some((j.clone(), DownloadJobView::from(&*j)));
+                            }
+                            Self::persist_locked(&g);
+                            out
+                        };
+                        if let Some((restored, v)) = view {
+                            self.emit_job(&v);
+                            job = restored;
+                            allow_below_target = true;
+                            continue;
+                        }
+                    }
+                    allow_below_target = true;
+                    continue;
+                }
                 Err(JobStop::Failed(msg)) => {
                     if !is_local_fatal_error(&msg) {
                         let (next_job_opt, view_opt) = {
@@ -2557,6 +2755,31 @@ impl DownloadManager {
                             }
                             job = next_job;
                             continue;
+                        }
+                        if let Some((best_h, best_src)) = best_low_res.take() {
+                            cleanup_job_artifacts(&job);
+                            let view = {
+                                let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut out = None;
+                                if let Some(j) = g.jobs.iter_mut().find(|j| j.id == job.id) {
+                                    apply_deferred_low_res_fallback(j, best_src, best_h);
+                                    j.status = DownloadStatus::Downloading;
+                                    j.stage = Some(format!(
+                                        "Using best available ({} · {best_h}p)…",
+                                        j.provider_name
+                                    ));
+                                    j.updated_at = now_ms();
+                                    out = Some((j.clone(), DownloadJobView::from(&*j)));
+                                }
+                                Self::persist_locked(&g);
+                                out
+                            };
+                            if let Some((restored, v)) = view {
+                                self.emit_job(&v);
+                                job = restored;
+                                allow_below_target = true;
+                                continue;
+                            }
                         }
                     }
                     self.update_job(&job.id, true, |j| {
@@ -2861,6 +3084,7 @@ impl DownloadManager {
         job: &mut DownloadJob,
         root: &Path,
         sig: &JobSignals,
+        allow_below_target: bool,
     ) -> Result<(PathBuf, u64), JobStop> {
         let init_meta = start_req_from_job(job);
         let (folder, _) = resolve_target_paths(root, &init_meta, "mp4");
@@ -2883,6 +3107,22 @@ impl DownloadManager {
             self.fetch_and_save_hls_state(job, &state_path, sig, false).await?
         };
 
+        // If the master playlist's best variant is strictly below the requested resolution and
+        // untried backup servers remain, defer this server and check backups before downloading segments.
+        if !allow_below_target {
+            if let (Some(target), Some(actual_h)) = (
+                job.preferred_quality.filter(|&q| q > 0),
+                work_state.selected_height,
+            ) {
+                if actual_h < target && has_better_untried_fallback(job, actual_h) {
+                    return Err(JobStop::LowQuality {
+                        actual_height: actual_h,
+                        target,
+                    });
+                }
+            }
+        }
+
         let resolved_h = work_state.selected_height.or(job.resolved_quality).or(job.quality);
         if resolved_h.is_some() {
             job.resolved_quality = resolved_h;
@@ -2904,6 +3144,56 @@ impl DownloadManager {
             };
             j.stage = Some(format!("Preparing segments{avail_note}…"));
         });
+
+        // For single-bitrate HLS playlists without master RESOLUTION tags, probe segment 0 early
+        // so we know the real resolution right away and can switch servers if it is SD/low-res.
+        if work_state.selected_height.is_none()
+            && !work_state.video.segments.is_empty()
+            && work_state.video.segments[0].map_uri.is_none()
+            && work_state.video.segments[0].key.is_none()
+        {
+            let seg0 = &work_state.video.segments[0];
+            let seg0_path = work_dir.join(format!("vseg_{:06}.{}", seg0.index, segment_ext(&seg0.uri)));
+            if !seg0_path.is_file() {
+                let _ = download_single_segment(&seg0.uri, seg0.byte_range, &seg0_path, &job.headers, sig).await;
+            }
+            if seg0_path.is_file() {
+                let app_opt = self.app.lock().ok().and_then(|g| g.clone());
+                if let Some(app_c) = app_opt {
+                    let p_c = seg0_path.clone();
+                    if let Ok(Some((Some(probed_h), probed_codec))) =
+                        tauri::async_runtime::spawn_blocking(move || probe_downloaded_video(&app_c, &p_c)).await
+                    {
+                        job.resolved_quality = Some(probed_h);
+                        job.quality = Some(probed_h);
+                        job.quality_verified = true;
+                        if probed_codec.is_some() {
+                            job.video_codec = probed_codec.clone();
+                        }
+                        work_state.selected_height = Some(probed_h);
+                        let _ = write_json_atomic(&state_path, &work_state);
+                        self.update_job(&job.id, true, |j| {
+                            j.resolved_quality = Some(probed_h);
+                            j.quality = Some(probed_h);
+                            j.quality_verified = true;
+                            if let Some(ref vc) = probed_codec {
+                                j.video_codec = Some(vc.clone());
+                            }
+                        });
+                        if !allow_below_target {
+                            if let Some(target) = job.preferred_quality.filter(|&q| q > 0) {
+                                if probed_h < target && has_better_untried_fallback(job, probed_h) {
+                                    return Err(JobStop::LowQuality {
+                                        actual_height: probed_h,
+                                        target,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         let final_meta = start_req_from_job(job);
         let (_, mp4_path) = resolve_target_paths(root, &final_meta, "mp4");
@@ -3226,6 +3516,7 @@ enum JobStop {
     Paused,
     Cancelled,
     Replaced,
+    LowQuality { actual_height: u32, target: u32 },
     Failed(String),
 }
 
@@ -3732,7 +4023,9 @@ fn remux_local_hls(
             std::fs::rename(&tmp_mp4, mp4_path).map_err(|e| JobStop::Failed(e.to_string()))?;
             return Ok(mp4_path.to_path_buf());
         }
-        Err(stop @ (JobStop::Cancelled | JobStop::Replaced | JobStop::Paused)) => return Err(stop),
+        Err(stop @ (JobStop::Cancelled | JobStop::Replaced | JobStop::Paused | JobStop::LowQuality { .. })) => {
+            return Err(stop)
+        }
         Err(JobStop::Failed(_)) => {}
     }
     match run_pass(false, "mp4", &tmp_mp4) {
@@ -3740,7 +4033,9 @@ fn remux_local_hls(
             std::fs::rename(&tmp_mp4, mp4_path).map_err(|e| JobStop::Failed(e.to_string()))?;
             return Ok(mp4_path.to_path_buf());
         }
-        Err(stop @ (JobStop::Cancelled | JobStop::Replaced | JobStop::Paused)) => return Err(stop),
+        Err(stop @ (JobStop::Cancelled | JobStop::Replaced | JobStop::Paused | JobStop::LowQuality { .. })) => {
+            return Err(stop)
+        }
         Err(JobStop::Failed(_)) => {}
     }
     match run_pass(false, "matroska", &tmp_mkv) {
@@ -3748,7 +4043,7 @@ fn remux_local_hls(
             std::fs::rename(&tmp_mkv, mkv_path).map_err(|e| JobStop::Failed(e.to_string()))?;
             Ok(mkv_path.to_path_buf())
         }
-        Err(stop @ (JobStop::Cancelled | JobStop::Replaced | JobStop::Paused)) => Err(stop),
+        Err(stop @ (JobStop::Cancelled | JobStop::Replaced | JobStop::Paused | JobStop::LowQuality { .. })) => Err(stop),
         Err(JobStop::Failed(err)) => Err(JobStop::Failed(format!("FFmpeg remux failed: {err}"))),
     }
 }
@@ -3962,8 +4257,10 @@ pub async fn download_remove(id: String, delete_file: bool) -> Result<DownloadSn
 }
 
 #[tauri::command]
-pub fn download_list() -> DownloadSnapshot {
-    manager().snapshot()
+pub async fn download_list() -> DownloadSnapshot {
+    tauri::async_runtime::spawn_blocking(move || manager().reconcile_snapshot())
+        .await
+        .unwrap_or_else(|_| manager().snapshot())
 }
 
 #[tauri::command]
@@ -4599,5 +4896,88 @@ seg2.m4s
         let ids_final: Vec<_> = g.jobs.iter().map(|j| j.id.as_str()).collect();
         assert_eq!(ids_final, vec!["j_done"]);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn reconcile_missing_files_prunes_deleted_entries_but_preserves_when_root_missing() {
+        let base = std::env::temp_dir().join(format!("abixcine_reconcile_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let ep_dir = base.join("Series").join("Andor (2022)").join("Season 01");
+        std::fs::create_dir_all(&ep_dir).unwrap();
+        let ep1 = ep_dir.join("Andor - S01E01.mp4");
+        let ep2 = ep_dir.join("Andor - S01E02.mp4");
+        let sub1 = ep_dir.join("Andor - S01E01.en.vtt");
+        std::fs::write(&ep1, b"ep1").unwrap();
+        std::fs::write(&ep2, b"ep2").unwrap();
+        std::fs::write(&sub1, b"WEBVTT").unwrap();
+
+        let mk_entry = |id: &str, ep: u32, path: &Path, subs: Vec<String>| DownloadedEntry {
+            id: id.into(),
+            media_key: "tmdb:tv:100".into(),
+            canonical_key: "tmdb:tv:100".into(),
+            title: "Andor".into(),
+            media_kind: "tv".into(),
+            is_film: false,
+            year: Some(2022),
+            season: Some(1),
+            episode: Some(ep),
+            episode_title: None,
+            audio: None,
+            quality: Some(1080),
+            quality_verified: true,
+            video_codec: Some("H.264".into()),
+            provider_id: "p1".into(),
+            provider_name: "P1".into(),
+            file_path: path.to_string_lossy().into_owned(),
+            file_size: 3,
+            subtitle_paths: subs,
+            poster_path: None,
+            backdrop_path: None,
+            downloaded_at: 1000,
+            media_snapshot: serde_json::json!({}),
+        };
+
+        let mut g = ManagerState::default();
+        g.root = Some(base.clone());
+        g.items = vec![
+            mk_entry("dl_1", 1, &ep1, vec![sub1.to_string_lossy().into_owned()]),
+            mk_entry("dl_2", 2, &ep2, Vec::new()),
+        ];
+
+        // Simulate user deleting ep2 and sub1 via File Explorer
+        std::fs::remove_file(&ep2).unwrap();
+        std::fs::remove_file(&sub1).unwrap();
+
+        let (removed, _, changed) = g.reconcile_missing_files_locked();
+        assert!(changed);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].id, "dl_2");
+        assert_eq!(g.items.len(), 1);
+        assert_eq!(g.items[0].id, "dl_1");
+        assert!(g.items[0].subtitle_paths.is_empty());
+
+        // If the entire root directory disappears (unplugged drive), keep items intact
+        std::fs::remove_dir_all(&base).unwrap();
+        let (removed2, _, changed2) = g.reconcile_missing_files_locked();
+        assert!(!changed2);
+        assert!(removed2.is_empty());
+        assert_eq!(g.items.len(), 1);
+    }
+
+    #[test]
+    fn master_playlist_normalizes_cinemascope_and_infers_untagged_uri_quality() {
+        let m3u8 = "#EXTM3U\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=1200000,RESOLUTION=1138x640\n\
+            low.m3u8\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=5200000,RESOLUTION=1920x804\n\
+            cinemascope.m3u8\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=2600000\n\
+            stream_720p.m3u8\n";
+        let (variants, _) = parse_master_playlist(m3u8, "https://cdn.example/master.m3u8").unwrap();
+        assert_eq!(variants[0].height, Some(640));
+        assert_eq!(variants[1].height, Some(1080));
+        assert_eq!(variants[2].height, Some(720));
+        assert_eq!(select_hls_variant(&variants, Some(1080)).and_then(|v| v.height), Some(1080));
+        assert_eq!(select_hls_variant(&variants, Some(720)).and_then(|v| v.height), Some(720));
     }
 }

@@ -193,18 +193,30 @@ export function onDownloadsChanged(cb: () => void): () => void {
   return () => changeCallbacks.delete(cb);
 }
 
+let lastRefreshAt = 0;
+let refreshInFlight: Promise<DownloadSnapshot | null> | null = null;
+let reconcileCleanup: (() => void) | null = null;
+
+function itemSignature(items: DownloadedEntry[]): string {
+  return items.map((it) => `${it.id}|${it.filePath}|${it.subtitlePaths?.length ?? 0}`).join("\n");
+}
+
 function notifyDownloadsChanged() {
   changeCallbacks.forEach((cb) => cb());
 }
 
 function applySnapshot(snap: DownloadSnapshot) {
+  if (!snap || typeof snap !== "object" || Array.isArray(snap)) return;
+  const nextItems = Array.isArray(snap.items) ? snap.items : [];
+  const itemsChanged = itemSignature(state.items) !== itemSignature(nextItems);
   state = {
     ...state,
     root: snap.root ?? state.root,
     jobs: Array.isArray(snap.jobs) ? snap.jobs : [],
-    items: Array.isArray(snap.items) ? snap.items : [],
+    items: nextItems,
   };
   emit();
+  if (itemsChanged) notifyDownloadsChanged();
 }
 
 export function useDownloads(): DownloadsStoreState {
@@ -311,20 +323,56 @@ async function attachProgressListener() {
         }
       }
     });
+    if (typeof window !== "undefined" && !reconcileCleanup) {
+      const onFocus = () => {
+        if (state.root) void refreshDownloads({ minIntervalMs: 1500 });
+      };
+      const onVis = () => {
+        if (typeof document !== "undefined" && document.visibilityState === "visible" && state.root) {
+          void refreshDownloads({ minIntervalMs: 1500 });
+        }
+      };
+      window.addEventListener("focus", onFocus);
+      document?.addEventListener?.("visibilitychange", onVis);
+      const timer = window.setInterval(() => {
+        if (
+          state.root &&
+          state.items.length > 0 &&
+          (typeof document === "undefined" || document.visibilityState === "visible")
+        ) {
+          void refreshDownloads({ minIntervalMs: 8000 });
+        }
+      }, 10_000);
+      reconcileCleanup = () => {
+        window.removeEventListener("focus", onFocus);
+        document?.removeEventListener?.("visibilitychange", onVis);
+        window.clearInterval(timer);
+      };
+    }
   } catch {
     listenerReady = false;
   }
 }
 
-export async function refreshDownloads(): Promise<DownloadSnapshot | null> {
+export async function refreshDownloads(opts?: { minIntervalMs?: number }): Promise<DownloadSnapshot | null> {
   if (!isTauri()) return null;
-  try {
-    const snap = await invoke<DownloadSnapshot>("download_list");
-    applySnapshot(snap);
-    return snap;
-  } catch {
+  if (opts?.minIntervalMs && lastRefreshAt > 0 && Date.now() - lastRefreshAt < opts.minIntervalMs) {
     return null;
   }
+  if (refreshInFlight) return refreshInFlight;
+  refreshInFlight = (async () => {
+    try {
+      const snap = await invoke<DownloadSnapshot>("download_list");
+      lastRefreshAt = Date.now();
+      applySnapshot(snap);
+      return snap && typeof snap === "object" && !Array.isArray(snap) ? snap : null;
+    } catch {
+      return null;
+    } finally {
+      refreshInFlight = null;
+    }
+  })();
+  return refreshInFlight;
 }
 
 export interface MigrateDownloadsResponse {
@@ -932,6 +980,8 @@ export function clearDownloadsConfig(): void {
 export function disposeDownloadsListener(): void {
   unlistenProgress?.();
   unlistenProgress = null;
+  reconcileCleanup?.();
+  reconcileCleanup = null;
   listenerReady = false;
 }
 
