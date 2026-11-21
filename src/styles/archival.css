@@ -1,60 +1,168 @@
 /* =========================================================
-   AbixCine — "Celluloid Archive v2" surface & motion layer
-   Sculptural matte darkroom cards, specular top catch-lights,
-   calibrated OKLCH projection accents, and sleek optical brackets.
-   Zero backdrop-filter blur.
+   AbixCine — "Celluloid Archive × Liquid Vibrancy" surface & motion layer
+   Luminous translucent frosted glass across shell chrome, Hero plinth,
+   search, popovers, inspector panels, and player HUD with 1px directional
+   specular bevels and composited frost grain on scrolling cards.
    ========================================================= */
 
-/* ---------- sculptural archival plates ---------- */
+/* ---------- composited frost-grain glass panes (scrollable card grids) ---------- */
 .panel,
 .facts,
 .file,
-.smart,
-.race-grid-wrap,
-.auth-card,
-.palette,
-.qd-drawer,
-.psheet,
 .source-block,
+.source-tile,
+.preset-card,
+.tt-ticket,
+.dlv-card,
+.theme-card,
+.race-grid-wrap {
+  position: relative;
+  background-color: var(--glass-bg-pane);
+  background-image: var(--frost-grain), var(--glass-sheen);
+  background-size: var(--glass-size);
+  background-repeat: var(--glass-repeat);
+  border: 0;
+  box-shadow: var(--glass-rim), var(--card-shadow);
+}
+
+a.file:hover,
+.preset-card:hover,
+.theme-card:hover,
+.dlv-card:hover {
+  background-color: color-mix(in oklab, var(--fg) 7%, var(--glass-bg-pane));
+  box-shadow: var(--glass-rim-hi), var(--card-hover-shadow);
+}
+
+/* ---------- focal real backdrop-filter glass panels ---------- */
+.smart,
+.tp-telemetry-card,
+.nw-spotlight,
 .lp-card,
 .spread-lead,
 .reel-lead,
-.tt-ticket {
-  background-color: var(--s0);
-  background-image: var(--plate);
+.filmreel,
+.top-hit,
+.dlv-setup {
+  position: relative;
+  background-color: var(--glass-bg-pane);
+  background-image: var(--frost-grain), var(--glass-sheen);
+  background-size: var(--glass-size);
+  background-repeat: var(--glass-repeat);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
   border: 0;
-  box-shadow: var(--rim), var(--card-shadow);
+  box-shadow: var(--glass-rim), var(--card-shadow);
 }
 
-.panel,
-.facts,
-.file,
-.source-block {
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.06), inset 0 0 0 1px var(--line), var(--card-shadow);
+.hero-plinth,
+.smart {
+  box-shadow: var(--glass-rim), var(--glass-shadow);
 }
 
-a.file:hover {
-  background-color: var(--s1);
-  box-shadow: var(--frame-rim), var(--card-hover-shadow);
-}
-
-.source-tile,
-.preset-card {
-  background-color: var(--s1);
-  background-image: var(--plate);
+/* ---------- floating heavy vibrancy liquid-glass sheets ---------- */
+.palette,
+.qd-drawer,
+.auth-card {
+  position: relative;
+  background-color: var(--glass-bg-strong);
+  background-image: var(--frost-grain), var(--glass-sheen);
+  background-size: var(--glass-size);
+  background-repeat: var(--glass-repeat);
+  backdrop-filter: var(--glass-blur-lg);
+  -webkit-backdrop-filter: var(--glass-blur-lg);
   border: 0;
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.06), inset 0 0 0 1px var(--line);
+  box-shadow: var(--glass-rim), var(--glass-shadow);
 }
 
-.preset-card:hover {
-  background-color: var(--s2);
-  box-shadow: var(--rim);
+.psheet {
+  background-color: rgb(16 16 26 / 0.48);
+  background-image: var(--frost-grain), var(--hud-sheen);
+  background-size: var(--glass-size);
+  background-repeat: var(--glass-repeat);
+  backdrop-filter: var(--hud-blur);
+  -webkit-backdrop-filter: var(--hud-blur);
+  border: 0;
+  box-shadow: var(--hud-rim), 0 30px 90px rgb(0 0 0 / 0.78);
 }
 
 .empty-ic,
 .pp-idle .pp-glyph {
-  background-color: color-mix(in oklab, var(--tone) 12%, var(--s1));
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.12), inset 0 0 0 1px color-mix(in oklab, var(--tone) 34%, transparent), 0 16px 36px -18px var(--glow);
+  background-color: color-mix(in oklab, var(--tone) 16%, var(--glass-bg-subtle));
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.24), inset 0 0 0 1px color-mix(in oklab, var(--tone) 42%, transparent), 0 16px 36px -18px var(--glow);
+}
+
+/* ---------- masked 1px Apple liquid-glass directional specular bevel rim ---------- */
+:is(
+  .hero-plinth,
+  .palette,
+  .qd-drawer,
+  .dl-modal,
+  .theme-popover,
+  .dl-pop,
+  .auth-card,
+  .search-box,
+  .smart,
+  .tp-telemetry-card,
+  .nw-spotlight,
+  .lp-card,
+  .panel,
+  .taste-ribbon,
+  .filmreel,
+  .spread-lead,
+  .top-hit,
+  .pbot,
+  .psheet
+)::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: var(--glass-edge);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events: none;
+  z-index: 4;
+}
+
+/* ---------- pointer-reactive liquid glass catch-light (lib/pointerLight.ts) ---------- */
+:is(
+  .hero-plinth,
+  .topbar-search,
+  .topbar-theme,
+  .topbar-dl,
+  .search-box,
+  .btn.glass,
+  .btn-glass,
+  .hero-next,
+  .palette,
+  .theme-popover,
+  .dl-queue-pop,
+  .dl-pop,
+  .dl-modal,
+  .qd-drawer,
+  .auth-card,
+  .smart,
+  .tp-telemetry-card,
+  .nw-spotlight,
+  .lp-card,
+  .spread-lead,
+  .reel-lead,
+  .filmreel,
+  .panel,
+  .dlv-card,
+  .dlv-setup,
+  .top-hit,
+  .pbot,
+  .psheet
+).lit {
+  background-image:
+    radial-gradient(300px circle at var(--gx, 50%) var(--gy, 0%), var(--glass-spot), transparent 68%),
+    var(--frost-grain),
+    var(--glass-sheen);
+  background-size: 100% 100%, var(--glass-size);
+  background-repeat: no-repeat, var(--glass-repeat);
 }
 
 /* ---------- optical corner registration brackets ---------- */
@@ -99,26 +207,40 @@ a.file:hover {
   filter: drop-shadow(0 0 6px var(--glow));
 }
 
-/* ---------- command palette accent ---------- */
+/* ---------- command palette Spotlight vibrancy ---------- */
 @property --pal-tone { syntax: "<color>"; inherits: true; initial-value: transparent; }
 .palette {
   --pal-tone: var(--tone);
-  background: var(--s0);
+  background-color: var(--glass-bg-strong);
   box-shadow:
-    inset 0 1px 0 rgb(255 255 255 / 0.12),
-    inset 0 0 0 1px color-mix(in oklab, var(--pal-tone) 46%, var(--line-2)),
-    0 48px 120px rgb(0 0 0 / 0.88),
-    0 0 90px -40px color-mix(in oklab, var(--pal-tone) 38%, transparent);
+    var(--glass-rim),
+    inset 0 0 0 1px color-mix(in oklab, var(--pal-tone) 34%, transparent),
+    0 48px 120px rgb(0 0 0 / 0.84),
+    0 0 90px -40px color-mix(in oklab, var(--pal-tone) 42%, transparent);
   transition: --pal-tone var(--slow) var(--ease), box-shadow var(--slow) var(--ease);
 }
-.palette-scrim {
-  background: rgb(4 4 6 / 0.78);
+.palette-scrim::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: rgb(5 5 10 / 0.44);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+:root[data-theme="alabaster"] .palette-scrim::before,
+:root[data-theme="alabaster"] .qd-scrim::before,
+:root[data-theme="alabaster"] .dl-modal-scrim::before {
+  background: rgb(24 22 20 / 0.24);
 }
 .pal-preview {
-  background: radial-gradient(120% 60% at 50% 0%, color-mix(in oklab, var(--pal-tone) 14%, transparent), transparent 70%), var(--s1);
+  background:
+    radial-gradient(120% 60% at 50% 0%, color-mix(in oklab, var(--pal-tone) 18%, transparent), transparent 70%),
+    color-mix(in oklab, var(--fg) 4%, transparent);
 }
 .pal-foot {
-  background: var(--bg);
+  background: color-mix(in oklab, var(--fg) 3.5%, transparent);
 }
 
 /* ---------- sliding indicators (lib/useSlidingIndicator.ts) ---------- */
@@ -137,28 +259,32 @@ a.file:hover {
   width: var(--ind-w);
   height: var(--ind-h);
   transform: translate(var(--ind-x), var(--ind-y));
-  border-radius: var(--ind-r, var(--r-xs));
+  border-radius: var(--ind-r, 7px);
   background: var(--ind-bg, var(--fg));
   box-shadow: var(--ind-shadow, none);
   pointer-events: none;
 }
 [data-ind="live"]::before {
-  transition: transform var(--emph) var(--ease-out), width var(--emph) var(--ease-out), height var(--emph) var(--ease-out);
+  transition: transform var(--emph) var(--ease-ios), width var(--emph) var(--ease-ios), height var(--emph) var(--ease-ios);
 }
 [data-ind] > button.on,
 [data-ind] .pal-item.on {
   background: transparent;
   box-shadow: none;
 }
-.seg3 { --ind-r: var(--r-xs); }
-.sub-seg { --ind-r: var(--r-xs); }
-.view-pick { --ind-bg: var(--s3); --ind-shadow: inset 0 1px 0 rgb(255 255 255 / 0.1), inset 0 0 0 1px var(--line-2); }
-.pal-list { --ind-r: var(--r-xs); --ind-bg: rgb(242 239 233 / 0.08); --ind-shadow: inset 2px 0 0 var(--tone); }
+.seg3 { --ind-r: 7px; }
+.sub-seg { --ind-r: 7px; }
+.view-pick { --ind-bg: var(--s3); --ind-shadow: inset 0 1px 0 rgb(255 255 255 / 0.16), inset 0 0 0 1px var(--line-2); }
+.pal-list {
+  --ind-r: var(--r-sm);
+  --ind-bg: color-mix(in oklab, var(--fg) 10%, transparent);
+  --ind-shadow: inset 0 1px 0 rgb(255 255 255 / 0.18), inset 2px 0 0 var(--tone);
+}
 .pal-list[data-ind="live"]::before { transition-duration: var(--base); }
 .set-nav {
-  --ind-r: var(--r-xs);
-  --ind-bg: var(--s1);
-  --ind-shadow: inset 2px 0 0 var(--tone), inset 0 0 0 1px var(--line-2);
+  --ind-r: 10px;
+  --ind-bg: color-mix(in oklab, var(--fg) 10%, var(--glass-bg-subtle));
+  --ind-shadow: var(--glass-rim), inset 2.5px 0 0 var(--tone);
 }
 .tabbar[data-ind]::before {
   top: auto;
@@ -179,18 +305,157 @@ a.file:hover {
 .panel input[type="url"],
 .panel input[type="password"],
 .panel textarea {
-  background-color: var(--bg);
+  background-color: color-mix(in oklab, var(--bg) 44%, transparent);
+  box-shadow: inset 0 1px 2px rgb(0 0 0 / 0.28), inset 0 0 0 1px rgb(255 255 255 / 0.14);
+  border-radius: 8px;
+}
+:root[data-theme="alabaster"] .panel input:not([type]),
+:root[data-theme="alabaster"] .panel input[type="text"],
+:root[data-theme="alabaster"] .panel input[type="url"],
+:root[data-theme="alabaster"] .panel input[type="password"],
+:root[data-theme="alabaster"] .panel textarea {
+  background-color: rgb(255 255 255 / 0.62);
+  box-shadow: inset 0 1px 2px rgb(24 22 20 / 0.08), inset 0 0 0 1px rgb(24 22 20 / 0.14);
 }
 
 /* ---------- high-contrast & accessibility contracts ---------- */
 @media (prefers-reduced-transparency: reduce) {
-  .palette, .qd-drawer, .psheet, .panel, .facts, .file, .notice, .smart, .race-grid-wrap, .auth-card {
+  :root,
+  :root[data-theme="alabaster"] {
+    --glass-bg: var(--s1);
+    --glass-bg-strong: var(--s0);
+    --glass-bg-subtle: var(--s1);
+    --glass-bg-pane: var(--s0);
+    --glass-media: rgb(10 10 14 / 0.92);
+  }
+  .rail::before,
+  .topbar::before,
+  .topbar-search,
+  .topbar-theme,
+  .topbar-dl,
+  .topbar-offline,
+  .theme-popover,
+  .menu,
+  .dl-queue-pop,
+  .btn.glass,
+  .btn-glass,
+  .seg-pills,
+  .seg3,
+  .sub-seg,
+  .sd,
+  .toast,
+  .update-toast,
+  .palette-scrim::before,
+  .palette,
+  .qd-scrim::before,
+  .qd-drawer,
+  .psheet,
+  .auth-card,
+  .auth-pitch li,
+  .search-box,
+  .dl-pop,
+  .dl-modal,
+  .dl-modal-scrim::before,
+  .hero-plinth,
+  .hero-next,
+  .back,
+  .act,
+  .lp-rank,
+  .nw-reason-tag,
+  .nw-tag,
+  .fr-pill,
+  .fr-speed,
+  .smart,
+  .tp-telemetry-card,
+  .nw-spotlight,
+  .lp-card,
+  .spread-lead,
+  .reel-lead,
+  .filmreel,
+  .top-hit,
+  .dlv-setup,
+  .taste-ribbon,
+  .card-curtain,
+  .more,
+  .nav-btn {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+    background-image: none;
+  }
+  .panel, .facts, .file, .notice, .source-block, .source-tile, .preset-card, .tt-ticket, .dlv-card, .theme-card, .race-grid-wrap {
     background-image: none;
   }
 }
 
 @media (prefers-contrast: more) {
-  .rail, .topbar, .panel, .facts, .file, .notice, .smart, .race-grid-wrap, .auth-card, .palette, .qd-drawer, .psheet, .menu, .toast, .update-toast, .tp-telemetry-card, .nw-spotlight, .theme-popover {
+  .rail::before,
+  .topbar::before,
+  .palette-scrim::before,
+  .qd-scrim::before,
+  .dl-modal-scrim::before {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+    background-image: none !important;
+  }
+  :is(
+    .hero-plinth,
+    .palette,
+    .qd-drawer,
+    .dl-modal,
+    .theme-popover,
+    .dl-pop,
+    .auth-card,
+    .search-box,
+    .smart,
+    .tp-telemetry-card,
+    .nw-spotlight,
+    .lp-card,
+    .panel,
+    .taste-ribbon,
+    .filmreel,
+    .spread-lead,
+    .top-hit,
+    .pbot,
+    .psheet
+  )::after {
+    display: none !important;
+  }
+  .rail,
+  .topbar,
+  .topbar-search,
+  .topbar-theme,
+  .topbar-dl,
+  .hero-plinth,
+  .taste-ribbon,
+  .panel,
+  .facts,
+  .file,
+  .notice,
+  .smart,
+  .race-grid-wrap,
+  .auth-card,
+  .palette,
+  .qd-drawer,
+  .psheet,
+  .menu,
+  .toast,
+  .update-toast,
+  .tp-telemetry-card,
+  .nw-spotlight,
+  .lp-card,
+  .spread-lead,
+  .reel-lead,
+  .filmreel,
+  .top-hit,
+  .dlv-setup,
+  .dlv-card,
+  .theme-popover,
+  .dl-queue-pop,
+  .dl-pop,
+  .dl-modal,
+  .search-box {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
     background-color: var(--bg) !important;
     background-image: none !important;
     border: 1px solid var(--fg) !important;

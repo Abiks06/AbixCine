@@ -2,10 +2,12 @@ import { getSettings } from "./settings";
 
 /**
  * Magnetic micro-pull for primary Play CTAs (.btn.play on Hero / Title Monograph and
- * the paused player's .cc-btn.main). Card 3D tilts and frosted rim tracking were retired
- * in favor of crisp projection gate corner brackets in CSS.
+ * the paused player's .cc-btn.main) plus pointer-reactive specular catch-light (--gx/--gy)
+ * on liquid-glass surfaces and frosted cards.
  */
 const MAGNETS = ":is(.hero, .tp-top) .btn.play:not(:disabled), .cc-btn.main";
+const GLASS =
+  ".hero-plinth, .topbar-search, .topbar-theme, .topbar-dl, .search-box, .btn.glass, .btn-glass, .hero-next, .palette, .theme-popover, .dl-queue-pop, .dl-pop, .dl-modal, .qd-drawer, .auth-card, .smart, .tp-telemetry-card, .nw-spotlight, .lp-card, .spread-lead, .reel-lead, .filmreel, .panel, .dlv-card, .dlv-setup, .top-hit, .pbot, .psheet";
 const MAGNET_PX = 4;
 
 export function installPointerLight() {
@@ -14,9 +16,12 @@ export function installPointerLight() {
   let frame = 0;
   let mag: HTMLElement | null = null;
   let magRect: DOMRect | null = null;
+  let glass: HTMLElement | null = null;
+  let glassRect: DOMRect | null = null;
 
   const invalidateRects = () => {
     magRect = null;
+    glassRect = null;
   };
 
   const unmag = () => {
@@ -28,25 +33,53 @@ export function installPointerLight() {
     magRect = null;
   };
 
+  const unglass = () => {
+    if (!glass) return;
+    glass.style.removeProperty("--gx");
+    glass.style.removeProperty("--gy");
+    glass.classList.remove("lit");
+    glass = null;
+    glassRect = null;
+  };
+
   const apply = () => {
     frame = 0;
     const e = last;
     if (!e || e.pointerType === "touch" || getSettings().reduceMotion) {
-      return unmag();
+      unmag();
+      unglass();
+      return;
     }
     const target = e.target as Element | null;
+
     const m = target?.closest?.<HTMLElement>(MAGNETS) ?? null;
     if (m !== mag) unmag();
-    if (!m) return;
-    mag = m;
-    magRect ??= m.getBoundingClientRect();
-    const r = magRect;
-    if (r.width && r.height) {
-      const dx = (e.clientX - (r.left + r.width / 2)) / (r.width / 2);
-      const dy = (e.clientY - (r.top + r.height / 2)) / (r.height / 2);
-      m.style.setProperty("--mag-x", `${(Math.max(-1, Math.min(1, dx)) * MAGNET_PX).toFixed(2)}px`);
-      m.style.setProperty("--mag-y", `${(Math.max(-1, Math.min(1, dy)) * MAGNET_PX * 0.6).toFixed(2)}px`);
-      m.classList.add("mag");
+    if (m) {
+      mag = m;
+      magRect ??= m.getBoundingClientRect();
+      const r = magRect;
+      if (r.width && r.height) {
+        const dx = (e.clientX - (r.left + r.width / 2)) / (r.width / 2);
+        const dy = (e.clientY - (r.top + r.height / 2)) / (r.height / 2);
+        m.style.setProperty("--mag-x", `${(Math.max(-1, Math.min(1, dx)) * MAGNET_PX).toFixed(2)}px`);
+        m.style.setProperty("--mag-y", `${(Math.max(-1, Math.min(1, dy)) * MAGNET_PX * 0.6).toFixed(2)}px`);
+        m.classList.add("mag");
+      }
+    }
+
+    const g = target?.closest?.<HTMLElement>(GLASS) ?? null;
+    if (g !== glass) unglass();
+    if (g) {
+      glass = g;
+      glassRect ??= g.getBoundingClientRect();
+      const r = glassRect;
+      if (r.width && r.height) {
+        const px = Math.max(0, Math.min(100, ((e.clientX - r.left) / r.width) * 100));
+        const py = Math.max(0, Math.min(100, ((e.clientY - r.top) / r.height) * 100));
+        g.style.setProperty("--gx", `${px.toFixed(1)}%`);
+        g.style.setProperty("--gy", `${py.toFixed(1)}%`);
+        g.classList.add("lit");
+      }
     }
   };
 
@@ -63,5 +96,6 @@ export function installPointerLight() {
   document.documentElement.addEventListener("pointerleave", () => {
     last = null;
     unmag();
+    unglass();
   });
 }
