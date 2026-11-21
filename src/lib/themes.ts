@@ -1,4 +1,12 @@
-export type ThemeId = "noir" | "crimson" | "indigo" | "emerald" | "violet" | "alabaster";
+export type ThemeId =
+  | "noir"
+  | "crimson"
+  | "indigo"
+  | "emerald"
+  | "violet"
+  | "solstice"
+  | "alabaster"
+  | "washi";
 
 export interface ThemeMeta {
   id: ThemeId;
@@ -12,44 +20,58 @@ export const THEMES: readonly ThemeMeta[] = [
   {
     id: "noir",
     name: "Celluloid Gold",
-    tagline: "Warm darkroom obsidian & 35mm amber gold",
+    tagline: "Deep darkroom charcoal, Kodak amber & slate blue",
     mode: "dark",
-    swatches: ["#09080b", "#17151c", "#d8ab4e", "#f5f1e8"],
+    swatches: ["#08080c", "#14141d", "#e2b14c", "#f5f1e8"],
   },
   {
     id: "crimson",
     name: "Grand Premiere",
-    tagline: "Theater velvet obsidian & scarlet rose",
+    tagline: "Opera velvet obsidian, scarlet rose & champagne",
     mode: "dark",
-    swatches: ["#0b0709", "#1a1115", "#e25d6c", "#f6eef0"],
+    swatches: ["#0b060a", "#1b0f17", "#ee5b6f", "#f7eef0"],
   },
   {
     id: "indigo",
     name: "Midnight Tokyo",
-    tagline: "Deep twilight indigo & neon cyan glass",
+    tagline: "Pacific twilight indigo, neon cyan & sakura violet",
     mode: "dark",
-    swatches: ["#070a12", "#121728", "#4fd3ec", "#eef3fb"],
+    swatches: ["#060914", "#10172b", "#43d9f5", "#eef4fc"],
   },
   {
     id: "emerald",
     name: "Criterion Jade",
-    tagline: "Pine-obsidian print room & chartreuse jade",
+    tagline: "Pine archival slate, celadon jade & brass gold",
     mode: "dark",
-    swatches: ["#070b09", "#101914", "#6fd48c", "#eff5f0"],
+    swatches: ["#060b09", "#0e1a15", "#5ee296", "#eff6f1"],
   },
   {
     id: "violet",
     name: "A24 Dusk",
-    tagline: "Ultraviolet studio night & luminous orchid",
+    tagline: "Ultraviolet studio night, orchid & glacier blue",
     mode: "dark",
-    swatches: ["#0a0710", "#171124", "#ba83f5", "#f3effa"],
+    swatches: ["#090612", "#161026", "#c485ff", "#f3effb"],
+  },
+  {
+    id: "solstice",
+    name: "Dune Solstice",
+    tagline: "Desert obsidian, molten copper & twilight cobalt",
+    mode: "dark",
+    swatches: ["#0c0806", "#1c120d", "#ea854c", "#f7f0e8"],
   },
   {
     id: "alabaster",
     name: "Daylight Print",
-    tagline: "Gallery cotton paper & vermilion ink",
+    tagline: "Gallery cotton paper, vermilion & cobalt ink",
     mode: "light",
-    swatches: ["#f4efe6", "#eae3d5", "#c84830", "#191716"],
+    swatches: ["#f6f1e8", "#ebe3d5", "#cc4429", "#181614"],
+  },
+  {
+    id: "washi",
+    name: "Kyoto Washi",
+    tagline: "Cherry-blossom washi paper, carmine & sage ink",
+    mode: "light",
+    swatches: ["#f7f2f4", "#ede4e8", "#be3b63", "#1d151a"],
   },
 ];
 
@@ -64,12 +86,15 @@ export function resolveTheme(v?: string): ThemeId {
 }
 
 export function isLightTheme(id?: ThemeId): boolean {
-  return resolveTheme(id) === "alabaster";
+  const r = resolveTheme(id);
+  return r === "alabaster" || r === "washi";
 }
 
 export function applyThemeToDom(theme: ThemeId, dynamicLight: boolean) {
   if (typeof document === "undefined") return;
+  const resolved = resolveTheme(theme);
   const root = document.documentElement;
-  root.dataset.theme = resolveTheme(theme);
+  root.dataset.theme = resolved;
+  root.dataset.mode = isLightTheme(resolved) ? "light" : "dark";
   root.dataset.dynamicLight = dynamicLight ? "1" : "0";
 }

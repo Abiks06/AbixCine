@@ -1,7 +1,9 @@
 import { isTauri } from "@tauri-apps/api/core";
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
+import { rankDownloadOptions } from "../lib/downloadRank";
 import { startDownload } from "../lib/downloads";
+import { useSettings } from "../lib/settings";
 import type { MediaDetail, PlaybackRequest } from "../lib/types";
 import { candKey } from "../sources/registry";
 import { useSourceSession } from "../sources/useSourceSession";
@@ -24,8 +26,13 @@ export function SmartSource({
   onPlay: (server?: string) => void;
 }) {
   const { snap, recheck } = useSourceSession(req, 1);
+  const s = useSettings();
   const [all, setAll] = useState(false);
   const rows = useMemo(() => (snap ? boardRows(snap) : []), [snap]);
+  const rankedBackups = useMemo(
+    () => (snap ? rankDownloadOptions(snap.candidates, s.preferredQuality) : []),
+    [snap, s.preferredQuality],
+  );
   if (!snap) {
     return (
       <aside className="smart" aria-busy>
@@ -80,7 +87,16 @@ export function SmartSource({
             grouped={false}
             limit={all ? undefined : 5}
             onPick={(c) => onPlay(candKey(c))}
-            onDownload={isTauri() ? (c) => void startDownload(req, c, detail) : undefined}
+            onDownload={
+              isTauri()
+                ? (c) =>
+                    void startDownload(req, c, detail, undefined, {
+                      fallbacks: rankedBackups.filter((x) => x !== c).slice(0, 6),
+                      preferredQuality: s.preferredQuality,
+                      replaceExisting: true,
+                    })
+                : undefined
+            }
           />
           {rows.length > 5 && (
             <button className="smart-more" onClick={() => setAll((x) => !x)}>

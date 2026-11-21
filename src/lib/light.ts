@@ -69,23 +69,23 @@ const oklch = (l: number, c: number, h: number) => `oklch(${f(l)} ${f(c)} ${f(h,
  * Grey artwork keeps a whisper of chroma rather than inventing a colour it doesn't have.
  */
 export function tonesFrom(h1: number, c1: number, h2 = (h1 + 40) % 360, c2 = c1): Tones {
-  const vivid = clamp(c1 * 1.3, 0.045, 0.18);
-  const soft = clamp(c2 * 1.12, 0.035, 0.14);
+  const vivid = clamp(c1 * 1.38, 0.055, 0.2);
+  const soft = clamp(c2 * 1.2, 0.045, 0.16);
   if (isLightTheme(resolveTheme(getSettings().theme))) {
     return {
-      tone: oklch(0.56, vivid, h1),
-      ink: oklch(0.42, Math.min(vivid, 0.16), h1),
-      deep: oklch(0.92, Math.min(vivid, 0.04), h1),
-      l1: oklch(0.76, Math.min(vivid, 0.09), h1),
-      l2: oklch(0.80, Math.min(soft, 0.08), h2),
+      tone: oklch(0.54, vivid, h1),
+      ink: oklch(0.42, Math.min(vivid, 0.17), h1),
+      deep: oklch(0.92, Math.min(vivid, 0.045), h1),
+      l1: oklch(0.75, Math.min(vivid, 0.11), h1),
+      l2: oklch(0.79, Math.min(soft, 0.095), h2),
     };
   }
   return {
-    tone: oklch(0.83, vivid, h1),
-    ink: oklch(0.92, Math.min(vivid, 0.125), h1),
+    tone: oklch(0.84, vivid, h1),
+    ink: oklch(0.92, Math.min(vivid, 0.135), h1),
     deep: oklch(0.24, Math.min(vivid, 0.055), h1),
-    l1: oklch(0.4, Math.min(vivid, 0.12), h1),
-    l2: oklch(0.3, Math.min(soft, 0.1), h2),
+    l1: oklch(0.42, Math.min(vivid, 0.14), h1),
+    l2: oklch(0.32, Math.min(soft, 0.115), h2),
   };
 }
 

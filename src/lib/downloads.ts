@@ -6,6 +6,7 @@ import { PROXY_URL_RX, unwrapProxyUrl, type StreamHeaders } from "../sources/nat
 import type { StreamCandidate } from "../sources/types";
 import { getSettings, updateSettings } from "./settings";
 import { toast } from "./toast";
+import { isUnairedEpisode } from "./normalizer";
 import { isFilm, type Episode, type Media, type MediaDetail, type PlaybackRequest } from "./types";
 
 export type DownloadStatus =
@@ -27,6 +28,16 @@ export interface DownloadSubtitleReq {
   isHearingImpaired?: boolean;
 }
 
+export interface DownloadSourceReq {
+  providerId: string;
+  providerName: string;
+  url: string;
+  kind: string;
+  headers: StreamHeaders;
+  quality?: number;
+  subtitles: DownloadSubtitleReq[];
+}
+
 export interface DownloadJob {
   id: string;
   root: string;
@@ -41,6 +52,10 @@ export interface DownloadJob {
   episodeTitle?: string;
   audio?: string;
   quality?: number;
+  preferredQuality?: number;
+  resolvedQuality?: number;
+  qualityVerified?: boolean;
+  videoCodec?: string;
   providerId: string;
   providerName: string;
   url: string;
@@ -56,6 +71,11 @@ export interface DownloadJob {
   percent: number;
   filePath?: string;
   error?: string;
+  attemptIndex?: number;
+  totalSources?: number;
+  fallbacksRemaining?: number;
+  triedProviders?: string[];
+  failoverNotes?: string[];
   createdAt: number;
   updatedAt: number;
 }
@@ -73,6 +93,8 @@ export interface DownloadedEntry {
   episodeTitle?: string;
   audio?: string;
   quality?: number;
+  qualityVerified?: boolean;
+  videoCodec?: string;
   providerId: string;
   providerName: string;
   filePath: string;
@@ -95,6 +117,7 @@ export interface DownloadsStoreState {
   defaultDir: string | null;
   jobs: DownloadJob[];
   items: DownloadedEntry[];
+  switchingIds: ReadonlySet<string>;
 }
 
 export interface SetupPromptState {
@@ -108,6 +131,7 @@ let state: DownloadsStoreState = {
   defaultDir: null,
   jobs: [],
   items: [],
+  switchingIds: new Set<string>(),
 };
 
 let setupState: SetupPromptState = {
@@ -118,9 +142,31 @@ let setupState: SetupPromptState = {
 
 let setupResolve: ((dir: string | null) => void) | null = null;
 let setupPending: Promise<string | null> | null = null;
+let folderInitInFlight: Promise<string | null> | null = null;
 let initializedRoot: string | null = null;
 let listenerReady = false;
 let unlistenProgress: UnlistenFn | null = null;
+let batchCancelHook: ((scope?: { canonicalKey?: string; season?: number }) => boolean) | null = null;
+const autoRecoveryAttempted = new Set<string>();
+
+export function registerBatchCancelHook(
+  hook: (scope?: { canonicalKey?: string; season?: number }) => boolean,
+): void {
+  batchCancelHook = hook;
+}
+
+/** Normalize Windows/POSIX folder paths for reliable equality comparison. */
+export function normalizePathKey(p?: string | null): string {
+  if (!p) return "";
+  let s = p.trim();
+  if (s.startsWith("\\\\?\\UNC\\")) s = `\\\\${s.slice(8)}`;
+  else if (s.startsWith("\\\\?\\")) s = s.slice(4);
+  s = s.replace(/[\\/]+$/, "");
+  if (/^[a-zA-Z]:/.test(s) || s.includes("\\")) {
+    s = s.replace(/\//g, "\\").toLowerCase();
+  }
+  return s;
+}
 
 const listeners = new Set<() => void>();
 const setupListeners = new Set<() => void>();
@@ -128,6 +174,14 @@ const changeCallbacks = new Set<() => void>();
 
 function emit() {
   listeners.forEach((fn) => fn());
+}
+
+function setSwitching(jobId: string, on: boolean) {
+  const next = new Set(state.switchingIds);
+  if (on) next.add(jobId);
+  else next.delete(jobId);
+  state = { ...state, switchingIds: next };
+  emit();
 }
 
 function emitSetup() {
@@ -160,6 +214,28 @@ export function useDownloads(): DownloadsStoreState {
       return () => listeners.delete(cb);
     },
     () => state,
+  );
+}
+
+/** Primitive selector that only re-renders when offline saved items transition between empty and non-empty. */
+export function useHasDownloadedItems(): boolean {
+  return useSyncExternalStore(
+    (cb) => {
+      listeners.add(cb);
+      return () => listeners.delete(cb);
+    },
+    () => state.items.length > 0,
+  );
+}
+
+/** Primitive selector returning how many offline files exist for a specific title, immune to 250ms job ticks. */
+export function useOfflineCountForMedia(canonicalKey: string, mediaKey: string): number {
+  return useSyncExternalStore(
+    (cb) => {
+      listeners.add(cb);
+      return () => listeners.delete(cb);
+    },
+    () => state.items.filter((e) => e.canonicalKey === canonicalKey || e.mediaKey === mediaKey).length,
   );
 }
 
@@ -214,11 +290,25 @@ async function attachProgressListener() {
       emit();
 
       if (job.status === "completed" && prev?.status !== "completed") {
+        autoRecoveryAttempted.delete(job.id);
         const epTag = !job.isFilm && job.episode != null ? ` S${String(job.season ?? 1).padStart(2, "0")}E${String(job.episode).padStart(2, "0")}` : "";
-        toast(`Saved “${job.title}${epTag}” for offline playback`, { icon: "check" });
+        const qInfo = formatDownloadQuality(job);
+        const qPart = qInfo.verified ? ` (${qInfo.label})` : "";
+        toast(`Saved “${job.title}${epTag}”${qPart} for offline playback`, { icon: "check" });
         void refreshDownloads().then(() => notifyDownloadsChanged());
       } else if (job.status === "failed" && prev?.status !== "failed") {
-        toast(`Download failed: ${job.error || job.title}`, { icon: "info" });
+        const msg = job.error || "";
+        const isLocalError = /no space|disk full|permission|access is denied|read-only|outside the downloads|disk write/i.test(msg);
+        if (!isLocalError && !autoRecoveryAttempted.has(job.id)) {
+          autoRecoveryAttempted.add(job.id);
+          void switchDownloadToNextServer(job, { auto: true }).then((switched) => {
+            if (!switched) {
+              toast(`Download failed: ${msg || job.title}`, { icon: "info" });
+            }
+          });
+        } else {
+          toast(`Download failed: ${msg || job.title}`, { icon: "info" });
+        }
       }
     });
   } catch {
@@ -237,12 +327,18 @@ export async function refreshDownloads(): Promise<DownloadSnapshot | null> {
   }
 }
 
+export interface MigrateDownloadsResponse {
+  root: string | null;
+  movedFiles: number;
+  migrated: boolean;
+}
+
 export async function configureDownloadsRoot(dir: string): Promise<string | null> {
   if (!isTauri() || !dir.trim()) return null;
   const trimmed = dir.trim();
   const snap = await invoke<DownloadSnapshot>("download_init_root", { root: trimmed });
   initializedRoot = snap.root ?? trimmed;
-  if (getSettings().downloadsPath !== initializedRoot) {
+  if (normalizePathKey(getSettings().downloadsPath) !== normalizePathKey(initializedRoot)) {
     updateSettings({ downloadsPath: initializedRoot });
   }
   applySnapshot(snap);
@@ -250,15 +346,38 @@ export async function configureDownloadsRoot(dir: string): Promise<string | null
   return initializedRoot;
 }
 
+export async function migrateDownloadsFolder(
+  newDir: string,
+  moveFiles: boolean,
+): Promise<MigrateDownloadsResponse> {
+  if (!isTauri() || !newDir.trim()) {
+    return { root: null, movedFiles: 0, migrated: false };
+  }
+  const res = await invoke<{ snapshot: DownloadSnapshot; movedFiles: number; migrated: boolean }>(
+    "download_migrate_root",
+    { newRoot: newDir.trim(), moveFiles },
+  );
+  initializedRoot = res.snapshot.root ?? newDir.trim();
+  if (normalizePathKey(getSettings().downloadsPath) !== normalizePathKey(initializedRoot)) {
+    updateSettings({ downloadsPath: initializedRoot });
+  }
+  applySnapshot(res.snapshot);
+  notifyDownloadsChanged();
+  return { root: initializedRoot, movedFiles: res.movedFiles, migrated: res.migrated };
+}
+
 export async function initDownloads(): Promise<void> {
   if (!isTauri()) return;
   await attachProgressListener();
   void getDefaultDownloadsDir();
   const saved = getSettings().downloadsPath;
-  if (saved && saved !== initializedRoot) {
+  if (saved && normalizePathKey(saved) !== normalizePathKey(initializedRoot)) {
     try {
       const snap = await invoke<DownloadSnapshot>("download_init_root", { root: saved });
       initializedRoot = snap.root ?? saved;
+      if (getSettings().downloadsPath !== initializedRoot) {
+        updateSettings({ downloadsPath: initializedRoot });
+      }
       applySnapshot(snap);
       notifyDownloadsChanged();
     } catch {
@@ -267,25 +386,39 @@ export async function initDownloads(): Promise<void> {
   }
 }
 
-export async function ensureDownloadFolder(): Promise<string | null> {
-  if (!isTauri()) return null;
-  await attachProgressListener();
+export function ensureDownloadFolder(): Promise<string | null> {
+  if (!isTauri()) return Promise.resolve(null);
   const saved = getSettings().downloadsPath;
   if (saved) {
-    if (initializedRoot !== saved) {
-      return await configureDownloadsRoot(saved);
+    void attachProgressListener();
+    if (normalizePathKey(initializedRoot) !== normalizePathKey(saved)) {
+      if (!folderInitInFlight) {
+        folderInitInFlight = configureDownloadsRoot(saved)
+          .catch(() => {
+            toast("Downloads folder is unreachable. Reconnect it or choose a new folder in Settings.", {
+              icon: "info",
+            });
+            return null;
+          })
+          .finally(() => {
+            folderInitInFlight = null;
+          });
+      }
+      return folderInitInFlight;
     }
-    return saved;
+    return Promise.resolve(initializedRoot ?? saved);
   }
   if (setupPending) return setupPending;
 
-  const defDir = await getDefaultDownloadsDir();
-  setupState = { open: true, defaultDir: defDir, busy: false };
-  emitSetup();
-
-  setupPending = new Promise<string | null>((resolve) => {
-    setupResolve = resolve;
-  });
+  setupPending = (async () => {
+    await attachProgressListener();
+    const defDir = await getDefaultDownloadsDir();
+    setupState = { open: true, defaultDir: defDir, busy: false };
+    emitSetup();
+    return await new Promise<string | null>((resolve) => {
+      setupResolve = resolve;
+    });
+  })();
   return setupPending;
 }
 
@@ -386,20 +519,7 @@ export function localArtUrl(path?: string): string | undefined {
   return isTauri() ? convertFileSrc(path) : undefined;
 }
 
-export async function startDownload(
-  req: PlaybackRequest,
-  candidate: StreamCandidate,
-  detail?: MediaDetail,
-  episodeTitle?: string,
-  opts?: { silent?: boolean },
-): Promise<DownloadJob | null> {
-  if (!isTauri()) {
-    toast("Offline downloads work in the AbixCine desktop app.", { icon: "info" });
-    return null;
-  }
-  const root = await ensureDownloadFolder();
-  if (!root) return null;
-
+export function buildDownloadSource(candidate: StreamCandidate): DownloadSourceReq {
   const rawSource = candidate.downloadUrl ?? candidate.url;
   const unwrapped = unwrapProxyUrl(rawSource);
   const targetKind = candidate.downloadUrl ? "file" : candidate.kind === "hls" ? "hls" : "file";
@@ -423,6 +543,51 @@ export async function startDownload(
       };
     });
 
+  return {
+    providerId: candidate.providerId,
+    providerName: candidate.providerName,
+    url: unwrapped.url,
+    kind: targetKind,
+    headers,
+    quality: candidate.probe?.quality ?? candidate.quality,
+    subtitles,
+  };
+}
+
+export async function startDownload(
+  req: PlaybackRequest,
+  candidate: StreamCandidate,
+  detail?: MediaDetail,
+  episodeTitle?: string,
+  opts?: {
+    silent?: boolean;
+    fallbacks?: StreamCandidate[];
+    preferredQuality?: number;
+    replaceExisting?: boolean;
+  },
+): Promise<DownloadJob | null> {
+  if (!isTauri()) {
+    toast("Offline downloads work in the AbixCine desktop app.", { icon: "info" });
+    return null;
+  }
+  const root = await ensureDownloadFolder();
+  if (!root) return null;
+
+  const primary = buildDownloadSource(candidate);
+  const seenUrls = new Set<string>([primary.url.toLowerCase()]);
+  const seenProviders = new Set<string>([primary.providerId]);
+  const fallbacks: DownloadSourceReq[] = [];
+  for (const fbCand of opts?.fallbacks ?? []) {
+    if (fallbacks.length >= 6) break;
+    const fb = buildDownloadSource(fbCand);
+    const low = fb.url.toLowerCase();
+    if (seenUrls.has(low) || seenProviders.has(fb.providerId)) continue;
+    seenUrls.add(low);
+    seenProviders.add(fb.providerId);
+    fallbacks.push(fb);
+  }
+
+  const targetQuality = opts?.preferredQuality ?? getSettings().preferredQuality;
   const mediaDetail = detail ?? (req.media as Partial<MediaDetail>);
   const posterUrl = sizeTmdbArt(req.media.poster ?? detail?.poster, "w500");
   const backdropUrl = sizeTmdbArt(req.media.backdrop ?? detail?.backdrop, "w1280");
@@ -438,14 +603,16 @@ export async function startDownload(
     episode: req.episode,
     episodeTitle,
     audio: req.audio ?? (candidate.audio !== "unknown" ? candidate.audio : undefined),
-    quality: candidate.probe?.quality ?? candidate.quality,
-    providerId: candidate.providerId,
-    providerName: candidate.providerName,
-    url: unwrapped.url,
-    kind: targetKind,
-    headers,
-    preferredQuality: getSettings().preferredQuality,
-    subtitles,
+    quality: primary.quality,
+    providerId: primary.providerId,
+    providerName: primary.providerName,
+    url: primary.url,
+    kind: primary.kind,
+    headers: primary.headers,
+    preferredQuality: targetQuality,
+    subtitles: primary.subtitles,
+    fallbacks,
+    replaceExisting: opts?.replaceExisting ?? true,
     posterUrl,
     backdropUrl,
     mediaSnapshot: compactSnapshot(req.media, detail),
@@ -453,11 +620,14 @@ export async function startDownload(
 
   try {
     const job = await invoke<DownloadJob>("download_start", { req: payload });
+    autoRecoveryAttempted.delete(job.id);
     const exists = state.jobs.some((j) => j.id === job.id);
     state = { ...state, jobs: exists ? state.jobs.map((j) => (j.id === job.id ? job : j)) : [job, ...state.jobs] };
     emit();
     if (!opts?.silent) {
-      toast(`Queued “${req.media.title}” from ${candidate.providerName}`, { icon: "download" });
+      const qLabel = targetQuality >= 2160 ? "4K" : `${targetQuality}p`;
+      const backupNote = fallbacks.length > 0 ? ` · ${fallbacks.length} backup${fallbacks.length === 1 ? "" : "s"}` : "";
+      toast(`Queued “${req.media.title}” (${candidate.providerName} · up to ${qLabel}${backupNote})`, { icon: "download" });
     }
     return job;
   } catch (e: unknown) {
@@ -465,6 +635,173 @@ export async function startDownload(
       toast(`Couldn't start download: ${e instanceof Error ? e.message : String(e)}`, { icon: "info" });
     }
     return null;
+  }
+}
+
+export async function switchDownloadSource(
+  id: string,
+  candidate: StreamCandidate,
+  extraFallbacks: StreamCandidate[] = [],
+  preferredQuality?: number,
+): Promise<DownloadJob | null> {
+  if (!isTauri()) return null;
+  const source = buildDownloadSource(candidate);
+  const seenUrls = new Set<string>([source.url.toLowerCase()]);
+  const fallbacks: DownloadSourceReq[] = [];
+  for (const c of extraFallbacks) {
+    if (fallbacks.length >= 6) break;
+    const fb = buildDownloadSource(c);
+    const low = fb.url.toLowerCase();
+    if (seenUrls.has(low) || fb.providerId === source.providerId) continue;
+    seenUrls.add(low);
+    fallbacks.push(fb);
+  }
+  try {
+    const job = await invoke<DownloadJob | null>("download_switch_source", {
+      id,
+      source,
+      extraFallbacks: fallbacks,
+      preferredQuality: preferredQuality ?? getSettings().preferredQuality,
+    });
+    if (job) {
+      autoRecoveryAttempted.delete(job.id);
+      const exists = state.jobs.some((j) => j.id === job.id);
+      state = { ...state, jobs: exists ? state.jobs.map((j) => (j.id === job.id ? job : j)) : [job, ...state.jobs] };
+      emit();
+    }
+    return job;
+  } catch (e: unknown) {
+    toast(`Couldn't switch server: ${e instanceof Error ? e.message : String(e)}`, { icon: "info" });
+    return null;
+  }
+}
+
+export async function switchDownloadToNextServer(
+  job: DownloadJob,
+  opts?: { auto?: boolean },
+): Promise<boolean> {
+  if (!isTauri()) return false;
+  if (state.switchingIds.has(job.id)) return false;
+  setSwitching(job.id, true);
+  if (!opts?.auto) {
+    toast(`Finding another server for “${job.title}”…`, { icon: "download" });
+  }
+  try {
+    const [{ acquireSession }, { getDetail, resolvePlaybackRequest }, { rankDownloadOptions }] = await Promise.all([
+      import("../sources/session"),
+      import("./catalog"),
+      import("./downloadRank"),
+    ]);
+
+    const detail = await getDetail(job.canonicalKey || job.mediaKey).catch(() => null);
+    const audioPref = job.audio === "sub" || job.audio === "dub" ? job.audio : undefined;
+    let req: PlaybackRequest | null = null;
+    if (detail) {
+      req = resolvePlaybackRequest(detail, job.season, job.episode, audioPref);
+    }
+    if (!req) {
+      req = {
+        media: {
+          key: job.mediaKey,
+          kind: (job.mediaKind as Media["kind"]) || "movie",
+          title: job.title,
+          overview: "",
+          genres: [],
+          year: job.year,
+        },
+        ...(job.season != null ? { season: job.season } : {}),
+        ...(job.episode != null ? { episode: job.episode } : {}),
+        ...(audioPref ? { audio: audioPref } : {}),
+      };
+    }
+
+    const tried = new Set<string>([job.providerId, ...(job.triedProviders ?? [])]);
+    const targetQ = job.preferredQuality ?? getSettings().preferredQuality;
+    const session = acquireSession(req);
+    session.retain();
+    session.start(3);
+
+    const picked = await new Promise<{ next: StreamCandidate; rest: StreamCandidate[] } | null>((resolve) => {
+      let settled = false;
+      let hardTimer: ReturnType<typeof setTimeout> | undefined;
+      let graceTimer: ReturnType<typeof setTimeout> | undefined;
+
+      const pickFromSnap = () => {
+        const snap = session.getSnapshot();
+        const ranked = rankDownloadOptions(snap.candidates, targetQ);
+        const freshProvider = ranked.find(
+          (c) => !tried.has(c.providerId) && unwrapProxyUrl(c.downloadUrl ?? c.url).url !== job.url,
+        );
+        const anyOtherUrl = ranked.find((c) => unwrapProxyUrl(c.downloadUrl ?? c.url).url !== job.url);
+        return { snap, chosen: freshProvider ?? anyOtherUrl, ranked };
+      };
+
+      const finish = (useResult: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(hardTimer);
+        clearTimeout(graceTimer);
+        unsub();
+        const { chosen, ranked } = pickFromSnap();
+        session.release();
+        if (!useResult || !chosen) {
+          resolve(null);
+          return;
+        }
+        resolve({ next: chosen, rest: ranked.filter((c) => c !== chosen && !tried.has(c.providerId)) });
+      };
+
+      const check = () => {
+        const { snap, chosen } = pickFromSnap();
+        if (chosen && !snap.busy) {
+          finish(true);
+          return;
+        }
+        if (chosen && !graceTimer) {
+          graceTimer = setTimeout(() => finish(true), 1200);
+        }
+        if (!snap.busy && !chosen) {
+          finish(false);
+        }
+      };
+
+      hardTimer = setTimeout(() => finish(true), 10_000);
+      const unsub = session.subscribe(check);
+      check();
+    });
+
+    if (!picked) {
+      if (!opts?.auto) {
+        toast(`No working backup server found for “${job.title}”`, { icon: "info" });
+      }
+      return false;
+    }
+
+    const updated = await switchDownloadSource(job.id, picked.next, picked.rest.slice(0, 5), targetQ);
+    if (updated) {
+      toast(
+        opts?.auto
+          ? `Switched “${job.title}” to ${picked.next.providerName}`
+          : `Now downloading “${job.title}” from ${picked.next.providerName}`,
+        { icon: "download" },
+      );
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  } finally {
+    setSwitching(job.id, false);
+  }
+}
+
+export async function clearFailedDownloads(): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    const snap = await invoke<DownloadSnapshot>("download_clear_failed");
+    applySnapshot(snap);
+  } catch (e: unknown) {
+    toast(`Couldn't clear failed downloads: ${e instanceof Error ? e.message : String(e)}`, { icon: "info" });
   }
 }
 
@@ -502,6 +839,63 @@ export async function cancelDownload(id: string): Promise<void> {
     emit();
   } catch (e: unknown) {
     toast(`Couldn't cancel download: ${e instanceof Error ? e.message : String(e)}`, { icon: "info" });
+  }
+}
+
+export async function pauseAllDownloads(scope?: { canonicalKey?: string; season?: number }): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    const snap = await invoke<DownloadSnapshot>("download_pause_all", {
+      canonicalKey: scope?.canonicalKey ?? null,
+      season: scope?.season ?? null,
+    });
+    applySnapshot(snap);
+    toast(
+      scope?.season != null ? `Paused Season ${scope.season} downloads` : "Paused active downloads",
+      { icon: "info" },
+    );
+  } catch (e: unknown) {
+    toast(`Couldn't pause downloads: ${e instanceof Error ? e.message : String(e)}`, { icon: "info" });
+  }
+}
+
+export async function resumeAllDownloads(scope?: { canonicalKey?: string; season?: number }): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    const snap = await invoke<DownloadSnapshot>("download_resume_all", {
+      canonicalKey: scope?.canonicalKey ?? null,
+      season: scope?.season ?? null,
+    });
+    applySnapshot(snap);
+    toast(
+      scope?.season != null ? `Resumed Season ${scope.season} downloads` : "Resumed queued downloads",
+      { icon: "download" },
+    );
+  } catch (e: unknown) {
+    toast(`Couldn't resume downloads: ${e instanceof Error ? e.message : String(e)}`, { icon: "info" });
+  }
+}
+
+export async function cancelAllDownloads(scope?: { canonicalKey?: string; season?: number }): Promise<void> {
+  batchCancelHook?.(scope);
+  if (!isTauri()) return;
+  try {
+    const snap = await invoke<DownloadSnapshot>("download_cancel_all", {
+      canonicalKey: scope?.canonicalKey ?? null,
+      season: scope?.season ?? null,
+    });
+    applySnapshot({
+      ...snap,
+      jobs: (snap.jobs ?? []).filter((j) => j.status !== "cancelled"),
+    });
+    toast(
+      scope?.season != null
+        ? `Stopped & cleared Season ${scope.season} downloads`
+        : "Stopped & cleared all downloads",
+      { icon: "info" },
+    );
+  } catch (e: unknown) {
+    toast(`Couldn't stop downloads: ${e instanceof Error ? e.message : String(e)}`, { icon: "info" });
   }
 }
 
@@ -745,6 +1139,24 @@ export function groupDownloadedTitles(items: DownloadedEntry[] = state.items): D
   return groups.sort((a, b) => b.latestAt - a.latestAt || a.media.title.localeCompare(b.media.title));
 }
 
+/** Return the saved offline entry for a specific episode (and optional audio variant), if present. */
+export function findDownloadedEpisode(
+  canonicalKey: string,
+  season: number | undefined,
+  episode: number,
+  audio?: string,
+  items: DownloadedEntry[] = state.items,
+): DownloadedEntry | undefined {
+  return items.find((e) => {
+    if (e.isFilm) return false;
+    if (e.canonicalKey !== canonicalKey && e.mediaKey !== canonicalKey) return false;
+    if (season != null && e.season != null && e.season !== season) return false;
+    if (e.episode !== episode) return false;
+    if (audio && e.audio && e.audio !== "dual" && e.audio !== audio) return false;
+    return true;
+  });
+}
+
 /** Check whether a specific episode (and optional audio variant) is already saved offline. */
 export function hasDownloadedEpisode(
   canonicalKey: string,
@@ -753,14 +1165,104 @@ export function hasDownloadedEpisode(
   audio?: string,
   items: DownloadedEntry[] = state.items,
 ): boolean {
-  return items.some((e) => {
-    if (e.isFilm) return false;
-    if (e.canonicalKey !== canonicalKey && e.mediaKey !== canonicalKey) return false;
-    if (season != null && e.season != null && e.season !== season) return false;
-    if (e.episode !== episode) return false;
-    if (audio && e.audio && e.audio !== "dual" && e.audio !== audio) return false;
-    return true;
-  });
+  return Boolean(findDownloadedEpisode(canonicalKey, season, episode, audio, items));
+}
+
+/** Compact resolution tag such as "4K ✓" or "1080p" for episode pills and summary cards. */
+export function formatQualityTag(quality?: number, verified?: boolean): string | null {
+  if (!quality || quality <= 0) return null;
+  const label = quality >= 2160 ? "4K" : `${quality}p`;
+  return verified ? `${label} ✓` : label;
+}
+
+export interface SeasonDownloadProgress {
+  total: number;
+  completed: number;
+  active: number;
+  paused: number;
+  failed: number;
+  percent: number;
+  completedPercent: number;
+  speedBps: number;
+  downloadingQualities: string[];
+  downloadedQualities: string[];
+}
+
+/** Aggregate live download progress, completed ratio, and quality tags across all aired episodes in a season. */
+export function computeSeasonDownloadProgress(
+  episodes: Episode[],
+  opts: {
+    canonicalKey: string;
+    season: number;
+    audio?: string;
+    items: DownloadedEntry[];
+    jobs: DownloadJob[];
+    airedCount?: number;
+    seriesStatus?: string;
+  },
+): SeasonDownloadProgress {
+  const aired = episodes.filter(
+    (ep) => !isUnairedEpisode(ep, { airedCount: opts.airedCount, seriesStatus: opts.seriesStatus }),
+  );
+  const total = aired.length;
+  let completed = 0;
+  let active = 0;
+  let paused = 0;
+  let failed = 0;
+  let fractional = 0;
+  let speedBps = 0;
+  const dlQuals = new Set<string>();
+  const savedQuals = new Set<string>();
+
+  for (const ep of aired) {
+    const saved = findDownloadedEpisode(opts.canonicalKey, opts.season, ep.number, opts.audio, opts.items);
+    if (saved) {
+      completed++;
+      fractional += 1;
+      const q = formatQualityTag(saved.quality, saved.qualityVerified);
+      if (q) savedQuals.add(q);
+      continue;
+    }
+    const job = opts.jobs.find(
+      (j) =>
+        !j.isFilm &&
+        j.status !== "cancelled" &&
+        j.status !== "completed" &&
+        (j.canonicalKey === opts.canonicalKey || j.mediaKey === opts.canonicalKey) &&
+        (j.season == null || j.season === opts.season) &&
+        j.episode === ep.number &&
+        (!opts.audio || !j.audio || j.audio === "dual" || j.audio === opts.audio),
+    );
+    if (!job) continue;
+    if (job.status === "failed") {
+      failed++;
+      continue;
+    }
+    if (job.status === "paused") {
+      paused++;
+    } else {
+      active++;
+      speedBps += job.speedBps || 0;
+    }
+    fractional += Math.max(0, Math.min(0.99, (job.percent || 0) / 100));
+    const qInfo = formatDownloadQuality(job);
+    if (qInfo.label) dlQuals.add(qInfo.verified ? `${qInfo.label} ✓` : qInfo.label);
+  }
+
+  const percent = total > 0 ? Math.max(0, Math.min(100, (fractional / total) * 100)) : 0;
+  const completedPercent = total > 0 ? Math.max(0, Math.min(100, (completed / total) * 100)) : 0;
+  return {
+    total,
+    completed,
+    active,
+    paused,
+    failed,
+    percent,
+    completedPercent,
+    speedBps,
+    downloadingQualities: [...dlQuals],
+    downloadedQualities: [...savedQuals],
+  };
 }
 
 /** Human-readable transfer speed ("12.4 MB/s"). */
@@ -781,6 +1283,28 @@ export function fmtEta(sec?: number): string {
   const h = Math.floor(m / 60);
   const remM = m % 60;
   return remM ? `${h}h ${remM}m` : `${h}h`;
+}
+
+/** Compact, user-friendly quality label & verification status for UI badges and toasts. */
+export function formatDownloadQuality(
+  job: Pick<DownloadJob, "resolvedQuality" | "quality" | "preferredQuality" | "qualityVerified">,
+): { label: string; verified: boolean; title: string } {
+  const q = job.resolvedQuality ?? job.quality;
+  const pref = job.preferredQuality;
+  const fmtQ = (n: number) => (n >= 2160 ? "4K" : `${n}p`);
+  if (q && q > 0) {
+    const qStr = fmtQ(q);
+    if (job.qualityVerified) {
+      const prefNote = pref ? ` (target: ${fmtQ(pref)})` : "";
+      return { label: qStr, verified: true, title: `Verified ${qStr} stream${prefNote}` };
+    }
+    return { label: `~${qStr}`, verified: false, title: `Reported ${qStr} stream` };
+  }
+  if (pref && pref > 0) {
+    const pStr = fmtQ(pref);
+    return { label: `Up to ${pStr}`, verified: false, title: `Targeting ${pStr} quality` };
+  }
+  return { label: "Auto", verified: false, title: "Best available quality" };
 }
 
 /** Seed test snapshot directly in Vitest without needing Tauri IPC. */

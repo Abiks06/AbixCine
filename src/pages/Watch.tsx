@@ -32,7 +32,7 @@ import { isFilm, reqKey, type PlaybackRequest } from "../lib/types";
 import { useAsync } from "../lib/useAsync";
 import { isUrlTokenExpired } from "../sources/native";
 import { candKey } from "../sources/registry";
-import type { SourceSession } from "../sources/session";
+import { acquireSession, type SourceSession } from "../sources/session";
 import { useSourceSession } from "../sources/useSourceSession";
 import type { StreamCandidate } from "../sources/types";
 
@@ -202,6 +202,16 @@ export function Watch() {
 
   // Trackers (lib/scrobble) hear about each film or episode once, when it is watched to the end.
   const scrobbled = useRef("");
+  const prefetchedKeyRef = useRef("");
+  const prefetchedSessionRef = useRef<SourceSession | null>(null);
+  useEffect(() => {
+    return () => {
+      prefetchedSessionRef.current?.release();
+      prefetchedSessionRef.current = null;
+      prefetchedKeyRef.current = "";
+    };
+  }, [key, season, episode, audio]);
+
   const onProgress = useCallback(
     (position: number, duration: number) => {
       if (!d) return;
@@ -209,6 +219,25 @@ export function Watch() {
         { media: { ...d, key: canonicalKey, canonicalKey }, season, episode, audio, position, duration },
         next && { season: next.s, episode: next.e },
       );
+      if (
+        next &&
+        navigator.onLine !== false &&
+        duration > 0 &&
+        (position / duration >= 0.75 || duration - position <= 120)
+      ) {
+        const nextReq = resolvePlaybackRequest(d, next.s, next.e, audio);
+        if (nextReq) {
+          const k = reqKey(nextReq);
+          if (prefetchedKeyRef.current !== k) {
+            prefetchedSessionRef.current?.release();
+            prefetchedKeyRef.current = k;
+            const nextSession = acquireSession(nextReq);
+            nextSession.retain();
+            nextSession.start(1);
+            prefetchedSessionRef.current = nextSession;
+          }
+        }
+      }
       const id = `${key}|${season ?? ""}|${episode ?? ""}`;
       if (scrobbled.current !== id && isDone(position, duration)) {
         scrobbled.current = id;

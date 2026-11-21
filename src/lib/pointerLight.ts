@@ -7,7 +7,7 @@ import { getSettings } from "./settings";
  */
 const MAGNETS = ":is(.hero, .tp-top) .btn.play:not(:disabled), .cc-btn.main";
 const GLASS =
-  ".hero-plinth, .topbar-search, .topbar-theme, .topbar-dl, .search-box, .btn.glass, .btn-glass, .hero-next, .palette, .theme-popover, .dl-queue-pop, .dl-pop, .dl-modal, .qd-drawer, .auth-card, .smart, .tp-telemetry-card, .nw-spotlight, .lp-card, .spread-lead, .reel-lead, .filmreel, .panel, .dlv-card, .dlv-setup, .top-hit, .pbot, .psheet";
+  ".hero-plinth, .topbar-search, .topbar-theme, .topbar-dl, .search-box, .btn.glass, .btn-glass, .hero-next, .palette, .theme-popover, .dl-queue-pop, .dl-pop, .dl-modal, .qd-drawer, .auth-card, .smart, .tp-telemetry-card, .nw-spotlight, .lp-card, .spread-lead, .reel-lead, .filmreel, .panel, .dlv-card, .dlv-setup, .dlv-queue, .ep-season-prog, .top-hit, .pbot, .psheet, .hover-preview";
 const MAGNET_PX = 4;
 
 export function installPointerLight() {

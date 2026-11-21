@@ -153,6 +153,13 @@ export function Search() {
             <span className="empty-ic"><Icon name="search" size={26} /></span>
             <h3>Search every catalog at once</h3>
             <p>Films, series and anime in one box. Add a year to narrow it down, like “Dune 2021”.</p>
+            <div className="search-starters" aria-label="Suggested searches">
+              {["Dune", "Severance", "Frieren", "Spirited Away", "Interstellar", "The Bear"].map((term) => (
+                <button key={term} type="button" className="chip" onClick={() => setQ(term)}>
+                  {term}
+                </button>
+              ))}
+            </div>
           </div>
         )
       ) : shown.length === 0 ? (

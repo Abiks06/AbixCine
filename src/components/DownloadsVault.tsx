@@ -1,12 +1,25 @@
 import { isTauri } from "@tauri-apps/api/core";
 import { useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
+import { useBatchDownloads } from "../lib/batchDownload";
 import { encodeKey } from "../lib/catalog";
 import {
+  cancelAllDownloads,
+  cancelDownload,
+  clearFailedDownloads,
   ensureDownloadFolder,
+  fmtEta,
+  fmtSpeed,
+  formatDownloadQuality,
+  formatQualityTag,
   groupDownloadedTitles,
   openDownloadsFolder,
+  pauseAllDownloads,
+  pauseDownload,
   removeDownloadedItem,
+  resumeAllDownloads,
+  resumeDownload,
+  switchDownloadToNextServer,
   useDownloads,
   type DownloadedTitleGroup,
 } from "../lib/downloads";
@@ -51,13 +64,33 @@ export function DownloadsVault({
   const desktop = isTauri();
   const s = useSettings();
   const online = useOnlineStatus();
-  const { items, root } = useDownloads();
+  const { jobs, items, root, switchingIds } = useDownloads();
+  const batch = useBatchDownloads();
   const nav = useNavigate();
 
   const [kindFilter, setKindFilter] = useState<KindFilter>("all");
   const [expanded, setExpanded] = useState<string | null>(null);
   const [confirmGroup, setConfirmGroup] = useState<string | null>(null);
   const [confirmEntry, setConfirmEntry] = useState<string | null>(null);
+  const [confirmStopAll, setConfirmStopAll] = useState(false);
+
+  const liveJobs = useMemo(
+    () =>
+      jobs.filter(
+        (j) =>
+          j.status === "queued" ||
+          j.status === "downloading" ||
+          j.status === "remuxing" ||
+          j.status === "paused" ||
+          j.status === "failed",
+      ),
+    [jobs],
+  );
+  const activeCount = liveJobs.filter(
+    (j) => j.status === "queued" || j.status === "downloading" || j.status === "remuxing",
+  ).length;
+  const pausedCount = liveJobs.filter((j) => j.status === "paused").length;
+  const failedCount = liveJobs.filter((j) => j.status === "failed").length;
 
   const groups = useMemo(() => groupDownloadedTitles(items), [items]);
   const filtered = useMemo(() => {
@@ -67,7 +100,7 @@ export function DownloadsVault({
 
   if (!desktop) return null;
 
-  if (groups.length === 0) {
+  if (groups.length === 0 && (compact || (liveJobs.length === 0 && !batch.active))) {
     if (!showSetupWhenEmpty) return null;
     return (
       <section className="shelf dlv-section" id="downloads-vault">
@@ -136,6 +169,272 @@ export function DownloadsVault({
         }
       />
 
+      {!compact && (liveJobs.length > 0 || batch.active) && (
+        <div className="dlv-queue glass" aria-label="Active and failed transfers">
+          <div className="dlv-queue-head">
+            <span>
+              TRANSFERS · {liveJobs.length}
+              {failedCount > 0 ? ` (${failedCount} FAILED)` : ""}
+            </span>
+            <div className="dlv-queue-acts">
+              {activeCount > 0 && (
+                <button type="button" className="chip" onClick={() => void pauseAllDownloads()}>
+                  <Icon name="pause" size={11} /> Pause all
+                </button>
+              )}
+              {(pausedCount > 0 || failedCount > 0) && (
+                <button type="button" className="chip" onClick={() => void resumeAllDownloads()}>
+                  <Icon name="play" size={11} /> Resume all
+                </button>
+              )}
+              {failedCount > 0 && (
+                <button type="button" className="chip" onClick={() => void clearFailedDownloads()}>
+                  Clear failed
+                </button>
+              )}
+              {confirmStopAll && liveJobs.length > 1 ? (
+                <>
+                  <button
+                    type="button"
+                    className="chip danger"
+                    onClick={() => {
+                      setConfirmStopAll(false);
+                      void cancelAllDownloads();
+                    }}
+                  >
+                    Stop all ({liveJobs.length})
+                  </button>
+                  <button type="button" className="chip" onClick={() => setConfirmStopAll(false)}>
+                    Keep
+                  </button>
+                </>
+              ) : (
+                <button
+                  type="button"
+                  className="chip danger"
+                  onClick={() => {
+                    if (liveJobs.length > 1) setConfirmStopAll(true);
+                    else void cancelAllDownloads();
+                  }}
+                >
+                  <Icon name="x" size={11} /> Stop &amp; clear all
+                </button>
+              )}
+            </div>
+          </div>
+          {batch.active && (
+            <div className="dlq-batch">
+              <div>
+                <strong>Finding streams · {batch.title}</strong>
+                <small>
+                  {batch.season != null ? `Season ${batch.season} · ` : ""}
+                  E{batch.currentEp ?? "…"} · {batch.queued}/{batch.total} queued
+                </small>
+              </div>
+              <button
+                type="button"
+                className="chip danger"
+                onClick={() => void cancelAllDownloads({ canonicalKey: batch.canonicalKey, season: batch.season })}
+              >
+                Stop
+              </button>
+            </div>
+          )}
+          {(() => {
+            const seasonGroups = new Map<string, { title: string; cKey: string; season: number; jobs: typeof liveJobs }>();
+            for (const j of liveJobs) {
+              if (j.isFilm || j.episode == null) continue;
+              const cKey = j.canonicalKey || j.mediaKey;
+              const sNum = j.season ?? 1;
+              const gKey = `${cKey}|${sNum}`;
+              const g = seasonGroups.get(gKey);
+              if (g) g.jobs.push(j);
+              else seasonGroups.set(gKey, { title: j.title, cKey, season: sNum, jobs: [j] });
+            }
+            for (const bs of Object.values(batch.seasons)) {
+              const gKey = `${bs.canonicalKey}|${bs.season}`;
+              if (!seasonGroups.has(gKey)) {
+                seasonGroups.set(gKey, { title: bs.title, cKey: bs.canonicalKey, season: bs.season, jobs: [] });
+              }
+            }
+            const shownSeasons = [...seasonGroups.values()].filter((g) => {
+              const bs = batch.seasons[`${g.cKey}|${g.season}`];
+              const savedCount = items.filter(
+                (it) => !it.isFilm && (it.canonicalKey === g.cKey || it.mediaKey === g.cKey) && (it.season ?? 1) === g.season,
+              ).length;
+              return Boolean(bs) || g.jobs.length > 1 || (savedCount > 0 && g.jobs.length >= 1);
+            });
+            if (!shownSeasons.length) return null;
+            return (
+              <div className="dlv-seasons" aria-label="Bulk season downloads">
+                {shownSeasons.map((g) => {
+                  const bs = batch.seasons[`${g.cKey}|${g.season}`];
+                  const savedCount = items.filter(
+                    (it) => !it.isFilm && (it.canonicalKey === g.cKey || it.mediaKey === g.cKey) && (it.season ?? 1) === g.season,
+                  ).length;
+                  const totalCount = bs ? Math.max(bs.total, savedCount + g.jobs.length) : savedCount + g.jobs.length;
+                  const frac =
+                    savedCount + g.jobs.reduce((acc, j) => acc + (j.status === "failed" ? 0 : (j.percent || 0) / 100), 0);
+                  const pct = totalCount > 0 ? Math.min(100, Math.round((frac / totalCount) * 100)) : 0;
+                  const activeInS = g.jobs.filter(
+                    (j) => j.status === "queued" || j.status === "downloading" || j.status === "remuxing",
+                  );
+                  const pausedOrFailedInS = g.jobs.filter((j) => j.status === "paused" || j.status === "failed");
+                  const spd = fmtSpeed(activeInS.reduce((s, j) => s + (j.speedBps || 0), 0));
+                  return (
+                    <div key={`${g.cKey}|${g.season}`} className="dlv-season-row">
+                      <div className="dlv-sr-main">
+                        <div className="dlv-sr-top">
+                          <strong>{g.title} · Season {g.season}</strong>
+                          <small>
+                            {savedCount}/{totalCount} offline
+                            {bs ? ` · resolving (${bs.queued}/${bs.total})` : ""}
+                            {activeInS.length > 0 ? ` · ${activeInS.length} active` : ""}
+                            {pausedOrFailedInS.length > 0 ? ` · ${pausedOrFailedInS.length} paused/failed` : ""}
+                            {spd ? ` · ${spd}` : ""}
+                          </small>
+                          <b>{pct}%</b>
+                        </div>
+                        <div className="dl-bar">
+                          <i style={{ transform: `scaleX(${Math.max(0.02, pct / 100)})` }} />
+                        </div>
+                      </div>
+                      <div className="dlv-sr-acts">
+                        {activeInS.length > 0 && (
+                          <button
+                            type="button"
+                            className="chip"
+                            onClick={() => void pauseAllDownloads({ canonicalKey: g.cKey, season: g.season })}
+                          >
+                            <Icon name="pause" size={11} /> Pause S{g.season}
+                          </button>
+                        )}
+                        {pausedOrFailedInS.length > 0 && (
+                          <button
+                            type="button"
+                            className="chip"
+                            onClick={() => void resumeAllDownloads({ canonicalKey: g.cKey, season: g.season })}
+                          >
+                            <Icon name="play" size={11} /> Resume S{g.season}
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          className="chip danger"
+                          onClick={() => void cancelAllDownloads({ canonicalKey: g.cKey, season: g.season })}
+                          title={`Stop & clear Season ${g.season} downloads`}
+                        >
+                          <Icon name="x" size={11} /> Cancel S{g.season}
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            );
+          })()}
+          <div className="dlv-queue-list">
+            {liveJobs.map((j) => {
+              const busy = j.status === "queued" || j.status === "downloading" || j.status === "remuxing";
+              const qInfo = formatDownloadQuality(j);
+              const isSwitching = switchingIds.has(j.id);
+              const epTag =
+                !j.isFilm && j.episode != null
+                  ? `S${String(j.season ?? 1).padStart(2, "0")}E${String(j.episode).padStart(2, "0")}`
+                  : null;
+              const spd = fmtSpeed(j.speedBps);
+              const eta = fmtEta(j.etaSec);
+              const sizeStr =
+                j.bytesDownloaded > 0
+                  ? j.totalBytes
+                    ? `${fmtSize(j.bytesDownloaded)} / ${fmtSize(j.totalBytes)}`
+                    : fmtSize(j.bytesDownloaded)
+                  : null;
+              return (
+                <div key={j.id} className={`dlv-qrow ${j.status}`}>
+                  <div className="dlq-main">
+                    <div className="dlq-title">
+                      <strong>{j.title}</strong>
+                      {epTag && <span className="badge dim">{epTag}</span>}
+                      <b className="dlq-pct">{Math.round(j.percent)}%</b>
+                    </div>
+                    <div className="dlq-badges">
+                      {qInfo.label && (
+                        <span className={`dlq-badge-q ${qInfo.verified ? "verified" : ""}`} title={qInfo.title}>
+                          {qInfo.label}
+                          {qInfo.verified ? " ✓" : ""}
+                        </span>
+                      )}
+                      {j.videoCodec && <span className="dlq-badge-dim">{j.videoCodec}</span>}
+                      <span className="dlq-badge-dim">{j.kind === "hls" ? "HLS→MP4" : "DIRECT"}</span>
+                      {((j.attemptIndex ?? 1) > 1 || (j.totalSources ?? 1) > 1) && (
+                        <span className="dlq-badge-dim">
+                          Server {j.attemptIndex ?? 1}/{Math.max(j.attemptIndex ?? 1, j.totalSources ?? 1)}
+                        </span>
+                      )}
+                    </div>
+                    <small>
+                      {[
+                        j.providerName,
+                        j.error || j.stage || j.status,
+                        j.segmentsDone != null && j.segmentsTotal ? `${j.segmentsDone}/${j.segmentsTotal} segs` : null,
+                        sizeStr,
+                        spd || null,
+                        eta ? `${eta} left` : null,
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")}
+                    </small>
+                    {j.failoverNotes && j.failoverNotes.length > 0 && (
+                      <span className="dlq-fail-note">
+                        Switched after: {j.failoverNotes[j.failoverNotes.length - 1]}
+                      </span>
+                    )}
+                    <div className="dl-bar">
+                      <i style={{ transform: `scaleX(${Math.max(0.02, j.percent / 100)})` }} />
+                    </div>
+                  </div>
+                  <div className="dlq-acts">
+                    {busy ? (
+                      <button
+                        type="button"
+                        className="chip"
+                        disabled={j.status === "remuxing"}
+                        onClick={() => void pauseDownload(j.id)}
+                      >
+                        <Icon name="pause" size={11} /> Pause
+                      </button>
+                    ) : (
+                      <button type="button" className="chip" onClick={() => void resumeDownload(j.id)}>
+                        <Icon name={j.status === "failed" ? "refresh" : "play"} size={11} />{" "}
+                        {j.status === "failed" ? "Retry" : "Resume"}
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="chip"
+                      disabled={j.status === "remuxing" || isSwitching}
+                      onClick={() => void switchDownloadToNextServer(j)}
+                      title="Switch to another server"
+                    >
+                      <Icon name="shuffle" size={11} /> {isSwitching ? "Finding…" : "Try another server"}
+                    </button>
+                    <button
+                      type="button"
+                      className="icon-btn"
+                      aria-label={`Cancel ${j.title}`}
+                      onClick={() => void cancelDownload(j.id)}
+                    >
+                      <Icon name="x" size={13} />
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       {!compact && presentKinds.size > 1 && (
         <div className="dlv-filters" role="tablist" aria-label="Filter downloads by type">
           {([
@@ -196,9 +495,36 @@ export function DownloadsVault({
                     {g.media.title}
                   </Link>
                   <div className="dlv-meta">{summaryMeta}</div>
+                  {!g.isFilm && (() => {
+                    const primaryS = g.entries[0]?.season ?? 1;
+                    const seasonObj = g.media.seasons?.find((sn) => sn.number === primaryS);
+                    const totalInSeason =
+                      seasonObj?.episodeCount ??
+                      (primaryS === 1 ? (g.media.episodeCount ?? g.media.totalEpisodes) : undefined);
+                    if (!totalInSeason || totalInSeason <= 0) return null;
+                    const savedInSeason = g.entries.filter((e) => (e.season ?? 1) === primaryS).length;
+                    const sPct = Math.min(100, Math.round((savedInSeason / totalInSeason) * 100));
+                    return (
+                      <div className="dlv-season-bar" title={`Season ${primaryS}: ${savedInSeason} of ${totalInSeason} episodes saved offline`}>
+                        <span>S{String(primaryS).padStart(2, "0")} · {savedInSeason}/{totalInSeason} ep ({sPct}%)</span>
+                        <div className="dl-bar"><i style={{ transform: `scaleX(${Math.max(0.03, sPct / 100)})` }} /></div>
+                      </div>
+                    );
+                  })()}
                   <div className="dlv-badges">
                     <span className="badge offline">OFFLINE</span>
-                    {g.bestQuality && <span className={`q ${qBadge === "4K" ? "" : "hd"}`}>{qBadge}</span>}
+                    {g.bestQuality && (
+                      <span
+                        className={`q ${qBadge === "4K" ? "" : "hd"}`}
+                        title={g.entries.some((e) => e.qualityVerified) ? "Verified via FFprobe" : undefined}
+                      >
+                        {qBadge}
+                        {g.entries.some((e) => e.qualityVerified) ? " ✓" : ""}
+                      </span>
+                    )}
+                    {g.entries[0]?.videoCodec && (
+                      <span className="badge dim">{g.entries[0].videoCodec}</span>
+                    )}
                     {g.audioTags.map((a) => (
                       <span key={a} className="badge dim">
                         {a.toUpperCase()}
@@ -282,7 +608,13 @@ export function DownloadsVault({
                           <b>{code}</b>
                           <span>{e.episodeTitle || `Episode ${e.episode ?? 1}`}</span>
                           <small>
-                            {[e.quality ? `${e.quality}p` : null, e.audio?.toUpperCase(), fmtSize(e.fileSize), e.providerName]
+                            {[
+                              formatQualityTag(e.quality, e.qualityVerified),
+                              e.videoCodec,
+                              e.audio?.toUpperCase(),
+                              fmtSize(e.fileSize),
+                              e.providerName,
+                            ]
                               .filter(Boolean)
                               .join(" · ")}
                           </small>

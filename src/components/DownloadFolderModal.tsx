@@ -55,6 +55,7 @@ export function DownloadFolderModal() {
 
         <p className="dl-modal-copy">
           Pick or create any folder for offline downloads, or start with the default location below.
+          You will only be asked once — you can change or move this folder anytime in <strong>Settings → Sources</strong>.
           AbixCine automatically sorts saved titles into subfolders and plays them first—even without
           an internet connection.
         </p>

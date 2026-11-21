@@ -42,7 +42,9 @@ a.file:hover,
 .reel-lead,
 .filmreel,
 .top-hit,
-.dlv-setup {
+.dlv-setup,
+.dlv-queue,
+.ep-season-prog {
   position: relative;
   background-color: var(--glass-bg-pane);
   background-image: var(--frost-grain), var(--glass-sheen);
@@ -111,7 +113,8 @@ a.file:hover,
   .spread-lead,
   .top-hit,
   .pbot,
-  .psheet
+  .psheet,
+  .hover-preview
 )::after {
   content: "";
   position: absolute;
@@ -153,9 +156,12 @@ a.file:hover,
   .panel,
   .dlv-card,
   .dlv-setup,
+  .dlv-queue,
+  .ep-season-prog,
   .top-hit,
   .pbot,
-  .psheet
+  .psheet,
+  .hover-preview
 ).lit {
   background-image:
     radial-gradient(300px circle at var(--gx, 50%) var(--gy, 0%), var(--glass-spot), transparent 68%),
@@ -229,9 +235,9 @@ a.file:hover,
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
 }
-:root[data-theme="alabaster"] .palette-scrim::before,
-:root[data-theme="alabaster"] .qd-scrim::before,
-:root[data-theme="alabaster"] .dl-modal-scrim::before {
+:root[data-mode="light"] .palette-scrim::before,
+:root[data-mode="light"] .qd-scrim::before,
+:root[data-mode="light"] .dl-modal-scrim::before {
   background: rgb(24 22 20 / 0.24);
 }
 .pal-preview {
@@ -309,11 +315,11 @@ a.file:hover,
   box-shadow: inset 0 1px 2px rgb(0 0 0 / 0.28), inset 0 0 0 1px rgb(255 255 255 / 0.14);
   border-radius: 8px;
 }
-:root[data-theme="alabaster"] .panel input:not([type]),
-:root[data-theme="alabaster"] .panel input[type="text"],
-:root[data-theme="alabaster"] .panel input[type="url"],
-:root[data-theme="alabaster"] .panel input[type="password"],
-:root[data-theme="alabaster"] .panel textarea {
+:root[data-mode="light"] .panel input:not([type]),
+:root[data-mode="light"] .panel input[type="text"],
+:root[data-mode="light"] .panel input[type="url"],
+:root[data-mode="light"] .panel input[type="password"],
+:root[data-mode="light"] .panel textarea {
   background-color: rgb(255 255 255 / 0.62);
   box-shadow: inset 0 1px 2px rgb(24 22 20 / 0.08), inset 0 0 0 1px rgb(24 22 20 / 0.14);
 }
@@ -321,7 +327,7 @@ a.file:hover,
 /* ---------- high-contrast & accessibility contracts ---------- */
 @media (prefers-reduced-transparency: reduce) {
   :root,
-  :root[data-theme="alabaster"] {
+  :root[data-mode="light"] {
     --glass-bg: var(--s1);
     --glass-bg-strong: var(--s0);
     --glass-bg-subtle: var(--s1);
@@ -374,8 +380,10 @@ a.file:hover,
   .filmreel,
   .top-hit,
   .dlv-setup,
+  .dlv-queue,
+  .ep-season-prog,
   .taste-ribbon,
-  .card-curtain,
+  .hover-preview,
   .more,
   .nav-btn {
     backdrop-filter: none !important;
@@ -416,7 +424,8 @@ a.file:hover,
     .spread-lead,
     .top-hit,
     .pbot,
-    .psheet
+    .psheet,
+    .hover-preview
   )::after {
     display: none !important;
   }
@@ -448,12 +457,15 @@ a.file:hover,
   .filmreel,
   .top-hit,
   .dlv-setup,
+  .dlv-queue,
+  .ep-season-prog,
   .dlv-card,
   .theme-popover,
   .dl-queue-pop,
   .dl-pop,
   .dl-modal,
-  .search-box {
+  .search-box,
+  .hover-preview {
     backdrop-filter: none !important;
     -webkit-backdrop-filter: none !important;
     background-color: var(--bg) !important;

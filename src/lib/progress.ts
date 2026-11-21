@@ -42,13 +42,28 @@ function load(): Record<string, ProgressEntry> {
   }
 }
 let store = load();
+let persistTimer: ReturnType<typeof setTimeout> | null = null;
 
-function save() {
+function persistNow() {
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
   try {
     localStorage.setItem(KEY, JSON.stringify(store));
   } catch {
     /* ignore */
   }
+}
+
+function schedulePersist() {
+  if (persistTimer) return;
+  persistTimer = setTimeout(persistNow, 1500);
+}
+
+function save(immediate = false) {
+  if (immediate) persistNow();
+  else schedulePersist();
   listeners.forEach((l) => l());
 }
 
@@ -100,7 +115,7 @@ export function saveProgress(
   } else {
     store = { ...store, [canonicalKey]: entry };
   }
-  save();
+  save(done);
   syncProgress(canonicalKey, entry, done);
 }
 
@@ -143,8 +158,16 @@ export function flushProgressSync(only?: string) {
 }
 
 if (typeof window !== "undefined") {
-  window.addEventListener("pagehide", () => flushProgressSync());
-  document.addEventListener("visibilitychange", () => document.hidden && flushProgressSync());
+  window.addEventListener("pagehide", () => {
+    persistNow();
+    flushProgressSync();
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      persistNow();
+      flushProgressSync();
+    }
+  });
 }
 
 export function getProgress(mediaKey: string, season?: number, episode?: number, fallbackKeys?: (string | undefined)[]) {
@@ -163,7 +186,7 @@ export function removeProgress(mediaKey: string) {
   pendingSync.delete(mediaKey);
   lastSync.delete(mediaKey);
   store = rest;
-  save();
+  save(true);
   push(`/progress/${encodeURIComponent(mediaKey)}`, "DELETE");
   return gone;
 }
@@ -171,7 +194,7 @@ export function removeProgress(mediaKey: string) {
 /** Put back an entry removed by mistake (the Undo on the toast). */
 export function restoreProgress(entry: ProgressEntry) {
   store = { ...store, [entry.media.key]: entry };
-  save();
+  save(true);
   push(`/progress/${encodeURIComponent(entry.media.key)}`, "PUT", entry);
 }
 
@@ -220,7 +243,7 @@ registerSync({
           if (mine && mine.updatedAt <= t.deletedAt) delete next[t.key];
         }
         store = next;
-        save();
+        save(true);
       })
       .catch(() => {}),
   clear: () => {
@@ -228,7 +251,7 @@ registerSync({
     pendingSync.clear();
     lastSync.clear();
     store = {};
-    save();
+    save(true);
   },
 });
 

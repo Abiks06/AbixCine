@@ -46,6 +46,28 @@ export {
 
 const inflightDetail = new Map<string, Promise<MediaDetail>>();
 const inflightSeasonEps = new Map<string, Promise<Episode[]>>();
+const detailMem = new Map<string, MediaDetail>();
+
+/** Synchronously return an already-fetched `MediaDetail` record when available in memory. */
+export function peekDetail(key: string): MediaDetail | undefined {
+  const cleanKey = key.trim();
+  const hit = detailMem.get(cleanKey);
+  if (hit) {
+    detailMem.delete(cleanKey);
+    detailMem.set(cleanKey, hit);
+  }
+  return hit;
+}
+
+function rememberDetail(key: string, detail: MediaDetail) {
+  detailMem.set(key, detail);
+  if (detail.key && detail.key !== key) detailMem.set(detail.key, detail);
+  while (detailMem.size > 300) {
+    const oldest = detailMem.keys().next();
+    if (oldest.done) break;
+    detailMem.delete(oldest.value);
+  }
+}
 
 /**
  * Route a media key to whichever catalog owns it and return a canonical, normalized
@@ -108,9 +130,16 @@ export function getDetail(key: string): Promise<MediaDetail> {
 
     return tmdbDetail(cleanKey);
   })()
+    .then((res) => {
+      rememberDetail(cleanKey, res);
+      return res;
+    })
     .catch((err) => {
       const offline = findOfflineDetail(cleanKey);
-      if (offline) return offline;
+      if (offline) {
+        rememberDetail(cleanKey, offline);
+        return offline;
+      }
       throw err;
     })
     .finally(() => inflightDetail.delete(cleanKey));

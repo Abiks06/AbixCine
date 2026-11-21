@@ -1,7 +1,8 @@
-import { memo, type MouseEvent, type ReactNode } from "react";
+import { memo, useRef, type MouseEvent, type ReactNode } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { encodeKey, getDetail, isUnreleasedMedia } from "../lib/catalog";
 import { openDossier, registerMedia } from "../lib/dossier";
+import { cancelHoverPreview, closeHoverPreviewNow, scheduleHoverPreview } from "../lib/hoverPreview";
 import { previewLight } from "../lib/light";
 import { playHref } from "../lib/play";
 import type { Move } from "../lib/ranks";
@@ -96,8 +97,8 @@ function warm(key: string) {
 
 /**
  * Memoised gallery card: unobstructed artwork at rest with structured metadata underneath.
- * Hovering or focusing reveals a smooth darkroom detail curtain with brief synopsis/metadata
- * and docked quick controls while keeping buttons strictly siblings of the anchor link.
+ * Hovering reveals a floating Liquid Glass preview with full synopsis, credits, and actions,
+ * while keeping card buttons strictly siblings of the anchor link for keyboard & touch access.
  */
 export const Card = memo(function Card({
   media,
@@ -120,6 +121,7 @@ export const Card = memo(function Card({
   registerMedia(media);
   const saved = useSaved(media.key);
   const nav = useNavigate();
+  const articleRef = useRef<HTMLElement>(null);
   const port = variant !== "landscape";
   const unreleased = isUnreleasedMedia(media);
   const peek = () => {
@@ -127,14 +129,19 @@ export const Card = memo(function Card({
     warm(media.key);
   };
   const aside = right ?? (rank != null && move ? <MoveBadge move={move} /> : media.rating ? <span className="star">★ {media.rating.toFixed(1)}</span> : null);
-  const teaser = media.overview?.trim();
-  const microLine = [kindLabel(media.kind, media.format), media.year, media.genres.slice(0, 2).join(" · ")].filter(Boolean).join(" · ");
 
   const card = (
     <article
+      ref={articleRef}
       className={`card ${port ? "port" : ""}`}
       style={{ ["--i" as string]: Math.min(index, 8) }}
       data-media-key={media.key}
+      onPointerEnter={(e) => {
+        if (e.pointerType !== "touch") scheduleHoverPreview(media, articleRef.current, { to, onRemove, removeLabel });
+      }}
+      onPointerLeave={(e) => {
+        if (e.pointerType !== "touch") cancelHoverPreview();
+      }}
     >
       <Link
         to={to ?? `/title/${encodeKey(media.key)}`}
@@ -143,6 +150,7 @@ export const Card = memo(function Card({
         title={media.title}
         viewTransition
         onClick={(e) => {
+          closeHoverPreviewNow();
           if (!to) tagForMorph(e);
           onOpen?.();
         }}
@@ -154,10 +162,6 @@ export const Card = memo(function Card({
         <div className="art-wrap gate-frame">
           <Art media={media} variant={port ? "poster" : "backdrop"} size="md" />
           <span className="gate-brackets" aria-hidden><i /></span>
-          <div className="card-curtain" aria-hidden>
-            <div className="cc-meta">{microLine}</div>
-            {teaser && <p className="cc-desc">{teaser}</p>}
-          </div>
           {extra}
           {progress != null && (
             <div className="prog"><i style={{ transform: `scaleX(${Math.min(1, Math.max(0.02, progress / 100))})` }} /></div>

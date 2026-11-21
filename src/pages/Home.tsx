@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { ActiveReel } from "../components/ActiveReel";
 import { ChartLedger, type ChartTab } from "../components/ChartLedger";
@@ -12,9 +12,9 @@ import { Icon } from "../components/Icon";
 import { NextWatchDeck } from "../components/NextWatchDeck";
 import { Row } from "../components/Row";
 import { useAuth } from "../lib/account";
-import { ANIME_FEEDS, loadAnimeFeed } from "../lib/anilist";
+import { ANIME_FEEDS, loadAnimeFeed, peekAnimeFeed } from "../lib/anilist";
 import { getDetail } from "../lib/catalog";
-import { useDownloads } from "../lib/downloads";
+import { useHasDownloadedItems } from "../lib/downloads";
 import { useFreshness } from "../lib/fresh";
 import { useOnlineStatus } from "../lib/online";
 import { removeProgress, restoreProgress, useContinueWatching, useProgressStore, type ProgressEntry } from "../lib/progress";
@@ -22,7 +22,7 @@ import { buildRecommendations, type RecommendMode, type SeedRelated } from "../l
 import { laneOf, mixByTaste, useTaste, type Lane } from "../lib/taste";
 import { toast } from "../lib/toast";
 import { useSettings } from "../lib/settings";
-import { FEEDS, hasTmdb, loadFeed, TOP10 } from "../lib/tmdb";
+import { FEEDS, hasTmdb, loadFeed, peekFeed, TOP10 } from "../lib/tmdb";
 import { type Media } from "../lib/types";
 import { useAsync, useProgressiveFeeds } from "../lib/useAsync";
 import { useSlidingIndicator } from "../lib/useSlidingIndicator";
@@ -44,7 +44,7 @@ export function Home() {
   const s = useSettings();
   const auth = useAuth();
   const isOnline = useOnlineStatus();
-  const dl = useDownloads();
+  const hasDownloads = useHasDownloadedItems();
   const fresh = useFreshness();
   const lensInd = useSlidingIndicator();
   const [lens, setLens] = useState<Lens>("all");
@@ -52,13 +52,23 @@ export function Home() {
   const [shuffleOffset, setShuffleOffset] = useState(0);
   const [dismissed, setDismissed] = useState<Set<string>>(() => new Set());
 
+  const homeFeedsList = useMemo(() => [...FEEDS.home, TOP10.movie, TOP10.tv], []);
   const feeds = useProgressiveFeeds(
-    [...FEEDS.home, TOP10.movie, TOP10.tv].map((f, i) => () => loadFeed(f, i).catch(() => [] as Media[])),
+    homeFeedsList.map((f, i) => () => loadFeed(f, i).catch(() => [] as Media[])),
     [s.tmdbKey, auth.tmdbProxy, fresh],
-    { keepPrevious: true },
+    {
+      keepPrevious: true,
+      initialItems: homeFeedsList.map((f) => peekFeed(f)),
+    },
   );
-  const anime = useAsync(() => loadAnimeFeed(ANIME_FEEDS[1], 1), [fresh], { keepPrevious: true });
-  const animeTrending = useAsync(() => loadAnimeFeed(ANIME_FEEDS[0], 0), [fresh], { keepPrevious: true });
+  const anime = useAsync(() => loadAnimeFeed(ANIME_FEEDS[1], 1), [fresh], {
+    keepPrevious: true,
+    initialData: peekAnimeFeed(ANIME_FEEDS[1]),
+  });
+  const animeTrending = useAsync(() => loadAnimeFeed(ANIME_FEEDS[0], 0), [fresh], {
+    keepPrevious: true,
+    initialData: peekAnimeFeed(ANIME_FEEDS[0]),
+  });
   const cont = useContinueWatching();
   const taste = useTaste();
   const watchlist = useWatchlist();
@@ -191,10 +201,10 @@ export function Home() {
   const seriesPct = Math.round(taste.share.series * 100);
   const animePct = Math.max(0, 100 - filmPct - seriesPct);
 
-  const handleRemoveReel = (p: ProgressEntry) => {
+  const handleRemoveReel = useCallback((p: ProgressEntry) => {
     const gone = removeProgress(p.media.key);
     if (gone) toast(`Removed “${p.media.title}” from Continue watching`, { icon: "x", action: { label: "Undo", run: () => restoreProgress(gone) } });
-  };
+  }, []);
 
   const heroLabel = lens === "all" ? "Tonight" : lens === "film" ? "Films" : lens === "series" ? "Series" : "Anime";
   const recsLoading = (catalog ? rowLoading(1) && rowLoading(4) : anime.loading && !anime.data) && !recs.picks.length;
@@ -236,7 +246,7 @@ export function Home() {
       </div>
 
       <div className="shelves pad">
-        {!isOnline && dl.items.length > 0 && <DownloadsVault compact limit={8} />}
+        {!isOnline && hasDownloads && <DownloadsVault compact limit={8} />}
 
         {!catalog && (
           <Link to="/settings#catalog" className="notice" viewTransition>
@@ -306,7 +316,7 @@ export function Home() {
           />
         )}
 
-        {isOnline && dl.items.length > 0 && <DownloadsVault compact limit={6} />}
+        {isOnline && hasDownloads && <DownloadsVault compact limit={6} />}
 
         <DriveSection limit={6} />
 

@@ -10,7 +10,7 @@ import { convertFileSrc, invoke, isTauri } from "@tauri-apps/api/core";
 import { useCallback, useEffect, useRef } from "react";
 import { DashCueCollector } from "../../lib/dashCues";
 import { langLabel, preferredAudioTrackIndex } from "../../lib/subtitles";
-import { type Audio } from "../../lib/settings";
+import { getSettings, type Audio } from "../../lib/settings";
 import type { StreamCandidate } from "../../sources/types";
 import { isUrlTokenExpired, native, playbackUrl, proxyUrl, unwrapProxyUrl } from "../../sources/native";
 import type { SourceSession } from "../../sources/session";
@@ -494,8 +494,14 @@ export function useStreamEngine(ctx: StreamEngineContext) {
       const hls = new H({
         enableWorker: true,
         lowLatencyMode: false,
+        startFragPrefetch: true,
+        capLevelToPlayerSize: false,
         maxBufferLength: 60,
+        maxMaxBufferLength: 120,
         backBufferLength: 30,
+        fragLoadingMaxRetry: 4,
+        manifestLoadingMaxRetry: 3,
+        levelLoadingMaxRetry: 3,
         xhrSetup: (xhr) => {
           xhr.withCredentials = false;
         },
@@ -513,6 +519,28 @@ export function useStreamEngine(ctx: StreamEngineContext) {
       hls.on(H.Events.MANIFEST_PARSED, (_, d) => {
         if (cancelled) return;
         lastNetErrCode = undefined;
+        const pref = getSettings().preferredQuality;
+        if (pref > 0 && d.levels.length > 1) {
+          let bestWithin = -1;
+          let bestWithinH = -1;
+          let closestAbove = -1;
+          let closestAboveH = Infinity;
+          d.levels.forEach((lvl, idx) => {
+            const h = lvl.height || 0;
+            if (!h) return;
+            if (h <= pref && h > bestWithinH) {
+              bestWithinH = h;
+              bestWithin = idx;
+            } else if (h > pref && h < closestAboveH) {
+              closestAboveH = h;
+              closestAbove = idx;
+            }
+          });
+          const startIdx = bestWithin >= 0 ? bestWithin : closestAbove;
+          if (startIdx >= 0) {
+            hls.startLevel = startIdx;
+          }
+        }
         setHlsReady(true);
         setLevels(d.levels.map((l) => ({ height: l.height })));
         seekAndPlay();

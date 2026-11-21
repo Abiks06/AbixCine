@@ -71,15 +71,23 @@ async function gql<T = unknown>(query: string, variables: Record<string, unknown
   if (existing) return existing as Promise<T>;
 
   const req = (async () => {
-    const res = await fetch(API, {
-      method: "POST",
-      headers: { "content-type": "application/json", accept: "application/json" },
-      body: JSON.stringify({ query, variables }),
-    });
-    if (!res.ok) throw new Error(`AniList ${res.status}`);
-    const j = await res.json();
-    if (j.errors) throw new Error(j.errors[0]?.message ?? "AniList error");
-    return j.data as T;
+    for (let attempt = 0; ; attempt++) {
+      const res = await fetch(API, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({ query, variables }),
+      });
+      if ((res.status === 429 || res.status >= 500) && attempt === 0) {
+        const ra = Number(res.headers.get("retry-after"));
+        const delayMs = Number.isFinite(ra) && ra > 0 ? Math.min(2500, Math.max(400, ra * 1000)) : 1200;
+        await new Promise((r) => setTimeout(r, delayMs));
+        continue;
+      }
+      if (!res.ok) throw new Error(`AniList ${res.status}`);
+      const j = await res.json();
+      if (j.errors) throw new Error(j.errors[0]?.message ?? "AniList error");
+      return j.data as T;
+    }
   })().finally(() => inflightGql.delete(sig));
 
   inflightGql.set(sig, req);
@@ -109,6 +117,8 @@ function toMedia(m: AnilistMediaItem): Media {
     backdrop: m.bannerImage ?? undefined,
     genres: m.genres ?? [],
     color: m.coverImage?.color ?? undefined,
+    ...(m.episodes ? { episodeCount: m.episodes } : {}),
+    ...(m.duration ? { runtime: m.duration } : {}),
     ...(m.nextAiringEpisode && typeof m.nextAiringEpisode.airingAt === "number"
       ? { nextAiring: { episode: m.nextAiringEpisode.episode, at: m.nextAiringEpisode.airingAt * 1000 } }
       : {}),
@@ -128,6 +138,10 @@ function currentSeason() {
   const m = d.getMonth();
   const season = m < 3 ? "WINTER" : m < 6 ? "SPRING" : m < 9 ? "SUMMER" : "FALL";
   return { season, year: d.getFullYear() };
+}
+
+export function peekAnimeFeed(f: (typeof ANIME_FEEDS)[number]): Media[] | undefined {
+  return peekCache<Media[]>(`anilist:feed:v3:${f.id}`, 3 * HOUR);
 }
 
 export async function loadAnimeFeed(f: (typeof ANIME_FEEDS)[number], _i?: number): Promise<Media[]> {

@@ -437,22 +437,42 @@ pub(crate) fn run_background_output(cmd: &mut std::process::Command) -> std::io:
     child.wait_with_output()
 }
 
+pub(crate) fn strip_verbatim_prefix(p: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = p.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    p
+}
+
 pub(crate) fn register_downloads_root(app: &tauri::AppHandle, dir: &Path) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("Could not create downloads folder: {e}"))?;
     let canonical = std::fs::canonicalize(dir).map_err(|e| e.to_string())?;
     app.asset_protocol_scope()
         .allow_directory(&canonical, true)
         .map_err(|e| e.to_string())?;
+    let clean = strip_verbatim_prefix(canonical);
+    let _ = app.asset_protocol_scope().allow_directory(&clean, true);
     *DOWNLOADS_ROOT
         .get_or_init(|| Mutex::new(None))
         .lock()
-        .map_err(|e| e.to_string())? = Some(canonical.clone());
-    Ok(canonical)
+        .map_err(|e| e.to_string())? = Some(clean.clone());
+    Ok(clean)
 }
 
 fn ensure_in_allowed_roots(path: &Path, allowed_roots: &[PathBuf]) -> Result<PathBuf, String> {
-    let canonical = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
-    if !canonical.is_file() || !allowed_roots.iter().any(|root| canonical.starts_with(root)) {
+    let canonical = strip_verbatim_prefix(std::fs::canonicalize(path).map_err(|e| e.to_string())?);
+    if !canonical.is_file()
+        || !allowed_roots
+            .iter()
+            .any(|root| canonical.starts_with(strip_verbatim_prefix(root.clone())))
+    {
         return Err("The requested file is not inside a selected library folder".into());
     }
     Ok(canonical)
@@ -1883,11 +1903,17 @@ pub fn run() {
             torrent::torrent_stop,
             downloads::download_default_dir,
             downloads::download_init_root,
+            downloads::download_migrate_root,
             downloads::download_start,
             downloads::download_pause,
+            downloads::download_pause_all,
             downloads::download_resume,
+            downloads::download_resume_all,
+            downloads::download_switch_source,
             downloads::download_cancel,
+            downloads::download_cancel_all,
             downloads::download_remove,
+            downloads::download_clear_failed,
             downloads::download_list,
             downloads::download_open_folder,
             prepare_for_update_exit,

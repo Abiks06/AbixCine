@@ -2,6 +2,7 @@ import { memo, type PointerEvent as ReactPointerEvent, type RefObject, useEffect
 import { Link, useNavigate } from "react-router-dom";
 import { encodeKey, isUnreleasedMedia } from "../lib/catalog";
 import { openDossier, registerMedia } from "../lib/dossier";
+import { cancelHoverPreview, closeHoverPreviewNow, scheduleHoverPreview } from "../lib/hoverPreview";
 import { previewLight } from "../lib/light";
 import { playHref } from "../lib/play";
 import { burst } from "../lib/burst";
@@ -69,18 +70,23 @@ const ReelFrame = memo(function ReelFrame({
 }) {
   registerMedia(media);
   const nav = useNavigate();
+  const frameRef = useRef<HTMLElement>(null);
   const saved = useSaved(media.key);
   const port = variant === "poster";
   const unreleased = isUnreleasedMedia(media);
   const airing = fmtAiringChip(media.nextAiring);
-  const micro = [kindLabel(media.kind, media.format), media.year, media.genres.slice(0, 2).join(" · ")]
-    .filter(Boolean)
-    .join(" · ");
 
   return (
     <article
+      ref={frameRef}
       className={`fr-frame card ${port ? "port" : ""}`}
       data-media-key={media.key}
+      onPointerEnter={(e) => {
+        if (!clone && e.pointerType !== "touch") scheduleHoverPreview(media, frameRef.current);
+      }}
+      onPointerLeave={(e) => {
+        if (!clone && e.pointerType !== "touch") cancelHoverPreview();
+      }}
     >
       <div className="fr-head">
         <span className="fr-code">{String(index + 1).padStart(2, "0")}A</span>
@@ -101,6 +107,7 @@ const ReelFrame = memo(function ReelFrame({
         className="card-hit"
         title={media.title}
         onClick={(e) => {
+          closeHoverPreviewNow();
           if (!clone) tagForMorph(e);
         }}
         onMouseEnter={() => previewLight(media)}
@@ -111,10 +118,6 @@ const ReelFrame = memo(function ReelFrame({
         <div className="art-wrap gate-frame">
           <Art media={media} variant={port ? "poster" : "backdrop"} size="md" eager={index < 8} />
           <span className="gate-brackets" aria-hidden><i /></span>
-          <div className="card-curtain" aria-hidden>
-            <div className="cc-meta">{micro}</div>
-            {media.overview && <p className="cc-desc">{media.overview}</p>}
-          </div>
         </div>
         <div className="card-info">
           <div className="card-name">
@@ -388,6 +391,7 @@ export function FilmReel({
 
       e.preventDefault();
       previewLight(null);
+      closeHoverPreviewNow();
       const p = physRef.current;
       const now = performance.now();
 
@@ -466,6 +470,7 @@ export function FilmReel({
         physRef.current.vel = 0;
         reelRef.current?.classList.add("dragging");
         previewLight(null);
+        closeHoverPreviewNow();
       }
 
       const now = performance.now();

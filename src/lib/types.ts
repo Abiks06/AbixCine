@@ -29,6 +29,10 @@ export interface Media {
   hue?: number;
   /** ISO 639-1 original language code (e.g. "en", "ja", "ko"). */
   originalLanguage?: string;
+  /** Typical runtime (minutes for films, minutes/episode for shows & anime). */
+  runtime?: number;
+  /** Episode count when provided by feed metadata. */
+  episodeCount?: number;
   /** AniList format ("TV", "MOVIE", "OVA"…). An anime film keeps kind "anime" for source lookup but plays as a film. */
   format?: string;
   /** ISO date of first release / first air date (`YYYY-MM-DD`). */

@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 
 use crate::stream::{self, Hdrs};
 
@@ -25,10 +25,18 @@ const MAX_CONCURRENT_JOBS: usize = 2;
 const HLS_SEGMENT_CONCURRENCY: usize = 4;
 const PROGRESS_EMIT_MS: u128 = 250;
 const SEGMENT_MAX_ATTEMPTS: usize = 3;
+const DIRECT_MAX_RECONNECTS: usize = 3;
+const DIRECT_MIN_VALID_BYTES: u64 = 65_536;
+const STALL_WINDOW_SECS: f64 = 25.0;
+const STALL_MIN_BPS: f64 = 4096.0;
 const MAX_SUBTITLE_TRACKS: usize = 4;
 const MAX_SUBTITLE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ART_BYTES: usize = 4 * 1024 * 1024;
 const EVENT_PROGRESS: &str = "abx://download-progress";
+
+fn default_one_u32() -> u32 {
+    1
+}
 
 static MANAGER: OnceLock<Arc<DownloadManager>> = OnceLock::new();
 static DL_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
@@ -99,6 +107,21 @@ pub struct DownloadSubtitleReq {
     pub is_hearing_impaired: Option<bool>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadFallbackSource {
+    pub provider_id: String,
+    pub provider_name: String,
+    pub url: String,
+    pub kind: String,
+    #[serde(default)]
+    pub headers: Hdrs,
+    #[serde(default)]
+    pub quality: Option<u32>,
+    #[serde(default)]
+    pub subtitles: Vec<DownloadSubtitleReq>,
+}
+
 #[derive(Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadStartReq {
@@ -131,6 +154,10 @@ pub struct DownloadStartReq {
     #[serde(default)]
     pub subtitles: Vec<DownloadSubtitleReq>,
     #[serde(default)]
+    pub fallbacks: Vec<DownloadFallbackSource>,
+    #[serde(default)]
+    pub replace_existing: bool,
+    #[serde(default)]
     pub poster_url: Option<String>,
     #[serde(default)]
     pub backdrop_url: Option<String>,
@@ -160,6 +187,12 @@ pub struct DownloadJob {
     pub audio: Option<String>,
     #[serde(default)]
     pub quality: Option<u32>,
+    #[serde(default)]
+    pub resolved_quality: Option<u32>,
+    #[serde(default)]
+    pub quality_verified: bool,
+    #[serde(default)]
+    pub video_codec: Option<String>,
     pub provider_id: String,
     pub provider_name: String,
     pub url: String,
@@ -170,6 +203,16 @@ pub struct DownloadJob {
     pub preferred_quality: Option<u32>,
     #[serde(default)]
     pub subtitles: Vec<DownloadSubtitleReq>,
+    #[serde(default)]
+    pub fallbacks: Vec<DownloadFallbackSource>,
+    #[serde(default)]
+    pub tried_providers: Vec<String>,
+    #[serde(default)]
+    pub failover_notes: Vec<String>,
+    #[serde(default = "default_one_u32")]
+    pub attempt_index: u32,
+    #[serde(default = "default_one_u32")]
+    pub total_sources: u32,
     #[serde(default)]
     pub poster_url: Option<String>,
     #[serde(default)]
@@ -214,6 +257,10 @@ pub struct DownloadJobView {
     pub episode_title: Option<String>,
     pub audio: Option<String>,
     pub quality: Option<u32>,
+    pub preferred_quality: Option<u32>,
+    pub resolved_quality: Option<u32>,
+    pub quality_verified: bool,
+    pub video_codec: Option<String>,
     pub provider_id: String,
     pub provider_name: String,
     pub url: String,
@@ -229,6 +276,11 @@ pub struct DownloadJobView {
     pub percent: f64,
     pub file_path: Option<String>,
     pub error: Option<String>,
+    pub attempt_index: u32,
+    pub total_sources: u32,
+    pub fallbacks_remaining: usize,
+    pub tried_providers: Vec<String>,
+    pub failover_notes: Vec<String>,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -249,6 +301,10 @@ impl From<&DownloadJob> for DownloadJobView {
             episode_title: j.episode_title.clone(),
             audio: j.audio.clone(),
             quality: j.quality,
+            preferred_quality: j.preferred_quality,
+            resolved_quality: j.resolved_quality,
+            quality_verified: j.quality_verified,
+            video_codec: j.video_codec.clone(),
             provider_id: j.provider_id.clone(),
             provider_name: j.provider_name.clone(),
             url: j.url.clone(),
@@ -264,6 +320,11 @@ impl From<&DownloadJob> for DownloadJobView {
             percent: j.percent,
             file_path: j.file_path.clone(),
             error: j.error.clone(),
+            attempt_index: j.attempt_index.max(1),
+            total_sources: j.total_sources.max(1),
+            fallbacks_remaining: j.fallbacks.len(),
+            tried_providers: j.tried_providers.clone(),
+            failover_notes: j.failover_notes.clone(),
             created_at: j.created_at,
             updated_at: j.updated_at,
         }
@@ -291,6 +352,10 @@ pub struct DownloadedEntry {
     pub audio: Option<String>,
     #[serde(default)]
     pub quality: Option<u32>,
+    #[serde(default)]
+    pub quality_verified: bool,
+    #[serde(default)]
+    pub video_codec: Option<String>,
     pub provider_id: String,
     pub provider_name: String,
     pub file_path: String,
@@ -312,6 +377,14 @@ pub struct DownloadSnapshot {
     pub root: Option<String>,
     pub jobs: Vec<DownloadJobView>,
     pub items: Vec<DownloadedEntry>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrateDownloadsResult {
+    pub snapshot: DownloadSnapshot,
+    pub moved_files: usize,
+    pub migrated: bool,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -560,6 +633,12 @@ struct HlsWorkState {
     audio_playlist_url: Option<String>,
     video: HlsMediaPlaylist,
     audio: Option<HlsMediaPlaylist>,
+    #[serde(default)]
+    selected_height: Option<u32>,
+    #[serde(default)]
+    selected_bandwidth: Option<u64>,
+    #[serde(default)]
+    available_heights: Vec<u32>,
 }
 
 fn parse_attr_list(raw: &str) -> HashMap<String, String> {
@@ -680,10 +759,142 @@ pub(crate) fn select_hls_variant(variants: &[HlsVariant], preferred_quality: Opt
         {
             return Some(best);
         }
+        // When all tagged variants exceed the user's cap, pick the closest one above it rather than jumping to 4K.
+        if let Some(closest_above) = variants
+            .iter()
+            .filter(|v| v.height.is_some())
+            .min_by_key(|v| (v.height.unwrap_or(u32::MAX), std::cmp::Reverse(v.bandwidth)))
+        {
+            return Some(closest_above);
+        }
     }
     variants
         .iter()
         .max_by_key(|v| (v.height.unwrap_or(0), v.bandwidth))
+}
+
+pub(crate) fn normalize_video_resolution(width: Option<u32>, height: Option<u32>) -> Option<u32> {
+    let w = width.unwrap_or(0);
+    let h = height.unwrap_or(0);
+    if w >= 3800 || h >= 2000 {
+        return Some(2160);
+    }
+    if w >= 2500 || h >= 1400 {
+        return Some(1440);
+    }
+    if w >= 1880 || h >= 1040 {
+        return Some(1080);
+    }
+    if w >= 1240 || h >= 700 {
+        return Some(720);
+    }
+    if w >= 820 || h >= 460 {
+        return Some(480);
+    }
+    if h >= 240 {
+        return Some(h);
+    }
+    None
+}
+
+pub(crate) fn friendly_video_codec(raw: &str) -> Option<String> {
+    let low = raw.trim().to_ascii_lowercase();
+    if low.is_empty() {
+        return None;
+    }
+    let label = if low.contains("h264") || low.contains("avc") {
+        "H.264"
+    } else if low.contains("hevc") || low.contains("h265") || low.contains("hev1") || low.contains("hvc1") {
+        "HEVC"
+    } else if low.contains("av1") || low.contains("av01") {
+        "AV1"
+    } else if low.contains("vp9") {
+        "VP9"
+    } else if low.contains("mpeg4") {
+        "MPEG-4"
+    } else {
+        let up = raw.trim().to_ascii_uppercase();
+        return if up.len() <= 12 { Some(up) } else { None };
+    };
+    Some(label.to_string())
+}
+
+pub(crate) fn is_invalid_video_content_type(ct: Option<&str>) -> bool {
+    let Some(raw) = ct else { return false };
+    let low = raw.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    low.starts_with("text/")
+        || low == "application/xhtml+xml"
+        || low == "application/json"
+        || low == "application/xml"
+        || low == "text/xml"
+}
+
+pub(crate) fn is_local_fatal_error(msg: &str) -> bool {
+    let low = msg.to_ascii_lowercase();
+    low.contains("no space")
+        || low.contains("disk full")
+        || low.contains("permission denied")
+        || low.contains("access is denied")
+        || low.contains("read-only")
+        || low.contains("outside the downloads folder")
+        || low.contains("disk write error")
+        || low.contains("could not finalize file")
+}
+
+pub(crate) fn advance_job_to_next_fallback(
+    job: &mut DownloadJob,
+    failed_reason: &str,
+) -> Option<(String, String)> {
+    let prev_name = job.provider_name.clone();
+    let prev_id = job.provider_id.clone();
+    if !job.tried_providers.iter().any(|p| p == &prev_id) {
+        job.tried_providers.push(prev_id);
+    }
+    let clean_reason = failed_reason.trim();
+    if !clean_reason.is_empty() {
+        let clipped = if clean_reason.len() > 80 {
+            let cut = stream::floor_char_boundary(clean_reason, 80);
+            format!("{}…", &clean_reason[..cut])
+        } else {
+            clean_reason.to_string()
+        };
+        job.failover_notes.push(format!("{prev_name}: {clipped}"));
+    }
+
+    while !job.fallbacks.is_empty() {
+        let next = job.fallbacks.remove(0);
+        if next.url == job.url {
+            continue;
+        }
+        if job.tried_providers.iter().any(|p| p == &next.provider_id) {
+            continue;
+        }
+        if stream::validate_http_url(&next.url).is_err() {
+            continue;
+        }
+        job.provider_id = next.provider_id;
+        job.provider_name = next.provider_name.clone();
+        job.url = next.url;
+        job.kind = next.kind;
+        job.headers = next.headers;
+        job.quality = next.quality;
+        job.resolved_quality = None;
+        job.quality_verified = false;
+        job.video_codec = None;
+        job.subtitles = next.subtitles;
+        job.bytes_downloaded = 0;
+        job.total_bytes = None;
+        job.segments_done = None;
+        job.segments_total = None;
+        job.speed_bps = 0;
+        job.eta_sec = None;
+        job.percent = 0.0;
+        job.error = None;
+        job.file_path = None;
+        job.attempt_index = job.attempt_index.saturating_add(1);
+        return Some((prev_name, next.provider_name));
+    }
+    None
 }
 
 fn select_audio_rendition<'a>(
@@ -990,9 +1201,216 @@ fn upsert_index_entry(items: &mut Vec<DownloadedEntry>, entry: DownloadedEntry) 
     items.insert(0, entry);
 }
 
+fn normalize_cmp_path(p: &Path) -> String {
+    let clean = crate::strip_verbatim_prefix(p.to_path_buf());
+    let mut s = clean.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    {
+        s = s.replace('/', r"\");
+        while s.len() > 3 && s.ends_with('\\') {
+            s.pop();
+        }
+        s.to_ascii_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        while s.len() > 1 && s.ends_with('/') {
+            s.pop();
+        }
+        s
+    }
+}
+
+fn is_same_or_subpath(child: &str, parent: &str) -> bool {
+    if child == parent {
+        return true;
+    }
+    let Some(rest) = child.strip_prefix(parent) else {
+        return false;
+    };
+    parent.ends_with('/') || parent.ends_with('\\') || rest.starts_with('/') || rest.starts_with('\\')
+}
+
+/// Validates migrating `old_root` -> `new_root`.
+/// Returns `Ok(false)` when both resolve to the same directory (no-op),
+/// `Ok(true)` when safe to migrate, or an error if one path nests inside the other.
+fn validate_migration_target(old_root: &Path, new_root: &Path) -> Result<bool, String> {
+    let old_n = normalize_cmp_path(old_root);
+    let new_n = normalize_cmp_path(new_root);
+    if old_n == new_n {
+        return Ok(false);
+    }
+    if is_same_or_subpath(&new_n, &old_n) {
+        return Err("Destination folder cannot be inside the current Downloads folder.".into());
+    }
+    if is_same_or_subpath(&old_n, &new_n) {
+        return Err("Current Downloads folder cannot be inside the destination folder.".into());
+    }
+    Ok(true)
+}
+
+fn clean_native_path(raw: &str) -> PathBuf {
+    let stripped = crate::strip_verbatim_prefix(PathBuf::from(raw));
+    #[cfg(windows)]
+    {
+        PathBuf::from(stripped.to_string_lossy().replace('/', r"\"))
+    }
+    #[cfg(not(windows))]
+    {
+        stripped
+    }
+}
+
+fn rewrite_root_prefix(raw: &str, old_root: &Path, new_root: &Path) -> String {
+    let raw_clean = clean_native_path(raw);
+    let old_clean = clean_native_path(&old_root.to_string_lossy());
+    let new_clean = clean_native_path(&new_root.to_string_lossy());
+
+    let raw_comps: Vec<String> = raw_clean
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let old_comps: Vec<String> = old_clean
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+
+    if old_comps.is_empty() || raw_comps.len() < old_comps.len() {
+        return raw.to_string();
+    }
+
+    let prefix_matches = raw_comps.iter().take(old_comps.len()).zip(&old_comps).all(|(a, b)| {
+        #[cfg(windows)]
+        {
+            a.eq_ignore_ascii_case(b)
+        }
+        #[cfg(not(windows))]
+        {
+            a == b
+        }
+    });
+
+    if !prefix_matches {
+        return raw.to_string();
+    }
+
+    let mut out = new_clean;
+    for part in raw_comps.into_iter().skip(old_comps.len()) {
+        out.push(part);
+    }
+    out.to_string_lossy().into_owned()
+}
+
+fn count_files_in_dir(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0usize;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            total += count_files_in_dir(&p);
+        } else if p.is_file() {
+            total += 1;
+        }
+    }
+    total
+}
+
+fn move_single_file(src: &Path, dst: &Path) -> Result<(), String> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Failed creating folder {}: {e}", parent.display()))?;
+    }
+    if !dst.exists() && std::fs::rename(src, dst).is_ok() {
+        return Ok(());
+    }
+    let expected_len = src
+        .metadata()
+        .map_err(|e| format!("Failed reading {}: {e}", src.display()))?
+        .len();
+    let tmp = dst.with_extension(format!("abxmove.{}", std::process::id()));
+    let copied = std::fs::copy(src, &tmp).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("Failed copying {} to {}: {e}", src.display(), dst.display())
+    })?;
+    if copied != expected_len {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!(
+            "Incomplete file copy for {} ({copied} of {expected_len} bytes)",
+            src.display()
+        ));
+    }
+    if dst.exists() {
+        std::fs::remove_file(dst).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("Failed replacing {}: {e}", dst.display())
+        })?;
+    }
+    std::fs::rename(&tmp, dst).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("Failed finalizing {}: {e}", dst.display())
+    })?;
+    std::fs::remove_file(src).map_err(|e| {
+        format!(
+            "Copied {} but could not remove old file: {e}",
+            src.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn move_path_recursive(src: &Path, dst: &Path) -> Result<usize, String> {
+    if !src.exists() {
+        return Ok(0);
+    }
+    if src.is_file() {
+        move_single_file(src, dst)?;
+        return Ok(1);
+    }
+    if !dst.exists() {
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let approx_count = count_files_in_dir(src);
+        if std::fs::rename(src, dst).is_ok() {
+            return Ok(approx_count);
+        }
+    }
+    std::fs::create_dir_all(dst).map_err(|e| format!("Failed creating {}: {e}", dst.display()))?;
+    let mut moved = 0usize;
+    let entries = std::fs::read_dir(src).map_err(|e| format!("Failed reading {}: {e}", src.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let child_src = entry.path();
+        let child_dst = dst.join(entry.file_name());
+        if child_src.is_dir() {
+            moved += move_path_recursive(&child_src, &child_dst)?;
+        } else if child_src.is_file() {
+            move_single_file(&child_src, &child_dst)?;
+            moved += 1;
+        }
+    }
+    let _ = std::fs::remove_dir(src);
+    Ok(moved)
+}
+
+fn job_matches_scope(j: &DownloadJob, canonical_key: Option<&str>, season: Option<u32>) -> bool {
+    if let Some(ck) = canonical_key {
+        if j.canonical_key != ck && j.media_key != ck {
+            return false;
+        }
+    }
+    if let Some(s) = season {
+        if j.is_film || j.season.unwrap_or(1) != s {
+            return false;
+        }
+    }
+    true
+}
+
 fn ensure_path_inside_root(target: &Path, root: &Path) -> Result<PathBuf, String> {
-    let canon_root = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
-    let canon_target = std::fs::canonicalize(target).map_err(|e| e.to_string())?;
+    let canon_root = crate::strip_verbatim_prefix(std::fs::canonicalize(root).map_err(|e| e.to_string())?);
+    let canon_target = crate::strip_verbatim_prefix(std::fs::canonicalize(target).map_err(|e| e.to_string())?);
     if !canon_target.starts_with(&canon_root) {
         return Err("Refusing to access file outside the Downloads folder".into());
     }
@@ -1001,10 +1419,36 @@ fn ensure_path_inside_root(target: &Path, root: &Path) -> Result<PathBuf, String
 
 /* ----------------------------------------------------------- job scheduler */
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct JobSignals {
     pause: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
+    replaced: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl JobSignals {
+    fn signal_pause(&self) {
+        self.pause.store(true, Ordering::Relaxed);
+        self.notify.notify_waiters();
+    }
+
+    fn signal_cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        self.notify.notify_waiters();
+    }
+
+    fn signal_replace(&self) {
+        self.replaced.store(true, Ordering::Relaxed);
+        self.notify.notify_waiters();
+    }
+}
+
+#[derive(Clone)]
+struct PendingSourceSwitch {
+    source: DownloadFallbackSource,
+    extra_fallbacks: Vec<DownloadFallbackSource>,
+    preferred_quality: Option<u32>,
 }
 
 struct ManagerState {
@@ -1013,6 +1457,7 @@ struct ManagerState {
     items: Vec<DownloadedEntry>,
     queue: VecDeque<String>,
     active: HashMap<String, JobSignals>,
+    pending_replace: HashMap<String, PendingSourceSwitch>,
 }
 
 impl Default for ManagerState {
@@ -1023,7 +1468,122 @@ impl Default for ManagerState {
             items: Vec::new(),
             queue: VecDeque::new(),
             active: HashMap::new(),
+            pending_replace: HashMap::new(),
         }
+    }
+}
+
+impl ManagerState {
+    fn pause_all_locked(
+        &mut self,
+        canonical_key: Option<&str>,
+        season: Option<u32>,
+    ) -> Vec<DownloadJobView> {
+        let mut match_ids: HashSet<String> = HashSet::new();
+        for j in &self.jobs {
+            if matches!(j.status, DownloadStatus::Queued | DownloadStatus::Downloading)
+                && job_matches_scope(j, canonical_key, season)
+            {
+                match_ids.insert(j.id.clone());
+            }
+        }
+        for (id, sig) in &self.active {
+            if match_ids.contains(id) {
+                sig.signal_pause();
+            }
+        }
+        self.queue.retain(|q| !match_ids.contains(q));
+        let ts = now_ms();
+        let mut views = Vec::new();
+        for j in &mut self.jobs {
+            if match_ids.contains(&j.id)
+                && matches!(j.status, DownloadStatus::Queued | DownloadStatus::Downloading)
+            {
+                j.status = DownloadStatus::Paused;
+                j.stage = Some("Paused".into());
+                j.speed_bps = 0;
+                j.eta_sec = None;
+                j.updated_at = ts;
+                views.push(DownloadJobView::from(&*j));
+            }
+        }
+        DownloadManager::persist_locked(self);
+        views
+    }
+
+    fn resume_all_locked(
+        &mut self,
+        canonical_key: Option<&str>,
+        season: Option<u32>,
+    ) -> (Vec<DownloadJobView>, bool) {
+        let ts = now_ms();
+        let mut views = Vec::new();
+        let mut to_queue = Vec::new();
+        for j in &mut self.jobs {
+            if matches!(j.status, DownloadStatus::Paused | DownloadStatus::Failed)
+                && job_matches_scope(j, canonical_key, season)
+            {
+                j.status = DownloadStatus::Queued;
+                j.stage = Some("Queued".into());
+                j.error = None;
+                j.updated_at = ts;
+                views.push(DownloadJobView::from(&*j));
+                to_queue.push(j.id.clone());
+            }
+        }
+        let mut queued_any = false;
+        for id in to_queue {
+            if !self.queue.iter().any(|q| q == &id) && !self.active.contains_key(&id) {
+                self.queue.push_back(id);
+                queued_any = true;
+            }
+        }
+        DownloadManager::persist_locked(self);
+        (views, queued_any)
+    }
+
+    fn cancel_all_locked(
+        &mut self,
+        canonical_key: Option<&str>,
+        season: Option<u32>,
+    ) -> (Vec<DownloadJob>, Vec<DownloadJobView>) {
+        let mut match_ids: HashSet<String> = HashSet::new();
+        for j in &self.jobs {
+            if !matches!(j.status, DownloadStatus::Completed | DownloadStatus::Cancelled)
+                && job_matches_scope(j, canonical_key, season)
+            {
+                match_ids.insert(j.id.clone());
+            }
+        }
+        for id in &match_ids {
+            self.pending_replace.remove(id);
+            if let Some(sig) = self.active.get(id) {
+                sig.signal_cancel();
+            }
+        }
+        self.queue.retain(|q| !match_ids.contains(q));
+
+        let active_ids: HashSet<String> = self.active.keys().cloned().collect();
+        let ts = now_ms();
+        let mut to_clean = Vec::new();
+        let mut active_views = Vec::new();
+        let mut kept = Vec::with_capacity(self.jobs.len());
+        for mut j in self.jobs.drain(..) {
+            if !match_ids.contains(&j.id) {
+                kept.push(j);
+            } else if active_ids.contains(&j.id) {
+                j.status = DownloadStatus::Cancelled;
+                j.stage = Some("Cancelling…".into());
+                j.updated_at = ts;
+                active_views.push(DownloadJobView::from(&j));
+                kept.push(j);
+            } else {
+                to_clean.push(j);
+            }
+        }
+        self.jobs = kept;
+        DownloadManager::persist_locked(self);
+        (to_clean, active_views)
     }
 }
 
@@ -1108,18 +1668,63 @@ impl DownloadManager {
         let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
         // If another root was open before, signal active tasks to pause cleanly.
         for sig in g.active.values() {
-            sig.pause.store(true, Ordering::Relaxed);
+            sig.signal_pause();
         }
         g.root = Some(canonical);
         g.jobs = q.jobs;
         g.items = idx.items;
         g.queue.clear();
+        g.pending_replace.clear();
         Self::persist_locked(&g);
         Ok(DownloadSnapshot {
             root: g.root.as_ref().map(|p| p.to_string_lossy().into_owned()),
             jobs: g.jobs.iter().map(DownloadJobView::from).collect(),
             items: g.items.clone(),
         })
+    }
+
+    fn apply_source_switch_to_job(job: &mut DownloadJob, sw: PendingSourceSwitch) {
+        let mut deduped = Vec::new();
+        let mut seen = HashSet::new();
+        seen.insert(sw.source.url.to_ascii_lowercase());
+        for fb in sw.extra_fallbacks {
+            if fb.provider_id == sw.source.provider_id {
+                continue;
+            }
+            let key = fb.url.to_ascii_lowercase();
+            if seen.insert(key) {
+                deduped.push(fb);
+            }
+        }
+        job.provider_id = sw.source.provider_id;
+        job.provider_name = sw.source.provider_name.clone();
+        job.url = sw.source.url;
+        job.kind = sw.source.kind;
+        job.headers = sw.source.headers;
+        job.quality = sw.source.quality;
+        job.resolved_quality = None;
+        job.quality_verified = false;
+        job.video_codec = None;
+        job.subtitles = sw.source.subtitles;
+        if let Some(pq) = sw.preferred_quality {
+            job.preferred_quality = Some(pq);
+        }
+        job.fallbacks = deduped;
+        job.tried_providers.clear();
+        job.failover_notes.clear();
+        job.attempt_index = 1;
+        job.total_sources = 1 + job.fallbacks.len() as u32;
+        job.bytes_downloaded = 0;
+        job.total_bytes = None;
+        job.segments_done = None;
+        job.segments_total = None;
+        job.speed_bps = 0;
+        job.eta_sec = None;
+        job.percent = 0.0;
+        job.file_path = None;
+        job.error = None;
+        job.status = DownloadStatus::Queued;
+        job.stage = Some(format!("Switched to {} · Queued", job.provider_name));
     }
 
     fn enqueue(self: &Arc<Self>, app: &tauri::AppHandle, req: DownloadStartReq) -> Result<DownloadJobView, String> {
@@ -1136,18 +1741,43 @@ impl DownloadManager {
             g = self.state.lock().unwrap_or_else(|e| e.into_inner());
         }
 
-        // Reuse existing non-cancelled/non-completed active or paused job for the exact target request + url.
-        if let Some(existing) = g.jobs.iter_mut().find(|j| {
+        if let Some(pos) = g.jobs.iter().position(|j| {
             j.canonical_key == req.canonical_key
                 && j.season == req.season
                 && j.episode == req.episode
                 && j.audio == req.audio
                 && matches!(
                     j.status,
-                    DownloadStatus::Queued | DownloadStatus::Downloading | DownloadStatus::Remuxing
+                    DownloadStatus::Queued
+                        | DownloadStatus::Downloading
+                        | DownloadStatus::Remuxing
+                        | DownloadStatus::Paused
+                        | DownloadStatus::Failed
                 )
         }) {
-            return Ok(DownloadJobView::from(&*existing));
+            let existing = &g.jobs[pos];
+            let existing_id = existing.id.clone();
+            if existing.status == DownloadStatus::Remuxing {
+                return Ok(DownloadJobView::from(existing));
+            }
+            if req.replace_existing {
+                drop(g);
+                let src = DownloadFallbackSource {
+                    provider_id: req.provider_id.clone(),
+                    provider_name: req.provider_name.clone(),
+                    url: req.url.clone(),
+                    kind: req.kind.clone(),
+                    headers: req.headers.clone(),
+                    quality: req.quality,
+                    subtitles: req.subtitles.clone(),
+                };
+                if let Some(view) = self.switch_source(app, &existing_id, src, req.fallbacks.clone(), req.preferred_quality)? {
+                    return Ok(view);
+                }
+                g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            } else if matches!(existing.status, DownloadStatus::Queued | DownloadStatus::Downloading) {
+                return Ok(DownloadJobView::from(existing));
+            }
         }
 
         let id = format!(
@@ -1161,6 +1791,21 @@ impl DownloadManager {
             ])
         );
         let now = now_ms();
+        let mut seen = HashSet::new();
+        seen.insert(req.url.to_ascii_lowercase());
+        let mut fallbacks = Vec::new();
+        for fb in req.fallbacks {
+            if fb.provider_id == req.provider_id {
+                continue;
+            }
+            if stream::validate_http_url(&fb.url).is_err() {
+                continue;
+            }
+            if seen.insert(fb.url.to_ascii_lowercase()) {
+                fallbacks.push(fb);
+            }
+        }
+        let total_sources = 1 + fallbacks.len() as u32;
         let job = DownloadJob {
             id: id.clone(),
             root: canonical_root.to_string_lossy().into_owned(),
@@ -1175,6 +1820,9 @@ impl DownloadManager {
             episode_title: req.episode_title,
             audio: req.audio,
             quality: req.quality,
+            resolved_quality: None,
+            quality_verified: false,
+            video_codec: None,
             provider_id: req.provider_id,
             provider_name: req.provider_name,
             url: req.url,
@@ -1182,6 +1830,11 @@ impl DownloadManager {
             headers: req.headers,
             preferred_quality: req.preferred_quality,
             subtitles: req.subtitles,
+            fallbacks,
+            tried_providers: Vec::new(),
+            failover_notes: Vec::new(),
+            attempt_index: 1,
+            total_sources,
             poster_url: req.poster_url,
             backdrop_url: req.backdrop_url,
             status: DownloadStatus::Queued,
@@ -1210,11 +1863,76 @@ impl DownloadManager {
         Ok(view)
     }
 
+    fn switch_source(
+        self: &Arc<Self>,
+        app: &tauri::AppHandle,
+        id: &str,
+        source: DownloadFallbackSource,
+        extra_fallbacks: Vec<DownloadFallbackSource>,
+        preferred_quality: Option<u32>,
+    ) -> Result<Option<DownloadJobView>, String> {
+        self.set_app(app);
+        stream::validate_http_url(&source.url)?;
+        let valid_fallbacks: Vec<DownloadFallbackSource> = extra_fallbacks
+            .into_iter()
+            .filter(|fb| stream::validate_http_url(&fb.url).is_ok())
+            .collect();
+        let sw = PendingSourceSwitch {
+            source,
+            extra_fallbacks: valid_fallbacks,
+            preferred_quality,
+        };
+
+        let mut cleanup_target: Option<DownloadJob> = None;
+        let (view, should_pump) = {
+            let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(pos) = g.jobs.iter().position(|j| j.id == id) else {
+                return Ok(None);
+            };
+            if g.jobs[pos].status == DownloadStatus::Remuxing || g.jobs[pos].status == DownloadStatus::Completed {
+                return Ok(Some(DownloadJobView::from(&g.jobs[pos])));
+            }
+            if let Some(sig) = g.active.get(id).cloned() {
+                let next_name = sw.source.provider_name.clone();
+                g.pending_replace.insert(id.to_string(), sw);
+                g.jobs[pos].stage = Some(format!("Switching to {next_name}…"));
+                g.jobs[pos].speed_bps = 0;
+                g.jobs[pos].eta_sec = None;
+                g.jobs[pos].updated_at = now_ms();
+                let view = DownloadJobView::from(&g.jobs[pos]);
+                sig.signal_replace();
+                Self::persist_locked(&g);
+                (Some(view), false)
+            } else {
+                cleanup_target = Some(g.jobs[pos].clone());
+                Self::apply_source_switch_to_job(&mut g.jobs[pos], sw);
+                g.jobs[pos].updated_at = now_ms();
+                let view = DownloadJobView::from(&g.jobs[pos]);
+                if !g.queue.iter().any(|q| q == id) {
+                    g.queue.push_back(id.to_string());
+                }
+                Self::persist_locked(&g);
+                (Some(view), true)
+            }
+        };
+
+        if let Some(ref old_job) = cleanup_target {
+            cleanup_job_artifacts(old_job);
+        }
+        if let Some(ref v) = view {
+            self.emit_job(v);
+        }
+        if should_pump {
+            self.pump();
+        }
+        Ok(view)
+    }
+
     fn pause(&self, id: &str) -> Result<Option<DownloadJobView>, String> {
         let view = {
             let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(sig) = g.active.get(id) {
-                sig.pause.store(true, Ordering::Relaxed);
+                sig.signal_pause();
             }
             g.queue.retain(|q| q != id);
             let mut out = None;
@@ -1272,8 +1990,9 @@ impl DownloadManager {
         let mut cleanup_target: Option<DownloadJob> = None;
         let view = {
             let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            g.pending_replace.remove(id);
             if let Some(sig) = g.active.get(id) {
-                sig.cancel.store(true, Ordering::Relaxed);
+                sig.signal_cancel();
             }
             g.queue.retain(|q| q != id);
             let mut out = None;
@@ -1299,6 +2018,246 @@ impl DownloadManager {
             self.emit_job(v);
         }
         Ok(())
+    }
+
+    fn clear_failed(&self) -> DownloadSnapshot {
+        let mut to_clean = Vec::new();
+        {
+            let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let active_ids: HashSet<String> = g.active.keys().cloned().collect();
+            let mut kept = Vec::with_capacity(g.jobs.len());
+            for j in g.jobs.drain(..) {
+                if j.status == DownloadStatus::Failed && !active_ids.contains(&j.id) {
+                    to_clean.push(j);
+                } else {
+                    kept.push(j);
+                }
+            }
+            g.jobs = kept;
+            Self::persist_locked(&g);
+        }
+        for job in &to_clean {
+            cleanup_job_artifacts(job);
+        }
+        self.snapshot()
+    }
+
+    fn pause_all(&self, canonical_key: Option<&str>, season: Option<u32>) -> DownloadSnapshot {
+        let updated_views = {
+            let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            g.pause_all_locked(canonical_key, season)
+        };
+        for v in &updated_views {
+            self.emit_job(v);
+        }
+        self.snapshot()
+    }
+
+    fn resume_all(
+        self: &Arc<Self>,
+        app: &tauri::AppHandle,
+        canonical_key: Option<&str>,
+        season: Option<u32>,
+    ) -> DownloadSnapshot {
+        self.set_app(app);
+        let (updated_views, should_pump) = {
+            let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            g.resume_all_locked(canonical_key, season)
+        };
+        for v in &updated_views {
+            self.emit_job(v);
+        }
+        if should_pump {
+            self.pump();
+        }
+        self.snapshot()
+    }
+
+    fn cancel_all(&self, canonical_key: Option<&str>, season: Option<u32>) -> DownloadSnapshot {
+        let (to_clean, active_views) = {
+            let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            g.cancel_all_locked(canonical_key, season)
+        };
+        for job in &to_clean {
+            cleanup_job_artifacts(job);
+        }
+        for v in &active_views {
+            self.emit_job(v);
+        }
+        self.snapshot()
+    }
+
+    fn migrate_root(&self, app: &tauri::AppHandle, new_dir: &Path, move_files: bool) -> Result<MigrateDownloadsResult, String> {
+        self.set_app(app);
+        if !move_files {
+            let snapshot = self.init_root(app, new_dir)?;
+            return Ok(MigrateDownloadsResult {
+                snapshot,
+                moved_files: 0,
+                migrated: false,
+            });
+        }
+
+        let new_canon = crate::register_downloads_root(app, new_dir)?;
+        let old_root_opt = {
+            let g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            g.root.clone()
+        };
+        let Some(old_root) = old_root_opt else {
+            let snapshot = self.init_root(app, &new_canon)?;
+            return Ok(MigrateDownloadsResult {
+                snapshot,
+                moved_files: 0,
+                migrated: false,
+            });
+        };
+
+        if !validate_migration_target(&old_root, &new_canon)? {
+            return Ok(MigrateDownloadsResult {
+                snapshot: self.snapshot(),
+                moved_files: 0,
+                migrated: false,
+            });
+        }
+
+        {
+            let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            for sig in g.active.values() {
+                sig.signal_pause();
+            }
+            g.queue.clear();
+            let ts = now_ms();
+            for j in &mut g.jobs {
+                if matches!(j.status, DownloadStatus::Queued | DownloadStatus::Downloading) {
+                    j.status = DownloadStatus::Paused;
+                    j.stage = Some("Paused for folder move".into());
+                    j.speed_bps = 0;
+                    j.eta_sec = None;
+                    j.updated_at = ts;
+                }
+            }
+            Self::persist_locked(&g);
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            let active_empty = {
+                let g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                g.active.is_empty()
+            };
+            if active_empty {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(
+                    "Active downloads are still finishing or remuxing. Pause or stop active transfers first, then try moving again."
+                        .into(),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let (mut old_items, mut old_jobs) = {
+            let g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            (g.items.clone(), g.jobs.clone())
+        };
+
+        let _ = std::fs::create_dir_all(meta_dir(&new_canon));
+        let new_art = art_dir(&new_canon);
+        let _ = std::fs::create_dir_all(&new_art);
+        let scope = app.asset_protocol_scope();
+        let _ = scope.allow_directory(&new_art, true);
+
+        let mut moved_files = 0usize;
+        for sub in ["Movies", "Series", "Anime"] {
+            moved_files += move_path_recursive(&old_root.join(sub), &new_canon.join(sub))?;
+        }
+        moved_files += move_path_recursive(&art_dir(&old_root), &new_art)?;
+
+        for it in &mut old_items {
+            it.file_path = rewrite_root_prefix(&it.file_path, &old_root, &new_canon);
+            for sp in &mut it.subtitle_paths {
+                *sp = rewrite_root_prefix(sp, &old_root, &new_canon);
+            }
+            if let Some(ref mut p) = it.poster_path {
+                *p = rewrite_root_prefix(p, &old_root, &new_canon);
+            }
+            if let Some(ref mut b) = it.backdrop_path {
+                *b = rewrite_root_prefix(b, &old_root, &new_canon);
+            }
+        }
+        let new_canon_str = new_canon.to_string_lossy().into_owned();
+        for j in &mut old_jobs {
+            j.root = new_canon_str.clone();
+            if let Some(ref mut fp) = j.file_path {
+                *fp = rewrite_root_prefix(fp, &old_root, &new_canon);
+            }
+        }
+
+        let existing_q = load_queue(&new_canon);
+        let existing_idx = load_index(&new_canon);
+
+        let mut merged_items = existing_idx.items;
+        for it in old_items.into_iter().rev() {
+            if Path::new(&it.file_path).is_file() {
+                upsert_index_entry(&mut merged_items, it);
+            }
+        }
+        merged_items.retain(|it| Path::new(&it.file_path).is_file());
+        for it in &merged_items {
+            let _ = scope.allow_file(Path::new(&it.file_path));
+            if let Some(ref p) = it.poster_path {
+                if Path::new(p).is_file() {
+                    let _ = scope.allow_file(Path::new(p));
+                }
+            }
+            if let Some(ref b) = it.backdrop_path {
+                if Path::new(b).is_file() {
+                    let _ = scope.allow_file(Path::new(b));
+                }
+            }
+        }
+
+        let mut seen_jobs: HashSet<String> = old_jobs.iter().map(|j| j.id.clone()).collect();
+        for mut j in existing_q.jobs {
+            if seen_jobs.insert(j.id.clone()) {
+                if matches!(
+                    j.status,
+                    DownloadStatus::Queued | DownloadStatus::Downloading | DownloadStatus::Remuxing
+                ) {
+                    j.status = DownloadStatus::Paused;
+                    j.stage = Some("Paused (app restarted)".into());
+                    j.speed_bps = 0;
+                    j.eta_sec = None;
+                }
+                old_jobs.push(j);
+            }
+        }
+
+        let snap = {
+            let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            g.root = Some(new_canon.clone());
+            g.items = merged_items;
+            g.jobs = old_jobs;
+            g.queue.clear();
+            g.pending_replace.clear();
+            Self::persist_locked(&g);
+            DownloadSnapshot {
+                root: Some(new_canon_str),
+                jobs: g.jobs.iter().map(DownloadJobView::from).collect(),
+                items: g.items.clone(),
+            }
+        };
+
+        let _ = std::fs::remove_file(index_path(&old_root));
+        let _ = std::fs::remove_file(queue_path(&old_root));
+        let _ = std::fs::remove_dir(meta_dir(&old_root));
+
+        Ok(MigrateDownloadsResult {
+            snapshot: snap,
+            moved_files,
+            migrated: true,
+        })
     }
 
     fn remove_entry(&self, id: &str, delete_file: bool) -> Result<DownloadSnapshot, String> {
@@ -1357,14 +2316,14 @@ impl DownloadManager {
                 let Some(next_id) = g.queue.pop_front() else {
                     break;
                 };
+                if g.active.contains_key(&next_id) {
+                    continue;
+                }
                 let Some(job) = g.jobs.iter().find(|j| j.id == next_id).cloned() else {
                     continue;
                 };
                 let sig = JobSignals::default();
-                g.active.insert(next_id.clone(), JobSignals {
-                    pause: sig.pause.clone(),
-                    cancel: sig.cancel.clone(),
-                });
+                g.active.insert(next_id.clone(), sig.clone());
                 (next_id, job, sig)
             };
 
@@ -1402,126 +2361,213 @@ impl DownloadManager {
         }
     }
 
-    async fn run_job(&self, job: DownloadJob, sig: JobSignals) {
-        self.update_job(&job.id, true, |j| {
-            j.status = DownloadStatus::Downloading;
-            j.stage = Some(if j.kind == "hls" { "Fetching playlist…" } else { "Connecting…" }.into());
-            j.error = None;
-        });
-
+    async fn run_job(&self, mut job: DownloadJob, sig: JobSignals) {
         let root = PathBuf::from(&job.root);
-        let outcome = if job.kind == "hls" {
-            self.run_hls_job(&job, &root, &sig).await
-        } else {
-            self.run_direct_job(&job, &root, &sig).await
-        };
+        loop {
+            self.update_job(&job.id, true, |j| {
+                j.status = DownloadStatus::Downloading;
+                j.stage = Some(if j.attempt_index > 1 {
+                    format!("Trying {} ({}/{})…", j.provider_name, j.attempt_index, j.total_sources)
+                } else if j.kind == "hls" {
+                    "Fetching playlist…".to_string()
+                } else {
+                    "Connecting…".to_string()
+                });
+                j.error = None;
+            });
 
-        match outcome {
-            Ok((final_path, final_size)) => {
-                let (subtitle_paths, (poster_path, backdrop_path)) = tokio::join!(
-                    download_sidecar_subtitles(&final_path, &job.subtitles),
-                    cache_title_artwork(
-                        &root,
-                        &job.canonical_key,
-                        job.poster_url.as_deref(),
-                        job.backdrop_url.as_deref(),
-                    )
-                );
-                if let Some(app) = self.app.lock().ok().and_then(|g| g.clone()) {
-                    let scope = app.asset_protocol_scope();
-                    let _ = scope.allow_file(&final_path);
-                    for s in &subtitle_paths {
-                        let _ = scope.allow_file(Path::new(s));
+            let outcome = if job.kind == "hls" {
+                self.run_hls_job(&mut job, &root, &sig).await
+            } else {
+                self.run_direct_job(&job, &root, &sig).await
+            };
+
+            match outcome {
+                Ok((final_path, final_size)) => {
+                    let app_opt = self.app.lock().ok().and_then(|g| g.clone());
+                    let probed = if let Some(ref app) = app_opt {
+                        let app_c = app.clone();
+                        let p_c = final_path.clone();
+                        tauri::async_runtime::spawn_blocking(move || probe_downloaded_video(&app_c, &p_c))
+                            .await
+                            .ok()
+                            .flatten()
+                    } else {
+                        None
+                    };
+                    let (probed_q, probed_codec) = probed.unwrap_or((None, None));
+                    let resolved_q = probed_q.or(job.resolved_quality).or(job.quality);
+                    let q_verified = probed_q.is_some() || job.quality_verified;
+                    let v_codec = probed_codec.or(job.video_codec.clone());
+
+                    let (subtitle_paths, (poster_path, backdrop_path)) = tokio::join!(
+                        download_sidecar_subtitles(&final_path, &job.subtitles),
+                        cache_title_artwork(
+                            &root,
+                            &job.canonical_key,
+                            job.poster_url.as_deref(),
+                            job.backdrop_url.as_deref(),
+                        )
+                    );
+                    if let Some(ref app) = app_opt {
+                        let scope = app.asset_protocol_scope();
+                        let _ = scope.allow_file(&final_path);
+                        for s in &subtitle_paths {
+                            let _ = scope.allow_file(Path::new(s));
+                        }
+                        if let Some(ref p) = poster_path {
+                            let _ = scope.allow_file(Path::new(p));
+                        }
+                        if let Some(ref b) = backdrop_path {
+                            let _ = scope.allow_file(Path::new(b));
+                        }
                     }
-                    if let Some(ref p) = poster_path {
-                        let _ = scope.allow_file(Path::new(p));
+                    let final_str = final_path.to_string_lossy().into_owned();
+                    let entry = DownloadedEntry {
+                        id: job.id.clone(),
+                        media_key: job.media_key.clone(),
+                        canonical_key: job.canonical_key.clone(),
+                        title: job.title.clone(),
+                        media_kind: job.media_kind.clone(),
+                        is_film: job.is_film,
+                        year: job.year,
+                        season: job.season,
+                        episode: job.episode,
+                        episode_title: job.episode_title.clone(),
+                        audio: job.audio.clone(),
+                        quality: resolved_q,
+                        quality_verified: q_verified,
+                        video_codec: v_codec.clone(),
+                        provider_id: job.provider_id.clone(),
+                        provider_name: job.provider_name.clone(),
+                        file_path: final_str.clone(),
+                        file_size: final_size,
+                        subtitle_paths,
+                        poster_path,
+                        backdrop_path,
+                        downloaded_at: now_ms(),
+                        media_snapshot: job.media_snapshot.clone(),
+                    };
+                    let view = {
+                        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                        upsert_index_entry(&mut g.items, entry);
+                        let mut out = None;
+                        if let Some(j) = g.jobs.iter_mut().find(|j| j.id == job.id) {
+                            j.status = DownloadStatus::Completed;
+                            j.stage = Some("Saved offline".into());
+                            j.file_path = Some(final_str);
+                            j.bytes_downloaded = final_size;
+                            j.total_bytes = Some(final_size);
+                            j.quality = resolved_q;
+                            j.resolved_quality = resolved_q;
+                            j.quality_verified = q_verified;
+                            j.video_codec = v_codec;
+                            j.speed_bps = 0;
+                            j.eta_sec = Some(0);
+                            j.percent = 100.0;
+                            j.error = None;
+                            j.updated_at = now_ms();
+                            out = Some(DownloadJobView::from(&*j));
+                        }
+                        Self::persist_locked(&g);
+                        out
+                    };
+                    if let Some(v) = view {
+                        self.emit_job(&v);
                     }
-                    if let Some(ref b) = backdrop_path {
-                        let _ = scope.allow_file(Path::new(b));
-                    }
+                    break;
                 }
-                let final_str = final_path.to_string_lossy().into_owned();
-                let entry = DownloadedEntry {
-                    id: job.id.clone(),
-                    media_key: job.media_key.clone(),
-                    canonical_key: job.canonical_key.clone(),
-                    title: job.title.clone(),
-                    media_kind: job.media_kind.clone(),
-                    is_film: job.is_film,
-                    year: job.year,
-                    season: job.season,
-                    episode: job.episode,
-                    episode_title: job.episode_title.clone(),
-                    audio: job.audio.clone(),
-                    quality: job.quality,
-                    provider_id: job.provider_id.clone(),
-                    provider_name: job.provider_name.clone(),
-                    file_path: final_str.clone(),
-                    file_size: final_size,
-                    subtitle_paths,
-                    poster_path,
-                    backdrop_path,
-                    downloaded_at: now_ms(),
-                    media_snapshot: job.media_snapshot.clone(),
-                };
-                let view = {
-                    let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    upsert_index_entry(&mut g.items, entry);
-                    let mut out = None;
-                    if let Some(j) = g.jobs.iter_mut().find(|j| j.id == job.id) {
-                        j.status = DownloadStatus::Completed;
-                        j.stage = Some("Saved offline".into());
-                        j.file_path = Some(final_str);
-                        j.bytes_downloaded = final_size;
-                        j.total_bytes = Some(final_size);
+                Err(JobStop::Paused) => {
+                    self.update_job(&job.id, true, |j| {
+                        j.status = DownloadStatus::Paused;
+                        j.stage = Some("Paused".into());
                         j.speed_bps = 0;
-                        j.eta_sec = Some(0);
-                        j.percent = 100.0;
-                        j.error = None;
-                        j.updated_at = now_ms();
-                        out = Some(DownloadJobView::from(&*j));
-                    }
-                    Self::persist_locked(&g);
-                    out
-                };
-                if let Some(v) = view {
-                    self.emit_job(&v);
+                        j.eta_sec = None;
+                    });
+                    break;
                 }
-            }
-            Err(JobStop::Paused) => {
-                self.update_job(&job.id, true, |j| {
-                    j.status = DownloadStatus::Paused;
-                    j.stage = Some("Paused".into());
-                    j.speed_bps = 0;
-                    j.eta_sec = None;
-                });
-            }
-            Err(JobStop::Cancelled) => {
-                cleanup_job_artifacts(&job);
-                let view = {
-                    let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    let mut out = None;
-                    if let Some(pos) = g.jobs.iter().position(|j| j.id == job.id) {
-                        let mut removed = g.jobs.remove(pos);
-                        removed.status = DownloadStatus::Cancelled;
-                        removed.stage = Some("Cancelled".into());
-                        out = Some(DownloadJobView::from(&removed));
+                Err(JobStop::Replaced) => {
+                    cleanup_job_artifacts(&job);
+                    let view = {
+                        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                        let sw = g.pending_replace.remove(&job.id);
+                        let mut out = None;
+                        if let Some(sw) = sw {
+                            if let Some(j) = g.jobs.iter_mut().find(|j| j.id == job.id) {
+                                Self::apply_source_switch_to_job(j, sw);
+                                j.updated_at = now_ms();
+                                out = Some(DownloadJobView::from(&*j));
+                            }
+                            if !g.queue.iter().any(|q| q == &job.id) {
+                                g.queue.push_back(job.id.clone());
+                            }
+                        }
+                        Self::persist_locked(&g);
+                        out
+                    };
+                    if let Some(v) = view {
+                        self.emit_job(&v);
                     }
-                    Self::persist_locked(&g);
-                    out
-                };
-                if let Some(v) = view {
-                    self.emit_job(&v);
+                    break;
                 }
-            }
-            Err(JobStop::Failed(msg)) => {
-                self.update_job(&job.id, true, |j| {
-                    j.status = DownloadStatus::Failed;
-                    j.stage = Some("Failed".into());
-                    j.speed_bps = 0;
-                    j.eta_sec = None;
-                    j.error = Some(msg);
-                });
+                Err(JobStop::Cancelled) => {
+                    cleanup_job_artifacts(&job);
+                    let view = {
+                        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                        g.pending_replace.remove(&job.id);
+                        let mut out = None;
+                        if let Some(pos) = g.jobs.iter().position(|j| j.id == job.id) {
+                            let mut removed = g.jobs.remove(pos);
+                            removed.status = DownloadStatus::Cancelled;
+                            removed.stage = Some("Cancelled".into());
+                            out = Some(DownloadJobView::from(&removed));
+                        }
+                        Self::persist_locked(&g);
+                        out
+                    };
+                    if let Some(v) = view {
+                        self.emit_job(&v);
+                    }
+                    break;
+                }
+                Err(JobStop::Failed(msg)) => {
+                    if !is_local_fatal_error(&msg) {
+                        let (next_job_opt, view_opt) = {
+                            let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut next_j = None;
+                            let mut next_v = None;
+                            if let Some(j) = g.jobs.iter_mut().find(|j| j.id == job.id) {
+                                if let Some((old_name, new_name)) = advance_job_to_next_fallback(j, &msg) {
+                                    j.status = DownloadStatus::Downloading;
+                                    j.stage = Some(format!("Switching to {new_name} ({old_name} failed)…"));
+                                    j.updated_at = now_ms();
+                                    next_v = Some(DownloadJobView::from(&*j));
+                                    next_j = Some(j.clone());
+                                }
+                            }
+                            if next_j.is_some() {
+                                Self::persist_locked(&g);
+                            }
+                            (next_j, next_v)
+                        };
+                        if let Some(next_job) = next_job_opt {
+                            cleanup_job_artifacts(&job);
+                            if let Some(v) = view_opt {
+                                self.emit_job(&v);
+                            }
+                            job = next_job;
+                            continue;
+                        }
+                    }
+                    self.update_job(&job.id, true, |j| {
+                        j.status = DownloadStatus::Failed;
+                        j.stage = Some("Failed".into());
+                        j.speed_bps = 0;
+                        j.eta_sec = None;
+                        j.error = Some(msg);
+                    });
+                    break;
+                }
             }
         }
     }
@@ -1546,153 +2592,258 @@ impl DownloadManager {
             .to_string();
         let mut part_path = folder.join(format!(".{file_name}.abxpart"));
 
-        let mut existing_bytes = tokio::fs::metadata(&part_path)
+        let mut downloaded = tokio::fs::metadata(&part_path)
             .await
             .map(|m| m.len())
             .unwrap_or(0);
-
-        let mut attempt_offset = existing_bytes;
-        let mut res = loop {
-            check_sig(sig)?;
-            let mut rb = stream::apply(download_client().get(&job.url), &job.headers);
-            if attempt_offset > 0 {
-                rb = rb.header(reqwest::header::RANGE, format!("bytes={attempt_offset}-"));
-            }
-            let r = rb
-                .send()
-                .await
-                .map_err(|e| JobStop::Failed(format!("Download request failed: {e}")))?;
-
-            if r.status().as_u16() == 416 && attempt_offset > 0 {
-                attempt_offset = 0;
-                existing_bytes = 0;
-                let _ = tokio::fs::remove_file(&part_path).await;
-                continue;
-            }
-            if !r.status().is_success() {
-                return Err(JobStop::Failed(format!("Server returned HTTP {}", r.status().as_u16())));
-            }
-            break r;
-        };
-
-        // Update extension if Content-Type revealed MKV/WebM on a tokenised URL without file extension.
-        if init_ext == "mp4" {
-            let ct = res
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok());
-            let detected = infer_direct_ext(&job.url, ct);
-            if detected != init_ext {
-                let (_, updated_final) = resolve_target_paths(root, &req_meta, detected);
-                let updated_name = updated_final
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("video.mkv");
-                let updated_part = folder.join(format!(".{updated_name}.abxpart"));
-                if existing_bytes > 0 {
-                    let _ = tokio::fs::rename(&part_path, &updated_part).await;
-                }
-                final_path = updated_final;
-                part_path = updated_part;
-            }
-        }
-
-        let is_partial = res.status() == reqwest::StatusCode::PARTIAL_CONTENT;
-        let start_offset = if is_partial { attempt_offset } else { 0 };
-        let total_bytes = if is_partial {
-            parse_content_range_total(res.headers().get(reqwest::header::CONTENT_RANGE))
-                .or_else(|| res.content_length().map(|len| start_offset + len))
-        } else {
-            res.content_length()
-        };
-
-        let mut file = if is_partial && start_offset > 0 {
-            tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&part_path)
-                .await
-                .map_err(|e| JobStop::Failed(e.to_string()))?
-        } else {
-            tokio::fs::File::create(&part_path)
-                .await
-                .map_err(|e| JobStop::Failed(e.to_string()))?
-        };
-
-        let mut downloaded = start_offset;
+        let mut total_bytes: Option<u64> = None;
+        let mut reconnects = 0usize;
         let mut last_emit = Instant::now();
         let mut win_start = Instant::now();
         let mut win_bytes = 0u64;
         let mut ewma_bps = 0f64;
 
-        self.update_job(&job.id, true, |j| {
-            j.stage = Some("Downloading file…".into());
-            j.bytes_downloaded = downloaded;
-            j.total_bytes = total_bytes;
-            j.percent = pct(downloaded, total_bytes);
-        });
+        loop {
+            check_sig(sig)?;
+            let attempt_offset = downloaded;
+            let mut rb = stream::apply(download_client().get(&job.url), &job.headers);
+            if attempt_offset > 0 {
+                rb = rb.header(reqwest::header::RANGE, format!("bytes={attempt_offset}-"));
+            }
 
-        while let Some(chunk) = res
-            .chunk()
-            .await
-            .map_err(|e| JobStop::Failed(format!("Stream interrupted: {e}")))?
-        {
-            if sig.cancel.load(Ordering::Relaxed) {
-                drop(file);
+            let res = match tokio::select! {
+                stop = wait_interrupt(sig) => return Err(stop),
+                resp = tokio::time::timeout(Duration::from_secs(20), rb.send()) => resp,
+            } {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    let msg = format!("Download request failed: {e}");
+                    if reconnects < DIRECT_MAX_RECONNECTS {
+                        reconnects += 1;
+                        let delay_s = 1u64 << (reconnects - 1);
+                        self.update_job(&job.id, true, |j| {
+                            j.stage = Some(format!("Reconnecting ({reconnects}/{DIRECT_MAX_RECONNECTS})…"));
+                            j.speed_bps = 0;
+                        });
+                        sleep_interruptible(sig, Duration::from_secs(delay_s)).await?;
+                        continue;
+                    }
+                    return Err(JobStop::Failed(msg));
+                }
+                Err(_) => {
+                    if reconnects < DIRECT_MAX_RECONNECTS {
+                        reconnects += 1;
+                        let delay_s = 1u64 << (reconnects - 1);
+                        self.update_job(&job.id, true, |j| {
+                            j.stage = Some(format!("Connection timed out · retry {reconnects}/{DIRECT_MAX_RECONNECTS}…"));
+                            j.speed_bps = 0;
+                        });
+                        sleep_interruptible(sig, Duration::from_secs(delay_s)).await?;
+                        continue;
+                    }
+                    return Err(JobStop::Failed("Server connection timed out".into()));
+                }
+            };
+
+            let code = res.status().as_u16();
+            if code == 416 && attempt_offset > 0 {
+                downloaded = 0;
                 let _ = tokio::fs::remove_file(&part_path).await;
-                return Err(JobStop::Cancelled);
+                continue;
             }
-            if sig.pause.load(Ordering::Relaxed) {
-                let _ = file.flush().await;
-                let _ = file.sync_data().await;
-                return Err(JobStop::Paused);
+            if !res.status().is_success() {
+                let msg = format!("Server returned HTTP {code}");
+                let hard_fail = matches!(code, 401 | 403 | 404 | 410 | 451);
+                if !hard_fail && (stream::is_retryable_status(code) || code == 408) && reconnects < DIRECT_MAX_RECONNECTS {
+                    reconnects += 1;
+                    let delay_s = 1u64 << (reconnects - 1);
+                    self.update_job(&job.id, true, |j| {
+                        j.stage = Some(format!("Server HTTP {code} · retry {reconnects}/{DIRECT_MAX_RECONNECTS}…"));
+                        j.speed_bps = 0;
+                    });
+                    sleep_interruptible(sig, Duration::from_secs(delay_s)).await?;
+                    continue;
+                }
+                return Err(JobStop::Failed(msg));
             }
 
-            file.write_all(&chunk)
-                .await
-                .map_err(|e| JobStop::Failed(format!("Disk write error: {e}")))?;
+            let ct = res
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            if is_invalid_video_content_type(ct.as_deref()) {
+                let _ = tokio::fs::remove_file(&part_path).await;
+                return Err(JobStop::Failed("Server returned a webpage instead of video".into()));
+            }
 
-            let n = chunk.len() as u64;
-            downloaded += n;
-            win_bytes += n;
+            // Update extension if Content-Type revealed MKV/WebM on a tokenised URL without file extension.
+            if init_ext == "mp4" && downloaded == 0 {
+                let detected = infer_direct_ext(&job.url, ct.as_deref());
+                if detected != init_ext {
+                    let (_, updated_final) = resolve_target_paths(root, &req_meta, detected);
+                    let updated_name = updated_final
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("video.mkv");
+                    let updated_part = folder.join(format!(".{updated_name}.abxpart"));
+                    final_path = updated_final;
+                    part_path = updated_part;
+                }
+            }
 
-            let win_elapsed = win_start.elapsed().as_secs_f64();
-            if win_elapsed >= 0.45 {
-                let inst = (win_bytes as f64) / win_elapsed;
-                ewma_bps = if ewma_bps <= 0.0 {
-                    inst
-                } else {
-                    ewma_bps * 0.6 + inst * 0.4
+            let is_partial = res.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+            let start_offset = if is_partial { attempt_offset } else { 0 };
+            total_bytes = if is_partial {
+                parse_content_range_total(res.headers().get(reqwest::header::CONTENT_RANGE))
+                    .or_else(|| res.content_length().map(|len| start_offset + len))
+            } else {
+                res.content_length().or(total_bytes)
+            };
+
+            let mut file = if is_partial && start_offset > 0 {
+                tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&part_path)
+                    .await
+                    .map_err(|e| JobStop::Failed(e.to_string()))?
+            } else {
+                downloaded = 0;
+                tokio::fs::File::create(&part_path)
+                    .await
+                    .map_err(|e| JobStop::Failed(e.to_string()))?
+            };
+
+            self.update_job(&job.id, true, |j| {
+                j.stage = Some("Downloading file…".into());
+                j.bytes_downloaded = downloaded;
+                j.total_bytes = total_bytes;
+                j.percent = pct(downloaded, total_bytes);
+            });
+
+            let mut res = res;
+            let transfer_started = Instant::now();
+            let mut stall_anchor = Instant::now();
+            let mut stall_bytes = 0u64;
+            let mut interrupted_by_net: Option<String> = None;
+            let mut finished_eof = false;
+
+            loop {
+                let next_chunk = tokio::select! {
+                    stop = wait_interrupt(sig) => {
+                        match stop {
+                            JobStop::Paused => {
+                                let _ = file.flush().await;
+                                let _ = file.sync_data().await;
+                                return Err(JobStop::Paused);
+                            }
+                            other => {
+                                drop(file);
+                                let _ = tokio::fs::remove_file(&part_path).await;
+                                return Err(other);
+                            }
+                        }
+                    }
+                    c = tokio::time::timeout(Duration::from_secs(20), res.chunk()) => c,
                 };
-                win_start = Instant::now();
-                win_bytes = 0;
+
+                match next_chunk {
+                    Ok(Ok(Some(chunk))) => {
+                        file.write_all(&chunk)
+                            .await
+                            .map_err(|e| JobStop::Failed(format!("Disk write error: {e}")))?;
+
+                        let n = chunk.len() as u64;
+                        downloaded += n;
+                        win_bytes += n;
+                        stall_bytes += n;
+
+                        let win_elapsed = win_start.elapsed().as_secs_f64();
+                        if win_elapsed >= 0.45 {
+                            let inst = (win_bytes as f64) / win_elapsed;
+                            ewma_bps = if ewma_bps <= 0.0 {
+                                inst
+                            } else {
+                                ewma_bps * 0.6 + inst * 0.4
+                            };
+                            win_start = Instant::now();
+                            win_bytes = 0;
+                        }
+
+                        let stall_elapsed = stall_anchor.elapsed().as_secs_f64();
+                        if stall_elapsed >= STALL_WINDOW_SECS {
+                            let avg_stall_bps = (stall_bytes as f64) / stall_elapsed;
+                            if transfer_started.elapsed().as_secs_f64() > 8.0 && avg_stall_bps < STALL_MIN_BPS {
+                                return Err(JobStop::Failed("Transfer stalled below minimum speed".into()));
+                            }
+                            stall_anchor = Instant::now();
+                            stall_bytes = 0;
+                        }
+
+                        if last_emit.elapsed().as_millis() >= PROGRESS_EMIT_MS {
+                            last_emit = Instant::now();
+                            let bps = ewma_bps.round() as u64;
+                            let eta = total_bytes
+                                .filter(|&tot| tot > downloaded && bps > 0)
+                                .map(|tot| (tot - downloaded) / bps);
+                            self.update_job(&job.id, true, |j| {
+                                j.bytes_downloaded = downloaded;
+                                j.total_bytes = total_bytes;
+                                j.speed_bps = bps;
+                                j.eta_sec = eta;
+                                j.percent = pct(downloaded, total_bytes);
+                            });
+                        }
+                    }
+                    Ok(Ok(None)) => {
+                        finished_eof = true;
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        interrupted_by_net = Some(format!("Stream interrupted: {e}"));
+                        break;
+                    }
+                    Err(_) => {
+                        interrupted_by_net = Some("Transfer stalled (no data for 20s)".into());
+                        break;
+                    }
+                }
             }
 
-            if last_emit.elapsed().as_millis() >= PROGRESS_EMIT_MS {
-                last_emit = Instant::now();
-                let bps = ewma_bps.round() as u64;
-                let eta = total_bytes
-                    .filter(|&tot| tot > downloaded && bps > 0)
-                    .map(|tot| (tot - downloaded) / bps);
-                self.update_job(&job.id, true, |j| {
-                    j.bytes_downloaded = downloaded;
-                    j.total_bytes = total_bytes;
-                    j.speed_bps = bps;
-                    j.eta_sec = eta;
-                    j.percent = pct(downloaded, total_bytes);
-                });
+            file.flush()
+                .await
+                .map_err(|e| JobStop::Failed(e.to_string()))?;
+            file.sync_data()
+                .await
+                .map_err(|e| JobStop::Failed(e.to_string()))?;
+            drop(file);
+
+            if finished_eof {
+                break;
+            }
+            if let Some(net_err) = interrupted_by_net {
+                if reconnects < DIRECT_MAX_RECONNECTS && total_bytes != Some(downloaded) {
+                    reconnects += 1;
+                    let delay_s = 1u64 << (reconnects - 1);
+                    self.update_job(&job.id, true, |j| {
+                        j.stage = Some(format!("Reconnecting ({reconnects}/{DIRECT_MAX_RECONNECTS})…"));
+                        j.bytes_downloaded = downloaded;
+                        j.speed_bps = 0;
+                    });
+                    sleep_interruptible(sig, Duration::from_secs(delay_s)).await?;
+                    continue;
+                }
+                return Err(JobStop::Failed(net_err));
             }
         }
 
-        file.flush()
-            .await
-            .map_err(|e| JobStop::Failed(e.to_string()))?;
-        file.sync_data()
-            .await
-            .map_err(|e| JobStop::Failed(e.to_string()))?;
-        drop(file);
-
         check_sig(sig)?;
+
+        if downloaded < DIRECT_MIN_VALID_BYTES {
+            let _ = tokio::fs::remove_file(&part_path).await;
+            return Err(JobStop::Failed("Downloaded file too small to be video".into()));
+        }
 
         tokio::fs::rename(&part_path, &final_path)
             .await
@@ -1707,12 +2858,12 @@ impl DownloadManager {
 
     async fn run_hls_job(
         &self,
-        job: &DownloadJob,
+        job: &mut DownloadJob,
         root: &Path,
         sig: &JobSignals,
     ) -> Result<(PathBuf, u64), JobStop> {
-        let req_meta = start_req_from_job(job);
-        let (folder, mp4_path) = resolve_target_paths(root, &req_meta, "mp4");
+        let init_meta = start_req_from_job(job);
+        let (folder, _) = resolve_target_paths(root, &init_meta, "mp4");
         tokio::fs::create_dir_all(&folder)
             .await
             .map_err(|e| JobStop::Failed(e.to_string()))?;
@@ -1723,179 +2874,218 @@ impl DownloadManager {
             .map_err(|e| JobStop::Failed(e.to_string()))?;
 
         let state_path = work_dir.join("state.json");
-        let work_state = if let Ok(bytes) = tokio::fs::read(&state_path).await {
+        let mut work_state = if let Ok(bytes) = tokio::fs::read(&state_path).await {
             match serde_json::from_slice::<HlsWorkState>(&bytes) {
                 Ok(s) => s,
-                Err(_) => self.fetch_and_save_hls_state(job, &state_path).await?,
+                Err(_) => self.fetch_and_save_hls_state(job, &state_path, sig, false).await?,
             }
         } else {
-            self.fetch_and_save_hls_state(job, &state_path).await?
+            self.fetch_and_save_hls_state(job, &state_path, sig, false).await?
         };
+
+        let resolved_h = work_state.selected_height.or(job.resolved_quality).or(job.quality);
+        if resolved_h.is_some() {
+            job.resolved_quality = resolved_h;
+            job.quality = resolved_h;
+            job.quality_verified = work_state.selected_height.is_some();
+        }
+        let available_heights = work_state.available_heights.clone();
+        self.update_job(&job.id, true, |j| {
+            j.resolved_quality = resolved_h;
+            if let Some(q) = resolved_h {
+                j.quality = Some(q);
+            }
+            j.quality_verified = work_state.selected_height.is_some();
+            let q_tag = resolved_h.map(|q| if q >= 2160 { "4K".to_string() } else { format!("{q}p") });
+            let avail_note = if available_heights.len() > 1 {
+                format!(" · {}/{} variants", q_tag.as_deref().unwrap_or("best"), available_heights.len())
+            } else {
+                q_tag.map(|q| format!(" · {q}")).unwrap_or_default()
+            };
+            j.stage = Some(format!("Preparing segments{avail_note}…"));
+        });
+
+        let final_meta = start_req_from_job(job);
+        let (_, mp4_path) = resolve_target_paths(root, &final_meta, "mp4");
+        let mkv_path = resolve_target_paths(root, &final_meta, "mkv").1;
 
         check_sig(sig)?;
 
-        // Gather unique key & init-map URLs across both video and optional audio playlists.
-        let (video_maps, video_keys) = download_aux_hls_assets(
-            &work_dir,
-            "v",
-            &work_state.video,
-            &job.headers,
-            sig,
-        )
-        .await?;
-        let (audio_maps, audio_keys) = if let Some(ref ap) = work_state.audio {
-            download_aux_hls_assets(&work_dir, "a", ap, &job.headers, sig).await?
-        } else {
-            (HashMap::new(), HashMap::new())
+        let mut refreshed = false;
+        let total_bytes_done = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (video_maps, video_keys, audio_maps, audio_keys, total_segs) = loop {
+            let (v_maps, v_keys) = download_aux_hls_assets(
+                &work_dir,
+                "v",
+                &work_state.video,
+                &job.headers,
+                sig,
+            )
+            .await?;
+            let (a_maps, a_keys) = if let Some(ref ap) = work_state.audio {
+                download_aux_hls_assets(&work_dir, "a", ap, &job.headers, sig).await?
+            } else {
+                (HashMap::new(), HashMap::new())
+            };
+
+            let mut tasks: Vec<(&HlsSegment, PathBuf)> = Vec::with_capacity(
+                work_state.video.segments.len() + work_state.audio.as_ref().map(|a| a.segments.len()).unwrap_or(0),
+            );
+            for seg in &work_state.video.segments {
+                let ext = segment_ext(&seg.uri);
+                tasks.push((seg, work_dir.join(format!("vseg_{:06}.{ext}", seg.index))));
+            }
+            if let Some(ref ap) = work_state.audio {
+                for seg in &ap.segments {
+                    let ext = segment_ext(&seg.uri);
+                    tasks.push((seg, work_dir.join(format!("aseg_{:06}.{ext}", seg.index))));
+                }
+            }
+
+            let total_segs = tasks.len() as u32;
+            let done_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            total_bytes_done.store(0, Ordering::Relaxed);
+            let mut pending_indices = Vec::new();
+            for (i, (_, path)) in tasks.iter().enumerate() {
+                if let Ok(m) = tokio::fs::metadata(path).await {
+                    if m.len() > 0 {
+                        done_count.fetch_add(1, Ordering::Relaxed);
+                        total_bytes_done.fetch_add(m.len(), Ordering::Relaxed);
+                        continue;
+                    }
+                }
+                pending_indices.push(i);
+            }
+
+            let initial_done = done_count.load(Ordering::Relaxed);
+            let initial_bytes = total_bytes_done.load(Ordering::Relaxed);
+            self.update_job(&job.id, true, |j| {
+                j.stage = Some(format!("Downloading segments ({initial_done}/{total_segs})…"));
+                j.segments_done = Some(initial_done);
+                j.segments_total = Some(total_segs);
+                j.bytes_downloaded = initial_bytes;
+                j.percent = if total_segs > 0 {
+                    (initial_done as f64 / total_segs as f64) * 95.0
+                } else {
+                    0.0
+                };
+            });
+
+            let sem = Arc::new(Semaphore::new(HLS_SEGMENT_CONCURRENCY));
+            let started_at = Instant::now();
+            let baseline_bytes = initial_bytes;
+            let last_emit = Arc::new(Mutex::new(Instant::now()));
+
+            let mut join_set = tokio::task::JoinSet::new();
+            for idx in pending_indices {
+                let (seg, seg_path) = (tasks[idx].0.clone(), tasks[idx].1.clone());
+                let sem_c = sem.clone();
+                let headers_c = job.headers.clone();
+                let sig_c = sig.clone();
+                let done_c = done_count.clone();
+                let bytes_c = total_bytes_done.clone();
+
+                join_set.spawn(async move {
+                    let _permit = tokio::select! {
+                        stop = wait_interrupt(&sig_c) => return Err(stop),
+                        p = sem_c.acquire_owned() => p.map_err(|_| JobStop::Failed("Download pool closed".into()))?,
+                    };
+                    check_sig(&sig_c)?;
+                    let seg_bytes = download_single_segment(
+                        &seg.uri,
+                        seg.byte_range,
+                        &seg_path,
+                        &headers_c,
+                        &sig_c,
+                    )
+                    .await?;
+                    done_c.fetch_add(1, Ordering::Relaxed);
+                    bytes_c.fetch_add(seg_bytes, Ordering::Relaxed);
+                    Ok(())
+                });
+            }
+
+            let mut first_err: Option<JobStop> = None;
+            while let Some(res) = join_set.join_next().await {
+                match res {
+                    Ok(Ok(())) => {
+                        let should_emit = {
+                            let mut lg = last_emit.lock().unwrap_or_else(|e| e.into_inner());
+                            if lg.elapsed().as_millis() >= PROGRESS_EMIT_MS {
+                                *lg = Instant::now();
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if should_emit {
+                            let done = done_count.load(Ordering::Relaxed);
+                            let bytes = total_bytes_done.load(Ordering::Relaxed);
+                            let elapsed = started_at.elapsed().as_secs_f64().max(0.25);
+                            let delta_bytes = bytes.saturating_sub(baseline_bytes);
+                            let bps = ((delta_bytes as f64) / elapsed).round() as u64;
+                            let est_total = if done > 0 && bytes > 0 {
+                                Some((bytes as u128 * total_segs as u128 / done as u128) as u64)
+                            } else {
+                                None
+                            };
+                            let eta = est_total
+                                .filter(|&tot| tot > bytes && bps > 0)
+                                .map(|tot| (tot - bytes) / bps);
+                            self.update_job(&job.id, true, |j| {
+                                j.stage = Some(format!("Downloading segments ({done}/{total_segs})…"));
+                                j.segments_done = Some(done);
+                                j.segments_total = Some(total_segs);
+                                j.bytes_downloaded = bytes;
+                                j.total_bytes = est_total;
+                                j.speed_bps = bps;
+                                j.eta_sec = eta;
+                                j.percent = if total_segs > 0 {
+                                    (done as f64 / total_segs as f64) * 95.0
+                                } else {
+                                    0.0
+                                };
+                            });
+                        }
+                    }
+                    Ok(Err(stop)) => {
+                        if first_err.is_none() {
+                            first_err = Some(stop);
+                            join_set.abort_all();
+                        }
+                    }
+                    Err(join_err) if !join_err.is_cancelled() => {
+                        if first_err.is_none() {
+                            first_err = Some(JobStop::Failed(join_err.to_string()));
+                            join_set.abort_all();
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+
+            if let Some(stop) = first_err {
+                if let JobStop::Failed(ref msg) = stop {
+                    let token_expired = msg.contains("HTTP 401")
+                        || msg.contains("HTTP 403")
+                        || msg.contains("HTTP 404")
+                        || msg.contains("HTTP 410");
+                    if !refreshed && token_expired {
+                        refreshed = true;
+                        self.update_job(&job.id, true, |j| {
+                            j.stage = Some("Refreshing expired stream links…".into());
+                            j.speed_bps = 0;
+                        });
+                        work_state = self.fetch_and_save_hls_state(job, &state_path, sig, true).await?;
+                        continue;
+                    }
+                }
+                return Err(stop);
+            }
+
+            break (v_maps, v_keys, a_maps, a_keys, total_segs);
         };
 
-        // Build full list of segments (video + audio) to download concurrently with resume support.
-        let mut tasks: Vec<(&HlsSegment, PathBuf)> = Vec::with_capacity(
-            work_state.video.segments.len() + work_state.audio.as_ref().map(|a| a.segments.len()).unwrap_or(0),
-        );
-        for seg in &work_state.video.segments {
-            let ext = segment_ext(&seg.uri);
-            tasks.push((seg, work_dir.join(format!("vseg_{:06}.{ext}", seg.index))));
-        }
-        if let Some(ref ap) = work_state.audio {
-            for seg in &ap.segments {
-                let ext = segment_ext(&seg.uri);
-                tasks.push((seg, work_dir.join(format!("aseg_{:06}.{ext}", seg.index))));
-            }
-        }
-
-        let total_segs = tasks.len() as u32;
-        let done_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let total_bytes_done = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let mut pending_indices = Vec::new();
-        for (i, (_, path)) in tasks.iter().enumerate() {
-            if let Ok(m) = tokio::fs::metadata(path).await {
-                if m.len() > 0 {
-                    done_count.fetch_add(1, Ordering::Relaxed);
-                    total_bytes_done.fetch_add(m.len(), Ordering::Relaxed);
-                    continue;
-                }
-            }
-            pending_indices.push(i);
-        }
-
-        let initial_done = done_count.load(Ordering::Relaxed);
-        let initial_bytes = total_bytes_done.load(Ordering::Relaxed);
-        self.update_job(&job.id, true, |j| {
-            j.stage = Some(format!("Downloading segments ({initial_done}/{total_segs})…"));
-            j.segments_done = Some(initial_done);
-            j.segments_total = Some(total_segs);
-            j.bytes_downloaded = initial_bytes;
-            j.percent = if total_segs > 0 {
-                (initial_done as f64 / total_segs as f64) * 95.0
-            } else {
-                0.0
-            };
-        });
-
-        let sem = Arc::new(Semaphore::new(HLS_SEGMENT_CONCURRENCY));
-        let started_at = Instant::now();
-        let baseline_bytes = initial_bytes;
-        let last_emit = Arc::new(Mutex::new(Instant::now()));
-
-        let mut join_set = tokio::task::JoinSet::new();
-        for idx in pending_indices {
-            let (seg, seg_path) = (tasks[idx].0.clone(), tasks[idx].1.clone());
-            let sem_c = sem.clone();
-            let headers_c = job.headers.clone();
-            let pause_flag = sig.pause.clone();
-            let cancel_flag = sig.cancel.clone();
-            let done_c = done_count.clone();
-            let bytes_c = total_bytes_done.clone();
-
-            join_set.spawn(async move {
-                let _permit = sem_c
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| JobStop::Failed("Download pool closed".into()))?;
-                if cancel_flag.load(Ordering::Relaxed) {
-                    return Err(JobStop::Cancelled);
-                }
-                if pause_flag.load(Ordering::Relaxed) {
-                    return Err(JobStop::Paused);
-                }
-                let seg_bytes = download_single_segment(
-                    &seg.uri,
-                    seg.byte_range,
-                    &seg_path,
-                    &headers_c,
-                    &pause_flag,
-                    &cancel_flag,
-                )
-                .await?;
-                done_c.fetch_add(1, Ordering::Relaxed);
-                bytes_c.fetch_add(seg_bytes, Ordering::Relaxed);
-                Ok(())
-            });
-        }
-
-        let mut first_err: Option<JobStop> = None;
-        while let Some(res) = join_set.join_next().await {
-            match res {
-                Ok(Ok(())) => {
-                    let should_emit = {
-                        let mut lg = last_emit.lock().unwrap_or_else(|e| e.into_inner());
-                        if lg.elapsed().as_millis() >= PROGRESS_EMIT_MS {
-                            *lg = Instant::now();
-                            true
-                        } else {
-                            false
-                        }
-                    };
-                    if should_emit {
-                        let done = done_count.load(Ordering::Relaxed);
-                        let bytes = total_bytes_done.load(Ordering::Relaxed);
-                        let elapsed = started_at.elapsed().as_secs_f64().max(0.25);
-                        let delta_bytes = bytes.saturating_sub(baseline_bytes);
-                        let bps = ((delta_bytes as f64) / elapsed).round() as u64;
-                        let est_total = if done > 0 && bytes > 0 {
-                            Some((bytes as u128 * total_segs as u128 / done as u128) as u64)
-                        } else {
-                            None
-                        };
-                        let eta = est_total
-                            .filter(|&tot| tot > bytes && bps > 0)
-                            .map(|tot| (tot - bytes) / bps);
-                        self.update_job(&job.id, true, |j| {
-                            j.stage = Some(format!("Downloading segments ({done}/{total_segs})…"));
-                            j.segments_done = Some(done);
-                            j.segments_total = Some(total_segs);
-                            j.bytes_downloaded = bytes;
-                            j.total_bytes = est_total;
-                            j.speed_bps = bps;
-                            j.eta_sec = eta;
-                            j.percent = if total_segs > 0 {
-                                (done as f64 / total_segs as f64) * 95.0
-                            } else {
-                                0.0
-                            };
-                        });
-                    }
-                }
-                Ok(Err(stop)) => {
-                    if first_err.is_none() {
-                        first_err = Some(stop);
-                        join_set.abort_all();
-                    }
-                }
-                Err(join_err) if !join_err.is_cancelled() => {
-                    if first_err.is_none() {
-                        first_err = Some(JobStop::Failed(join_err.to_string()));
-                        join_set.abort_all();
-                    }
-                }
-                Err(_) => {}
-            }
-        }
-
-        if let Some(stop) = first_err {
-            return Err(stop);
-        }
         check_sig(sig)?;
 
         // Write local playlists inside work_dir using strictly relative file names.
@@ -1935,17 +3125,17 @@ impl DownloadManager {
             .and_then(|g| g.clone())
             .ok_or_else(|| JobStop::Failed("App handle unavailable for remux".into()))?;
         let ffmpeg = crate::ffmpeg_tool(&app, "ffmpeg").map_err(JobStop::Failed)?;
-        let mkv_path = resolve_target_paths(root, &req_meta, "mkv").1;
 
         let work_dir_c = work_dir.clone();
         let mp4_path_c = mp4_path.clone();
         let mkv_path_c = mkv_path.clone();
+        let cancel_c = sig.cancel.clone();
+        let replaced_c = sig.replaced.clone();
         let final_out = tauri::async_runtime::spawn_blocking(move || {
-            remux_local_hls(&ffmpeg, &work_dir_c, has_audio, &mp4_path_c, &mkv_path_c)
+            remux_local_hls(&ffmpeg, &work_dir_c, has_audio, &mp4_path_c, &mkv_path_c, &cancel_c, &replaced_c)
         })
         .await
-        .map_err(|e| JobStop::Failed(e.to_string()))?
-        .map_err(JobStop::Failed)?;
+        .map_err(|e| JobStop::Failed(e.to_string()))??;
 
         let _ = tokio::fs::remove_dir_all(&work_dir).await;
         let final_size = tokio::fs::metadata(&final_out)
@@ -1955,44 +3145,77 @@ impl DownloadManager {
         Ok((final_out, final_size))
     }
 
-    async fn fetch_and_save_hls_state(&self, job: &DownloadJob, state_path: &Path) -> Result<HlsWorkState, JobStop> {
-        let master_or_media = fetch_text_with_headers(&job.url, &job.headers)
-            .await
-            .map_err(JobStop::Failed)?;
+    async fn fetch_and_save_hls_state(
+        &self,
+        job: &DownloadJob,
+        state_path: &Path,
+        sig: &JobSignals,
+        force_refresh: bool,
+    ) -> Result<HlsWorkState, JobStop> {
+        let master_or_media = fetch_text_with_headers(&job.url, &job.headers, sig).await?;
 
-        let (video_url, audio_url, video_text) = if master_or_media.contains("#EXT-X-STREAM-INF") {
-            let (variants, audios) =
-                parse_master_playlist(&master_or_media, &job.url).map_err(JobStop::Failed)?;
-            let picked = select_hls_variant(&variants, job.preferred_quality.or(job.quality))
-                .ok_or_else(|| JobStop::Failed("No playable HLS variants found".into()))?;
-            let audio_rend = select_audio_rendition(
-                &audios,
-                picked.audio_group.as_deref(),
-                job.audio.as_deref(),
-            );
-            let v_txt = fetch_text_with_headers(&picked.uri, &job.headers)
-                .await
-                .map_err(JobStop::Failed)?;
-            (picked.uri.clone(), audio_rend.map(|a| a.uri.clone()), v_txt)
-        } else {
-            (job.url.clone(), None, master_or_media)
-        };
+        let (video_url, audio_url, video_text, selected_height, selected_bandwidth, available_heights) =
+            if master_or_media.contains("#EXT-X-STREAM-INF") {
+                let (variants, audios) =
+                    parse_master_playlist(&master_or_media, &job.url).map_err(JobStop::Failed)?;
+                let mut heights: Vec<u32> = variants.iter().filter_map(|v| v.height).collect();
+                heights.sort_unstable();
+                heights.dedup();
+                let picked = select_hls_variant(&variants, job.preferred_quality.or(job.quality))
+                    .ok_or_else(|| JobStop::Failed("No playable HLS variants found".into()))?;
+                let audio_rend = select_audio_rendition(
+                    &audios,
+                    picked.audio_group.as_deref(),
+                    job.audio.as_deref(),
+                );
+                let v_txt = fetch_text_with_headers(&picked.uri, &job.headers, sig).await?;
+                (
+                    picked.uri.clone(),
+                    audio_rend.map(|a| a.uri.clone()),
+                    v_txt,
+                    picked.height,
+                    Some(picked.bandwidth),
+                    heights,
+                )
+            } else {
+                (job.url.clone(), None, master_or_media, job.quality, None, Vec::new())
+            };
 
         let video = parse_media_playlist(&video_text, &video_url).map_err(JobStop::Failed)?;
         let audio = if let Some(ref au) = audio_url {
-            let a_txt = fetch_text_with_headers(au, &job.headers)
-                .await
-                .map_err(JobStop::Failed)?;
+            let a_txt = fetch_text_with_headers(au, &job.headers, sig).await?;
             Some(parse_media_playlist(&a_txt, au).map_err(JobStop::Failed)?)
         } else {
             None
         };
+
+        if force_refresh {
+            if let Ok(old_bytes) = tokio::fs::read(state_path).await {
+                if let Ok(old_state) = serde_json::from_slice::<HlsWorkState>(&old_bytes) {
+                    if old_state.video.segments.len() != video.segments.len() {
+                        if let Some(work_dir) = state_path.parent() {
+                            if let Ok(mut entries) = tokio::fs::read_dir(work_dir).await {
+                                while let Ok(Some(ent)) = entries.next_entry().await {
+                                    let name = ent.file_name().to_string_lossy().into_owned();
+                                    if name.starts_with("vseg_") || name.starts_with("aseg_") {
+                                        let _ = tokio::fs::remove_file(ent.path()).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         let state = HlsWorkState {
             video_playlist_url: video_url,
             audio_playlist_url: audio_url,
             video,
             audio,
+            selected_height,
+            selected_bandwidth,
+            available_heights,
         };
         write_json_atomic(state_path, &state).map_err(JobStop::Failed)?;
         Ok(state)
@@ -2002,10 +3225,14 @@ impl DownloadManager {
 enum JobStop {
     Paused,
     Cancelled,
+    Replaced,
     Failed(String),
 }
 
 fn check_sig(sig: &JobSignals) -> Result<(), JobStop> {
+    if sig.replaced.load(Ordering::Relaxed) {
+        return Err(JobStop::Replaced);
+    }
     if sig.cancel.load(Ordering::Relaxed) {
         return Err(JobStop::Cancelled);
     }
@@ -2013,6 +3240,23 @@ fn check_sig(sig: &JobSignals) -> Result<(), JobStop> {
         return Err(JobStop::Paused);
     }
     Ok(())
+}
+
+async fn wait_interrupt(sig: &JobSignals) -> JobStop {
+    loop {
+        let notified = sig.notify.notified();
+        if let Err(stop) = check_sig(sig) {
+            return stop;
+        }
+        notified.await;
+    }
+}
+
+async fn sleep_interruptible(sig: &JobSignals, dur: Duration) -> Result<(), JobStop> {
+    tokio::select! {
+        stop = wait_interrupt(sig) => Err(stop),
+        _ = tokio::time::sleep(dur) => Ok(()),
+    }
 }
 
 fn pct(done: u64, total: Option<u64>) -> f64 {
@@ -2056,6 +3300,8 @@ fn start_req_from_job(job: &DownloadJob) -> DownloadStartReq {
         headers: job.headers.clone(),
         preferred_quality: job.preferred_quality,
         subtitles: job.subtitles.clone(),
+        fallbacks: job.fallbacks.clone(),
+        replace_existing: false,
         poster_url: job.poster_url.clone(),
         backdrop_url: job.backdrop_url.clone(),
         media_snapshot: job.media_snapshot.clone(),
@@ -2168,21 +3414,62 @@ fn cleanup_job_artifacts(job: &DownloadJob) {
     }
 }
 
-async fn fetch_text_with_headers(url: &str, headers: &Hdrs) -> Result<String, String> {
-    stream::validate_http_url(url)?;
-    let res = stream::apply(download_client().get(url), headers)
-        .timeout(Duration::from_secs(20))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch playlist: {e}"))?;
-    if !res.status().is_success() {
-        return Err(format!("Playlist HTTP {}", res.status().as_u16()));
+fn probe_downloaded_video(app: &tauri::AppHandle, path: &Path) -> Option<(Option<u32>, Option<String>)> {
+    let ffprobe = crate::ffmpeg_tool(app, "ffprobe").ok()?;
+    let mut cmd = crate::background_command(&ffprobe);
+    cmd.args([
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height,codec_name",
+        "-of",
+        "json",
+    ])
+    .arg(path);
+    let out = crate::run_background_output(&mut cmd).ok()?;
+    if !out.status.success() {
+        return None;
     }
-    let bytes = res
-        .bytes()
-        .await
-        .map_err(|e| format!("Failed reading playlist: {e}"))?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    let val: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let stream0 = val.get("streams")?.as_array()?.first()?;
+    let w = stream0.get("width").and_then(|v| v.as_u64()).map(|n| n as u32);
+    let h = stream0.get("height").and_then(|v| v.as_u64()).map(|n| n as u32);
+    let codec = stream0
+        .get("codec_name")
+        .and_then(|v| v.as_str())
+        .and_then(friendly_video_codec);
+    let norm_q = normalize_video_resolution(w, h);
+    if norm_q.is_none() && codec.is_none() {
+        return None;
+    }
+    Some((norm_q, codec))
+}
+
+async fn fetch_text_with_headers(url: &str, headers: &Hdrs, sig: &JobSignals) -> Result<String, JobStop> {
+    check_sig(sig)?;
+    stream::validate_http_url(url).map_err(JobStop::Failed)?;
+    let req_fut = stream::apply(download_client().get(url), headers)
+        .timeout(Duration::from_secs(20))
+        .send();
+    let res = tokio::select! {
+        stop = wait_interrupt(sig) => return Err(stop),
+        r = req_fut => r.map_err(|e| JobStop::Failed(format!("Failed to fetch playlist: {e}")))?,
+    };
+    if !res.status().is_success() {
+        return Err(JobStop::Failed(format!("Playlist HTTP {}", res.status().as_u16())));
+    }
+    let bytes = tokio::select! {
+        stop = wait_interrupt(sig) => return Err(stop),
+        b = res.bytes() => b.map_err(|e| JobStop::Failed(format!("Failed reading playlist: {e}")))?,
+    };
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let trimmed = text.trim_start().to_ascii_lowercase();
+    if trimmed.starts_with("<!doctype") || trimmed.starts_with("<html") {
+        return Err(JobStop::Failed("Server returned an HTML page instead of an HLS playlist".into()));
+    }
+    Ok(text)
 }
 
 async fn download_aux_hls_assets(
@@ -2206,7 +3493,7 @@ async fn download_aux_hls_assets(
                 let dest = work_dir.join(&fname);
                 let exists = tokio::fs::metadata(&dest).await.map(|m| m.len() > 0).unwrap_or(false);
                 if !exists {
-                    download_single_segment(uri, None, &dest, headers, &sig.pause, &sig.cancel).await?;
+                    download_single_segment(uri, None, &dest, headers, sig).await?;
                 }
                 map_files.insert(uri.clone(), fname);
             }
@@ -2219,7 +3506,7 @@ async fn download_aux_hls_assets(
                     let dest = work_dir.join(&fname);
                     let exists = tokio::fs::metadata(&dest).await.map(|m| m.len() > 0).unwrap_or(false);
                     if !exists {
-                        download_single_segment(uri, None, &dest, headers, &sig.pause, &sig.cancel).await?;
+                        download_single_segment(uri, None, &dest, headers, sig).await?;
                     }
                     key_files.insert(uri.clone(), fname);
                 }
@@ -2234,22 +3521,16 @@ async fn download_single_segment(
     byte_range: Option<(u64, u64)>,
     dest: &Path,
     headers: &Hdrs,
-    pause_flag: &AtomicBool,
-    cancel_flag: &AtomicBool,
+    sig: &JobSignals,
 ) -> Result<u64, JobStop> {
     stream::validate_http_url(url).map_err(JobStop::Failed)?;
     let part = dest.with_extension("part");
     let mut last_err = String::new();
 
     for attempt in 0..SEGMENT_MAX_ATTEMPTS {
-        if cancel_flag.load(Ordering::Relaxed) {
-            return Err(JobStop::Cancelled);
-        }
-        if pause_flag.load(Ordering::Relaxed) {
-            return Err(JobStop::Paused);
-        }
+        check_sig(sig)?;
 
-        let mut rb = stream::apply(download_client().get(url), headers).timeout(Duration::from_secs(30));
+        let mut rb = stream::apply(download_client().get(url), headers).timeout(Duration::from_secs(45));
         if let Some((off, len)) = byte_range {
             rb = rb.header(
                 reqwest::header::RANGE,
@@ -2257,30 +3538,78 @@ async fn download_single_segment(
             );
         }
 
-        match rb.send().await {
-            Ok(res) if res.status().is_success() => {
-                match res.bytes().await {
-                    Ok(bytes) => {
-                        if cancel_flag.load(Ordering::Relaxed) {
+        let send_res = tokio::select! {
+            stop = wait_interrupt(sig) => return Err(stop),
+            r = rb.send() => r,
+        };
+
+        match send_res {
+            Ok(mut res) if res.status().is_success() => {
+                let ct = res
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                if is_invalid_video_content_type(ct.as_deref()) {
+                    let ct_desc = ct.unwrap_or_else(|| "text".into());
+                    return Err(JobStop::Failed(format!(
+                        "Server returned {ct_desc} instead of a media segment"
+                    )));
+                }
+
+                let mut buf = Vec::new();
+                let mut checked_prefix = false;
+                let mut stream_err: Option<String> = None;
+
+                loop {
+                    let next_chunk = tokio::select! {
+                        stop = wait_interrupt(sig) => {
                             let _ = tokio::fs::remove_file(&part).await;
-                            return Err(JobStop::Cancelled);
+                            return Err(stop);
                         }
-                        if pause_flag.load(Ordering::Relaxed) {
-                            let _ = tokio::fs::remove_file(&part).await;
-                            return Err(JobStop::Paused);
+                        c = tokio::time::timeout(Duration::from_secs(20), res.chunk()) => c,
+                    };
+
+                    match next_chunk {
+                        Ok(Ok(Some(chunk))) => {
+                            if !checked_prefix && !chunk.is_empty() {
+                                checked_prefix = true;
+                                let sniff = String::from_utf8_lossy(&chunk[..chunk.len().min(64)])
+                                    .trim_start()
+                                    .to_ascii_lowercase();
+                                if sniff.starts_with("<!doctype") || sniff.starts_with("<html") {
+                                    let _ = tokio::fs::remove_file(&part).await;
+                                    return Err(JobStop::Failed(
+                                        "Server returned an HTML error page instead of video data".into(),
+                                    ));
+                                }
+                            }
+                            buf.extend_from_slice(&chunk);
                         }
-                        if let Err(e) = tokio::fs::write(&part, &bytes).await {
-                            return Err(JobStop::Failed(e.to_string()));
+                        Ok(Ok(None)) => break,
+                        Ok(Err(e)) => {
+                            stream_err = Some(format!("Segment read error: {e}"));
+                            break;
                         }
-                        if let Err(e) = tokio::fs::rename(&part, dest).await {
-                            let _ = tokio::fs::remove_file(&part).await;
-                            return Err(JobStop::Failed(e.to_string()));
+                        Err(_) => {
+                            stream_err = Some("Segment stalled while downloading".into());
+                            break;
                         }
-                        return Ok(bytes.len() as u64);
                     }
-                    Err(e) => {
-                        last_err = format!("Segment read error: {e}");
+                }
+
+                if let Some(err) = stream_err {
+                    last_err = err;
+                } else {
+                    check_sig(sig)?;
+                    if let Err(e) = tokio::fs::write(&part, &buf).await {
+                        return Err(JobStop::Failed(e.to_string()));
                     }
+                    if let Err(e) = tokio::fs::rename(&part, dest).await {
+                        let _ = tokio::fs::remove_file(&part).await;
+                        return Err(JobStop::Failed(e.to_string()));
+                    }
+                    return Ok(buf.len() as u64);
                 }
             }
             Ok(res) => {
@@ -2296,7 +3625,7 @@ async fn download_single_segment(
         }
 
         if attempt + 1 < SEGMENT_MAX_ATTEMPTS {
-            tokio::time::sleep(Duration::from_millis(450 * (attempt as u64 + 1))).await;
+            sleep_interruptible(sig, Duration::from_millis(450 * (attempt as u64 + 1))).await?;
         }
     }
 
@@ -2309,15 +3638,30 @@ fn remux_local_hls(
     has_audio: bool,
     mp4_path: &Path,
     mkv_path: &Path,
-) -> Result<PathBuf, String> {
+    cancel_flag: &AtomicBool,
+    replaced_flag: &AtomicBool,
+) -> Result<PathBuf, JobStop> {
+    if replaced_flag.load(Ordering::Relaxed) {
+        return Err(JobStop::Replaced);
+    }
+    if cancel_flag.load(Ordering::Relaxed) {
+        return Err(JobStop::Cancelled);
+    }
+
     let tmp_mp4 = mp4_path.with_extension("abxremux.mp4");
     let tmp_mkv = mkv_path.with_extension("abxremux.mkv");
     let _ = std::fs::remove_file(&tmp_mp4);
     let _ = std::fs::remove_file(&tmp_mkv);
 
-    let run_pass = |use_bsf: bool, format: &str, out_path: &Path| -> Result<(), String> {
+    let run_pass = |use_bsf: bool, format: &str, out_path: &Path| -> Result<(), JobStop> {
+        use std::io::Read;
+        use std::process::Stdio;
+
         let mut cmd = crate::background_command(ffmpeg);
         cmd.current_dir(work_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
             .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
             .args(["-allowed_extensions", "ALL", "-protocol_whitelist", "file,crypto"])
             .args(["-i", "local.m3u8"]);
@@ -2336,29 +3680,76 @@ fn remux_local_hls(
         }
         cmd.arg(out_path);
 
-        let out = crate::run_background_output(&mut cmd)
-            .map_err(|e| format!("Failed to start FFmpeg remux: {e}"))?;
-        if out.status.success() && out_path.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| JobStop::Failed(format!("Failed to start FFmpeg remux: {e}")))?;
+
+        let started = Instant::now();
+        let status = loop {
+            if replaced_flag.load(Ordering::Relaxed) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(out_path);
+                return Err(JobStop::Replaced);
+            }
+            if cancel_flag.load(Ordering::Relaxed) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(out_path);
+                return Err(JobStop::Cancelled);
+            }
+            if started.elapsed() > Duration::from_secs(180) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(out_path);
+                return Err(JobStop::Failed("FFmpeg remux timed out".into()));
+            }
+            match child.try_wait() {
+                Ok(Some(st)) => break st,
+                Ok(None) => std::thread::sleep(Duration::from_millis(120)),
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = std::fs::remove_file(out_path);
+                    return Err(JobStop::Failed(format!("FFmpeg remux wait error: {e}")));
+                }
+            }
+        };
+
+        if status.success() && out_path.metadata().map(|m| m.len() > 0).unwrap_or(false) {
             return Ok(());
         }
+        let mut stderr_buf = String::new();
+        if let Some(mut se) = child.stderr.take() {
+            let _ = se.read_to_string(&mut stderr_buf);
+        }
         let _ = std::fs::remove_file(out_path);
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        Err(JobStop::Failed(stderr_buf.trim().to_string()))
     };
 
-    if run_pass(true, "mp4", &tmp_mp4).is_ok() {
-        std::fs::rename(&tmp_mp4, mp4_path).map_err(|e| e.to_string())?;
-        return Ok(mp4_path.to_path_buf());
+    match run_pass(true, "mp4", &tmp_mp4) {
+        Ok(()) => {
+            std::fs::rename(&tmp_mp4, mp4_path).map_err(|e| JobStop::Failed(e.to_string()))?;
+            return Ok(mp4_path.to_path_buf());
+        }
+        Err(stop @ (JobStop::Cancelled | JobStop::Replaced | JobStop::Paused)) => return Err(stop),
+        Err(JobStop::Failed(_)) => {}
     }
-    if run_pass(false, "mp4", &tmp_mp4).is_ok() {
-        std::fs::rename(&tmp_mp4, mp4_path).map_err(|e| e.to_string())?;
-        return Ok(mp4_path.to_path_buf());
+    match run_pass(false, "mp4", &tmp_mp4) {
+        Ok(()) => {
+            std::fs::rename(&tmp_mp4, mp4_path).map_err(|e| JobStop::Failed(e.to_string()))?;
+            return Ok(mp4_path.to_path_buf());
+        }
+        Err(stop @ (JobStop::Cancelled | JobStop::Replaced | JobStop::Paused)) => return Err(stop),
+        Err(JobStop::Failed(_)) => {}
     }
     match run_pass(false, "matroska", &tmp_mkv) {
         Ok(()) => {
-            std::fs::rename(&tmp_mkv, mkv_path).map_err(|e| e.to_string())?;
+            std::fs::rename(&tmp_mkv, mkv_path).map_err(|e| JobStop::Failed(e.to_string()))?;
             Ok(mkv_path.to_path_buf())
         }
-        Err(err) => Err(format!("FFmpeg remux failed: {err}")),
+        Err(stop @ (JobStop::Cancelled | JobStop::Replaced | JobStop::Paused)) => Err(stop),
+        Err(JobStop::Failed(err)) => Err(JobStop::Failed(format!("FFmpeg remux failed: {err}"))),
     }
 }
 
@@ -2452,7 +3843,7 @@ pub(crate) fn pause_all_on_exit() {
     let Some(mgr) = MANAGER.get() else { return };
     let mut g = mgr.state.lock().unwrap_or_else(|e| e.into_inner());
     for sig in g.active.values() {
-        sig.pause.store(true, Ordering::Relaxed);
+        sig.signal_pause();
     }
     g.queue.clear();
     for j in &mut g.jobs {
@@ -2491,8 +3882,42 @@ pub async fn download_init_root(app: tauri::AppHandle, root: String) -> Result<D
 }
 
 #[tauri::command]
+pub async fn download_migrate_root(
+    app: tauri::AppHandle,
+    new_root: String,
+    move_files: bool,
+) -> Result<MigrateDownloadsResult, String> {
+    let dir = PathBuf::from(new_root);
+    tauri::async_runtime::spawn_blocking(move || manager().migrate_root(&app, &dir, move_files))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 pub async fn download_start(app: tauri::AppHandle, req: DownloadStartReq) -> Result<DownloadJobView, String> {
     manager().enqueue(&app, req)
+}
+
+#[tauri::command]
+pub async fn download_switch_source(
+    app: tauri::AppHandle,
+    id: String,
+    source: DownloadFallbackSource,
+    extra_fallbacks: Option<Vec<DownloadFallbackSource>>,
+    preferred_quality: Option<u32>,
+) -> Result<Option<DownloadJobView>, String> {
+    manager().switch_source(
+        &app,
+        &id,
+        source,
+        extra_fallbacks.unwrap_or_default(),
+        preferred_quality,
+    )
+}
+
+#[tauri::command]
+pub fn download_clear_failed() -> DownloadSnapshot {
+    manager().clear_failed()
 }
 
 #[tauri::command]
@@ -2501,13 +3926,32 @@ pub fn download_pause(id: String) -> Result<Option<DownloadJobView>, String> {
 }
 
 #[tauri::command]
+pub fn download_pause_all(canonical_key: Option<String>, season: Option<u32>) -> DownloadSnapshot {
+    manager().pause_all(canonical_key.as_deref(), season)
+}
+
+#[tauri::command]
 pub async fn download_resume(app: tauri::AppHandle, id: String) -> Result<Option<DownloadJobView>, String> {
     manager().resume(&app, &id)
 }
 
 #[tauri::command]
+pub async fn download_resume_all(
+    app: tauri::AppHandle,
+    canonical_key: Option<String>,
+    season: Option<u32>,
+) -> DownloadSnapshot {
+    manager().resume_all(&app, canonical_key.as_deref(), season)
+}
+
+#[tauri::command]
 pub fn download_cancel(id: String) -> Result<(), String> {
     manager().cancel(&id)
+}
+
+#[tauri::command]
+pub fn download_cancel_all(canonical_key: Option<String>, season: Option<u32>) -> DownloadSnapshot {
+    manager().cancel_all(canonical_key.as_deref(), season)
 }
 
 #[tauri::command]
@@ -2578,6 +4022,8 @@ mod tests {
             headers: Hdrs::default(),
             preferred_quality: Some(1080),
             subtitles: Vec::new(),
+            fallbacks: Vec::new(),
+            replace_existing: false,
             poster_url: None,
             backdrop_url: None,
             media_snapshot: serde_json::json!({}),
@@ -2757,6 +4203,8 @@ seg2.m4s
             episode_title: None,
             audio: None,
             quality: Some(1080),
+            quality_verified: true,
+            video_codec: Some("H.264".into()),
             provider_id: "vidlink".into(),
             provider_name: "VidLink".into(),
             file_path: base.join(format!("{id}.mp4")).to_string_lossy().into_owned(),
@@ -2780,6 +4228,376 @@ seg2.m4s
         remove_orphaned_artwork(&base, &[], &ep2);
         assert!(!shared_backdrop.exists());
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn select_hls_variant_respects_preferred_cap_and_closest_above_fallback() {
+        let variants = vec![
+            HlsVariant {
+                uri: "https://cdn.example/480.m3u8".into(),
+                bandwidth: 900_000,
+                height: Some(480),
+                audio_group: None,
+            },
+            HlsVariant {
+                uri: "https://cdn.example/720.m3u8".into(),
+                bandwidth: 2_200_000,
+                height: Some(720),
+                audio_group: None,
+            },
+            HlsVariant {
+                uri: "https://cdn.example/1080.m3u8".into(),
+                bandwidth: 5_000_000,
+                height: Some(1080),
+                audio_group: None,
+            },
+            HlsVariant {
+                uri: "https://cdn.example/2160.m3u8".into(),
+                bandwidth: 14_000_000,
+                height: Some(2160),
+                audio_group: None,
+            },
+        ];
+
+        assert_eq!(
+            select_hls_variant(&variants, Some(720)).and_then(|v| v.height),
+            Some(720)
+        );
+        assert_eq!(
+            select_hls_variant(&variants, Some(1080)).and_then(|v| v.height),
+            Some(1080)
+        );
+        assert_eq!(
+            select_hls_variant(&variants, Some(2160)).and_then(|v| v.height),
+            Some(2160)
+        );
+
+        let high_only = &variants[2..]; // 1080p and 2160p only
+        assert_eq!(
+            select_hls_variant(high_only, Some(720)).and_then(|v| v.height),
+            Some(1080)
+        );
+    }
+
+    #[test]
+    fn normalizes_cinemascope_resolutions_and_friendly_codecs() {
+        assert_eq!(normalize_video_resolution(Some(1920), Some(804)), Some(1080));
+        assert_eq!(normalize_video_resolution(Some(1280), Some(534)), Some(720));
+        assert_eq!(normalize_video_resolution(Some(3840), Some(1608)), Some(2160));
+        assert_eq!(normalize_video_resolution(Some(854), Some(480)), Some(480));
+        assert_eq!(normalize_video_resolution(Some(100), Some(100)), None);
+
+        assert_eq!(friendly_video_codec("h264").as_deref(), Some("H.264"));
+        assert_eq!(friendly_video_codec("hevc").as_deref(), Some("HEVC"));
+        assert_eq!(friendly_video_codec("av1").as_deref(), Some("AV1"));
+        assert_eq!(friendly_video_codec("vp9").as_deref(), Some("VP9"));
+    }
+
+    #[test]
+    fn rejects_html_text_content_types_and_detects_local_fatal_errors() {
+        assert!(is_invalid_video_content_type(Some("text/html; charset=utf-8")));
+        assert!(is_invalid_video_content_type(Some("application/json")));
+        assert!(!is_invalid_video_content_type(Some("video/mp2t")));
+        assert!(!is_invalid_video_content_type(Some("application/octet-stream")));
+        assert!(!is_invalid_video_content_type(None));
+
+        assert!(is_local_fatal_error("Disk write error: No space left on device"));
+        assert!(is_local_fatal_error("Access is denied (os error 5)"));
+        assert!(!is_local_fatal_error("HTTP 502 Bad Gateway"));
+        assert!(!is_local_fatal_error("Stream stalled while downloading"));
+    }
+
+    #[test]
+    fn advance_job_to_next_fallback_skips_same_provider_and_invalid_urls() {
+        let mut job = DownloadJob {
+            id: "dl_test".into(),
+            root: "C:/Downloads".into(),
+            media_key: "tmdb:movie:1".into(),
+            canonical_key: "tmdb:movie:1".into(),
+            title: "Test Movie".into(),
+            media_kind: "movie".into(),
+            is_film: true,
+            year: Some(2024),
+            season: None,
+            episode: None,
+            episode_title: None,
+            audio: None,
+            quality: Some(1080),
+            resolved_quality: Some(1080),
+            quality_verified: true,
+            video_codec: Some("H.264".into()),
+            provider_id: "p1".into(),
+            provider_name: "Server One".into(),
+            url: "https://cdn1.example/v.m3u8".into(),
+            kind: "hls".into(),
+            headers: Hdrs::default(),
+            preferred_quality: Some(1080),
+            subtitles: Vec::new(),
+            fallbacks: vec![
+                DownloadFallbackSource {
+                    provider_id: "p1".into(),
+                    provider_name: "Server One Dup".into(),
+                    url: "https://cdn1b.example/v.m3u8".into(),
+                    kind: "hls".into(),
+                    headers: Hdrs::default(),
+                    quality: Some(1080),
+                    subtitles: Vec::new(),
+                },
+                DownloadFallbackSource {
+                    provider_id: "p2".into(),
+                    provider_name: "Bad URL".into(),
+                    url: "http://169.254.169.254/latest/meta-data".into(),
+                    kind: "mp4".into(),
+                    headers: Hdrs::default(),
+                    quality: Some(720),
+                    subtitles: Vec::new(),
+                },
+                DownloadFallbackSource {
+                    provider_id: "p2b".into(),
+                    provider_name: "File Scheme".into(),
+                    url: "file:///C:/secret.mp4".into(),
+                    kind: "mp4".into(),
+                    headers: Hdrs::default(),
+                    quality: Some(720),
+                    subtitles: Vec::new(),
+                },
+                DownloadFallbackSource {
+                    provider_id: "p3".into(),
+                    provider_name: "Server Three".into(),
+                    url: "https://cdn3.example/video.mp4".into(),
+                    kind: "mp4".into(),
+                    headers: Hdrs::default(),
+                    quality: Some(720),
+                    subtitles: Vec::new(),
+                },
+            ],
+            tried_providers: Vec::new(),
+            failover_notes: Vec::new(),
+            attempt_index: 1,
+            total_sources: 3,
+            poster_url: None,
+            backdrop_url: None,
+            status: DownloadStatus::Downloading,
+            stage: None,
+            bytes_downloaded: 1234,
+            total_bytes: Some(5000),
+            segments_done: Some(3),
+            segments_total: Some(10),
+            speed_bps: 100,
+            eta_sec: Some(20),
+            percent: 30.0,
+            file_path: None,
+            error: Some("HTTP 403".into()),
+            created_at: 1,
+            updated_at: 2,
+            media_snapshot: serde_json::json!({}),
+        };
+
+        let switched = advance_job_to_next_fallback(&mut job, "HTTP 403");
+        assert_eq!(switched, Some(("Server One".into(), "Server Three".into())));
+        assert_eq!(job.provider_id, "p3");
+        assert_eq!(job.url, "https://cdn3.example/video.mp4");
+        assert_eq!(job.attempt_index, 2);
+        assert_eq!(job.bytes_downloaded, 0);
+        assert!(!job.quality_verified);
+        assert_eq!(job.failover_notes, vec!["Server One: HTTP 403".to_string()]);
+        assert_eq!(advance_job_to_next_fallback(&mut job, "Timeout"), None);
+    }
+
+    #[test]
+    fn deserializes_legacy_queue_store_without_failover_fields() {
+        let raw = serde_json::json!({
+            "jobs": [{
+                "id": "dl_legacy",
+                "root": "C:/Downloads",
+                "mediaKey": "tmdb:movie:2",
+                "canonicalKey": "tmdb:movie:2",
+                "title": "Legacy Film",
+                "mediaKind": "movie",
+                "isFilm": true,
+                "providerId": "vidlink",
+                "providerName": "VidLink",
+                "url": "https://cdn.example/master.m3u8",
+                "kind": "hls",
+                "status": "paused",
+                "bytesDownloaded": 500,
+                "speedBps": 0,
+                "percent": 10.0,
+                "createdAt": 100,
+                "updatedAt": 200
+            }]
+        });
+        let store: QueueStore = serde_json::from_value(raw).unwrap();
+        assert_eq!(store.jobs.len(), 1);
+        assert_eq!(store.jobs[0].attempt_index, 1);
+        assert_eq!(store.jobs[0].total_sources, 1);
+        assert!(store.jobs[0].fallbacks.is_empty());
+        assert!(!store.jobs[0].quality_verified);
+    }
+
+    #[test]
+    fn validates_migration_targets_and_rewrites_prefixes() {
+        assert_eq!(
+            validate_migration_target(Path::new(r"\\?\C:\Downloads\Abix"), Path::new(r"C:/Downloads/Abix/")),
+            Ok(false)
+        );
+        assert!(validate_migration_target(Path::new(r"C:\Downloads"), Path::new(r"C:\Downloads\Nested")).is_err());
+        assert!(validate_migration_target(Path::new(r"C:\Downloads\Sub"), Path::new(r"C:\Downloads")).is_err());
+        assert_eq!(
+            validate_migration_target(Path::new(r"C:\Downloads"), Path::new(r"D:\Media\AbixCine")),
+            Ok(true)
+        );
+        // Sibling folders sharing prefix must not be rejected as nested
+        assert_eq!(
+            validate_migration_target(Path::new(r"C:\Downloads"), Path::new(r"C:\Downloads2")),
+            Ok(true)
+        );
+
+        let rewritten = rewrite_root_prefix(
+            r"\\?\C:\Users\Demo\Videos\AbixCine Downloads\Series\Andor (2022)\Season 01\ep1.mp4",
+            Path::new(r"C:\Users\Demo\Videos\AbixCine Downloads"),
+            Path::new(r"E:\Vault"),
+        );
+        assert_eq!(
+            PathBuf::from(&rewritten),
+            PathBuf::from(r"E:\Vault\Series\Andor (2022)\Season 01\ep1.mp4")
+        );
+    }
+
+    #[test]
+    fn move_path_recursive_migrates_files_and_cleans_source_dirs() {
+        let base = std::env::temp_dir().join(format!("abixcine_migrate_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let old_dir = base.join("old");
+        let new_dir = base.join("new");
+        let ep_dir = old_dir.join("Series").join("Andor (2022)").join("Season 01");
+        std::fs::create_dir_all(&ep_dir).unwrap();
+        let src_file = ep_dir.join("Andor - S01E01.mp4");
+        std::fs::write(&src_file, b"video-bytes-12345").unwrap();
+
+        let count = move_path_recursive(&old_dir.join("Series"), &new_dir.join("Series")).unwrap();
+        assert_eq!(count, 1);
+        assert!(!src_file.exists());
+        let dst_file = new_dir.join("Series").join("Andor (2022)").join("Season 01").join("Andor - S01E01.mp4");
+        assert_eq!(std::fs::read(dst_file).unwrap(), b"video-bytes-12345");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn bulk_pause_and_scoped_cancel_all_clear_matching_jobs() {
+        let base = std::env::temp_dir().join(format!("abixcine_bulk_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let mk_job = |id: &str, ckey: &str, season: u32, ep: u32, status: DownloadStatus| {
+            let mut req = sample_req("hls", false);
+            req.root = base.to_string_lossy().into_owned();
+            req.canonical_key = ckey.into();
+            req.media_key = ckey.into();
+            req.season = Some(season);
+            req.episode = Some(ep);
+            DownloadJob {
+                id: id.into(),
+                root: req.root,
+                media_key: req.media_key,
+                canonical_key: req.canonical_key,
+                title: "Test".into(),
+                media_kind: "tv".into(),
+                is_film: false,
+                year: Some(2024),
+                season: Some(season),
+                episode: Some(ep),
+                episode_title: None,
+                audio: None,
+                quality: Some(1080),
+                resolved_quality: None,
+                quality_verified: false,
+                video_codec: None,
+                provider_id: "p1".into(),
+                provider_name: "P1".into(),
+                url: "https://cdn.example/v.m3u8".into(),
+                kind: "hls".into(),
+                headers: Hdrs::default(),
+                preferred_quality: Some(1080),
+                subtitles: Vec::new(),
+                fallbacks: Vec::new(),
+                tried_providers: Vec::new(),
+                failover_notes: Vec::new(),
+                attempt_index: 1,
+                total_sources: 1,
+                poster_url: None,
+                backdrop_url: None,
+                status,
+                stage: None,
+                bytes_downloaded: 0,
+                total_bytes: None,
+                segments_done: None,
+                segments_total: None,
+                speed_bps: 100,
+                eta_sec: Some(5),
+                percent: 25.0,
+                file_path: None,
+                error: None,
+                created_at: 1,
+                updated_at: 1,
+                media_snapshot: serde_json::json!({}),
+            }
+        };
+
+        let j1 = mk_job("j_s1e1", "tmdb:tv:1", 1, 1, DownloadStatus::Downloading);
+        let (ep_folder, ep_target) = resolve_target_paths(&base, &start_req_from_job(&j1), "mp4");
+        std::fs::create_dir_all(&ep_folder).unwrap();
+        let part_path = ep_folder.join(format!(
+            ".{}.abxpart",
+            ep_target.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&part_path, b"partial-bytes").unwrap();
+
+        let mut g = ManagerState::default();
+        g.root = Some(base.clone());
+        g.jobs = vec![
+            j1,
+            mk_job("j_s1e2", "tmdb:tv:1", 1, 2, DownloadStatus::Queued),
+            mk_job("j_s2e1", "tmdb:tv:1", 2, 1, DownloadStatus::Downloading),
+            mk_job("j_done", "tmdb:tv:1", 1, 3, DownloadStatus::Completed),
+        ];
+        g.queue.push_back("j_s1e2".into());
+
+        // Pause ONLY Season 1 -> pauses j_s1e1 & j_s1e2 while S2 stays Downloading
+        let paused_s1 = g.pause_all_locked(Some("tmdb:tv:1"), Some(1));
+        assert_eq!(paused_s1.len(), 2);
+        assert_eq!(g.jobs[0].status, DownloadStatus::Paused);
+        assert_eq!(g.jobs[1].status, DownloadStatus::Paused);
+        assert_eq!(g.jobs[2].status, DownloadStatus::Downloading);
+
+        // Resume ONLY Season 1 -> re-queues j_s1e1 & j_s1e2 cleanly
+        let (resumed_s1, should_pump) = g.resume_all_locked(Some("tmdb:tv:1"), Some(1));
+        assert!(should_pump);
+        assert_eq!(resumed_s1.len(), 2);
+        assert_eq!(g.queue.len(), 2);
+
+        // Global pause pauses everything non-completed (now including S2)
+        let paused_all = g.pause_all_locked(None, None);
+        assert_eq!(paused_all.len(), 3);
+        assert_eq!(g.jobs[2].status, DownloadStatus::Paused);
+
+        // Cancel only Season 1 of tmdb:tv:1 -> removes j_s1e1 and j_s1e2, preserves S2 and Completed
+        let (to_clean_s1, _) = g.cancel_all_locked(Some("tmdb:tv:1"), Some(1));
+        for job in &to_clean_s1 {
+            cleanup_job_artifacts(job);
+        }
+        assert!(!part_path.exists());
+        let ids: Vec<_> = g.jobs.iter().map(|j| j.id.as_str()).collect();
+        assert_eq!(ids, vec!["j_s2e1", "j_done"]);
+
+        // Cancel remaining unscoped -> clears j_s2e1, preserves Completed
+        let (to_clean_all, _) = g.cancel_all_locked(None, None);
+        for job in &to_clean_all {
+            cleanup_job_artifacts(job);
+        }
+        let ids_final: Vec<_> = g.jobs.iter().map(|j| j.id.as_str()).collect();
+        assert_eq!(ids_final, vec!["j_done"]);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

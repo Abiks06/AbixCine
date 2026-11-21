@@ -93,7 +93,13 @@ export const Row = memo(function Row({
           </>
         }
       />
-      <div className={`track ${ranked ? "ranked" : ""}`} ref={ref} onScroll={update}>
+      <div
+        className={`track ${ranked ? "ranked" : ""}`}
+        ref={ref}
+        onScroll={update}
+        data-edge-left={edges.left ? "1" : undefined}
+        data-edge-right={edges.right ? "1" : undefined}
+      >
         {children ??
           (loading
             ? Array.from({ length: 8 }, (_, i) => <CardSkeleton key={i} variant={ranked ? "rank" : variant} />)

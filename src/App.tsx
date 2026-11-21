@@ -2,6 +2,7 @@ import { Component, type ErrorInfo, type ReactNode, useEffect, useLayoutEffect, 
 import { isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { createHashRouter, Outlet, RouterProvider, useLocation, useNavigationType, useRouteError } from "react-router-dom";
+import { CardHoverPreview } from "./components/CardHoverPreview";
 import { CommandPalette } from "./components/CommandPalette";
 import { DownloadFolderModal } from "./components/DownloadFolderModal";
 import { QuickDossier } from "./components/QuickDossier";
@@ -12,6 +13,7 @@ import { UpdateToast } from "./components/UpdateToast";
 import { bootAccount, useAuth } from "./lib/account";
 import { closeDossier, lookupMedia, openDossier } from "./lib/dossier";
 import { initDownloads } from "./lib/downloads";
+import { closeHoverPreviewNow } from "./lib/hoverPreview";
 import { syncThemeLight } from "./lib/light";
 import { getSettings, useSettings } from "./lib/settings";
 import { applyThemeToDom, resolveTheme } from "./lib/themes";
@@ -176,6 +178,7 @@ function Shell() {
   const scrolledRef = useRef(false);
   useEffect(() => () => cancelAnimationFrame(scrollRaf.current), []);
   const onScroll = () => {
+    closeHoverPreviewNow();
     if (scrollRaf.current) return;
     scrollRaf.current = requestAnimationFrame(() => {
       scrollRaf.current = 0;
@@ -201,6 +204,7 @@ function Shell() {
 
   useEffect(() => {
     closeDossier();
+    closeHoverPreviewNow();
   }, [loc.pathname]);
 
   useEffect(() => {
@@ -247,6 +251,7 @@ function Shell() {
             </RouteErrorBoundary>
           </main>
           <QuickDossier />
+          <CardHoverPreview />
           <DownloadFolderModal />
           <CommandPalette open={palette} onClose={() => setPalette(false)} />
           {!watching && <UpdateToast />}

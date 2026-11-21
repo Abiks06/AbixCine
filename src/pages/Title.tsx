@@ -12,16 +12,24 @@ import { TitleArt } from "../components/TitleArt";
 import { TrailerModal } from "../components/TrailerModal";
 import {
   batchEpisodeKey,
-  cancelBatchDownloads,
+  getBatchForSeason,
   queueEpisodeDownload,
   queueSeasonDownloads,
   selectMissingEpisodes,
   useBatchDownloads,
 } from "../lib/batchDownload";
 import {
-  hasDownloadedEpisode,
+  cancelAllDownloads,
+  computeSeasonDownloadProgress,
+  findDownloadedEpisode,
+  fmtSpeed,
+  formatDownloadQuality,
+  formatQualityTag,
+  pauseAllDownloads,
   pauseDownload,
+  resumeAllDownloads,
   resumeDownload,
+  switchDownloadToNextServer,
   useDownloads,
 } from "../lib/downloads";
 import { isYouTubeId } from "../lib/trailer";
@@ -608,27 +616,52 @@ export function Title() {
                   airedCount,
                   seriesStatus: d.status,
                 });
-                const batchForSeason = batch.active && batch.canonicalKey === canonicalKey && batch.season === season;
-                if (batchForSeason) {
+                const seasonProgTop = computeSeasonDownloadProgress(epList, {
+                  canonicalKey,
+                  season,
+                  audio,
+                  items: dl.items,
+                  jobs: dl.jobs,
+                  airedCount,
+                  seriesStatus: d.status,
+                });
+                const batchForSeason = getBatchForSeason(batch, canonicalKey, season);
+                const hasLiveSeasonJobs = seasonProgTop.active > 0 || seasonProgTop.paused > 0 || seasonProgTop.failed > 0;
+                if (batchForSeason || seasonProgTop.active > 0) {
                   return (
                     <button
                       type="button"
                       className="btn glass sm ep-season-dl active"
-                      onClick={cancelBatchDownloads}
-                      title="Cancel season download queue"
+                      onClick={() => void cancelAllDownloads({ canonicalKey, season })}
+                      title={`Click to stop & clear all Season ${season} downloads`}
                     >
                       <span className="mini-spin" />
                       <span>
-                        E{batch.currentEp ?? "…"} ({batch.queued}/{batch.total}) · Stop
+                        {batchForSeason
+                          ? `Stop S${season} (${batchForSeason.queued}/${batchForSeason.total})`
+                          : `Stop S${season} (${seasonProgTop.completed}/${seasonProgTop.total})`}
                       </span>
                     </button>
                   );
                 }
-                if (missingEps.length === 0) {
+                if (missingEps.length === 0 && !hasLiveSeasonJobs) {
                   return (
-                    <span className="ep-season-done" title={`All aired episodes in Season ${season} are saved or queued`}>
+                    <span className="ep-season-done" title={`All aired episodes in Season ${season} are saved offline`}>
                       <Icon name="check" size={13} /> S{season} offline
                     </span>
+                  );
+                }
+                if (missingEps.length === 0 && hasLiveSeasonJobs) {
+                  return (
+                    <button
+                      type="button"
+                      className="btn glass sm ep-season-dl active"
+                      onClick={() => void cancelAllDownloads({ canonicalKey, season })}
+                      title={`Stop & clear Season ${season} paused/failed queue`}
+                    >
+                      <Icon name="x" size={14} />
+                      <span>Stop S{season} ({seasonProgTop.paused + seasonProgTop.failed})</span>
+                    </button>
                   );
                 }
                 return (
@@ -722,9 +755,92 @@ export function Title() {
 
             const hasStills = shown.some((e) => e.still) || !!d.backdrop;
             const layout = !hasStills ? "compact" : (view ?? (epList.length > 30 ? "grid" : "list")) === "list" ? "list" : "";
+            const batchForSeason = desktop ? getBatchForSeason(batch, canonicalKey, season) : undefined;
+            const seasonProg = desktop
+              ? computeSeasonDownloadProgress(epList, {
+                  canonicalKey,
+                  season,
+                  audio,
+                  items: dl.items,
+                  jobs: dl.jobs,
+                  airedCount,
+                  seriesStatus: d.status,
+                })
+              : null;
+            const showSeasonBar =
+              Boolean(desktop && seasonProg && seasonProg.total > 0) &&
+              ((seasonProg?.completed ?? 0) > 0 ||
+                (seasonProg?.active ?? 0) > 0 ||
+                (seasonProg?.paused ?? 0) > 0 ||
+                (seasonProg?.failed ?? 0) > 0 ||
+                Boolean(batchForSeason));
 
             return (
               <>
+                {showSeasonBar && seasonProg && (
+                  <div className="ep-season-prog" role="region" aria-label={`Season ${season} download progress`}>
+                    <div className="ep-sp-head">
+                      <span className="ep-sp-stat">
+                        <strong>Season {season} downloads</strong>
+                        <small>
+                          {seasonProg.completed}/{seasonProg.total} offline
+                          {batchForSeason ? ` · queueing E${batchForSeason.currentEp ?? "…"} (${batchForSeason.queued}/${batchForSeason.total})` : ""}
+                          {seasonProg.active > 0 ? ` · ${seasonProg.active} downloading` : ""}
+                          {seasonProg.paused > 0 ? ` · ${seasonProg.paused} paused` : ""}
+                          {seasonProg.failed > 0 ? ` · ${seasonProg.failed} failed` : ""}
+                          {fmtSpeed(seasonProg.speedBps) ? ` · ${fmtSpeed(seasonProg.speedBps)}` : ""}
+                        </small>
+                      </span>
+                      <span className="ep-sp-right">
+                        {seasonProg.downloadingQualities.map((ql) => (
+                          <span key={`dl-${ql}`} className="dlq-badge-q" title={`Currently downloading in ${ql}`}>
+                            Downloading {ql}
+                          </span>
+                        ))}
+                        {seasonProg.downloadedQualities.map((ql) => (
+                          <span key={`sv-${ql}`} className="dlq-badge-q verified" title={`Saved offline in ${ql}`}>
+                            Saved {ql}
+                          </span>
+                        ))}
+                        <b>{Math.round(seasonProg.percent)}%</b>
+                        {seasonProg.active > 0 && (
+                          <button
+                            type="button"
+                            className="chip ep-sp-stop"
+                            title={`Pause active Season ${season} downloads`}
+                            onClick={() => void pauseAllDownloads({ canonicalKey, season })}
+                          >
+                            <Icon name="pause" size={11} /> Pause S{season}
+                          </button>
+                        )}
+                        {(seasonProg.paused > 0 || seasonProg.failed > 0) && (
+                          <button
+                            type="button"
+                            className="chip ep-sp-stop"
+                            title={`Resume or retry Season ${season} downloads`}
+                            onClick={() => void resumeAllDownloads({ canonicalKey, season })}
+                          >
+                            <Icon name="play" size={11} /> Resume S{season}
+                          </button>
+                        )}
+                        {(batchForSeason || seasonProg.active > 0 || seasonProg.paused > 0 || seasonProg.failed > 0) && (
+                          <button
+                            type="button"
+                            className="chip danger ep-sp-stop"
+                            title={`Stop & clear all Season ${season} transfers`}
+                            onClick={() => void cancelAllDownloads({ canonicalKey, season })}
+                          >
+                            <Icon name="x" size={11} /> Stop S{season}
+                          </button>
+                        )}
+                      </span>
+                    </div>
+                    <div className="ep-sp-track" aria-hidden>
+                      <div className="ep-sp-active" style={{ transform: `scaleX(${Math.max(0.01, seasonProg.percent / 100)})` }} />
+                      <div className="ep-sp-done" style={{ transform: `scaleX(${Math.max(0, seasonProg.completedPercent / 100)})` }} />
+                    </div>
+                  </div>
+                )}
                 {(paged || (airedCount ?? epList.length) > 12) && (
                   <div className="ep-tools">
                     {paged && (
@@ -795,7 +911,9 @@ export function Title() {
                     const watched = !!p && p.duration > 0 && p.position / p.duration > 0.92;
                     const left = p && p.duration > 0 && !watched ? Math.max(1, Math.round((p.duration - p.position) / 60)) : null;
 
-                    const epSaved = desktop && hasDownloadedEpisode(canonicalKey, season, e.number, audio, dl.items);
+                    const epEntry = desktop ? findDownloadedEpisode(canonicalKey, season, e.number, audio, dl.items) : undefined;
+                    const epSaved = Boolean(epEntry);
+                    const savedQTag = formatQualityTag(epEntry?.quality, epEntry?.qualityVerified);
                     const epJob = desktop
                       ? dl.jobs.find(
                           (j) =>
@@ -813,6 +931,7 @@ export function Title() {
                     const epPaused = epJob?.status === "paused";
                     const epFailed = epJob?.status === "failed";
                     const epResolving = desktop && batch.pendingKeys.has(batchEpisodeKey(canonicalKey, season, e.number, audio));
+                    const epQShort = epJob ? formatDownloadQuality(epJob).label.replace(/^Up to /, "") : null;
 
                     const cardEl = (
                       <button
@@ -824,12 +943,25 @@ export function Title() {
                         <div className="ec-th">
                           {still && <img src={still} alt="" loading="lazy" decoding="async" className={e.still ? "" : "dim"} />}
                           <span className="ec-num">{e.number}</span>
-                          {epSaved && <span className="ec-offline" title="Saved offline"><Icon name="download" size={11} /></span>}
+                          {epSaved && (
+                            <span
+                              className={`ec-offline ${savedQTag ? "has-q" : ""}`}
+                              title={savedQTag ? `Saved offline (${savedQTag}${epEntry?.videoCodec ? ` · ${epEntry.videoCodec}` : ""})` : "Saved offline"}
+                            >
+                              <Icon name="download" size={10} />
+                              {savedQTag && <span>{savedQTag}</span>}
+                            </span>
+                          )}
                           {isCur && <span className="ec-ribbon">{p && p.position > 30 ? "Resume" : "Up next"}</span>}
                           {watched && <span className="ec-seen" aria-label="Watched"><Icon name="check" size={12} /></span>}
                           {e.runtime ? <span className="ec-rt">{e.runtime}m</span> : null}
                           <span className="ec-play"><Icon name="play" size={18} /></span>
                           {p && p.duration > 0 && !watched && <div className="ec-bar"><i style={{ transform: `scaleX(${Math.min(1, p.position / p.duration)})` }} /></div>}
+                          {(epBusy || epPaused) && epJob && (
+                            <div className="ec-dl-bar" aria-hidden>
+                              <i style={{ transform: `scaleX(${Math.max(0.03, (epJob.percent || 0) / 100)})` }} />
+                            </div>
+                          )}
                         </div>
                         <div className="ec-tx">
                           <div className="ec-t">{e.title}</div>
@@ -842,16 +974,16 @@ export function Title() {
 
                     const epDlLabel = epBusy
                       ? epJob.status === "remuxing"
-                        ? "Saving to folder…"
-                        : `Pause E${e.number} (${Math.round(epJob.percent)}%)`
+                        ? `Saving E${e.number}${epQShort ? ` · ${epQShort}` : ""} (${epJob.providerName})…`
+                        : `Pause E${e.number} · Downloading ${epQShort ? `${epQShort} · ` : ""}${Math.round(epJob.percent)}% (${epJob.providerName})`
                       : epPaused
-                        ? `Resume E${e.number}`
+                        ? `Resume E${e.number}${epQShort ? ` · ${epQShort}` : ""} (${epJob.providerName})`
                         : epFailed
-                          ? `Retry E${e.number}`
+                          ? `Retry / Switch server for E${e.number}${epJob?.error ? ` (${epJob.error})` : ""}`
                           : epResolving
                             ? `Finding stream for E${e.number}…`
                             : epSaved
-                              ? `E${e.number} saved offline`
+                              ? `E${e.number} saved offline${savedQTag ? ` (${savedQTag})` : ""}`
                               : `Download E${e.number}`;
 
                     return (
@@ -859,14 +991,16 @@ export function Title() {
                         {cardEl}
                         <button
                           type="button"
-                          className={`ep-dl ${epBusy || epResolving ? "busy" : ""} ${epPaused ? "paused" : ""} ${epSaved ? "saved" : ""}`}
+                          className={`ep-dl ${epBusy || epResolving ? "busy" : ""} ${epPaused ? "paused" : ""} ${epFailed ? "failed" : ""} ${epSaved ? "saved" : ""}`}
                           title={epDlLabel}
                           aria-label={epDlLabel}
                           disabled={epJob?.status === "remuxing" || epResolving || (epSaved && !epBusy && !epPaused)}
                           onClick={() => {
                             if (epBusy && epJob) {
                               void pauseDownload(epJob.id);
-                            } else if ((epPaused || epFailed) && epJob) {
+                            } else if (epFailed && epJob) {
+                              void switchDownloadToNextServer(epJob);
+                            } else if (epPaused && epJob) {
                               void resumeDownload(epJob.id);
                             } else if (!epSaved && !epResolving) {
                               void queueEpisodeDownload(d, season, e, audio);
@@ -876,7 +1010,11 @@ export function Title() {
                           {epResolving ? (
                             <span className="mini-spin" />
                           ) : epBusy ? (
-                            <span>{epJob.status === "remuxing" ? "…" : `${Math.round(epJob.percent)}%`}</span>
+                            <span>
+                              {epJob.status === "remuxing"
+                                ? `${epQShort ?? ""}…`
+                                : `${epQShort ? `${epQShort} · ` : ""}${Math.round(epJob.percent)}%`}
+                            </span>
                           ) : epPaused ? (
                             <Icon name="play" size={12} />
                           ) : epFailed ? (

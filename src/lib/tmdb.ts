@@ -1,5 +1,5 @@
 import { whenAnimeMappingsHydrated } from "./animeMapping";
-import { cached } from "./cache";
+import { cached, peekCache } from "./cache";
 import { api, getAuth, isWakingError, whenServerAwake } from "./account";
 import { isFutureIsoDate, normalizeEpisodes, normalizeTmdbSeasons, tmdbReleaseWindows, todayIso, type RawTmdbSeason } from "./normalizer";
 import { getSettings } from "./settings";
@@ -203,6 +203,13 @@ export const FEEDS: Record<"home" | "movie" | "tv", Feed[]> = {
     { id: "crime", title: "Crime", path: "/discover/tv", kind: "tv", params: { with_genres: 80, sort_by: "popularity.desc" } },
   ],
 };
+
+export function peekFeed(f: Feed): Media[] | undefined {
+  if (!hasTmdb()) return undefined;
+  const params = liveParams(f);
+  const ttl = (f.ttl ?? 180) * 60_000;
+  return peekCache<Media[]>(`tmdb:v2:${f.path}:${JSON.stringify(params ?? {})}`, ttl);
+}
 
 export async function loadFeed(f: Feed, _i?: number): Promise<Media[]> {
   if (!hasTmdb()) return [];

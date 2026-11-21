@@ -5,8 +5,14 @@ import { useCallback, useEffect, useState } from "react";
  * so a page never renders title B with title A's details (pass keepPrevious for refreshes of the
  * same view). `reload()` re-runs it (for Retry buttons).
  */
-export function useAsync<T>(fn: () => Promise<T>, deps: unknown[], opts: { keepPrevious?: boolean } = {}) {
-  const [state, setState] = useState<{ data?: T; error?: Error; loading: boolean }>({ loading: true });
+export function useAsync<T>(
+  fn: () => Promise<T>,
+  deps: unknown[],
+  opts: { keepPrevious?: boolean; initialData?: T } = {},
+) {
+  const [state, setState] = useState<{ data?: T; error?: Error; loading: boolean }>(() =>
+    opts.initialData !== undefined ? { data: opts.initialData, loading: true } : { loading: true },
+  );
   const [nonce, setNonce] = useState(0);
   useEffect(() => {
     let live = true;
@@ -32,11 +38,17 @@ export function useAsync<T>(fn: () => Promise<T>, deps: unknown[], opts: { keepP
 export function useProgressiveFeeds<T>(
   loaders: (() => Promise<T>)[],
   deps: unknown[],
-  opts: { keepPrevious?: boolean } = {},
+  opts: { keepPrevious?: boolean; initialItems?: (T | undefined)[] } = {},
 ) {
   const [state, setState] = useState<{ items: (T | undefined)[]; settled: boolean[] }>(() => ({
-    items: new Array<T | undefined>(loaders.length).fill(undefined),
-    settled: new Array<boolean>(loaders.length).fill(false),
+    items:
+      opts.initialItems && opts.initialItems.length === loaders.length
+        ? opts.initialItems
+        : new Array<T | undefined>(loaders.length).fill(undefined),
+    settled:
+      opts.initialItems && opts.initialItems.length === loaders.length
+        ? opts.initialItems.map((x) => x !== undefined)
+        : new Array<boolean>(loaders.length).fill(false),
   }));
   const [nonce, setNonce] = useState(0);
 
@@ -48,7 +60,10 @@ export function useProgressiveFeeds<T>(
         opts.keepPrevious && prev.items.length === count
           ? prev.items
           : new Array<T | undefined>(count).fill(undefined),
-      settled: new Array<boolean>(count).fill(false),
+      settled:
+        opts.keepPrevious && prev.items.some((x) => x !== undefined) && prev.settled.length === count
+          ? prev.settled
+          : new Array<boolean>(count).fill(false),
     }));
     if (count === 0) return;
 

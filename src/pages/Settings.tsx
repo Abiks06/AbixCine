@@ -10,7 +10,14 @@ import { Icon } from "../components/Icon";
 import { SubtitleOverlay } from "../components/SubtitleOverlay";
 import { errorMessage, getApiBase, leaveGuest, signOut, updateProfile, useAuth } from "../lib/account";
 import { loadDebridConfig, saveDebridConfig, type DebridProvider } from "../lib/debrid";
-import { clearDownloadsConfig, configureDownloadsRoot, openDownloadsFolder, useDownloads } from "../lib/downloads";
+import {
+  clearDownloadsConfig,
+  configureDownloadsRoot,
+  migrateDownloadsFolder,
+  normalizePathKey,
+  openDownloadsFolder,
+  useDownloads,
+} from "../lib/downloads";
 import { toggleSource, updateSettings, useSettings } from "../lib/settings";
 import { resolveTheme, THEMES } from "../lib/themes";
 import { clearSubtitleSearchCache } from "../lib/subtitleProviders";
@@ -148,6 +155,8 @@ export function Settings() {
   const [scan, setScan] = useState<string | null>(null);
   const dl = useDownloads();
   const [dlNote, setDlNote] = useState<string | null>(null);
+  const [pendingDlFolder, setPendingDlFolder] = useState<string | null>(null);
+  const [dlMigrating, setDlMigrating] = useState(false);
   const [jfTest, setJfTest] = useState<string | null>(null);
   const [name, setName] = useState(user?.name ?? "");
   const [profileMsg, setProfileMsg] = useState<string | null>(null);
@@ -523,6 +532,51 @@ export function Settings() {
       if (mountedRef.current) setScan(`Scan failed: ${e instanceof Error ? e.message : String(e)}`);
     }
   };
+  const selectDownloadsTarget = async (dir: string) => {
+    setDlNote(null);
+    const trimmed = dir.trim();
+    if (!trimmed) return;
+    if (!s.downloadsPath) {
+      const root = await configureDownloadsRoot(trimmed);
+      if (mountedRef.current && root) setDlNote("Downloads vault ready");
+      return;
+    }
+    if (normalizePathKey(trimmed) === normalizePathKey(s.downloadsPath)) {
+      setPendingDlFolder(null);
+      setDlNote("Already using this folder");
+      return;
+    }
+    setPendingDlFolder(trimmed);
+  };
+
+  const applyPendingDownloadFolder = async (moveFiles: boolean) => {
+    if (!pendingDlFolder || dlMigrating) return;
+    setDlMigrating(true);
+    setDlNote(moveFiles ? "Moving downloaded files to new folder…" : "Switching Downloads folder…");
+    try {
+      const res = await migrateDownloadsFolder(pendingDlFolder, moveFiles);
+      if (!mountedRef.current) return;
+      setPendingDlFolder(null);
+      if (res.root) {
+        if (moveFiles) {
+          setDlNote(
+            res.movedFiles > 0
+              ? `Moved ${res.movedFiles} file${res.movedFiles === 1 ? "" : "s"} to the new Downloads folder`
+              : "Switched Downloads folder",
+          );
+        } else {
+          setDlNote("Switched Downloads folder (previous files kept in old location)");
+        }
+      }
+    } catch (e: unknown) {
+      if (mountedRef.current) {
+        setDlNote(`Couldn't change folder: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    } finally {
+      if (mountedRef.current) setDlMigrating(false);
+    }
+  };
+
   const chooseDownloadFolder = async () => {
     setDlNote(null);
     try {
@@ -533,8 +587,7 @@ export function Settings() {
         title: "Choose or create a Downloads folder",
       });
       if (!mountedRef.current || typeof dir !== "string" || !dir.trim()) return;
-      const root = await configureDownloadsRoot(dir);
-      if (mountedRef.current && root) setDlNote("Downloads vault ready");
+      await selectDownloadsTarget(dir);
     } catch (e: unknown) {
       if (mountedRef.current) setDlNote(`Couldn't set folder: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -791,30 +844,68 @@ export function Settings() {
             </div>
           ) : null}
           <div className="field-row">
-            <button type="button" className="btn btn-ion sm" onClick={() => void chooseDownloadFolder()} disabled={!isTauri()}>
+            <button
+              type="button"
+              className="btn btn-ion sm"
+              onClick={() => void chooseDownloadFolder()}
+              disabled={!isTauri() || dlMigrating}
+            >
               <Icon name="folder" size={15} /> {s.downloadsPath ? "Change folder" : "Choose or create folder"}
             </button>
-            {dl.defaultDir && dl.defaultDir !== s.downloadsPath && (
+            {dl.defaultDir && normalizePathKey(dl.defaultDir) !== normalizePathKey(s.downloadsPath) && (
               <button
                 type="button"
                 className="btn btn-glass sm"
-                disabled={!isTauri()}
-                onClick={() => {
-                  setDlNote(null);
-                  void configureDownloadsRoot(dl.defaultDir!).then(() => mountedRef.current && setDlNote("Using default folder"));
-                }}
+                disabled={!isTauri() || dlMigrating}
+                onClick={() => void selectDownloadsTarget(dl.defaultDir!)}
               >
                 Use default
               </button>
             )}
             {s.downloadsPath && (
-              <button type="button" className="btn btn-glass sm" onClick={() => void openDownloadsFolder(s.downloadsPath)}>
+              <button type="button" className="btn btn-glass sm" disabled={dlMigrating} onClick={() => void openDownloadsFolder(s.downloadsPath)}>
                 Open folder
               </button>
             )}
             {dlNote && <span className="muted">{dlNote}</span>}
             {!isTauri() && <span className="muted">Offline downloads work in the desktop app.</span>}
           </div>
+          {pendingDlFolder && (
+            <div className="dl-migrate-box" role="region" aria-label="Change Downloads folder">
+              <div className="dl-migrate-head">
+                <strong>Switch Downloads folder</strong>
+                <span>Move existing offline titles and queued metadata to the new location?</span>
+              </div>
+              <code className="dl-migrate-dest">{pendingDlFolder}</code>
+              <div className="field-row">
+                <button
+                  type="button"
+                  className="btn btn-ion sm"
+                  disabled={dlMigrating}
+                  onClick={() => void applyPendingDownloadFolder(true)}
+                >
+                  <Icon name="download" size={14} />{" "}
+                  {dlMigrating ? "Moving files…" : "Move files & switch (Migrate)"}
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-glass sm"
+                  disabled={dlMigrating}
+                  onClick={() => void applyPendingDownloadFolder(false)}
+                >
+                  Switch without moving
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-glass sm"
+                  disabled={dlMigrating}
+                  onClick={() => setPendingDlFolder(null)}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
         </div>
 
         <button className="expander" onClick={() => setShowExternal((x) => !x)} aria-expanded={showExternal}>
@@ -1166,7 +1257,7 @@ export function Settings() {
           <AudioToggle value={s.animeAudio} onChange={(a) => updateSettings({ animeAudio: a })} />
         </div>
         <div className="setting-line">
-          <div><strong>Preferred quality</strong><span className="muted">Used to rank sources.</span></div>
+          <div><strong>Preferred quality</strong><span className="muted">Used to rank streams and target download quality (picks closest resolution up to this limit).</span></div>
           <div className="tabs">
             {[2160, 1080, 720, 480].map((q) => (
               <button key={q} className={`chip ${s.preferredQuality === q ? "on" : ""}`} onClick={() => updateSettings({ preferredQuality: q })}>{q === 2160 ? "4K" : `${q}p`}</button>
