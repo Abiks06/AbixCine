@@ -87,11 +87,54 @@ const showWindowButtons = () => isTauri() || (import.meta.env.DEV && location.se
 /** Minimise / maximise / close for the borderless window. Shared by the utility bar and sign-in. */
 export function WindowButtons() {
   const w = useMemo(appWindow, []);
+  const [maximized, setMaximized] = useState(false);
+
+  useEffect(() => {
+    if (!w) return;
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    let timer: number | undefined;
+
+    const sync = () => {
+      void w
+        .isMaximized()
+        .then((m) => {
+          if (!cancelled) setMaximized(m);
+        })
+        .catch(() => {});
+    };
+
+    sync();
+    void w
+      .onResized(() => {
+        window.clearTimeout(timer);
+        timer = window.setTimeout(sync, 60);
+      })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+      unlisten?.();
+    };
+  }, [w]);
+
   if (!showWindowButtons()) return null;
   return (
     <div className="win">
       <button aria-label="Minimize" onClick={() => w?.minimize()}><Icon name="min" size={14} /></button>
-      <button aria-label="Maximize" onClick={() => w?.toggleMaximize()}><Icon name="max" size={12} /></button>
+      <button
+        aria-label={maximized ? "Restore" : "Maximize"}
+        title={maximized ? "Restore" : "Maximize"}
+        aria-pressed={maximized}
+        onClick={() => w?.toggleMaximize()}
+      >
+        <Icon name="max" size={12} />
+      </button>
       <button aria-label="Close" className="close" onClick={() => w?.close()}><Icon name="x" size={14} /></button>
     </div>
   );

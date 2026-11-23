@@ -15,6 +15,9 @@ export type SubBg = "glass" | "box" | "none";
 export type SubEdge = "shadow" | "outline" | "raised" | "none";
 export type SubMode = "auto" | "on" | "off";
 export type SubHIFilter = "any" | "avoid" | "prefer";
+export type SubSignLayout = "separate" | "positioned" | "hide";
+export type SubAssMode = "native" | "clean";
+export type CueKind = "dialogue" | "sign" | "song";
 
 export interface SubPref {
   /** Legacy explicit on/off; undefined means "auto" (on for subbed anime / foreign language). */
@@ -35,6 +38,10 @@ export interface SubPref {
   lineHeight: number;
   preferHearingImpaired: SubHIFilter;
   autoFetchOnline: boolean;
+  /** How anime signs/typesetting/on-screen translations are presented relative to dialogue. */
+  signLayout: SubSignLayout;
+  /** Whether ASS/SSA tracks use the libass WASM renderer ("native") or AbixCine's clean DOM layout ("clean"). */
+  assMode: SubAssMode;
 }
 
 export interface CueSpan {
@@ -58,6 +65,8 @@ export interface SubtitleCue {
   align: CueAlign;
   pos?: { xPct: number; yPct: number };
   layer?: number;
+  kind?: CueKind;
+  styleName?: string;
 }
 
 export interface ParsedSubtitles {
@@ -219,6 +228,8 @@ export const DEFAULT_SUB_PREF: SubPref = {
   lineHeight: 1.35,
   preferHearingImpaired: "any",
   autoFetchOnline: false,
+  signLayout: "separate",
+  assMode: "native",
 };
 
 const CUE_SIZES = new Set<CueSize>(["xs", "s", "m", "l", "xl"]);
@@ -227,6 +238,8 @@ const SUB_BGS = new Set<SubBg>(["glass", "box", "none"]);
 const SUB_EDGES = new Set<SubEdge>(["shadow", "outline", "raised", "none"]);
 const SUB_MODES = new Set<SubMode>(["auto", "on", "off"]);
 const SUB_HI = new Set<SubHIFilter>(["any", "avoid", "prefer"]);
+const SUB_SIGN_LAYOUTS = new Set<SubSignLayout>(["separate", "positioned", "hide"]);
+const SUB_ASS_MODES = new Set<SubAssMode>(["native", "clean"]);
 
 const clamp = (n: number, min: number, max: number) => Math.min(max, Math.max(min, n));
 
@@ -282,6 +295,12 @@ export function normalizeSubPref(raw?: Partial<SubPref> | Record<string, unknown
       ? (src.preferHearingImpaired as SubHIFilter)
       : DEFAULT_SUB_PREF.preferHearingImpaired,
     autoFetchOnline: typeof src.autoFetchOnline === "boolean" ? src.autoFetchOnline : DEFAULT_SUB_PREF.autoFetchOnline,
+    signLayout: SUB_SIGN_LAYOUTS.has(src.signLayout as SubSignLayout)
+      ? (src.signLayout as SubSignLayout)
+      : DEFAULT_SUB_PREF.signLayout,
+    assMode: SUB_ASS_MODES.has(src.assMode as SubAssMode)
+      ? (src.assMode as SubAssMode)
+      : DEFAULT_SUB_PREF.assMode,
   };
 }
 
@@ -751,6 +770,57 @@ function lookupAssStyle(styles: Map<string, AssStyle>, name: string): AssStyle {
   );
 }
 
+const ASS_SONG_RX = /(?:^|[\W_])(op|ed|song|songs|lyric|lyrics|romaji|kanji|karaoke|opening|ending|insert)\d*(?:$|[\W_])/i;
+const ASS_SIGN_RX = /(?:^|[\W_])(sign|signs|title|caption|captions|note|notes|screen|text|label|card|board|phone|letter|banner|typeset(?:ting)?|ts|eyecatch|chapter|next|preview|credit|credits|staff|info|date|location|placard)\d*(?:$|[\W_])/i;
+const ASS_DIALOGUE_STYLE_RX = /^(?:\*?)(?:default|main|dialogue|dialog|italics?|narrator|narration|flashback|thoughts?|overlap|top[-_\s]?dialogue|speech|sub|subs)(?:[\s._-]?\d*)?$/i;
+const SIGN_TEXT_PREFIX_RX = /^\s*(?:\[\s*(?:sign|text|note|title|caption|on[- ]?screen)[^\]]*\]|\(\s*(?:sign|text|note|title|caption)[^)]*\)|【[^】]+】)/i;
+
+function splitStyleTokens(value: string): string {
+  return value.replace(/([a-z])([A-Z])/g, "$1 $2");
+}
+
+function classifyAssCue(
+  styleName: string,
+  actorName: string,
+  align: CueAlign,
+  pos: { xPct: number; yPct: number } | undefined,
+  text: string,
+): CueKind {
+  const trimmed = text.trim();
+  const styleTokens = splitStyleTokens(styleName);
+  const actorTokens = splitStyleTokens(actorName);
+  if (ASS_SONG_RX.test(styleTokens) || ASS_SONG_RX.test(actorTokens) || /^[♪♫].*[♪♫]$/s.test(trimmed)) {
+    return "song";
+  }
+  if (ASS_SIGN_RX.test(styleTokens) || ASS_SIGN_RX.test(actorTokens)) {
+    return "sign";
+  }
+  const isExplicitDialogue = ASS_DIALOGUE_STYLE_RX.test(styleName.trim());
+  if (pos && (!isExplicitDialogue || pos.yPct < 75)) {
+    return "sign";
+  }
+  if (align >= 4 && !isExplicitDialogue) {
+    return "sign";
+  }
+  if (SIGN_TEXT_PREFIX_RX.test(trimmed)) {
+    return "sign";
+  }
+  return "dialogue";
+}
+
+export function classifyTextCue(
+  text: string,
+  align: CueAlign,
+  pos?: { xPct: number; yPct: number },
+): CueKind {
+  const trimmed = text.trim();
+  if (/^[♪♫].*[♪♫]$/s.test(trimmed)) return "song";
+  if (SIGN_TEXT_PREFIX_RX.test(trimmed)) return "sign";
+  if (pos && pos.yPct < 75) return "sign";
+  if (align >= 4) return "sign";
+  return "dialogue";
+}
+
 function parseAssSubtitles(normalized: string): SubtitleCue[] {
   const lines = normalized.split("\n");
   let section = "";
@@ -832,12 +902,16 @@ function parseAssSubtitles(normalized: string): SubtitleCue[] {
         const layer = Number.isFinite(layerVal) ? layerVal : 0;
 
         const styleIdx = idxOf("style");
-        const baseStyle = lookupAssStyle(styles, styleIdx >= 0 ? (fields[styleIdx] ?? "") : "");
+        const styleName = styleIdx >= 0 ? (fields[styleIdx] ?? "").trim() : "";
+        const nameIdx = idxOf("name");
+        const actorName = nameIdx >= 0 ? (fields[nameIdx] ?? "").trim() : "";
+        const baseStyle = lookupAssStyle(styles, styleName);
 
         const rawText = textIdx >= 0 ? (fields[textIdx] ?? "") : (fields[fields.length - 1] ?? "");
         const parsed = parseAssDialogueText(rawText, baseStyle, styles, playResX, playResY);
         const text = parsed.spans.map((s) => s.text).join("");
         if (!text.trim()) continue;
+        const kind = classifyAssCue(styleName, actorName, parsed.align, parsed.pos, text);
 
         cues.push({
           id: `ass-${cues.length + 1}`,
@@ -848,6 +922,8 @@ function parseAssSubtitles(normalized: string): SubtitleCue[] {
           align: parsed.align,
           ...(parsed.pos ? { pos: parsed.pos } : {}),
           layer,
+          kind,
+          ...(styleName ? { styleName } : {}),
         });
       }
     }
@@ -1039,15 +1115,19 @@ function parseVttCueSettings(settingsStr: string): { align: CueAlign; pos?: { xP
         const pct = clamp(Number(pctMatch[1]), 0, 100);
         yPct = pct;
         row = pct < 33.34 ? 2 : pct <= 66.66 ? 1 : 0;
-      } else if (/^\d+$/.test(head)) {
+      } else if (/^-?\d+$/.test(head)) {
         const lineNum = Number(head);
         if (lineNum >= 0 && lineNum < 5) row = 2;
+        else if (lineNum < 0) row = 0;
       }
     }
   }
 
   const align = toCueAlign(row * 3 + col + 1);
-  if (xPct !== undefined || yPct !== undefined) {
+  const isStandardBottom =
+    (yPct === undefined || yPct >= 78) &&
+    (xPct === undefined || (xPct >= 40 && xPct <= 60));
+  if ((xPct !== undefined || yPct !== undefined) && !isStandardBottom) {
     return {
       align,
       pos: {
@@ -1127,15 +1207,18 @@ function parseVttOrSrtSubtitles(normalized: string, format: "vtt" | "srt"): Subt
     const text = spans.map((s) => s.text).join("");
     if (!text.trim()) continue;
 
+    const align = alignOverride ?? vttAlign;
     const pos = posOverride ?? vttPos;
+    const kind = classifyTextCue(text, align, pos);
     cues.push({
       id: cueId || `${format}-${cues.length + 1}`,
       start,
       end,
       text,
       spans,
-      align: alignOverride ?? vttAlign,
+      align,
       ...(pos ? { pos } : {}),
+      kind,
     });
   }
 
@@ -1324,6 +1407,193 @@ export function activeCuesAt(cues: readonly SubtitleCue[], timeSec: number, offs
   }
   matched.reverse();
   return matched;
+}
+
+export interface PositionedCue {
+  cue: SubtitleCue;
+  xPct: number;
+  yPct: number;
+}
+
+export interface SubtitleLayout {
+  zones: Map<CueAlign, SubtitleCue[]>;
+  positioned: PositionedCue[];
+  signs: SubtitleCue[];
+  songs: SubtitleCue[];
+}
+
+const SHORT_WRAPPED_SIGN_RX = /^(?:\[[^\]\n]{1,48}\]|\([^)\n]{1,48}\)|【[^】\n]{1,48}】)$/;
+
+function effectiveCueKind(cue: SubtitleCue): CueKind {
+  if (cue.kind) return cue.kind;
+  return classifyTextCue(cue.text, toCueAlign(cue.align), cue.pos);
+}
+
+function horizInterval(xPct: number, halfW: number, align: CueAlign): [number, number] {
+  const col = (align - 1) % 3;
+  if (col === 0) return [xPct, xPct + 2 * halfW];
+  if (col === 2) return [xPct - 2 * halfW, xPct];
+  return [xPct - halfW, xPct + halfW];
+}
+
+/**
+ * Separate spoken dialogue, anime signs/typesetting, and OP/ED lyrics cleanly without overlap.
+ * Deduplicates layered ASS duplicates, promotes unlabeled inline signs alongside spoken lines,
+ * and resolves 2D vertical collisions when rendering signs in `"positioned"` mode.
+ */
+export function layoutActiveCues(
+  cues: readonly SubtitleCue[],
+  signLayout: SubSignLayout = "separate",
+): SubtitleLayout {
+  const zones = new Map<CueAlign, SubtitleCue[]>();
+  const positioned: PositionedCue[] = [];
+  const songs: SubtitleCue[] = [];
+
+  if (!cues.length) {
+    return { zones, positioned, signs: [], songs };
+  }
+
+  // Step A: deduplicate simultaneous identical cues (e.g., layered ASS shadow/outline clones).
+  const deduped: Array<{ cue: SubtitleCue; kind: CueKind }> = [];
+  const seen = new Set<string>();
+  for (const cue of cues) {
+    const norm = cue.text.replace(/\s+/g, " ").trim();
+    if (!norm) continue;
+    const kind = effectiveCueKind(cue);
+    const key = `${kind}::${norm}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push({ cue, kind });
+  }
+
+  // Step B: promote unlabeled anime signs/item labels when co-occurring with normal dialogue.
+  const bottomDialogue = deduped.filter(
+    (item) => item.kind === "dialogue" && toCueAlign(item.cue.align) <= 3 && !item.cue.pos,
+  );
+  if (bottomDialogue.length >= 2) {
+    for (const item of bottomDialogue) {
+      const hasOtherMixedCase = bottomDialogue.some((other) => other !== item && /[a-z]/.test(other.cue.text));
+      if (!hasOtherMixedCase) continue;
+      const trimmed = item.cue.text.trim();
+      const isWrapped = SHORT_WRAPPED_SIGN_RX.test(trimmed);
+      const letterCount = trimmed.match(/[A-Za-z]/g)?.length ?? 0;
+      const isShortAllCaps =
+        trimmed.length <= 40 &&
+        letterCount >= 3 &&
+        !/[a-z]/.test(trimmed) &&
+        !/[?!]$/.test(trimmed);
+      if (isWrapped || isShortAllCaps) {
+        item.kind = "sign";
+      }
+    }
+  }
+
+  // Step C: route cues by kind and layout mode.
+  const rawSigns: SubtitleCue[] = [];
+  const posCandidates: SubtitleCue[] = [];
+  const pushZone = (align: CueAlign, cue: SubtitleCue) => {
+    const bucket = zones.get(align);
+    if (bucket) bucket.push(cue);
+    else zones.set(align, [cue]);
+  };
+
+  for (const { cue, kind } of deduped) {
+    if (kind === "song") {
+      if (signLayout === "hide") continue;
+      songs.push(cue);
+      continue;
+    }
+    if (kind === "sign") {
+      if (signLayout === "hide") continue;
+      if (signLayout === "separate") {
+        rawSigns.push(cue);
+      } else if (cue.pos) {
+        posCandidates.push(cue);
+      } else {
+        const z = toCueAlign(cue.align);
+        pushZone(z >= 4 ? z : 8, cue);
+      }
+      continue;
+    }
+    if (cue.pos && signLayout === "positioned") {
+      posCandidates.push(cue);
+    } else {
+      pushZone(toCueAlign(cue.align), cue);
+    }
+  }
+
+  // Cap separate signs at 4 concurrent unique labels (prioritizing newest / shortest).
+  let signs = rawSigns;
+  if (rawSigns.length > 4) {
+    const topIndices = new Set(
+      rawSigns
+        .map((c, idx) => ({ c, idx }))
+        .sort((a, b) => (b.c.start - a.c.start) || (a.c.text.length - b.c.text.length))
+        .slice(0, 4)
+        .map((x) => x.idx),
+    );
+    signs = rawSigns.filter((_, idx) => topIndices.has(idx));
+  }
+
+  // Step D: 2D collision avoidance for positioned cues.
+  if (posCandidates.length > 0) {
+    const hasBottomDialogue = zones.has(1) || zones.has(2) || zones.has(3);
+    const minY = 8;
+    const maxY = hasBottomDialogue ? 74 : 86;
+
+    const boxes = posCandidates
+      .map((cue) => {
+        const align = toCueAlign(cue.align);
+        const lines = cue.text.split("\n");
+        const maxLineChars = Math.max(...lines.map((l) => l.length), 1);
+        const halfW = Math.min(40, Math.max(10, maxLineChars * 0.9));
+        const heightPct = Math.max(1, lines.length) * 5.2 + 3.0;
+        const xPct = clamp(cue.pos!.xPct, 6, 94);
+        const yPct = clamp(cue.pos!.yPct, minY, maxY);
+        const [xLeft, xRight] = horizInterval(xPct, halfW, align);
+        return { cue, xPct, yPct, xLeft, xRight, heightPct };
+      })
+      .sort((a, b) => a.yPct - b.yPct || a.xPct - b.xPct);
+
+    for (let i = 0; i < boxes.length; i++) {
+      const cur = boxes[i];
+      for (let j = 0; j < i; j++) {
+        const prev = boxes[j];
+        if (cur.xLeft < prev.xRight && prev.xLeft < cur.xRight) {
+          const minGap = (prev.heightPct + cur.heightPct) / 2;
+          if (cur.yPct - prev.yPct < minGap) {
+            cur.yPct = prev.yPct + minGap;
+          }
+        }
+      }
+    }
+
+    if (boxes.some((b) => b.yPct > maxY)) {
+      for (let i = boxes.length - 1; i >= 0; i--) {
+        const cur = boxes[i];
+        cur.yPct = Math.min(cur.yPct, maxY);
+        for (let j = boxes.length - 1; j > i; j--) {
+          const below = boxes[j];
+          if (cur.xLeft < below.xRight && below.xLeft < cur.xRight) {
+            const minGap = (cur.heightPct + below.heightPct) / 2;
+            if (below.yPct - cur.yPct < minGap) {
+              cur.yPct = Math.max(minY, below.yPct - minGap);
+            }
+          }
+        }
+      }
+    }
+
+    for (const b of boxes) {
+      positioned.push({
+        cue: b.cue,
+        xPct: Math.round(b.xPct * 100) / 100,
+        yPct: Math.round(clamp(b.yPct, minY, maxY) * 100) / 100,
+      });
+    }
+  }
+
+  return { zones, positioned, signs, songs };
 }
 
 /* ------------------------------------------- smart matching & track memory */

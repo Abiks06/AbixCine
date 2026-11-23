@@ -27,7 +27,7 @@ const MAX_LOG_BYTES: u64 = 256 * 1024;
 /// arguments (WebView2 runs one browser per folder), so the main window and sniff windows both
 /// read [`browser_args`].
 pub const BASE_BROWSER_ARGS: &str =
-    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required";
+    "--disable-features=msWebOOUI,msPdfOOUI --autoplay-policy=no-user-gesture-required";
 const SAFE_GPU_ARGS: &str = "--disable-gpu --disable-gpu-compositing";
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -268,5 +268,10 @@ mod tests {
         let s = stamp();
         assert_eq!(s.len(), 20, "{s}");
         assert!(s.ends_with('Z'));
+    }
+
+    #[test]
+    fn base_browser_args_excludes_smartscreen_disable() {
+        assert!(!BASE_BROWSER_ARGS.contains("SmartScreen"));
     }
 }

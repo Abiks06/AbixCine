@@ -701,10 +701,13 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     }
 
     saveNowRef.current();
+    clearTimeout(bumpTimer.current);
+    setBump(null);
     failedSessionRef.current = -1;
     started.current = false;
     setHasStarted(false);
     setPlaying(false);
+    setWaiting(true);
     setLiveStreamId(null);
     setFatal(null);
     setRecovering(false);
@@ -1236,15 +1239,15 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
               </button>
             )}
             {!isEmbed && <button className={`pbtn icon ${keysOpen ? "on" : ""}`} onClick={() => setKeysOpen((x) => !x)} aria-label="Keyboard shortcuts" title="Keyboard shortcuts (?)"><Icon name="keys" size={18} /></button>}
-            <button className="pbtn icon" onClick={toggleFull} aria-label="Fullscreen" title="Fullscreen (F)"><Icon name={isFull ? "unfull" : "full"} size={18} /></button>
+            {isEmbed && <button className="pbtn icon" onClick={toggleFull} aria-label="Fullscreen" title="Fullscreen (F)"><Icon name={isFull ? "unfull" : "full"} size={18} /></button>}
           </div>
         </header>
 
         {!isEmbed && (
-          <div className={`center-controls ${paused && !fatal ? "show" : ""}`} onClick={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()}>
-            <button className="cc-btn" onClick={() => seek(-10)} aria-label="Back 10 seconds"><Icon name="replay10" size={26} /></button>
-            <button className="cc-btn main" onClick={toggle} aria-label={playing ? "Pause" : "Play"}><Icon name={playing ? "pause" : "play"} size={34} /></button>
-            <button className="cc-btn" onClick={() => seek(10)} aria-label="Forward 10 seconds"><Icon name="fwd10" size={26} /></button>
+          <div className={`center-controls ${paused && !fatal && !comparing && !keysOpen && !(showUpNext && ended) ? "show" : ""}`} onClick={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()}>
+            <button className="cc-btn" onClick={() => seek(-10)} aria-label="Back 10 seconds"><Icon name="replay10" size={24} /></button>
+            <button className="cc-btn main" onClick={toggle} aria-label="Play"><Icon name="play" size={28} /></button>
+            <button className="cc-btn" onClick={() => seek(10)} aria-label="Forward 10 seconds"><Icon name="fwd10" size={24} /></button>
           </div>
         )}
 
@@ -1268,7 +1271,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
             />
             <div className="prow">
               <div className="pc">
-                <button className="pbtn round big" onClick={toggle} aria-label={playing ? "Pause" : "Play"}><Icon name={playing ? "pause" : "play"} size={20} /></button>
+                <button className={`pbtn play-toggle ${playing ? "" : "is-play"}`} onClick={toggle} aria-label={playing ? "Pause" : "Play"}><Icon name={playing ? "pause" : "play"} size={20} /></button>
                 <button className="pbtn icon" onClick={() => seek(-10)} aria-label="Back 10 seconds"><Icon name="replay10" size={20} /></button>
                 <button className="pbtn icon" onClick={() => seek(10)} aria-label="Forward 10 seconds"><Icon name="fwd10" size={20} /></button>
                 {onNext && <button className="pbtn icon" onClick={goNext} aria-label="Next episode" title="Next episode (N)"><Icon name="next" size={20} /></button>}
@@ -1449,6 +1452,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
               onLoadOnline={(res, asDual) => void loadOnlineResult(res, asDual)}
               loadingOnlineId={loadingOnlineId}
               loadedOnlineMap={loadedOnlineMap}
+              isAssTrack={isPrimAss}
             />
           )}
 

@@ -1708,6 +1708,35 @@ fn cleanup_before_exit(app: &tauri::AppHandle) {
     let _ = pids;
 }
 
+static FULLSCREEN_WAS_MAXIMIZED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[tauri::command]
+fn get_window_fullscreen(window: tauri::WebviewWindow) -> Result<bool, String> {
+    window.is_fullscreen().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_window_fullscreen(window: tauri::WebviewWindow, fullscreen: bool) -> Result<bool, String> {
+    let currently_full = window.is_fullscreen().unwrap_or(false);
+    if fullscreen {
+        if !currently_full {
+            let was_max = window.is_maximized().unwrap_or(false);
+            FULLSCREEN_WAS_MAXIMIZED.store(was_max, std::sync::atomic::Ordering::SeqCst);
+            if was_max {
+                let _ = window.unmaximize();
+            }
+        }
+        window.set_fullscreen(true).map_err(|e| e.to_string())?;
+    } else {
+        window.set_fullscreen(false).map_err(|e| e.to_string())?;
+        if FULLSCREEN_WAS_MAXIMIZED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            let _ = window.maximize();
+        }
+    }
+    window.is_fullscreen().map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn prepare_for_update_exit(app: tauri::AppHandle) {
     cleanup_before_exit(&app);
@@ -1917,6 +1946,8 @@ pub fn run() {
             downloads::download_list,
             downloads::download_open_folder,
             prepare_for_update_exit,
+            get_window_fullscreen,
+            set_window_fullscreen,
             diagnostics::app_ready,
             gateway::stream_gateway,
             diagnostics::reset_safe_mode,

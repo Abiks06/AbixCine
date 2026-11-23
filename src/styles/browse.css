@@ -770,6 +770,9 @@
   .card:hover .card-acts:has(.dismiss) .act:not(.dismiss) { opacity: 0; pointer-events: none; }
   .card[data-preview-open="1"] .card-acts { opacity: 0 !important; pointer-events: none !important; }
 }
+.card:focus-within .gate-brackets::after,
+.card:has(.card-acts .on) .gate-brackets::after,
+.card:hover:has(.card-acts .dismiss) .gate-brackets::after { opacity: 0; }
 .act {
   width: 28px;
   height: 28px;
@@ -1571,7 +1574,7 @@ p.muted.drive-note { margin: 0; max-width: 64ch; line-height: 1.6; }
 .ep-grid.compact .ec-th { aspect-ratio: auto; height: 82px; background: var(--s0); }
 .ep-grid.compact .ec-th::after { background: radial-gradient(120% 140% at 100% 0%, color-mix(in oklab, var(--tone) 18%, transparent), transparent 60%); }
 .ep-grid.compact .ec-num { font-size: 36px; left: 12px; bottom: 8px; }
-.ep-grid.compact .ec-play { left: auto; right: 12px; top: 50%; margin: -17px 0 0; width: 34px; height: 34px; }
+.ep-grid.compact .ec-play { left: 50%; top: 50%; margin: -17px; width: 34px; height: 34px; }
 .ep-grid.compact .ep-card { gap: 7px; }
 .ep-grid.compact .ec-t { font-size: 13px; }
 .ep-grid.compact .ec-d { -webkit-line-clamp: 1; }

@@ -29,7 +29,7 @@ const DIRECT_MAX_RECONNECTS: usize = 3;
 const DIRECT_MIN_VALID_BYTES: u64 = 65_536;
 const STALL_WINDOW_SECS: f64 = 25.0;
 const STALL_MIN_BPS: f64 = 4096.0;
-const MAX_SUBTITLE_TRACKS: usize = 4;
+const MAX_SUBTITLE_TRACKS: usize = 8;
 const MAX_SUBTITLE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ART_BYTES: usize = 4 * 1024 * 1024;
 const EVENT_PROGRESS: &str = "abx://download-progress";
@@ -105,6 +105,8 @@ pub struct DownloadSubtitleReq {
     pub is_forced: Option<bool>,
     #[serde(default)]
     pub is_hearing_impaired: Option<bool>,
+    #[serde(default)]
+    pub content: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -153,6 +155,8 @@ pub struct DownloadStartReq {
     pub preferred_quality: Option<u32>,
     #[serde(default)]
     pub subtitles: Vec<DownloadSubtitleReq>,
+    #[serde(default)]
+    pub preferred_sub_langs: Vec<String>,
     #[serde(default)]
     pub fallbacks: Vec<DownloadFallbackSource>,
     #[serde(default)]
@@ -203,6 +207,8 @@ pub struct DownloadJob {
     pub preferred_quality: Option<u32>,
     #[serde(default)]
     pub subtitles: Vec<DownloadSubtitleReq>,
+    #[serde(default)]
+    pub preferred_sub_langs: Vec<String>,
     #[serde(default)]
     pub fallbacks: Vec<DownloadFallbackSource>,
     #[serde(default)]
@@ -586,6 +592,25 @@ pub(crate) struct HlsVariant {
     pub bandwidth: u64,
     pub height: Option<u32>,
     pub audio_group: Option<String>,
+    #[serde(default)]
+    pub subtitles_group: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct HlsSubtitleRendition {
+    pub group_id: String,
+    pub uri: String,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub is_default: bool,
+    #[serde(default)]
+    pub autoselect: bool,
+    #[serde(default)]
+    pub forced: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -639,6 +664,8 @@ struct HlsWorkState {
     selected_bandwidth: Option<u64>,
     #[serde(default)]
     available_heights: Vec<u32>,
+    #[serde(default)]
+    subtitles: Vec<HlsSubtitleRendition>,
 }
 
 fn parse_attr_list(raw: &str) -> HashMap<String, String> {
@@ -706,10 +733,14 @@ fn infer_height_from_hint(name_attr: Option<&str>, uri: &str) -> Option<u32> {
     None
 }
 
-pub(crate) fn parse_master_playlist(text: &str, base_url: &str) -> Result<(Vec<HlsVariant>, Vec<HlsAudioRendition>), String> {
+pub(crate) fn parse_master_playlist_full(
+    text: &str,
+    base_url: &str,
+) -> Result<(Vec<HlsVariant>, Vec<HlsAudioRendition>, Vec<HlsSubtitleRendition>), String> {
     let base = url::Url::parse(base_url).map_err(|e| format!("Invalid master playlist URL: {e}"))?;
     let mut variants = Vec::new();
     let mut audios = Vec::new();
+    let mut subtitles = Vec::new();
     let mut pending_inf: Option<HashMap<String, String>> = None;
 
     for raw_line in text.lines() {
@@ -719,7 +750,8 @@ pub(crate) fn parse_master_playlist(text: &str, base_url: &str) -> Result<(Vec<H
         }
         if let Some(rest) = line.strip_prefix("#EXT-X-MEDIA:") {
             let attrs = parse_attr_list(rest);
-            if attrs.get("TYPE").map(String::as_str) == Some("AUDIO") {
+            let media_type = attrs.get("TYPE").map(String::as_str);
+            if media_type == Some("AUDIO") {
                 if let (Some(group_id), Some(uri)) = (attrs.get("GROUP-ID"), attrs.get("URI")) {
                     if !uri.trim().is_empty() {
                         audios.push(HlsAudioRendition {
@@ -728,6 +760,20 @@ pub(crate) fn parse_master_playlist(text: &str, base_url: &str) -> Result<(Vec<H
                             language: attrs.get("LANGUAGE").cloned(),
                             is_default: attrs.get("DEFAULT").map(String::as_str) == Some("YES"),
                             autoselect: attrs.get("AUTOSELECT").map(String::as_str) == Some("YES"),
+                        });
+                    }
+                }
+            } else if media_type == Some("SUBTITLES") {
+                if let (Some(group_id), Some(uri)) = (attrs.get("GROUP-ID"), attrs.get("URI")) {
+                    if !uri.trim().is_empty() {
+                        subtitles.push(HlsSubtitleRendition {
+                            group_id: group_id.clone(),
+                            uri: stream::resolve(&base, uri),
+                            language: attrs.get("LANGUAGE").cloned(),
+                            name: attrs.get("NAME").cloned(),
+                            is_default: attrs.get("DEFAULT").map(String::as_str) == Some("YES"),
+                            autoselect: attrs.get("AUTOSELECT").map(String::as_str) == Some("YES"),
+                            forced: attrs.get("FORCED").map(String::as_str) == Some("YES"),
                         });
                     }
                 }
@@ -757,15 +803,22 @@ pub(crate) fn parse_master_playlist(text: &str, base_url: &str) -> Result<(Vec<H
                 })
                 .or_else(|| infer_height_from_hint(attrs.get("NAME").map(String::as_str), line));
             let audio_group = attrs.get("AUDIO").cloned();
+            let subtitles_group = attrs.get("SUBTITLES").cloned();
             variants.push(HlsVariant {
                 uri: stream::resolve(&base, line),
                 bandwidth,
                 height,
                 audio_group,
+                subtitles_group,
             });
         }
     }
 
+    Ok((variants, audios, subtitles))
+}
+
+pub(crate) fn parse_master_playlist(text: &str, base_url: &str) -> Result<(Vec<HlsVariant>, Vec<HlsAudioRendition>), String> {
+    let (variants, audios, _) = parse_master_playlist_full(text, base_url)?;
     Ok((variants, audios))
 }
 
@@ -913,6 +966,88 @@ pub(crate) fn is_local_fatal_error(msg: &str) -> bool {
         || low.contains("could not finalize file")
 }
 
+fn norm_sub_lang_key(lang: &str) -> String {
+    let base = lang
+        .trim()
+        .split(['-', '_'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    canon_lang_code(&base).to_string()
+}
+
+fn canon_lang_code(code: &str) -> &str {
+    match code {
+        "eng" | "english" => "en",
+        "jpn" | "jp" | "japanese" => "ja",
+        "spa" | "esp" | "spanish" => "es",
+        "fra" | "fre" | "french" => "fr",
+        "deu" | "ger" | "german" => "de",
+        "por" | "portuguese" => "pt",
+        "ita" | "italian" => "it",
+        "ara" | "arabic" => "ar",
+        "kor" | "korean" => "ko",
+        "zho" | "chi" | "zh" | "chinese" => "zh",
+        "rus" | "russian" => "ru",
+        "hin" | "hindi" => "hi",
+        "tur" | "turkish" => "tr",
+        "pol" | "polish" => "pl",
+        "nld" | "dut" | "dutch" => "nl",
+        "ind" | "indonesian" => "id",
+        "vie" | "vietnamese" => "vi",
+        "tha" | "thai" => "th",
+        other => other,
+    }
+}
+
+pub(crate) fn merge_subtitles_for_failover(
+    prev: &[DownloadSubtitleReq],
+    next: Vec<DownloadSubtitleReq>,
+) -> Vec<DownloadSubtitleReq> {
+    if next.is_empty() {
+        return prev.iter().take(MAX_SUBTITLE_TRACKS).cloned().collect();
+    }
+    let mut out = Vec::with_capacity(MAX_SUBTITLE_TRACKS);
+    let mut seen_urls = HashSet::new();
+    let mut seen_lang_forced = HashSet::new();
+
+    for sub in next {
+        if out.len() >= MAX_SUBTITLE_TRACKS {
+            return out;
+        }
+        let url_key = sub.url.to_ascii_lowercase();
+        if !url_key.is_empty() && !seen_urls.insert(url_key) {
+            continue;
+        }
+        let lk = (norm_sub_lang_key(&sub.lang), sub.is_forced.unwrap_or(false));
+        if !lk.0.is_empty() && lk.0 != "und" {
+            seen_lang_forced.insert(lk);
+        }
+        out.push(sub);
+    }
+
+    for sub in prev {
+        if out.len() >= MAX_SUBTITLE_TRACKS {
+            break;
+        }
+        let has_inline = sub.content.as_deref().is_some_and(|c| !c.trim().is_empty());
+        let lk = (norm_sub_lang_key(&sub.lang), sub.is_forced.unwrap_or(false));
+        let lang_needed = !lk.0.is_empty() && lk.0 != "und" && !seen_lang_forced.contains(&lk);
+        if !has_inline && !lang_needed {
+            continue;
+        }
+        let url_key = sub.url.to_ascii_lowercase();
+        if !url_key.is_empty() && !seen_urls.insert(url_key) {
+            continue;
+        }
+        if !lk.0.is_empty() && lk.0 != "und" {
+            seen_lang_forced.insert(lk);
+        }
+        out.push(sub.clone());
+    }
+    out
+}
+
 pub(crate) fn advance_job_to_next_fallback(
     job: &mut DownloadJob,
     failed_reason: &str,
@@ -953,7 +1088,8 @@ pub(crate) fn advance_job_to_next_fallback(
         job.resolved_quality = None;
         job.quality_verified = false;
         job.video_codec = None;
-        job.subtitles = next.subtitles;
+        let prev_subs = std::mem::take(&mut job.subtitles);
+        job.subtitles = merge_subtitles_for_failover(&prev_subs, next.subtitles);
         job.bytes_downloaded = 0;
         job.total_bytes = None;
         job.segments_done = None;
@@ -1676,7 +1812,9 @@ impl ManagerState {
             if Path::new(&it.file_path).is_file() {
                 let prev_subs = it.subtitle_paths.len();
                 it.subtitle_paths.retain(|sp| Path::new(sp).is_file());
-                if it.subtitle_paths.len() != prev_subs {
+                let discovered = discover_sidecars_for_video(Path::new(&it.file_path));
+                let merged = merge_sidecar_paths(&mut it.subtitle_paths, discovered);
+                if it.subtitle_paths.len() != prev_subs || merged {
                     changed = true;
                 }
                 kept.push(it);
@@ -1735,19 +1873,37 @@ impl DownloadManager {
     }
 
     fn reconcile_snapshot(&self) -> DownloadSnapshot {
-        let (removed, root_opt, remaining) = {
+        let (removed, root_opt, remaining, discovered_subs) = {
             let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let (removed, root_opt, _changed) = g.reconcile_missing_files_locked();
+            let (removed, root_opt, changed) = g.reconcile_missing_files_locked();
             let remaining = if removed.is_empty() {
                 Vec::new()
             } else {
                 g.items.clone()
             };
-            (removed, root_opt, remaining)
+            let discovered_subs: Vec<String> = if changed {
+                g.items
+                    .iter()
+                    .flat_map(|it| it.subtitle_paths.iter().cloned())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (removed, root_opt, remaining, discovered_subs)
         };
         if let Some(ref root) = root_opt {
             for entry in &removed {
                 remove_orphaned_artwork(root, &remaining, entry);
+            }
+        }
+        if !discovered_subs.is_empty() {
+            if let Some(app) = self.app.lock().ok().and_then(|g| g.clone()) {
+                let scope = app.asset_protocol_scope();
+                for s in &discovered_subs {
+                    if Path::new(s).is_file() {
+                        let _ = scope.allow_file(Path::new(s));
+                    }
+                }
             }
         }
         self.snapshot()
@@ -1790,7 +1946,19 @@ impl DownloadManager {
 
         let mut idx = load_index(&canonical);
         idx.items.retain(|it| Path::new(&it.file_path).is_file());
-        for it in &idx.items {
+        let mut idx_changed = false;
+        for it in &mut idx.items {
+            let prev_len = it.subtitle_paths.len();
+            it.subtitle_paths.retain(|sp| Path::new(sp).is_file());
+            let discovered = discover_sidecars_for_video(Path::new(&it.file_path));
+            let merged = merge_sidecar_paths(&mut it.subtitle_paths, discovered);
+            if it.subtitle_paths.len() != prev_len || merged {
+                idx_changed = true;
+            }
+            let _ = scope.allow_file(Path::new(&it.file_path));
+            for sp in &it.subtitle_paths {
+                let _ = scope.allow_file(Path::new(sp));
+            }
             if let Some(ref p) = it.poster_path {
                 if Path::new(p).is_file() {
                     let _ = scope.allow_file(Path::new(p));
@@ -1802,6 +1970,7 @@ impl DownloadManager {
                 }
             }
         }
+        let _ = idx_changed;
 
         let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
         // If another root was open before, signal active tasks to pause cleanly.
@@ -1843,7 +2012,8 @@ impl DownloadManager {
         job.resolved_quality = None;
         job.quality_verified = false;
         job.video_codec = None;
-        job.subtitles = sw.source.subtitles;
+        let prev_subs = std::mem::take(&mut job.subtitles);
+        job.subtitles = merge_subtitles_for_failover(&prev_subs, sw.source.subtitles);
         if let Some(pq) = sw.preferred_quality {
             job.preferred_quality = Some(pq);
         }
@@ -1968,6 +2138,7 @@ impl DownloadManager {
             headers: req.headers,
             preferred_quality: req.preferred_quality,
             subtitles: req.subtitles,
+            preferred_sub_langs: req.preferred_sub_langs,
             fallbacks,
             tried_providers: Vec::new(),
             failover_notes: Vec::new(),
@@ -2342,8 +2513,15 @@ impl DownloadManager {
             }
         }
         merged_items.retain(|it| Path::new(&it.file_path).is_file());
-        for it in &merged_items {
+        for it in &mut merged_items {
+            let discovered = discover_sidecars_for_video(Path::new(&it.file_path));
+            merge_sidecar_paths(&mut it.subtitle_paths, discovered);
             let _ = scope.allow_file(Path::new(&it.file_path));
+            for sp in &it.subtitle_paths {
+                if Path::new(sp).is_file() {
+                    let _ = scope.allow_file(Path::new(sp));
+                }
+            }
             if let Some(ref p) = it.poster_path {
                 if Path::new(p).is_file() {
                     let _ = scope.allow_file(Path::new(p));
@@ -2519,11 +2697,13 @@ impl DownloadManager {
             let outcome = if job.kind == "hls" {
                 self.run_hls_job(&mut job, &root, &sig, allow_below_target).await
             } else {
-                self.run_direct_job(&job, &root, &sig).await
+                self.run_direct_job(&job, &root, &sig)
+                    .await
+                    .map(|(p, sz)| (p, sz, Vec::new()))
             };
 
             match outcome {
-                Ok((final_path, final_size)) => {
+                Ok((final_path, final_size, hls_subs)) => {
                     let app_opt = self.app.lock().ok().and_then(|g| g.clone());
                     let probed = if let Some(ref app) = app_opt {
                         let app_c = app.clone();
@@ -2540,8 +2720,14 @@ impl DownloadManager {
                     let q_verified = probed_q.is_some() || job.quality_verified;
                     let v_codec = probed_codec.or(job.video_codec.clone());
 
-                    let (subtitle_paths, (poster_path, backdrop_path)) = tokio::join!(
-                        download_sidecar_subtitles(&final_path, &job.subtitles),
+                    let (mut subtitle_paths, (poster_path, backdrop_path)) = tokio::join!(
+                        download_sidecar_subtitles(
+                            &final_path,
+                            &job.subtitles,
+                            &hls_subs,
+                            &job.headers,
+                            &job.preferred_sub_langs,
+                        ),
                         cache_title_artwork(
                             &root,
                             &job.canonical_key,
@@ -2549,6 +2735,7 @@ impl DownloadManager {
                             job.backdrop_url.as_deref(),
                         )
                     );
+                    merge_sidecar_paths(&mut subtitle_paths, discover_sidecars_for_video(&final_path));
                     if let Some(ref app) = app_opt {
                         let scope = app.asset_protocol_scope();
                         let _ = scope.allow_file(&final_path);
@@ -3085,7 +3272,7 @@ impl DownloadManager {
         root: &Path,
         sig: &JobSignals,
         allow_below_target: bool,
-    ) -> Result<(PathBuf, u64), JobStop> {
+    ) -> Result<(PathBuf, u64, Vec<HlsSubtitleRendition>), JobStop> {
         let init_meta = start_req_from_job(job);
         let (folder, _) = resolve_target_paths(root, &init_meta, "mp4");
         tokio::fs::create_dir_all(&folder)
@@ -3432,7 +3619,7 @@ impl DownloadManager {
             .await
             .map(|m| m.len())
             .unwrap_or(seg_bytes);
-        Ok((final_out, final_size))
+        Ok((final_out, final_size, work_state.subtitles))
     }
 
     async fn fetch_and_save_hls_state(
@@ -3444,32 +3631,58 @@ impl DownloadManager {
     ) -> Result<HlsWorkState, JobStop> {
         let master_or_media = fetch_text_with_headers(&job.url, &job.headers, sig).await?;
 
-        let (video_url, audio_url, video_text, selected_height, selected_bandwidth, available_heights) =
-            if master_or_media.contains("#EXT-X-STREAM-INF") {
-                let (variants, audios) =
-                    parse_master_playlist(&master_or_media, &job.url).map_err(JobStop::Failed)?;
-                let mut heights: Vec<u32> = variants.iter().filter_map(|v| v.height).collect();
-                heights.sort_unstable();
-                heights.dedup();
-                let picked = select_hls_variant(&variants, job.preferred_quality.or(job.quality))
-                    .ok_or_else(|| JobStop::Failed("No playable HLS variants found".into()))?;
-                let audio_rend = select_audio_rendition(
-                    &audios,
-                    picked.audio_group.as_deref(),
-                    job.audio.as_deref(),
-                );
-                let v_txt = fetch_text_with_headers(&picked.uri, &job.headers, sig).await?;
-                (
-                    picked.uri.clone(),
-                    audio_rend.map(|a| a.uri.clone()),
-                    v_txt,
-                    picked.height,
-                    Some(picked.bandwidth),
-                    heights,
-                )
+        let (
+            video_url,
+            audio_url,
+            video_text,
+            selected_height,
+            selected_bandwidth,
+            available_heights,
+            matched_subs,
+        ) = if master_or_media.contains("#EXT-X-STREAM-INF") {
+            let (variants, audios, all_subs) =
+                parse_master_playlist_full(&master_or_media, &job.url).map_err(JobStop::Failed)?;
+            let mut heights: Vec<u32> = variants.iter().filter_map(|v| v.height).collect();
+            heights.sort_unstable();
+            heights.dedup();
+            let picked = select_hls_variant(&variants, job.preferred_quality.or(job.quality))
+                .ok_or_else(|| JobStop::Failed("No playable HLS variants found".into()))?;
+            let audio_rend = select_audio_rendition(
+                &audios,
+                picked.audio_group.as_deref(),
+                job.audio.as_deref(),
+            );
+            let matched_subs: Vec<HlsSubtitleRendition> = if let Some(ref sg) = picked.subtitles_group {
+                let filtered: Vec<_> = all_subs.iter().filter(|s| &s.group_id == sg).cloned().collect();
+                if filtered.is_empty() {
+                    all_subs
+                } else {
+                    filtered
+                }
             } else {
-                (job.url.clone(), None, master_or_media, job.quality, None, Vec::new())
+                all_subs
             };
+            let v_txt = fetch_text_with_headers(&picked.uri, &job.headers, sig).await?;
+            (
+                picked.uri.clone(),
+                audio_rend.map(|a| a.uri.clone()),
+                v_txt,
+                picked.height,
+                Some(picked.bandwidth),
+                heights,
+                matched_subs,
+            )
+        } else {
+            (
+                job.url.clone(),
+                None,
+                master_or_media,
+                job.quality,
+                None,
+                Vec::new(),
+                Vec::new(),
+            )
+        };
 
         let video = parse_media_playlist(&video_text, &video_url).map_err(JobStop::Failed)?;
         let audio = if let Some(ref au) = audio_url {
@@ -3506,6 +3719,7 @@ impl DownloadManager {
             selected_height,
             selected_bandwidth,
             available_heights,
+            subtitles: matched_subs,
         };
         write_json_atomic(state_path, &state).map_err(JobStop::Failed)?;
         Ok(state)
@@ -3591,6 +3805,7 @@ fn start_req_from_job(job: &DownloadJob) -> DownloadStartReq {
         headers: job.headers.clone(),
         preferred_quality: job.preferred_quality,
         subtitles: job.subtitles.clone(),
+        preferred_sub_langs: job.preferred_sub_langs.clone(),
         fallbacks: job.fallbacks.clone(),
         replace_existing: false,
         poster_url: job.poster_url.clone(),
@@ -4048,24 +4263,311 @@ fn remux_local_hls(
     }
 }
 
-async fn download_sidecar_subtitles(video_path: &Path, subs: &[DownloadSubtitleReq]) -> Vec<String> {
+pub(crate) fn looks_like_html_error(bytes: &[u8]) -> bool {
+    let head = String::from_utf8_lossy(&bytes[..bytes.len().min(1024)]);
+    let low = head.trim_start_matches('\u{feff}').trim_start().to_ascii_lowercase();
+    low.starts_with("<!doctype html")
+        || low.starts_with("<!doctype")
+        || low.starts_with("<html")
+        || low.starts_with("<head")
+        || low.starts_with("<title")
+}
+
+pub(crate) fn infer_ext_from_content(bytes: &[u8], fallback_ext: &'static str) -> &'static str {
+    let head = String::from_utf8_lossy(&bytes[..bytes.len().min(2048)]);
+    let clean = head.trim_start_matches('\u{feff}').trim_start();
+    if clean.starts_with("WEBVTT") {
+        return "vtt";
+    }
+    if clean.contains("[Script Info]") || clean.contains("Dialogue:") {
+        return if fallback_ext == "ssa" { "ssa" } else { "ass" };
+    }
+    if clean.lines().any(|l| l.contains("-->") && l.contains(',')) {
+        return "srt";
+    }
+    if clean.contains("-->") {
+        return if fallback_ext == "vtt" { "vtt" } else { "srt" };
+    }
+    fallback_ext
+}
+
+fn merge_headers(base: &Hdrs, over: Option<&Hdrs>) -> Hdrs {
+    let Some(o) = over else {
+        return base.clone();
+    };
+    Hdrs {
+        referer: o.referer.clone().or_else(|| base.referer.clone()),
+        origin: o.origin.clone().or_else(|| base.origin.clone()),
+        ua: o.ua.clone().or_else(|| base.ua.clone()),
+    }
+}
+
+pub(crate) fn stitch_vtt_segments(segments: &[String]) -> String {
+    let mut out = String::from("WEBVTT\n\n");
+    let mut prev_block = String::new();
+
+    for seg in segments {
+        let normalized = seg
+            .trim_start_matches('\u{feff}')
+            .replace("\r\n", "\n")
+            .replace('\r', "\n");
+
+        let mut body_lines = Vec::new();
+        let mut in_header = true;
+        for line in normalized.lines() {
+            let t = line.trim();
+            if in_header {
+                if t.is_empty() {
+                    continue;
+                }
+                if t.contains("-->") || t.chars().all(|c| c.is_ascii_digit()) {
+                    in_header = false;
+                    body_lines.push(line);
+                    continue;
+                }
+                if t.starts_with("WEBVTT")
+                    || t.starts_with("X-TIMESTAMP-MAP")
+                    || t.starts_with("Kind:")
+                    || t.starts_with("Language:")
+                    || t.starts_with("Region:")
+                    || t.starts_with("NOTE")
+                {
+                    continue;
+                }
+                in_header = false;
+            }
+            body_lines.push(line);
+        }
+
+        let body = body_lines.join("\n");
+        for raw_block in body.split("\n\n") {
+            let block = raw_block.trim();
+            if block.is_empty()
+                || block.starts_with("WEBVTT")
+                || block.starts_with("X-TIMESTAMP-MAP")
+                || block.starts_with("STYLE")
+                || block.starts_with("NOTE")
+            {
+                continue;
+            }
+            if block == prev_block {
+                continue;
+            }
+            prev_block = block.to_string();
+            out.push_str(block);
+            out.push_str("\n\n");
+        }
+    }
+
+    out
+}
+
+async fn download_hls_subtitle_rendition(uri: &str, headers: &Hdrs) -> Option<Vec<u8>> {
+    if stream::validate_http_url(uri).is_err() {
+        return None;
+    }
+    let res = stream::apply(download_client().get(uri), headers)
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .ok()?;
+    if !res.status().is_success() {
+        return None;
+    }
+    let bytes = res.bytes().await.ok()?;
+    if bytes.is_empty() || bytes.len() > MAX_SUBTITLE_BYTES || looks_like_html_error(&bytes) {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let trimmed = text.trim_start_matches('\u{feff}').trim_start();
+    if !trimmed.starts_with("#EXTM3U") && !trimmed.contains("#EXTINF:") {
+        return Some(bytes.to_vec());
+    }
+
+    let playlist = parse_media_playlist(&text, uri).ok()?;
+    let seg_count = playlist.segments.len().min(3600);
+    if seg_count == 0 {
+        return None;
+    }
+
+    let sem = Arc::new(Semaphore::new(6));
+    let mut handles = Vec::with_capacity(seg_count);
+    for (idx, seg) in playlist.segments.into_iter().take(seg_count).enumerate() {
+        let sem_c = Arc::clone(&sem);
+        let hdrs_c = headers.clone();
+        handles.push(tauri::async_runtime::spawn(async move {
+            let _permit = sem_c.acquire_owned().await.ok()?;
+            if stream::validate_http_url(&seg.uri).is_err() {
+                return None;
+            }
+            let r = stream::apply(download_client().get(&seg.uri), &hdrs_c)
+                .timeout(Duration::from_secs(12))
+                .send()
+                .await
+                .ok()?;
+            if !r.status().is_success() {
+                return None;
+            }
+            let b = r.bytes().await.ok()?;
+            if b.is_empty() || b.len() > 2 * 1024 * 1024 || looks_like_html_error(&b) {
+                return None;
+            }
+            Some((idx, String::from_utf8_lossy(&b).into_owned()))
+        }));
+    }
+
+    let mut collected = Vec::new();
+    for h in handles {
+        if let Ok(Some((idx, txt))) = h.await {
+            collected.push((idx, txt));
+        }
+    }
+    if collected.is_empty() {
+        return None;
+    }
+    collected.sort_by_key(|(idx, _)| *idx);
+    let seg_strings: Vec<String> = collected.into_iter().map(|(_, t)| t).collect();
+    let stitched = stitch_vtt_segments(&seg_strings);
+    if !stitched.contains("-->") || stitched.len() > MAX_SUBTITLE_BYTES {
+        return None;
+    }
+    Some(stitched.into_bytes())
+}
+
+pub(crate) fn discover_sidecars_for_video(video_path: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let Some(parent) = video_path.parent() else {
+        return found;
+    };
+    let stem = video_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if stem.is_empty() {
+        return found;
+    }
+    let is_sub_file = |p: &Path| -> bool {
+        p.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| matches!(e.to_ascii_lowercase().as_str(), "vtt" | "srt" | "ass" | "ssa"))
+            .unwrap_or(false)
+    };
+    let is_video_file = |p: &Path| -> bool {
+        p.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| {
+                matches!(
+                    e.to_ascii_lowercase().as_str(),
+                    "mp4" | "mkv" | "webm" | "m4v" | "mov" | "avi" | "ts"
+                )
+            })
+            .unwrap_or(false)
+    };
+    let matches_stem = |p: &Path| -> bool {
+        let Some(sub_stem) = p
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase())
+        else {
+            return false;
+        };
+        if sub_stem == stem {
+            return true;
+        }
+        if let Some(rest) = sub_stem.strip_prefix(&stem) {
+            return rest.starts_with(['.', '_', '-', ' ']);
+        }
+        false
+    };
+
+    let mut seen = HashSet::new();
+    let mut single_video_in_dir = false;
+
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        let mut paths = Vec::new();
+        let mut vid_count = 0usize;
+        for ent in entries.flatten() {
+            let p = ent.path();
+            if p.is_file() {
+                if is_video_file(&p) {
+                    vid_count += 1;
+                }
+                if is_sub_file(&p) {
+                    paths.push(p);
+                }
+            }
+        }
+        single_video_in_dir = vid_count <= 1;
+        paths.sort();
+        for p in paths {
+            if matches_stem(&p) {
+                let s = p.to_string_lossy().into_owned();
+                if seen.insert(s.to_ascii_lowercase()) {
+                    found.push(s);
+                }
+            }
+        }
+    }
+
+    for sub_dir_name in ["Subs", "Subtitles"] {
+        let sub_dir = parent.join(sub_dir_name);
+        if !sub_dir.is_dir() {
+            continue;
+        }
+        if let Ok(entries) = std::fs::read_dir(&sub_dir) {
+            let mut paths: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_file() && is_sub_file(p))
+                .collect();
+            paths.sort();
+            for p in paths {
+                if single_video_in_dir || matches_stem(&p) {
+                    let s = p.to_string_lossy().into_owned();
+                    if seen.insert(s.to_ascii_lowercase()) {
+                        found.push(s);
+                    }
+                }
+            }
+        }
+    }
+
+    found
+}
+
+fn merge_sidecar_paths(existing: &mut Vec<String>, extra: Vec<String>) -> bool {
+    let mut seen: HashSet<String> = existing.iter().map(|s| s.to_ascii_lowercase()).collect();
+    let mut changed = false;
+    for p in extra {
+        if seen.insert(p.to_ascii_lowercase()) {
+            existing.push(p);
+            changed = true;
+        }
+    }
+    changed
+}
+
+async fn download_sidecar_subtitles(
+    video_path: &Path,
+    subs: &[DownloadSubtitleReq],
+    hls_subs: &[HlsSubtitleRendition],
+    default_headers: &Hdrs,
+    preferred_langs: &[String],
+) -> Vec<String> {
     let mut saved = Vec::new();
-    let Some(parent) = video_path.parent() else { return saved };
+    let Some(parent) = video_path.parent() else {
+        return saved;
+    };
     let stem = video_path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("video");
     let mut used_names = HashSet::new();
+    let mut saved_lang_forced = HashSet::new();
 
     for sub in subs.iter().take(MAX_SUBTITLE_TRACKS) {
-        let url_lower = sub.url.to_ascii_lowercase();
-        if !url_lower.starts_with("http://") && !url_lower.starts_with("https://") {
-            continue;
-        }
-        if stream::validate_http_url(&sub.url).is_err() {
-            continue;
-        }
-        let ext = match sub.format.as_deref().map(|f| f.to_ascii_lowercase()).as_deref() {
+        let fallback_ext = match sub.format.as_deref().map(|f| f.to_ascii_lowercase()).as_deref() {
             Some("srt") => "srt",
             Some("ass") => "ass",
             Some("ssa") => "ssa",
@@ -4083,10 +4585,59 @@ async fn download_sidecar_subtitles(video_path: &Path, subs: &[DownloadSubtitleR
                 }
             }
         };
-        let lang = sanitize_component(if sub.lang.trim().is_empty() { "und" } else { &sub.lang })
+
+        let payload_bytes: Option<Vec<u8>> = if let Some(ref content) = sub.content {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                let b = trimmed.as_bytes();
+                if b.len() <= MAX_SUBTITLE_BYTES && !looks_like_html_error(b) {
+                    Some(b.to_vec())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            let url_lower = sub.url.to_ascii_lowercase();
+            if (!url_lower.starts_with("http://") && !url_lower.starts_with("https://"))
+                || stream::validate_http_url(&sub.url).is_err()
+            {
+                None
+            } else {
+                let hdrs = merge_headers(default_headers, sub.headers.as_ref());
+                match stream::apply(download_client().get(&sub.url), &hdrs)
+                    .timeout(Duration::from_secs(15))
+                    .send()
+                    .await
+                {
+                    Ok(res) if res.status().is_success() => match res.bytes().await {
+                        Ok(bytes)
+                            if !bytes.is_empty()
+                                && bytes.len() <= MAX_SUBTITLE_BYTES
+                                && !looks_like_html_error(&bytes) =>
+                        {
+                            Some(bytes.to_vec())
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            }
+        };
+
+        let Some(bytes) = payload_bytes else {
+            continue;
+        };
+
+        let ext = infer_ext_from_content(&bytes, fallback_ext);
+        let raw_lang = sanitize_component(if sub.lang.trim().is_empty() { "und" } else { &sub.lang })
             .to_ascii_lowercase();
-        let mut suffix = format!(".{lang}");
-        if sub.is_forced == Some(true) {
+        let lang_norm = norm_sub_lang_key(&raw_lang);
+        let lang_tag = if lang_norm.is_empty() { raw_lang } else { lang_norm.clone() };
+        let forced = sub.is_forced == Some(true);
+        let mut suffix = format!(".{lang_tag}");
+        if forced {
             suffix.push_str(".forced");
         }
         if sub.is_hearing_impaired == Some(true) {
@@ -4098,24 +4649,81 @@ async fn download_sidecar_subtitles(video_path: &Path, subs: &[DownloadSubtitleR
             candidate_name = format!("{stem}{suffix}.{n}.{ext}");
             n += 1;
         }
-        let hdrs = sub.headers.clone().unwrap_or_default();
-        if let Ok(res) = stream::apply(download_client().get(&sub.url), &hdrs)
-            .timeout(Duration::from_secs(15))
-            .send()
-            .await
-        {
-            if res.status().is_success() {
-                if let Ok(bytes) = res.bytes().await {
-                    if !bytes.is_empty() && bytes.len() <= MAX_SUBTITLE_BYTES {
-                        let out_path = parent.join(&candidate_name);
-                        if tokio::fs::write(&out_path, &bytes).await.is_ok() {
-                            saved.push(out_path.to_string_lossy().into_owned());
-                        }
-                    }
+        let out_path = parent.join(&candidate_name);
+        if tokio::fs::write(&out_path, &bytes).await.is_ok() {
+            saved.push(out_path.to_string_lossy().into_owned());
+            if !lang_norm.is_empty() && lang_norm != "und" {
+                saved_lang_forced.insert((lang_norm, forced));
+            }
+        }
+    }
+
+    if saved.len() < MAX_SUBTITLE_TRACKS && !hls_subs.is_empty() {
+        let mut ranked: Vec<&HlsSubtitleRendition> = hls_subs.iter().collect();
+        let pref_norm: Vec<String> = preferred_langs
+            .iter()
+            .map(|l| norm_sub_lang_key(l))
+            .filter(|l| !l.is_empty() && l != "und")
+            .collect();
+        ranked.sort_by_key(|h| {
+            let l_key = h
+                .language
+                .as_deref()
+                .or(h.name.as_deref())
+                .map(norm_sub_lang_key)
+                .unwrap_or_default();
+            let pref_rank = pref_norm
+                .iter()
+                .position(|p| p == &l_key)
+                .unwrap_or(if l_key == "en" { 500 } else { 999 });
+            (pref_rank, h.forced, !(h.is_default || h.autoselect))
+        });
+
+        for h in ranked {
+            if saved.len() >= MAX_SUBTITLE_TRACKS {
+                break;
+            }
+            let raw_l = h
+                .language
+                .as_deref()
+                .or(h.name.as_deref())
+                .unwrap_or("und");
+            let lang_norm = norm_sub_lang_key(raw_l);
+            if !lang_norm.is_empty()
+                && lang_norm != "und"
+                && saved_lang_forced.contains(&(lang_norm.clone(), h.forced))
+            {
+                continue;
+            }
+            let Some(bytes) = download_hls_subtitle_rendition(&h.uri, default_headers).await else {
+                continue;
+            };
+            let ext = infer_ext_from_content(&bytes, "vtt");
+            let lang_tag = if !lang_norm.is_empty() {
+                lang_norm.clone()
+            } else {
+                sanitize_component(raw_l).to_ascii_lowercase()
+            };
+            let mut suffix = format!(".{lang_tag}");
+            if h.forced {
+                suffix.push_str(".forced");
+            }
+            let mut candidate_name = format!("{stem}{suffix}.{ext}");
+            let mut n = 2usize;
+            while !used_names.insert(candidate_name.clone()) {
+                candidate_name = format!("{stem}{suffix}.{n}.{ext}");
+                n += 1;
+            }
+            let out_path = parent.join(&candidate_name);
+            if tokio::fs::write(&out_path, &bytes).await.is_ok() {
+                saved.push(out_path.to_string_lossy().into_owned());
+                if !lang_norm.is_empty() && lang_norm != "und" {
+                    saved_lang_forced.insert((lang_norm, h.forced));
                 }
             }
         }
     }
+
     saved
 }
 
@@ -4319,6 +4927,7 @@ mod tests {
             headers: Hdrs::default(),
             preferred_quality: Some(1080),
             subtitles: Vec::new(),
+            preferred_sub_langs: Vec::new(),
             fallbacks: Vec::new(),
             replace_existing: false,
             poster_url: None,
@@ -4536,24 +5145,28 @@ seg2.m4s
                 bandwidth: 900_000,
                 height: Some(480),
                 audio_group: None,
+                subtitles_group: None,
             },
             HlsVariant {
                 uri: "https://cdn.example/720.m3u8".into(),
                 bandwidth: 2_200_000,
                 height: Some(720),
                 audio_group: None,
+                subtitles_group: None,
             },
             HlsVariant {
                 uri: "https://cdn.example/1080.m3u8".into(),
                 bandwidth: 5_000_000,
                 height: Some(1080),
                 audio_group: None,
+                subtitles_group: None,
             },
             HlsVariant {
                 uri: "https://cdn.example/2160.m3u8".into(),
                 bandwidth: 14_000_000,
                 height: Some(2160),
                 audio_group: None,
+                subtitles_group: None,
             },
         ];
 
@@ -4631,6 +5244,7 @@ seg2.m4s
             headers: Hdrs::default(),
             preferred_quality: Some(1080),
             subtitles: Vec::new(),
+            preferred_sub_langs: Vec::new(),
             fallbacks: vec![
                 DownloadFallbackSource {
                     provider_id: "p1".into(),
@@ -4818,6 +5432,7 @@ seg2.m4s
                 headers: Hdrs::default(),
                 preferred_quality: Some(1080),
                 subtitles: Vec::new(),
+                preferred_sub_langs: Vec::new(),
                 fallbacks: Vec::new(),
                 tried_providers: Vec::new(),
                 failover_notes: Vec::new(),
@@ -4979,5 +5594,106 @@ seg2.m4s
         assert_eq!(variants[2].height, Some(720));
         assert_eq!(select_hls_variant(&variants, Some(1080)).and_then(|v| v.height), Some(1080));
         assert_eq!(select_hls_variant(&variants, Some(720)).and_then(|v| v.height), Some(720));
+    }
+
+    #[test]
+    fn parses_master_playlist_subtitle_renditions_and_groups() {
+        let master = r#"#EXTM3U
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",LANGUAGE="eng",DEFAULT=YES,AUTOSELECT=YES,URI="subs/en.m3u8"
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="Signs & Songs",LANGUAGE="eng",FORCED=YES,URI="subs/en_forced.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=4500000,RESOLUTION=1920x1080,SUBTITLES="subs"
+1080p/index.m3u8
+"#;
+        let (variants, _audios, subs) =
+            parse_master_playlist_full(master, "https://cdn.example/master.m3u8").unwrap();
+        assert_eq!(variants[0].subtitles_group.as_deref(), Some("subs"));
+        assert_eq!(subs.len(), 2);
+        assert_eq!(subs[0].group_id, "subs");
+        assert_eq!(subs[0].language.as_deref(), Some("eng"));
+        assert_eq!(subs[0].uri, "https://cdn.example/subs/en.m3u8");
+        assert!(subs[0].is_default && subs[0].autoselect && !subs[0].forced);
+        assert!(subs[1].forced);
+    }
+
+    #[test]
+    fn stitches_vtt_segments_and_deduplicates_boundary_cues() {
+        let seg1 = "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000\n\n00:00:01.000 --> 00:00:03.000\nFirst line\n\n00:00:04.000 --> 00:00:06.000\nBoundary cue";
+        let seg2 = "\u{feff}WEBVTT\nKind: captions\nLanguage: en\n\n00:00:04.000 --> 00:00:06.000\nBoundary cue\n\n00:00:07.000 --> 00:00:09.000\nNext line";
+        let merged = stitch_vtt_segments(&[seg1.to_string(), seg2.to_string()]);
+        assert!(merged.starts_with("WEBVTT\n\n"));
+        assert_eq!(merged.matches("WEBVTT").count(), 1);
+        assert_eq!(merged.matches("X-TIMESTAMP-MAP").count(), 0);
+        assert_eq!(merged.matches("Boundary cue").count(), 1);
+        assert!(merged.contains("First line"));
+        assert!(merged.contains("Next line"));
+    }
+
+    #[test]
+    fn rejects_html_error_pages_and_infers_subtitle_extension() {
+        assert!(looks_like_html_error(b"<!DOCTYPE html><html><title>403 Forbidden</title></html>"));
+        assert!(looks_like_html_error(b"\xef\xbb\xbf  <html><body>Blocked</body></html>"));
+        assert!(!looks_like_html_error(b"WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello"));
+        assert_eq!(infer_ext_from_content(b"WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHi", "srt"), "vtt");
+        assert_eq!(infer_ext_from_content(b"[Script Info]\nTitle: Anime\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Yo", "vtt"), "ass");
+        assert_eq!(infer_ext_from_content(b"1\n00:00:01,000 --> 00:00:02,000\nHi", "vtt"), "srt");
+    }
+
+    #[test]
+    fn writes_inline_content_subtitles_and_preserves_across_failover() {
+        let dir = std::env::temp_dir().join(format!("abixcine_sub_inline_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let video = dir.join("Show - S01E01 [1080p].mp4");
+        std::fs::write(&video, b"fake-video").unwrap();
+
+        let inline_sub = DownloadSubtitleReq {
+            lang: "en".into(),
+            label: "English (Online)".into(),
+            url: "https://subs.example/en.srt".into(),
+            format: Some("srt".into()),
+            headers: None,
+            is_forced: Some(false),
+            is_hearing_impaired: Some(false),
+            content: Some("1\n00:00:01,000 --> 00:00:03,000\nInline offline subtitle\n".into()),
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let written = rt.block_on(download_sidecar_subtitles(
+            &video,
+            std::slice::from_ref(&inline_sub),
+            &[],
+            &Hdrs::default(),
+            &["en".into()],
+        ));
+        assert_eq!(written.len(), 1);
+        assert!(written[0].ends_with(".en.srt"));
+        assert!(std::fs::read_to_string(&written[0]).unwrap().contains("Inline offline subtitle"));
+
+        let merged = merge_subtitles_for_failover(&[inline_sub], Vec::new());
+        assert_eq!(merged.len(), 1);
+        assert!(merged[0].content.is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discovers_sidecars_in_same_folder_and_subs_subfolder() {
+        let dir = std::env::temp_dir().join(format!("abixcine_discover_subs_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let subs_dir = dir.join("Subs");
+        std::fs::create_dir_all(&subs_dir).unwrap();
+        let video = dir.join("Dune Part Two (2024) [1080p].mkv");
+        let matching_sidecar = dir.join("Dune Part Two (2024) [1080p].en.ass");
+        let subfolder_sidecar = subs_dir.join("English.srt");
+        std::fs::write(&video, b"vid").unwrap();
+        std::fs::write(&matching_sidecar, b"[Script Info]\n").unwrap();
+        std::fs::write(&subfolder_sidecar, b"1\n00:00:01,000 --> 00:00:02,000\nHi\n").unwrap();
+
+        let found = discover_sidecars_for_video(&video);
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().any(|p| p.ends_with("Dune Part Two (2024) [1080p].en.ass")));
+        assert!(found.iter().any(|p| p.ends_with("English.srt")));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

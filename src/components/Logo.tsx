@@ -1,25 +1,30 @@
 import { useId } from "react";
 
 /**
- * AbixCine emblem: anamorphic aperture "A" sculpted from paired optical blades inside a dark
- * cinema gate with a luminous central play-prism and lens-flare crossbar that opens on launch.
+ * AbixCine emblem: monolithic architectural "A" set in warm ivory inside a dark cinema
+ * tile with a nestled accent-gold play prism that opens on launch.
  */
 export function MarkGlyph({ slotClass }: { slotClass?: string }) {
   const uid = useId().replace(/:/g, "");
   const gTile = `abx-tile-${uid}`;
+  const gGlow = `abx-glow-${uid}`;
   const gBlade = `abx-blade-${uid}`;
   const gBeam = `abx-beam-${uid}`;
 
   return (
-    <svg viewBox="0 0 36 36" aria-hidden>
+    <svg viewBox="0 0 64 64" aria-hidden>
       <defs>
-        <radialGradient id={gTile} cx="35%" cy="22%" r="85%">
-          <stop offset="0%" stopColor="#1b1822" />
-          <stop offset="100%" stopColor="#09080b" />
+        <radialGradient id={gTile} cx="30%" cy="18%" r="85%">
+          <stop offset="0%" stopColor="#221d2d" />
+          <stop offset="100%" stopColor="#09080c" />
+        </radialGradient>
+        <radialGradient id={gGlow} cx="50%" cy="62%" r="48%">
+          <stop offset="0%" stopColor="var(--tone)" stopOpacity="0.22" />
+          <stop offset="100%" stopColor="var(--tone)" stopOpacity="0" />
         </radialGradient>
         <linearGradient id={gBlade} x1="0%" y1="0%" x2="100%" y2="100%">
-          <stop offset="0%" stopColor="#faf7ef" />
-          <stop offset="100%" stopColor="#cbc4b6" />
+          <stop offset="0%" stopColor="#fbf8f1" />
+          <stop offset="100%" stopColor="#cfc7b7" />
         </linearGradient>
         <linearGradient id={gBeam} x1="0%" y1="0%" x2="100%" y2="100%">
           <stop offset="0%" stopColor="var(--tone-ink)" />
@@ -28,32 +33,30 @@ export function MarkGlyph({ slotClass }: { slotClass?: string }) {
       </defs>
 
       <rect
-        x="1.25"
-        y="1.25"
-        width="33.5"
-        height="33.5"
-        rx="7.5"
+        x="2"
+        y="2"
+        width="60"
+        height="60"
+        rx="15"
         fill={`url(#${gTile})`}
-        stroke="rgba(255,255,255,0.12)"
-        strokeWidth="1"
+        stroke="#ffffff"
+        strokeOpacity="0.14"
+        strokeWidth="1.2"
       />
+      <rect x="2" y="2" width="60" height="60" rx="15" fill={`url(#${gGlow})`} />
 
-      {/* Projection gate corner registration ticks */}
-      <g stroke="var(--tone-ink)" strokeOpacity="0.52" strokeWidth="1.2" fill="none" strokeLinecap="round">
-        <path d="M5.5 8.8V5.5H8.8" />
-        <path d="M27.2 5.5H30.5V8.8" />
-        <path d="M5.5 27.2V30.5H8.8" />
-        <path d="M27.2 30.5H30.5V27.2" />
-      </g>
+      {/* Monolithic architectural "A" */}
+      <path d="M 28.8 12 H 35.2 L 51.5 51 H 42.0 L 32 26 L 22.0 51 H 12.5 Z" fill={`url(#${gBlade})`} />
 
-      {/* Sculpted split "A" blades */}
-      <path d="M16.9 7.6L9.1 28.4H13.4L18 15.2L16.9 7.6Z" fill={`url(#${gBlade})`} />
-      <path d="M19.1 7.6L26.9 28.4H22.6L18 15.2L19.1 7.6Z" fill={`url(#${gBlade})`} />
-      <polygon points="16.9,7.6 19.1,7.6 18,12.4" fill={`url(#${gBlade})`} />
-
-      {/* Center luminous cinema play prism + anamorphic flare crossbar */}
-      <polygon points="15.9,14.5 21.5,17.8 15.9,21.1" fill={`url(#${gBeam})`} />
-      <rect className={slotClass} x="11.2" y="21.9" width="13.6" height="2.2" rx="1.1" fill={`url(#${gBeam})`} />
+      {/* Nestled accent play prism */}
+      <path
+        className={slotClass}
+        d="M 28.8 41.2 L 37.2 45.8 L 28.8 50.4 Z"
+        fill={`url(#${gBeam})`}
+        stroke={`url(#${gBeam})`}
+        strokeWidth="1.5"
+        strokeLinejoin="round"
+      />
     </svg>
   );
 }

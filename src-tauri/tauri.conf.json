@@ -23,7 +23,7 @@
         "center": true,
         "label": "main",
         "dragDropEnabled": false,
-        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required"
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI --autoplay-policy=no-user-gesture-required"
       }
     ],
     "security": {

@@ -22,6 +22,7 @@ import {
   cancelAllDownloads,
   computeSeasonDownloadProgress,
   findDownloadedEpisode,
+  findOfflineDetail,
   fmtSpeed,
   formatDownloadQuality,
   formatQualityTag,
@@ -89,14 +90,27 @@ export function Title() {
   const nav = useNavigate();
   const loc = useLocation();
 
+  const s = useSettings();
+  const dl = useDownloads();
+  const batch = useBatchDownloads();
+  const desktop = isTauri();
+  const [dlQualityOverride, setDlQualityOverride] = useState<number | null>(null);
+  const dlTargetQuality = dlQualityOverride ?? s.preferredQuality;
+  const dlQualityLabel = dlTargetQuality >= 2160 ? "4K" : `${dlTargetQuality}p`;
+
   const { data: detail, error, reload } = useAsync(() => getDetail(key), [key]);
   const seed = (loc.state as { seed?: Media } | null)?.seed;
   const morphTitle = (loc.state as { morph?: string } | null)?.morph === "title";
+  const offlineDetail = useMemo(() => findOfflineDetail(key, dl.items), [key, dl.items]);
+  const offlineNow = typeof navigator !== "undefined" && navigator.onLine === false;
   const d: MediaDetail | undefined = useMemo(
-    () => detail ?? (seed && seed.key === key ? { ...seed, cast: [], crew: [], related: [] } : undefined),
-    [detail, seed, key],
+    () =>
+      detail ??
+      (offlineNow || error ? offlineDetail : undefined) ??
+      (seed && seed.key === key ? { ...seed, cast: [], crew: [], related: [] } : offlineDetail),
+    [detail, offlineNow, error, offlineDetail, seed, key],
   );
-  const ready = !!detail;
+  const ready = Boolean(detail || offlineDetail);
 
   const progressKeys = useMemo(() => {
     if (!d) return [key];
@@ -161,17 +175,12 @@ export function Title() {
   const season = activeSeasonObj?.number ?? 1;
 
   const eps = useAsync(
-    () => (detail && !isFilm(detail) ? getSeasonEpisodes(detail, activeSeasonObj?.number) : Promise.resolve([] as Episode[])),
-    [detail?.key, activeSeasonObj?.number],
+    () => {
+      const src = detail ?? offlineDetail;
+      return src && !isFilm(src) ? getSeasonEpisodes(src, activeSeasonObj?.number) : Promise.resolve([] as Episode[]);
+    },
+    [detail?.key, offlineDetail?.key, activeSeasonObj?.number],
   );
-
-  const s = useSettings();
-  const dl = useDownloads();
-  const batch = useBatchDownloads();
-  const desktop = isTauri();
-  const [dlQualityOverride, setDlQualityOverride] = useState<number | null>(null);
-  const dlTargetQuality = dlQualityOverride ?? s.preferredQuality;
-  const dlQualityLabel = dlTargetQuality >= 2160 ? "4K" : `${dlTargetQuality}p`;
 
   useEffect(() => {
     if (desktop && dl.root) void refreshDownloads({ minIntervalMs: 1500 });
@@ -222,10 +231,12 @@ export function Title() {
 
   const canPlay = ready && ((film && !unreleasedFilm) || hasPlayableEps);
 
-  const req = useMemo(
-    () => (detail && canPlay && (!theatricalOnly || checkAnyway) ? resolvePlaybackRequest(detail, startS, startE, audio) : null),
-    [detail, canPlay, theatricalOnly, checkAnyway, startS, startE, audio],
-  );
+  const req = useMemo(() => {
+    const src = detail ?? (offlineNow || error ? offlineDetail : undefined);
+    return src && canPlay && (!theatricalOnly || checkAnyway)
+      ? resolvePlaybackRequest(src, startS, startE, audio)
+      : null;
+  }, [detail, offlineNow, error, offlineDetail, canPlay, theatricalOnly, checkAnyway, startS, startE, audio]);
 
   if (error && !d) {
     return (

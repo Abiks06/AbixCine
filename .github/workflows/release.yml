@@ -187,6 +187,22 @@ jobs:
             [ -n "$SIG" ] && gh release delete-asset "v${VERSION}" "$SIG" --yes || true
           done
 
+      - name: Generate and upload SHA-256 checksums
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          $files = @(Get-ChildItem src-tauri/target/release/bundle/nsis/*.exe -ErrorAction SilentlyContinue) +
+                   @(Get-ChildItem src-tauri/target/release/bundle/msi/*.msi -ErrorAction SilentlyContinue) +
+                   @(Get-Item "AbixCine_$($env:VERSION)_x64-portable.zip" -ErrorAction SilentlyContinue)
+          $lines = foreach ($f in $files) {
+            $h = (Get-FileHash -Algorithm SHA256 -LiteralPath $f.FullName).Hash.ToLowerInvariant()
+            "$h  $($f.Name)"
+          }
+          $lines | Set-Content -Encoding utf8 SHA256SUMS.txt
+          gh release upload "v$($env:VERSION)" SHA256SUMS.txt --clobber
+
       - name: Publish release
         shell: bash
         env:

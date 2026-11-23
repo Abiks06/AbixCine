@@ -294,9 +294,11 @@ export function CardHoverPreview() {
     };
     window.addEventListener("resize", onResize, { passive: true });
     window.addEventListener("keydown", onKey);
+    window.addEventListener("blur", closeHoverPreviewNow);
     return () => {
       window.removeEventListener("resize", onResize);
       window.removeEventListener("keydown", onKey);
+      window.removeEventListener("blur", closeHoverPreviewNow);
     };
   }, []);
 

@@ -3,8 +3,9 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useSyncExternalStore } from "react";
 import { PROXY_URL_RX, unwrapProxyUrl, type StreamHeaders } from "../sources/native";
-import type { StreamCandidate } from "../sources/types";
+import type { StreamCandidate, SubtitleTrack } from "../sources/types";
 import { getSettings, updateSettings } from "./settings";
+import { langBase, loadSubPref, type SubPref } from "./subtitles";
 import { toast } from "./toast";
 import { isUnairedEpisode } from "./normalizer";
 import { isFilm, type Episode, type Media, type MediaDetail, type PlaybackRequest } from "./types";
@@ -26,6 +27,7 @@ export interface DownloadSubtitleReq {
   headers?: StreamHeaders;
   isForced?: boolean;
   isHearingImpaired?: boolean;
+  content?: string;
 }
 
 export interface DownloadSourceReq {
@@ -567,7 +569,61 @@ export function localArtUrl(path?: string): string | undefined {
   return isTauri() ? convertFileSrc(path) : undefined;
 }
 
-export function buildDownloadSource(candidate: StreamCandidate): DownloadSourceReq {
+export function prioritizeDownloadSubtitles(
+  subtitles: readonly SubtitleTrack[] | undefined,
+  pref: Pick<SubPref, "lang" | "secondaryLang" | "preferHearingImpaired"> = loadSubPref(),
+  fallbackHeaders: StreamHeaders = {},
+): DownloadSubtitleReq[] {
+  if (!subtitles?.length) return [];
+  const pBase = langBase(pref.lang || "en");
+  const sBase = pref.secondaryLang ? langBase(pref.secondaryLang) : "";
+
+  const seenUrls = new Set<string>();
+  const scored: { req: DownloadSubtitleReq; score: number; index: number }[] = [];
+
+  for (let i = 0; i < subtitles.length; i++) {
+    const s = subtitles[i];
+    if (!s.url || (!/^https?:\/\//i.test(s.url) && !PROXY_URL_RX.test(s.url))) continue;
+    const subUnwrapped = unwrapProxyUrl(s.url);
+    const urlLow = subUnwrapped.url.toLowerCase();
+    if (seenUrls.has(urlLow)) continue;
+    seenUrls.add(urlLow);
+
+    const mergedHeaders: StreamHeaders = { ...fallbackHeaders, ...subUnwrapped.headers };
+    const req: DownloadSubtitleReq = {
+      lang: s.lang || "und",
+      label: s.label || "Subtitles",
+      url: subUnwrapped.url,
+      ...(s.format ? { format: s.format } : {}),
+      ...(Object.keys(mergedHeaders).length ? { headers: mergedHeaders } : {}),
+      ...(s.isForced != null ? { isForced: s.isForced } : {}),
+      ...(s.isHearingImpaired != null ? { isHearingImpaired: s.isHearingImpaired } : {}),
+    };
+
+    const lBase = langBase(s.lang || "und");
+    let score = 0;
+    if (lBase !== "und" && lBase === pBase) score += 100;
+    else if (sBase && sBase !== "und" && lBase === sBase) score += 60;
+    else if (lBase === "en") score += 30;
+
+    if (!s.isForced) score += 20;
+    if (pref.preferHearingImpaired === "avoid" && s.isHearingImpaired) score -= 8;
+    else if (pref.preferHearingImpaired === "prefer" && s.isHearingImpaired) score += 8;
+    if (s.isDefault) score += 3;
+    if (s.format === "ass" || s.format === "ssa") score += 2;
+    else if (s.format === "srt") score += 1;
+
+    scored.push({ req, score, index: i });
+  }
+
+  scored.sort((a, b) => b.score - a.score || a.index - b.index);
+  return scored.slice(0, 8).map((x) => x.req);
+}
+
+export function buildDownloadSource(
+  candidate: StreamCandidate,
+  pref: Pick<SubPref, "lang" | "secondaryLang" | "preferHearingImpaired"> = loadSubPref(),
+): DownloadSourceReq {
   const rawSource = candidate.downloadUrl ?? candidate.url;
   const unwrapped = unwrapProxyUrl(rawSource);
   const targetKind = candidate.downloadUrl ? "file" : candidate.kind === "hls" ? "hls" : "file";
@@ -575,21 +631,7 @@ export function buildDownloadSource(candidate: StreamCandidate): DownloadSourceR
     ? (candidate.headers ?? {})
     : { ...unwrapped.headers, ...candidate.headers };
 
-  const subtitles: DownloadSubtitleReq[] = (candidate.subtitles ?? [])
-    .filter((s) => s.url && (/^https?:\/\//i.test(s.url) || PROXY_URL_RX.test(s.url)))
-    .slice(0, 6)
-    .map((s) => {
-      const subUnwrapped = unwrapProxyUrl(s.url);
-      return {
-        lang: s.lang || "und",
-        label: s.label || "Subtitles",
-        url: subUnwrapped.url,
-        ...(s.format ? { format: s.format } : {}),
-        ...(Object.keys(subUnwrapped.headers).length ? { headers: subUnwrapped.headers } : {}),
-        ...(s.isForced != null ? { isForced: s.isForced } : {}),
-        ...(s.isHearingImpaired != null ? { isHearingImpaired: s.isHearingImpaired } : {}),
-      };
-    });
+  const subtitles = prioritizeDownloadSubtitles(candidate.subtitles, pref, headers);
 
   return {
     providerId: candidate.providerId,
@@ -600,6 +642,277 @@ export function buildDownloadSource(candidate: StreamCandidate): DownloadSourceR
     quality: candidate.probe?.quality ?? candidate.quality,
     subtitles,
   };
+}
+
+function mergeDownloadSubtitleLists(
+  base: readonly DownloadSubtitleReq[],
+  extra: readonly DownloadSubtitleReq[],
+): DownloadSubtitleReq[] {
+  const out: DownloadSubtitleReq[] = [];
+  const seenUrls = new Set<string>();
+  for (const s of [...base, ...extra]) {
+    if (out.length >= 8) break;
+    const key = s.url.toLowerCase();
+    if (!seenUrls.add(key)) continue;
+    out.push(s);
+  }
+  return out;
+}
+
+function hasNonForcedLang(subs: readonly DownloadSubtitleReq[], targetLang: string): boolean {
+  const want = langBase(targetLang);
+  if (!want || want === "und") return true;
+  return subs.some((s) => langBase(s.lang) === want && !s.isForced);
+}
+
+function preferredSubLangList(pref: Pick<SubPref, "lang" | "secondaryLang">): string[] {
+  const out: string[] = [];
+  for (const raw of [pref.lang || "en", pref.secondaryLang || "", "en"]) {
+    const b = langBase(raw);
+    if (b && b !== "und" && !out.includes(b)) out.push(b);
+  }
+  return out;
+}
+
+function streamHeadersToRecord(h?: StreamHeaders): Record<string, string> | undefined {
+  if (!h) return undefined;
+  const out: Record<string, string> = {};
+  if (h.referer) out.Referer = h.referer;
+  if (h.origin) out.Origin = h.origin;
+  if (h.ua) out["User-Agent"] = h.ua;
+  return Object.keys(out).length ? out : undefined;
+}
+
+const SUB_ENRICH_TIMEOUT_MS = 4500;
+
+async function enrichDownloadSubtitles(
+  req: PlaybackRequest,
+  primary: DownloadSourceReq,
+  fallbacks: DownloadSourceReq[],
+  detail: MediaDetail | undefined,
+  pref: Pick<SubPref, "lang" | "secondaryLang" | "preferHearingImpaired">,
+): Promise<void> {
+  const wantPrimary = langBase(pref.lang || "en");
+  const wantSecondary = pref.secondaryLang ? langBase(pref.secondaryLang) : "";
+
+  // 1. Borrow matching subtitles from fallback sources if primary lacks them.
+  const siblingSubs: DownloadSubtitleReq[] = [];
+  for (const fb of fallbacks) {
+    for (const s of fb.subtitles) {
+      const lb = langBase(s.lang);
+      if (lb === wantPrimary || (wantSecondary && lb === wantSecondary) || primary.subtitles.length < 2) {
+        siblingSubs.push(s);
+      }
+    }
+  }
+  if (siblingSubs.length > 0) {
+    primary.subtitles = mergeDownloadSubtitleLists(primary.subtitles, siblingSubs);
+  }
+
+  // 2. Decrypt any encrypted KissKH subtitle URLs & auto-fetch online subs if missing requested languages.
+  const missingLangs = [
+    ...(wantPrimary && wantPrimary !== "und" && !hasNonForcedLang(primary.subtitles, wantPrimary) ? [wantPrimary] : []),
+    ...(wantSecondary && wantSecondary !== "und" && wantSecondary !== wantPrimary && !hasNonForcedLang(primary.subtitles, wantSecondary)
+      ? [wantSecondary]
+      : []),
+  ];
+
+  const needOnline = missingLangs.length > 0 && (typeof navigator === "undefined" || navigator.onLine !== false);
+  let hasEncrypted = false;
+  try {
+    const { isEncryptedSubCandidateUrl } = await import("./kisskhSubs");
+    hasEncrypted = primary.subtitles.some((s) => !s.content && isEncryptedSubCandidateUrl(s.url));
+  } catch {
+    hasEncrypted = false;
+  }
+
+  if (!needOnline && !hasEncrypted) return;
+
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), SUB_ENRICH_TIMEOUT_MS);
+  try {
+    const [{ fetchAndParseSubtitle, searchOnlineSubtitles }, { isEncryptedSubCandidateUrl }] = await Promise.all([
+      import("./subtitleProviders"),
+      import("./kisskhSubs"),
+    ]);
+
+    if (hasEncrypted) {
+      await Promise.all(
+        primary.subtitles.map(async (sub) => {
+          if (sub.content || !isEncryptedSubCandidateUrl(sub.url)) return;
+          try {
+            const parsed = await fetchAndParseSubtitle(sub.url, {
+              formatHint: sub.format,
+              headers: streamHeadersToRecord(sub.headers),
+              signal: ctl.signal,
+              episode: { season: req.season, episode: req.episode },
+            });
+            if (parsed.raw.trim()) {
+              sub.content = parsed.raw;
+              sub.format = parsed.format ?? sub.format;
+            }
+          } catch {
+            /* keep raw URL if decrypt times out */
+          }
+        }),
+      );
+    }
+
+    if (needOnline) {
+      const mediaDetail = detail ?? (req.media as Partial<MediaDetail>);
+      const kind: "movie" | "tv" | "anime" = isFilm(req.media)
+        ? "movie"
+        : req.media.kind === "anime"
+          ? "anime"
+          : "tv";
+      const subdlApiKey = getSettings().subdlApiKey?.trim() || undefined;
+      const results = await searchOnlineSubtitles(
+        {
+          tmdbId: mediaDetail.tmdbId ?? req.media.tmdbId,
+          imdbId: mediaDetail.imdbId,
+          title: mediaDetail.title ?? req.media.title,
+          year: mediaDetail.year ?? req.media.year,
+          kind,
+          season: req.season,
+          episode: req.episode,
+          languages: missingLangs,
+          preferHearingImpaired: pref.preferHearingImpaired,
+          subdlApiKey,
+        },
+        ctl.signal,
+      );
+
+      const onlineFetched: DownloadSubtitleReq[] = [];
+      for (const langNeeded of missingLangs) {
+        const match =
+          results.find((r) => langBase(r.lang) === langNeeded && !r.forced) ??
+          results.find((r) => langBase(r.lang) === langNeeded);
+        if (!match) continue;
+        try {
+          const parsed = await fetchAndParseSubtitle(match.url, {
+            formatHint: match.format,
+            signal: ctl.signal,
+            episode: { season: req.season, episode: req.episode },
+          });
+          if (parsed.raw.trim()) {
+            onlineFetched.push({
+              lang: match.lang || langNeeded,
+              label: match.release ? `${match.langName || match.lang} · ${match.release}` : match.langName || match.lang,
+              url: match.url,
+              format: parsed.format ?? match.format,
+              content: parsed.raw,
+              ...(match.forced ? { isForced: true } : {}),
+              ...(match.hearingImpaired ? { isHearingImpaired: true } : {}),
+            });
+          }
+        } catch {
+          /* try next or proceed without blocking video download */
+        }
+      }
+
+      if (onlineFetched.length > 0) {
+        primary.subtitles = mergeDownloadSubtitleLists(onlineFetched, primary.subtitles);
+      }
+    }
+  } catch {
+    /* never block or fail a video download if subtitle enrichment fails */
+  } finally {
+    clearTimeout(timer);
+  }
+
+  for (const fb of fallbacks) {
+    fb.subtitles = mergeDownloadSubtitleLists(fb.subtitles, primary.subtitles);
+  }
+}
+
+export async function fetchMissingDownloadSubtitles(entry: DownloadedEntry): Promise<number> {
+  if (!isTauri()) return 0;
+  if (typeof navigator !== "undefined" && navigator.onLine === false) {
+    toast("Connect to the internet to fetch subtitles for saved items.", { icon: "info" });
+    return 0;
+  }
+
+  const pref = loadSubPref();
+  const wantPrimary = langBase(pref.lang || "en");
+  const wantSecondary = pref.secondaryLang ? langBase(pref.secondaryLang) : "";
+  const languages = [
+    ...(wantPrimary && wantPrimary !== "und" ? [wantPrimary] : ["en"]),
+    ...(wantSecondary && wantSecondary !== "und" && wantSecondary !== wantPrimary ? [wantSecondary] : []),
+  ];
+
+  const snap = entry.mediaSnapshot;
+  const kind: "movie" | "tv" | "anime" = entry.isFilm
+    ? "movie"
+    : entry.mediaKind === "anime"
+      ? "anime"
+      : "tv";
+  const subdlApiKey = getSettings().subdlApiKey?.trim() || undefined;
+
+  try {
+    const { fetchAndParseSubtitle, searchOnlineSubtitles } = await import("./subtitleProviders");
+    const results = await searchOnlineSubtitles({
+      tmdbId: snap?.tmdbId,
+      imdbId: snap?.imdbId,
+      title: snap?.title ?? entry.title,
+      year: snap?.year ?? entry.year,
+      kind,
+      season: entry.season,
+      episode: entry.episode,
+      languages,
+      preferHearingImpaired: pref.preferHearingImpaired,
+      localPath: entry.filePath,
+      fileSize: entry.fileSize,
+      subdlApiKey,
+    });
+
+    if (!results.length) {
+      toast(`No online subtitles found for “${entry.title}”`, { icon: "info" });
+      return 0;
+    }
+
+    const baseName = entry.filePath.split(/[\\/]/).pop() ?? "video";
+    const stem =
+      baseName
+        .replace(/\.[^.]+$/, "")
+        .replace(/[\/\\:*?"<>|\x00]/g, "_")
+        .replace(/\.{2,}/g, ".") || "subtitle";
+
+    let saved = 0;
+    for (const wantLang of languages) {
+      const hit =
+        results.find((r) => langBase(r.lang) === wantLang && !r.forced) ??
+        results.find((r) => langBase(r.lang) === wantLang) ??
+        (saved === 0 ? results[0] : undefined);
+      if (!hit) continue;
+      const parsed = await fetchAndParseSubtitle(hit.url, {
+        formatHint: hit.format,
+        episode: { season: entry.season, episode: entry.episode },
+      });
+      if (!parsed.raw.trim()) continue;
+      const fmt: string = parsed.format ?? hit.format;
+      const safeExt = fmt === "ass" || fmt === "ssa" || fmt === "vtt" ? fmt : "srt";
+      const code = langBase(hit.lang) !== "und" ? langBase(hit.lang) : wantLang;
+      const sdhPart = hit.hearingImpaired ? ".sdh" : "";
+      const filename = `${stem}.${code}${sdhPart}.${safeExt}`;
+      await invoke<string>("save_sidecar_subtitle", {
+        videoPath: entry.filePath,
+        filename,
+        content: parsed.raw,
+      });
+      saved++;
+    }
+
+    if (saved > 0) {
+      await refreshDownloads({ minIntervalMs: 0 });
+      toast(`Saved ${saved} offline subtitle${saved === 1 ? "" : "s"} for “${entry.title}”`, { icon: "check" });
+    } else {
+      toast(`Couldn't download subtitles for “${entry.title}”`, { icon: "info" });
+    }
+    return saved;
+  } catch (e: unknown) {
+    toast(`Subtitle lookup failed: ${e instanceof Error ? e.message : String(e)}`, { icon: "info" });
+    return 0;
+  }
 }
 
 export async function startDownload(
@@ -621,19 +934,22 @@ export async function startDownload(
   const root = await ensureDownloadFolder();
   if (!root) return null;
 
-  const primary = buildDownloadSource(candidate);
+  const pref = loadSubPref();
+  const primary = buildDownloadSource(candidate, pref);
   const seenUrls = new Set<string>([primary.url.toLowerCase()]);
   const seenProviders = new Set<string>([primary.providerId]);
   const fallbacks: DownloadSourceReq[] = [];
   for (const fbCand of opts?.fallbacks ?? []) {
     if (fallbacks.length >= 6) break;
-    const fb = buildDownloadSource(fbCand);
+    const fb = buildDownloadSource(fbCand, pref);
     const low = fb.url.toLowerCase();
     if (seenUrls.has(low) || seenProviders.has(fb.providerId)) continue;
     seenUrls.add(low);
     seenProviders.add(fb.providerId);
     fallbacks.push(fb);
   }
+
+  await enrichDownloadSubtitles(req, primary, fallbacks, detail, pref);
 
   const targetQuality = opts?.preferredQuality ?? getSettings().preferredQuality;
   const mediaDetail = detail ?? (req.media as Partial<MediaDetail>);
@@ -659,6 +975,7 @@ export async function startDownload(
     headers: primary.headers,
     preferredQuality: targetQuality,
     subtitles: primary.subtitles,
+    preferredSubLangs: preferredSubLangList(pref),
     fallbacks,
     replaceExisting: opts?.replaceExisting ?? true,
     posterUrl,
@@ -693,12 +1010,13 @@ export async function switchDownloadSource(
   preferredQuality?: number,
 ): Promise<DownloadJob | null> {
   if (!isTauri()) return null;
-  const source = buildDownloadSource(candidate);
+  const pref = loadSubPref();
+  const source = buildDownloadSource(candidate, pref);
   const seenUrls = new Set<string>([source.url.toLowerCase()]);
   const fallbacks: DownloadSourceReq[] = [];
   for (const c of extraFallbacks) {
     if (fallbacks.length >= 6) break;
-    const fb = buildDownloadSource(c);
+    const fb = buildDownloadSource(c, pref);
     const low = fb.url.toLowerCase();
     if (seenUrls.has(low) || fb.providerId === source.providerId) continue;
     seenUrls.add(low);

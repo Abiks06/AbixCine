@@ -1,5 +1,5 @@
 import { Component, type ErrorInfo, type ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { isTauri } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { createHashRouter, Outlet, RouterProvider, useLocation, useNavigationType, useRouteError } from "react-router-dom";
 import { CardHoverPreview } from "./components/CardHoverPreview";
@@ -199,7 +199,18 @@ function Shell() {
 
   // Never strand the window in fullscreen once you leave the player.
   useEffect(() => {
-    if (!watching && isTauri()) getCurrentWindow().setFullscreen(false).catch(() => {});
+    if (watching) return;
+    if (document.fullscreenElement) void document.exitFullscreen().catch(() => {});
+    if (isTauri()) {
+      void invoke<boolean>("get_window_fullscreen")
+        .then((full) => (full ? invoke("set_window_fullscreen", { fullscreen: false }) : undefined))
+        .catch(() =>
+          getCurrentWindow()
+            .isFullscreen()
+            .then((f) => (f ? getCurrentWindow().setFullscreen(false) : undefined))
+            .catch(() => {}),
+        );
+    }
   }, [watching]);
 
   useEffect(() => {

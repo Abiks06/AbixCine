@@ -30,12 +30,14 @@ import {
   normalizeSubPref,
   saveSubPref,
   type CueSize,
+  type SubAssMode,
   type SubBg,
   type SubEdge,
   type SubFont,
   type SubHIFilter,
   type SubMode,
   type SubPref,
+  type SubSignLayout,
   type SubtitleCue,
 } from "../lib/subtitles";
 import { circuitRemainingMs, getHealth, isCircuitHalfOpen, isCircuitOpen, reliability, resetHealth } from "../sources/health";
@@ -90,6 +92,29 @@ const PREVIEW_PRIMARY_CUES: SubtitleCue[] = [
       { text: " fade." },
     ],
     align: 2,
+  },
+];
+
+const PREVIEW_SIGN_CUES: SubtitleCue[] = [
+  {
+    id: "preview-sign-1",
+    start: 0,
+    end: 10,
+    text: "Bountiful Harvest Tavern",
+    spans: [{ text: "Bountiful Harvest Tavern" }],
+    align: 8,
+    kind: "sign",
+    pos: { xPct: 24, yPct: 34 },
+  },
+  {
+    id: "preview-sign-2",
+    start: 0,
+    end: 10,
+    text: "Special: Miso Ramen ¥850",
+    spans: [{ text: "Special: Miso Ramen ¥850" }],
+    align: 8,
+    kind: "sign",
+    pos: { xPct: 74, yPct: 38 },
   },
 ];
 
@@ -175,6 +200,7 @@ export function Settings() {
     normalizeSubPref({ ...loadSubPref(), ...(s.subtitlePref ?? {}) }),
   );
   const [previewDual, setPreviewDual] = useState(false);
+  const [previewSigns, setPreviewSigns] = useState(true);
   const upd = useUpdate();
   const [version, setVersion] = useState("");
   const mountedRef = useRef(true);
@@ -1301,16 +1327,24 @@ export function Settings() {
           <div className="sub-preview-bg" aria-hidden />
           <div className="sub-preview-bar">
             <span className="sub-preview-badge">Live Preview</span>
-            <button
-              className={`chip ${previewDual || !!subPref.secondaryLang ? "on" : ""}`}
-              onClick={() => setPreviewDual((x) => !x)}
-            >
-              <Icon name="dual" size={13} /> {previewDual || subPref.secondaryLang ? "Dual on" : "Preview dual"}
-            </button>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              <button
+                className={`chip ${previewSigns ? "on" : ""}`}
+                onClick={() => setPreviewSigns((x) => !x)}
+              >
+                <Icon name="spark" size={13} /> {previewSigns ? "Signs on" : "Anime signs"}
+              </button>
+              <button
+                className={`chip ${previewDual || !!subPref.secondaryLang ? "on" : ""}`}
+                onClick={() => setPreviewDual((x) => !x)}
+              >
+                <Icon name="dual" size={13} /> {previewDual || subPref.secondaryLang ? "Dual on" : "Preview dual"}
+              </button>
+            </div>
           </div>
           <SubtitleOverlay
             preview
-            cues={PREVIEW_PRIMARY_CUES}
+            cues={previewSigns ? [...PREVIEW_PRIMARY_CUES, ...PREVIEW_SIGN_CUES] : PREVIEW_PRIMARY_CUES}
             secondaryCues={previewDual || subPref.secondaryLang ? PREVIEW_SECONDARY_CUES : undefined}
             subPref={subPref}
             controlsVisible={false}
@@ -1397,6 +1431,53 @@ export function Settings() {
                 onClick={() => patchSubPref({ preferHearingImpaired: f.id })}
               >
                 {f.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="setting-line">
+          <div>
+            <strong>Anime signs &amp; notes</strong>
+            <span className="muted">Keep translated anime signs and item labels in a compact top band so they don&apos;t cover spoken dialogue.</span>
+          </div>
+          <div className="sub-seg">
+            {(
+              [
+                { id: "separate", label: "Separate" },
+                { id: "positioned", label: "On-screen" },
+                { id: "hide", label: "Dialogue only" },
+              ] as { id: SubSignLayout; label: string }[]
+            ).map((opt) => (
+              <button
+                key={opt.id}
+                className={(subPref.signLayout ?? "separate") === opt.id ? "on" : ""}
+                onClick={() => patchSubPref({ signLayout: opt.id })}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="setting-line">
+          <div>
+            <strong>ASS / SSA subtitles</strong>
+            <span className="muted">Native ASS renders full anime typesetting; Clean layout uses your font, size, and separated sign band.</span>
+          </div>
+          <div className="sub-seg">
+            {(
+              [
+                { id: "native", label: "Native ASS" },
+                { id: "clean", label: "Clean layout" },
+              ] as { id: SubAssMode; label: string }[]
+            ).map((opt) => (
+              <button
+                key={opt.id}
+                className={(subPref.assMode ?? "native") === opt.id ? "on" : ""}
+                onClick={() => patchSubPref({ assMode: opt.id })}
+              >
+                {opt.label}
               </button>
             ))}
           </div>

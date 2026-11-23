@@ -4,15 +4,18 @@ import {
   DEFAULT_SUB_PREF,
   SUB_PREF_EVENT,
   activeCuesAt,
+  classifyTextCue,
   nextCueBoundaryAfter,
   cuesToVtt,
   decodeSubtitle,
   detectSubtitleFormat,
   langBase,
   langLabel,
+  layoutActiveCues,
   loadSubPref,
   loadSubTrackMemory,
   normalizeSubLang,
+  normalizeSubPref,
   parseSubtitles,
   pickBestSubtitleIndex,
   preferredAudioTrackIndex,
@@ -419,5 +422,131 @@ describe("nextCueBoundaryAfter", () => {
   it("applies the subtitle offset", () => {
     // Shifted 2 s later: the first cue starts at media time 3.
     expect(nextCueBoundaryAfter(cues, 0, 2)).toBe(3);
+  });
+});
+
+describe("anime sign classification & layoutActiveCues", () => {
+  it("classifies ASS styles, OP/ED songs, Dialogue, and \\pos signs", () => {
+    const ass = `[Script Info]
+PlayResX: 1920
+PlayResY: 1080
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,1
+Style: SignTop,Arial,36,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,8,10,10,10,1
+Style: SignBottom,Arial,36,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,1
+Style: Typesetting,Arial,36,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,1
+Style: OP_Romaji,Arial,36,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,8,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:01.00,0:00:05.00,Default,,0,0,0,,Are you ready to go?
+Dialogue: 0,0:00:01.00,0:00:05.00,SignTop,,0,0,0,,Adventurers Guild
+Dialogue: 0,0:00:01.00,0:00:05.00,Typesetting,,0,0,0,,Chapter 1: Dawn
+Dialogue: 0,0:00:01.00,0:00:05.00,Default,,0,0,0,,{\\pos(480,324)}Potion Shop
+Dialogue: 0,0:00:06.00,0:00:10.00,OP_Romaji,,0,0,0,,Hikari no naka e
+Dialogue: 0,0:00:07.00,0:00:10.00,SignBottom,,0,0,0,,Guild Board
+`;
+    const parsed = parseSubtitles(ass, "ass");
+    expect(parsed.cues).toHaveLength(6);
+    expect(parsed.cues[0].kind).toBe("dialogue");
+    expect(parsed.cues[1].kind).toBe("sign");
+    expect(parsed.cues[2].kind).toBe("sign");
+    expect(parsed.cues[3].kind).toBe("sign");
+    expect(parsed.cues[3].pos).toEqual({ xPct: 25, yPct: 30 });
+    expect(parsed.cues[4].kind).toBe("song");
+    expect(parsed.cues[5].kind).toBe("sign");
+  });
+
+  it("classifies text cues for prefixes, positions, and musical notes", () => {
+    expect(classifyTextCue("Let's hurry inside.", 2)).toBe("dialogue");
+    expect(classifyTextCue("[Sign: Bakery]", 2)).toBe("sign");
+    expect(classifyTextCue("【第1話】", 2)).toBe("sign");
+    expect(classifyTextCue("Top note", 8)).toBe("sign");
+    expect(classifyTextCue("Poster", 2, { xPct: 25, yPct: 30 })).toBe("sign");
+    expect(classifyTextCue("♪ Shining across the sky ♪", 2)).toBe("song");
+  });
+
+  it("keeps VTT line:90% at bottom-center without pos while giving line:35% a pos", () => {
+    const vtt = `WEBVTT
+
+00:00:01.000 --> 00:00:04.000 line:90%
+Normal bottom line
+
+00:00:01.000 --> 00:00:04.000 line:35% position:25%
+Mid-screen sign
+`;
+    const parsed = parseSubtitles(vtt, "vtt");
+    expect(parsed.cues).toHaveLength(2);
+    expect(parsed.cues[0].align).toBe(2);
+    expect(parsed.cues[0].pos).toBeUndefined();
+    expect(parsed.cues[0].kind).toBe("dialogue");
+    expect(parsed.cues[1].pos).toEqual({ xPct: 25, yPct: 35 });
+    expect(parsed.cues[1].kind).toBe("sign");
+  });
+
+  it("separates signs, caps at 4, deduplicates clones, and promotes contextual unlabeled anime signs", () => {
+    const makeCue = (id: string, text: string, overrides: Partial<SubtitleCue> = {}): SubtitleCue => ({
+      id,
+      start: 1,
+      end: 5,
+      text,
+      spans: [{ text }],
+      align: 2,
+      ...overrides,
+    });
+
+    const input: SubtitleCue[] = [
+      makeCue("d1", "Here is what you ordered."),
+      makeCue("u1", "SPECIAL MENU: TONKOTSU RAMEN"), // unlabeled bottom all-caps item text
+      makeCue("s1", "Sign One", { kind: "sign", start: 1 }),
+      makeCue("s1-dup", "Sign   One", { kind: "sign", start: 1 }), // duplicate shadow clone
+      makeCue("s2", "Sign Two", { kind: "sign", start: 2 }),
+      makeCue("s3", "Sign Three", { kind: "sign", start: 3 }),
+      makeCue("s4", "Sign Four", { kind: "sign", start: 4 }),
+      makeCue("song1", "♪ Opening theme ♪", { kind: "song" }),
+    ];
+
+    const sep = layoutActiveCues(input, "separate");
+    expect(sep.zones.get(2)?.map((c) => c.id)).toEqual(["d1"]);
+    expect(sep.songs.map((c) => c.id)).toEqual(["song1"]);
+    expect(sep.signs).toHaveLength(4);
+    expect(sep.signs.some((c) => c.id === "s1-dup")).toBe(false);
+    // "s4", "s3", "s2" have later start times (4,3,2) while "u1" and "s1" are at start=1
+    expect(sep.signs.some((c) => c.id === "s4")).toBe(true);
+
+    const hidden = layoutActiveCues(input, "hide");
+    expect(hidden.signs).toHaveLength(0);
+    expect(hidden.songs).toHaveLength(0);
+    expect(hidden.zones.get(2)?.map((c) => c.id)).toEqual(["d1"]);
+  });
+
+  it("resolves vertical collisions in positioned mode so overlapping coordinates do not stack identically", () => {
+    const overlapping: SubtitleCue[] = [
+      { id: "p1", start: 1, end: 5, text: "Poster A", spans: [{ text: "Poster A" }], align: 5, kind: "sign", pos: { xPct: 50, yPct: 40 } },
+      { id: "p2", start: 1, end: 5, text: "Poster B", spans: [{ text: "Poster B" }], align: 5, kind: "sign", pos: { xPct: 50, yPct: 40 } },
+      { id: "d1", start: 1, end: 5, text: "Dialogue", spans: [{ text: "Dialogue" }], align: 2, kind: "dialogue" },
+    ];
+    const layout = layoutActiveCues(overlapping, "positioned");
+    expect(layout.zones.get(2)?.map((c) => c.id)).toEqual(["d1"]);
+    expect(layout.positioned).toHaveLength(2);
+    expect(layout.positioned[0].yPct).not.toBe(layout.positioned[1].yPct);
+    expect(layout.positioned[1].yPct).toBeGreaterThan(layout.positioned[0].yPct);
+  });
+
+  it("normalizes and persists signLayout and assMode preferences with defaults", () => {
+    localStorage.clear();
+    expect(DEFAULT_SUB_PREF.signLayout).toBe("separate");
+    expect(DEFAULT_SUB_PREF.assMode).toBe("native");
+
+    const fallback = normalizeSubPref({ signLayout: "bogus" as never, assMode: "nope" as never });
+    expect(fallback.signLayout).toBe("separate");
+    expect(fallback.assMode).toBe("native");
+
+    saveSubPref({ signLayout: "positioned", assMode: "clean" });
+    const loaded = loadSubPref();
+    expect(loaded.signLayout).toBe("positioned");
+    expect(loaded.assMode).toBe("clean");
   });
 });

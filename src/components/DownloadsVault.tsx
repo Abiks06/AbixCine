@@ -8,6 +8,7 @@ import {
   cancelDownload,
   clearFailedDownloads,
   ensureDownloadFolder,
+  fetchMissingDownloadSubtitles,
   fmtEta,
   fmtSpeed,
   formatDownloadQuality,
@@ -78,6 +79,17 @@ export function DownloadsVault({
   const [confirmGroup, setConfirmGroup] = useState<string | null>(null);
   const [confirmEntry, setConfirmEntry] = useState<string | null>(null);
   const [confirmStopAll, setConfirmStopAll] = useState(false);
+  const [fetchingSubId, setFetchingSubId] = useState<string | null>(null);
+
+  const handleFetchSubs = async (entry: DownloadedTitleGroup["entries"][number]) => {
+    if (fetchingSubId) return;
+    setFetchingSubId(entry.id);
+    try {
+      await fetchMissingDownloadSubtitles(entry);
+    } finally {
+      setFetchingSubId((cur) => (cur === entry.id ? null : cur));
+    }
+  };
 
   const liveJobs = useMemo(
     () =>
@@ -535,6 +547,11 @@ export function DownloadsVault({
                         {a.toUpperCase()}
                       </span>
                     ))}
+                    {g.entries.some((e) => (e.subtitlePaths?.length ?? 0) > 0) && (
+                      <span className="badge dim" title="Offline subtitles saved">
+                        SUBS
+                      </span>
+                    )}
                   </div>
                 </div>
 
@@ -542,7 +559,9 @@ export function DownloadsVault({
                   <button
                     type="button"
                     className="btn play sm"
-                    onClick={() => nav(playTargetUrl(g), { viewTransition: true, state: { from: "app" } })}
+                    onClick={() =>
+                      nav(playTargetUrl(g), { viewTransition: true, state: { from: "app", offline: true, quick: true } })
+                    }
                     title={
                       g.isFilm
                         ? `Play ${g.media.title}`
@@ -554,6 +573,19 @@ export function DownloadsVault({
                       {g.isFilm ? "Play" : `Play E${g.entries[0]?.episode ?? 1}`}
                     </span>
                   </button>
+
+                  {!compact && g.isFilm && online && g.entries[0] && !(g.entries[0].subtitlePaths?.length) && (
+                    <button
+                      type="button"
+                      className="btn glass sm"
+                      disabled={fetchingSubId === g.entries[0].id}
+                      onClick={() => void handleFetchSubs(g.entries[0])}
+                      title="Download offline subtitles for this film"
+                    >
+                      <Icon name="subtitles" size={14} />
+                      <span>{fetchingSubId === g.entries[0].id ? "Fetching…" : "Get subs"}</span>
+                    </button>
+                  )}
 
                   {!compact && !g.isFilm && (
                     <button
@@ -625,10 +657,30 @@ export function DownloadsVault({
                           </small>
                         </div>
                         <div className="dlv-ep-acts">
+                          {(e.subtitlePaths?.length ?? 0) > 0 ? (
+                            <span className="badge dim" title="Offline subtitles saved">
+                              SUBS
+                            </span>
+                          ) : online ? (
+                            <button
+                              type="button"
+                              className="chip"
+                              disabled={fetchingSubId === e.id}
+                              onClick={() => void handleFetchSubs(e)}
+                              title="Download offline subtitles for this episode"
+                            >
+                              <Icon name="subtitles" size={11} /> {fetchingSubId === e.id ? "Fetching…" : "Get subs"}
+                            </button>
+                          ) : null}
                           <button
                             type="button"
                             className="chip"
-                            onClick={() => nav(playTargetUrl(g, e), { viewTransition: true, state: { from: "app" } })}
+                            onClick={() =>
+                              nav(playTargetUrl(g, e), {
+                                viewTransition: true,
+                                state: { from: "app", offline: true, quick: true },
+                              })
+                            }
                           >
                             <Icon name="play" size={11} /> Play
                           </button>

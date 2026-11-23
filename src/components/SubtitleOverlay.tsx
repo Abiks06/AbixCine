@@ -1,6 +1,7 @@
 import type JASSUB from "jassub";
 import { memo, useEffect, useRef, useState, type CSSProperties, type RefObject } from "react";
 import type { CueAlign, CueSpan, SubPref, SubtitleCue } from "../lib/subtitles";
+import { layoutActiveCues } from "../lib/subtitles";
 import type { SubtitleFormat } from "../sources/types";
 
 /** JASSUB draws on its own canvas over the video. */
@@ -108,7 +109,8 @@ export const SubtitleOverlay = memo(function SubtitleOverlay({
   offsetSec = 0,
   subEnabled = true,
 }: SubtitleOverlayProps) {
-  const assTrack = !preview && (assFormat === "ass" || assFormat === "ssa") && Boolean(assRaw);
+  const wantNativeAss = subPref.assMode !== "clean" && subPref.signLayout !== "hide";
+  const assTrack = !preview && wantNativeAss && (assFormat === "ass" || assFormat === "ssa") && Boolean(assRaw);
   const jassubKey = assTrack && assRaw ? `${assFormat}:${assRaw.length}:${assRaw.slice(0, 64)}` : "";
   // The renderer (a 2.2 MB WASM worker) starts the first time subtitles are on for this track and
   // then stays: toggling subtitles (C) only hides its canvas instead of tearing the worker down.
@@ -227,32 +229,55 @@ export const SubtitleOverlay = memo(function SubtitleOverlay({
     if (subEnabled && v) repaintIfPaused(inst, v);
   }, [subEnabled, usingJassub, videoRef]);
 
+  // Keep the JASSUB canvas aligned across window resizes, fullscreen transitions, and side drawers.
+  useEffect(() => {
+    const videoEl = videoRef?.current;
+    if (!usingJassub || !videoEl) return;
+
+    let timer: number | undefined;
+    const syncCanvas = () => {
+      const inst = jassubRef.current;
+      if (!inst || !videoEl.isConnected) return;
+      void inst.resize(true).catch(() => {});
+      repaintIfPaused(inst, videoEl);
+    };
+    const scheduleSync = () => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(syncCanvas, 40);
+    };
+
+    const ro = typeof ResizeObserver !== "undefined" ? new ResizeObserver(scheduleSync) : null;
+    ro?.observe(videoEl);
+    window.addEventListener("resize", scheduleSync, { passive: true });
+    document.addEventListener("fullscreenchange", scheduleSync);
+    return () => {
+      window.clearTimeout(timer);
+      ro?.disconnect();
+      window.removeEventListener("resize", scheduleSync);
+      document.removeEventListener("fullscreenchange", scheduleSync);
+    };
+  }, [usingJassub, videoRef]);
+
   const primaryCues = usingJassub ? [] : cues;
   const secList = secondaryCues ?? [];
   if (!primaryCues.length && !secList.length) return null;
 
-  const zoneMap = new Map<CueAlign, SubtitleCue[]>();
-  const positioned: SubtitleCue[] = [];
-
-  for (const cue of primaryCues) {
-    if (cue.pos) {
-      positioned.push(cue);
-    } else {
-      const z = (cue.align >= 1 && cue.align <= 9 ? cue.align : 2) as CueAlign;
-      const bucket = zoneMap.get(z);
-      if (bucket) bucket.push(cue);
-      else zoneMap.set(z, [cue]);
-    }
+  const { zones: zoneMap, positioned, signs, songs } = layoutActiveCues(
+    primaryCues,
+    subPref.signLayout ?? "separate",
+  );
+  if (!zoneMap.size && !positioned.length && !signs.length && !songs.length && !secList.length) {
+    return null;
   }
 
   // Secondary subtitles render in a distinct top-center band by default so they never collide
-  // with standard bottom-center dialogue. If primary already uses top-center without bottom-center,
-  // park secondary at bottom-center; if both top and bottom are occupied, offset below top-center.
-  const hasTopCenter = zoneMap.has(8);
+  // with standard bottom-center dialogue. If primary already occupies top-center/signs/songs
+  // without bottom-center, park secondary at bottom-center; if both bands are occupied, offset below.
+  const hasTopBand = zoneMap.has(8) || signs.length > 0 || songs.length > 0;
   const hasBottomCenter = zoneMap.has(2);
-  const secondaryPosClass = hasTopCenter && !hasBottomCenter
+  const secondaryPosClass = hasTopBand && !hasBottomCenter
     ? "at-bottom"
-    : hasTopCenter && hasBottomCenter
+    : hasTopBand && hasBottomCenter
       ? "at-top below-top"
       : "at-top";
 
@@ -278,6 +303,26 @@ export const SubtitleOverlay = memo(function SubtitleOverlay({
 
   return (
     <div className={rootClass} style={rootStyle} aria-live="polite">
+      {signs.length > 0 && (
+        <div className="sub-zone sub-signs-band" aria-label="On-screen text">
+          {signs.map((cue) => (
+            <div key={`sign-${cue.id}`} className="sub-cue is-sign">
+              <CueSpans cue={cue} />
+            </div>
+          ))}
+        </div>
+      )}
+
+      {songs.length > 0 && (
+        <div className={`sub-zone sub-songs-band${signs.length > 0 ? " below-signs" : ""}`}>
+          {songs.map((cue) => (
+            <div key={`song-${cue.id}`} className="sub-cue is-song">
+              <CueSpans cue={cue} />
+            </div>
+          ))}
+        </div>
+      )}
+
       {ALL_ZONES.map((zone) => {
         const list = zoneMap.get(zone);
         if (!list?.length) return null;
@@ -292,9 +337,9 @@ export const SubtitleOverlay = memo(function SubtitleOverlay({
         );
       })}
 
-      {positioned.map((cue) => {
-        const x = clamp(cue.pos!.xPct, 2, 98);
-        const y = clamp(cue.pos!.yPct, 2, 98);
+      {positioned.map(({ cue, xPct, yPct }) => {
+        const x = clamp(xPct, 2, 98);
+        const y = clamp(yPct, 2, 98);
         const align = (cue.align >= 1 && cue.align <= 9 ? cue.align : 2) as CueAlign;
         return (
           <div
@@ -308,7 +353,7 @@ export const SubtitleOverlay = memo(function SubtitleOverlay({
               zIndex: cue.layer != null ? Math.max(1, Math.min(50, cue.layer)) : undefined,
             }}
           >
-            <div className="sub-cue">
+            <div className={`sub-cue${cue.kind === "sign" ? " is-sign" : cue.kind === "song" ? " is-song" : ""}`}>
               <CueSpans cue={cue} />
             </div>
           </div>

@@ -140,6 +140,7 @@ export function TrailerModal({ id, title, onClose }: { id: string; title?: strin
 
   // The iframe API only starts talking after the host says it is listening.
   const hello = () => {
+    setState((x) => (x === "loading" ? "ready" : x));
     const w = frame.current?.contentWindow;
     if (!w) return;
     const msg = JSON.stringify({ event: "listening", id: 1, channel: "widget" });

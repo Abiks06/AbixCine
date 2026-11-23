@@ -75,6 +75,13 @@ function rememberDetail(key: string, detail: MediaDetail) {
  */
 export function getDetail(key: string): Promise<MediaDetail> {
   const cleanKey = key.trim();
+  if (typeof navigator !== "undefined" && navigator.onLine === false) {
+    const offline = findOfflineDetail(cleanKey);
+    if (offline) {
+      rememberDetail(cleanKey, offline);
+      return Promise.resolve(offline);
+    }
+  }
   const existing = inflightDetail.get(cleanKey);
   if (existing) return existing;
 
@@ -180,9 +187,11 @@ export async function getSeasonEpisodes(
   if (!targetSeason) {
     // Standalone single-entry anime without a seasons array
     if (detail.key.startsWith("anilist:") && detail.episodeCount && detail.episodeCount > 0) {
-      return animeEpisodes(detail.key, 1, detail.episodeCount, detail.runtime);
+      return animeEpisodes(detail.key, 1, detail.episodeCount, detail.runtime).catch(() =>
+        findOfflineSeasonEpisodes(detail.canonicalKey ?? detail.key, 1),
+      );
     }
-    return [];
+    return findOfflineSeasonEpisodes(detail.canonicalKey ?? detail.key, requestedSeason ?? 1);
   }
 
   const seasonObj = targetSeason;
@@ -192,6 +201,9 @@ export async function getSeasonEpisodes(
 
   const task = (async (): Promise<Episode[]> => {
     const fallbackEps = findOfflineSeasonEpisodes(detail.canonicalKey ?? detail.key, seasonObj.number);
+    if (typeof navigator !== "undefined" && navigator.onLine === false && fallbackEps.length > 0) {
+      return fallbackEps;
+    }
     if (detail.key.startsWith("tmdb:")) {
       const eps = await tmdbSeason(detail.key, seasonObj.number).catch(() => null);
       if (!eps) return fallbackEps;

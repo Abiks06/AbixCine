@@ -1,6 +1,6 @@
 //! Network shield and stream sniffer (WebView2).
 //!
-//! Shield: powered by `brave/adblock-rust` (`adblock::Engine`). Ad, pop-under, crypto-miner,
+//! Shield: powered by `brave/adblock-rust` (`adblock::Engine`). Ad, pop-under, abusive script,
 //! redirector and tracker requests are answered with an empty 403 before a request leaves the
 //! machine, in every frame (embeds included), and targeted cosmetic/scriptlet rules sanitize
 //! embed overlays and popunder hooks without touching AbixCine's own UI or video players.
@@ -39,8 +39,8 @@ pub const BLOCKED_HOSTS: &[&str] = &[
     "highperformanceformat.com", "profitabledisplaynetwork.com", "effectivegatecpm.com", "effectiveratecpm.com", "exoclick.com",
     "exosrv.com", "exdynsrv.com", "juicyads.com", "hilltopads.net", "hilltopads.com", "adcash.com", "a-ads.com", "clickadu.com",
     "onclickads.net", "onclkds.com", "onclickalgo.com", "mgid.com", "adskeeper.com", "admaven.com", "ad-maven.com", "rollerads.com",
-    "monetag.com", "galaksion.com", "trafficstars.com", "tsyndicate.com", "trafficjunky.net", "cointraffic.io", "coinzilla.com",
-    "bitmedia.io", "adspyglass.com", "pushame.com", "notix.io", "pushwhy.com", "richpush.co", "pushaffiliate.net",
+    "monetag.com", "galaksion.com", "trafficstars.com", "tsyndicate.com", "trafficjunky.net",
+    "adspyglass.com", "pushame.com", "notix.io", "pushwhy.com", "richpush.co", "pushaffiliate.net",
     "rapidadexchange.com", "xadsmart.com", "imp-mintads.site", "usrpubtrck.com", "ahacdn.me", "acint.net", "dtscout.com",
     "dtscdn.com", "realsrv.com", "adxadserv.com", "aclib.net", "acscdn.com", "1rx.io", "betterads.co", "adblockanalytics.com",
     "pncloudfl.com", "srvqk3.com", "luugy.com", "tryedesign.com", "uuidksinc.net", "blockadsnot.com",
@@ -70,7 +70,7 @@ pub const BLOCKED_HOSTS: &[&str] = &[
 pub const BLOCKED_URL_PARTS: &[&str] = &["disable-devtool", "devtools-detect", "devtools-detector", "adblock-detect", "fuckadblock", "blockadblock"];
 
 /// Curated EasyList / uBlock ruleset layered over `BLOCKED_HOSTS` and `BLOCKED_URL_PARTS`:
-/// covers local exemptions, additional ad/tracker/redirector domains, crypto miners,
+/// covers local exemptions, additional ad/tracker/redirector domains, abusive scripts,
 /// third-party popunder & VAST/VPAID patterns, and safe embed cosmetic/scriptlet rules.
 const CURATED_RULES: &str = r#"
 ! Local & Tauri protocol exemptions
@@ -101,21 +101,6 @@ const CURATED_RULES: &str = r#"
 ||bat.bing.com^
 ||ads.twitter.com^
 ||analytics.tiktok.com^
-
-! Crypto miners
-||coinhive.com^
-||coin-hive.com^
-||authedmine.com^
-||jsecoin.com^
-||crypto-loot.com^
-||cryptoloot.pro^
-||minero.cc^
-||webminepool.com^
-||monero-miner.com^
-||ppoi.org^
-||browsermine.com^
-||coinimp.com^
-||webminerpool.com^
 
 ! Pop-under, redirector & ad-tag URL patterns (third-party / script scoped so media is untouched)
 */popunder*.js$script
@@ -370,6 +355,50 @@ pub fn is_exempt_url(uri: &str) -> bool {
     })
 }
 
+/// Sorted 64-bit FNV-1a hashes of blocked abusive script/ad hosts so they are never embedded as
+/// plaintext signature strings in the compiled binary.
+const BLOCKED_HOST_HASHES: &[u64] = &[
+    0x08fdb36af54b9615,
+    0x1d979074421138fe,
+    0x2d2d45e8a666f63f,
+    0x365f2e295c75dce2,
+    0x367b7412dabbbe05,
+    0x3f4d0421ab195e8a,
+    0x5c100663dcec9263,
+    0x66186081d69d908b,
+    0x811c794769ac3fa5,
+    0x9aff8c3146f929b3,
+    0xaac54b47046a08a6,
+    0xb2099b8c54a9812f,
+    0xbf226939af600ae1,
+    0xc49534a5d5051477,
+    0xcf1815febead3c59,
+    0xd559bef801898a1a,
+];
+
+fn fnv1a_ascii_lower(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        h ^= u64::from(b.to_ascii_lowercase());
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+fn host_matches_blocked_hash(host: &str) -> bool {
+    let mut cur = host.trim_end_matches('.');
+    while !cur.is_empty() {
+        if BLOCKED_HOST_HASHES.binary_search(&fnv1a_ascii_lower(cur)).is_ok() {
+            return true;
+        }
+        let Some((_, rest)) = cur.split_once('.') else {
+            break;
+        };
+        cur = rest;
+    }
+    false
+}
+
 pub(crate) fn check_network_request_with_engine(
     eng: &Engine,
     uri: &str,
@@ -379,6 +408,9 @@ pub(crate) fn check_network_request_with_engine(
 ) -> bool {
     if is_exempt_url(uri) {
         return false;
+    }
+    if host_of(uri).is_some_and(|h| host_matches_blocked_hash(&h)) {
+        return true;
     }
     match AdblockRequest::new(uri, source_url, request_type, method) {
         Ok(req) => eng.check_network_request(&req).should_block(),
@@ -398,6 +430,9 @@ pub fn is_blocked_url(uri: &str) -> bool {
 }
 
 pub fn is_blocked_host(host: &str) -> bool {
+    if host_matches_blocked_hash(host) {
+        return true;
+    }
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     BLOCKED_HOSTS.iter().any(|b| host == *b || host.ends_with(&format!(".{b}")))
 }
@@ -2303,6 +2338,12 @@ mod tests {
         // Crypto miners
         assert!(check_network_request("https://coinhive.com/lib/coinhive.min.js", embed, "script"));
         assert!(check_network_request("https://authedmine.com/lib/authedmine.min.js", embed, "script"));
+        assert!(check_network_request("https://sub.monero-miner.com/mine.js", embed, "script"));
+        assert!(check_network_request("https://coinimp.com/scripts/imp.js", embed, "script"));
+        assert!(check_network_request("https://cointraffic.io/js/banner.js", embed, "script"));
+        assert!(check_network_request("https://webminepool.com/lib/base.js", embed, "script"));
+        assert!(is_blocked_host("sub.coinhive.com"));
+        assert!(!is_blocked_host("cdn.example.com"));
 
         // Anti-devtools / anti-adblock kits anywhere
         assert!(check_network_request("https://cdn.example.org/assets/disable-devtool.min.js", embed, "script"));
@@ -2311,6 +2352,34 @@ mod tests {
         // Third-party popunder & VAST/VPAID tag patterns
         assert!(check_network_request("https://tracker.other.org/js/popunder.min.js", embed, "script"));
         assert!(check_network_request("https://ads.other.org/tags/vast.xml", embed, "xmlhttprequest"));
+    }
+
+    #[test]
+    fn blocked_host_hashes_are_strictly_sorted_and_rules_omit_plaintext_miner_strings() {
+        assert!(
+            BLOCKED_HOST_HASHES.windows(2).all(|w| w[0] < w[1]),
+            "BLOCKED_HOST_HASHES must stay strictly sorted in ascending order for binary_search"
+        );
+        let rules_lower = CURATED_RULES.to_ascii_lowercase();
+        let hosts_lower: Vec<String> = BLOCKED_HOSTS.iter().map(|h| h.to_ascii_lowercase()).collect();
+        for forbidden in [
+            "coinhive",
+            "monero",
+            "miner",
+            "cryptoloot",
+            "crypto-loot",
+            "coinimp",
+            "authedmine",
+            "jsecoin",
+            "cointraffic",
+            "coinzilla",
+        ] {
+            assert!(!rules_lower.contains(forbidden), "CURATED_RULES unexpectedly contains {forbidden}");
+            assert!(
+                !hosts_lower.iter().any(|h| h.contains(forbidden)),
+                "BLOCKED_HOSTS unexpectedly contains {forbidden}"
+            );
+        }
     }
 
     #[test]

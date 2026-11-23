@@ -1,7 +1,7 @@
 import { isTauri } from "@tauri-apps/api/core";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { findOfflineDetail, startDownload } from "../lib/downloads";
+import { findOfflineDetail, findOfflineSeasonEpisodes, startDownload } from "../lib/downloads";
 import { Player, type EpisodeNav } from "../components/Player";
 import { Art, sized } from "../components/Art";
 import { seedState } from "../components/Card";
@@ -66,14 +66,21 @@ export function Watch() {
     [detail.data],
   );
   const savedEntry = getEntry(canonicalKey, [key, detail.data?.key, ...courKeys]);
+  const preferOffline =
+    Boolean((loc.state as { offline?: boolean } | null)?.offline) ||
+    (typeof navigator !== "undefined" && navigator.onLine === false);
+  const offlineDetail = useMemo(
+    () => findOfflineDetail(key) ?? findOfflineDetail(canonicalKey),
+    [key, canonicalKey],
+  );
   const d: MediaDetail | undefined = useMemo(() => {
     if (detail.data) return detail.data;
+    if (!preferOffline && !detail.error) return undefined;
+    if (offlineDetail) return offlineDetail;
     if (!detail.error) return undefined;
-    const offline = findOfflineDetail(key) ?? findOfflineDetail(canonicalKey);
-    if (offline) return offline;
     const m = savedEntry?.media ?? list.find((w) => w.media.key === key || w.media.key === canonicalKey)?.media;
     return m ? { ...m, cast: [], crew: [], related: [] } : undefined;
-  }, [detail.data, detail.error, key, canonicalKey, list, savedEntry]);
+  }, [detail.data, detail.error, preferOffline, offlineDetail, key, canonicalKey, list, savedEntry]);
 
   const isAnime = key.startsWith("anilist:") || d?.kind === "anime";
   const isSeries = key.startsWith("tmdb:tv:") || d?.kind === "tv";
@@ -98,11 +105,11 @@ export function Watch() {
   // raw fallback is reserved strictly for offline/catalog-error playback of saved/local titles.
   const req: PlaybackRequest | null = useMemo(() => {
     if (resolvedReq) return resolvedReq;
-    if (!detail.data && d && detail.error && !isUnreleasedMedia(d)) {
+    if (!detail.data && d && (detail.error || preferOffline) && !isUnreleasedMedia(d)) {
       return { media: d, season, episode, absolute, audio };
     }
     return null;
-  }, [resolvedReq, detail.data, detail.error, d, season, episode, absolute, audio]);
+  }, [resolvedReq, detail.data, detail.error, preferOffline, d, season, episode, absolute, audio]);
 
   /* ---------------------------------------------------------------- source */
 
@@ -293,7 +300,9 @@ export function Watch() {
       episode,
       count: activeSeasonObj?.episodeCount ?? d.episodeCount,
       loadSeason: playableSeasons.length ? (s: number) => getSeasonEpisodes(d, s) : undefined,
-      loadAll: !playableSeasons.length && key.startsWith("anilist:") ? () => animeEpisodes(key) : undefined,
+      loadAll: !playableSeasons.length && key.startsWith("anilist:")
+        ? () => animeEpisodes(key).catch(() => findOfflineSeasonEpisodes(canonicalKey, season ?? 1))
+        : undefined,
       go: goEp,
       fallbackStill: sized(d.backdrop, "w300"),
       nextLabel,

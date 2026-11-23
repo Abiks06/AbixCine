@@ -17,6 +17,7 @@ import {
   type OnlineSubtitleResult,
 } from "../../lib/subtitleProviders";
 import { getSettings, updateSettings, type Audio } from "../../lib/settings";
+import { refreshDownloads } from "../../lib/downloads";
 import type { StreamCandidate, SubtitleFormat } from "../../sources/types";
 import { type UnifiedSubTrack } from "../SubtitleSheet";
 import { SUB_FILE_EXT_RX, cueSignature, inferUserSubLang, textTrackToCues, type ExtractedSubtitleResult, type TrackCueCache, type EpisodeNav } from "./shared";
@@ -803,6 +804,7 @@ export function useSubtitles(ctx: SubtitlesContext) {
         filename,
         content,
       });
+      void refreshDownloads({ minIntervalMs: 0 });
       if (!mountedRef.current) return;
       setSavedTrackIds((prev) => {
         const next = new Set(prev);
@@ -823,6 +825,7 @@ export function useSubtitles(ctx: SubtitlesContext) {
   useEffect(() => {
     const mem = subMemoryKey ? loadSubTrackMemory(subMemoryKey) : null;
     if (!cur || isEmbed || !pref.autoFetchOnline) return;
+    if (typeof navigator !== "undefined" && navigator.onLine === false) return;
     if (mem?.enabled === false || (pref.mode === "off" && mem?.enabled !== true)) return;
     if ((cur.kind === "hls" || cur.kind === "dash") && !hlsReady) return;
     const wantLang = langBase(pref.lang || "en");

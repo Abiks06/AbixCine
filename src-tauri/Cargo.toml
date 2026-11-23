@@ -2,6 +2,7 @@
 name = "abixcine"
 version = "1.13.1"
 description = "AbixCine: a desktop player for movies, series and anime"
+authors = ["Ayomide Abikoye"]
 edition = "2021"
 
 [lib]

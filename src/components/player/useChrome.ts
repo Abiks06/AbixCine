@@ -3,7 +3,7 @@
  * fullscreen (the Tauri window, or the element in a browser) and picture-in-picture.
  * Split out of Player.tsx (PERF-06); behaviour is unchanged.
  */
-import { isTauri } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useEffect, useMemo, useRef, useState, type MouseEvent, type MutableRefObject, type RefObject } from "react";
 import { isKeyboardFocused } from "../../lib/playerControls";
@@ -71,47 +71,133 @@ export function useIdleChrome(wrap: RefObject<HTMLElement>, playing: boolean) {
 export function useFullscreen(wrap: RefObject<HTMLElement>, mountedRef: MutableRefObject<boolean>) {
   const [isFull, setIsFull] = useState(false);
   const isFullRef = useRef(false);
-  isFullRef.current = isFull;
+  const seqRef = useRef(0);
+  const settlingUntilRef = useRef(0);
+  const settleTimerRef = useRef<number>();
   const win = useMemo(() => (isTauri() ? getCurrentWindow() : null), []);
-  const setFull = async (on: boolean) => {
+
+  const commitFull = (next: boolean) => {
+    isFullRef.current = next;
+    if (mountedRef.current) setIsFull(next);
+  };
+
+  const readTauriFull = async (): Promise<boolean> => {
     try {
-      if (win) {
-        // Noted before the await, so a quick second press (F, then F again) toggles back instead of
-        // repeating the same request off the not-yet-updated state.
-        isFullRef.current = on;
-        await win.setFullscreen(on);
-        setIsFull(on);
-      } else if (on) await wrap.current?.requestFullscreen();
-      else if (document.fullscreenElement) await document.exitFullscreen();
+      return await invoke<boolean>("get_window_fullscreen");
     } catch {
-      if (win) void win.isFullscreen().then((f) => mountedRef.current && setIsFull(f)).catch(() => {});
+      return win ? await win.isFullscreen() : false;
     }
   };
+
+  const setFull = async (on: boolean) => {
+    const seq = ++seqRef.current;
+    settlingUntilRef.current = performance.now() + 350;
+    clearTimeout(settleTimerRef.current);
+    // Noted before the await, so a quick second press (F, then F again) toggles back instead of
+    // repeating the same request off the not-yet-updated state.
+    commitFull(on);
+    try {
+      if (!on && document.fullscreenElement) {
+        await document.exitFullscreen().catch(() => {});
+      }
+      if (win) {
+        let actual = on;
+        try {
+          actual = await invoke<boolean>("set_window_fullscreen", { fullscreen: on });
+        } catch {
+          await win.setFullscreen(on);
+          actual = await win.isFullscreen();
+        }
+        if (seq !== seqRef.current || !mountedRef.current) return;
+        commitFull(actual || !!document.fullscreenElement);
+        settlingUntilRef.current = performance.now() + 350;
+        settleTimerRef.current = window.setTimeout(() => {
+          if (seq !== seqRef.current || !mountedRef.current) return;
+          void readTauriFull()
+            .then((f) => {
+              if (seq === seqRef.current && mountedRef.current) {
+                commitFull(f || !!document.fullscreenElement);
+              }
+            })
+            .catch(() => {});
+        }, 380);
+      } else if (on) {
+        await wrap.current?.requestFullscreen();
+      } else if (document.fullscreenElement) {
+        await document.exitFullscreen();
+      }
+    } catch {
+      if (seq !== seqRef.current || !mountedRef.current) return;
+      if (win) {
+        void readTauriFull()
+          .then((f) => {
+            if (seq === seqRef.current && mountedRef.current) {
+              commitFull(f || !!document.fullscreenElement);
+            }
+          })
+          .catch(() => {});
+      } else {
+        commitFull(!!document.fullscreenElement);
+      }
+    }
+  };
+
   const toggleFull = () => void setFull(!isFullRef.current);
+
   useEffect(() => {
-    if (win) return;
-    const f = () => setIsFull(!!document.fullscreenElement);
+    const f = () => {
+      if (document.fullscreenElement) {
+        commitFull(true);
+      } else if (win) {
+        void readTauriFull()
+          .then((full) => {
+            if (mountedRef.current) commitFull(full);
+          })
+          .catch(() => {});
+      } else {
+        commitFull(false);
+      }
+    };
     document.addEventListener("fullscreenchange", f);
     return () => document.removeEventListener("fullscreenchange", f);
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [win]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // The player remounts on every episode; pick up the window's state so fullscreen carries over.
   // (Leaving the watch screen altogether exits fullscreen: see the app shell.)
   useEffect(() => {
     if (!win) return;
     let live = true;
     let off: (() => void) | undefined;
-    const sync = () => win.isFullscreen().then((f) => live && setIsFull(f)).catch(() => {});
-    void sync();
+    let resizeTimer: number | undefined;
+    const sync = () => {
+      if (performance.now() < settlingUntilRef.current) return;
+      void readTauriFull()
+        .then((f) => {
+          if (live && performance.now() >= settlingUntilRef.current) {
+            commitFull(f || !!document.fullscreenElement);
+          }
+        })
+        .catch(() => {});
+    };
+    void readTauriFull()
+      .then((f) => live && commitFull(f || !!document.fullscreenElement))
+      .catch(() => {});
     // Fullscreen can change without us (F11, a snap layout, another screen): follow the window.
     win
-      .onResized(() => void sync())
+      .onResized(() => {
+        clearTimeout(resizeTimer);
+        resizeTimer = window.setTimeout(sync, 80);
+      })
       .then((un) => (live ? (off = un) : un()))
       .catch(() => {});
     return () => {
       live = false;
+      clearTimeout(resizeTimer);
+      clearTimeout(settleTimerRef.current);
       off?.();
     };
-  }, [win]);
+  }, [win]); // eslint-disable-line react-hooks/exhaustive-deps
+
   return { isFull, setFull, toggleFull };
 }
 

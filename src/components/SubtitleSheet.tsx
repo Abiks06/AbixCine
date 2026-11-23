@@ -4,7 +4,9 @@ import {
   langBase,
   langLabel,
   type CueSize,
+  type SubAssMode,
   type SubPref,
+  type SubSignLayout,
   type SubtitleCue,
 } from "../lib/subtitles";
 import type { OnlineSubtitleResult } from "../lib/subtitleProviders";
@@ -69,6 +71,7 @@ export interface SubtitleSheetProps {
   onLoadOnline: (res: OnlineSubtitleResult, asSecondary: boolean) => void;
   loadingOnlineId: string | null;
   loadedOnlineMap: ReadonlyMap<string, string>;
+  isAssTrack?: boolean;
 }
 
 const QUICK_SIZES: readonly { id: CueSize; label: string }[] = [
@@ -77,6 +80,17 @@ const QUICK_SIZES: readonly { id: CueSize; label: string }[] = [
   { id: "m", label: "M" },
   { id: "l", label: "L" },
   { id: "xl", label: "XL" },
+];
+
+const SIGN_LAYOUTS: readonly { id: SubSignLayout; label: string }[] = [
+  { id: "separate", label: "Separate" },
+  { id: "positioned", label: "On-screen" },
+  { id: "hide", label: "Dialogue only" },
+];
+
+const ASS_MODES: readonly { id: SubAssMode; label: string }[] = [
+  { id: "native", label: "Native ASS" },
+  { id: "clean", label: "Clean layout" },
 ];
 
 const ORIGIN_LABELS: Record<SubTrackOrigin, string> = {
@@ -128,6 +142,7 @@ export const SubtitleSheet = memo(function SubtitleSheet({
   onLoadOnline,
   loadingOnlineId,
   loadedOnlineMap,
+  isAssTrack = false,
 }: SubtitleSheetProps) {
   const [searchTitle, setSearchTitle] = useState(media?.title ?? "");
   const [searchLang, setSearchLang] = useState(subPref.lang || "en");
@@ -475,6 +490,45 @@ export const SubtitleSheet = memo(function SubtitleSheet({
             />
             <code>{subPref.bottomPct}%</code>
           </label>
+
+          <div className="sub-sheet-head-row">
+            <span className="ps-note">Anime signs &amp; notes</span>
+          </div>
+          <div className="seg3" role="group" aria-label="Anime signs layout">
+            {SIGN_LAYOUTS.map((m) => (
+              <button
+                key={m.id}
+                type="button"
+                className={(subPref.signLayout ?? "separate") === m.id ? "on" : ""}
+                onClick={() => onPatchPref({ signLayout: m.id })}
+              >
+                {m.label}
+              </button>
+            ))}
+          </div>
+
+          {isAssTrack && (
+            <>
+              <div className="sub-sheet-head-row">
+                <span className="ps-note">ASS renderer</span>
+              </div>
+              <div className="seg3" role="group" aria-label="ASS subtitle renderer">
+                {ASS_MODES.map((m) => (
+                  <button
+                    key={m.id}
+                    type="button"
+                    className={(subPref.assMode ?? "native") === m.id ? "on" : ""}
+                    onClick={() => onPatchPref({ assMode: m.id })}
+                  >
+                    {m.label}
+                  </button>
+                ))}
+              </div>
+              <span className="ps-note">
+                Clean layout separates anime signs into a compact top band using your typography.
+              </span>
+            </>
+          )}
 
           <div className="sub-sheet-head-row">
             <span className="ps-note">Dual subtitles</span>

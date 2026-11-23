@@ -4,7 +4,7 @@
  * Split out of Player.tsx (PERF-06); behaviour is unchanged.
  */
 import { ENHANCE_MODES, type EnhanceMode } from "../../lib/enhance";
-import { langBase, parseSubtitles, type CueAlign, type SubtitleCue } from "../../lib/subtitles";
+import { classifyTextCue, langBase, parseSubtitles, type CueAlign, type SubtitleCue } from "../../lib/subtitles";
 import type { Episode } from "../../lib/types";
 import type { SubtitleFormat } from "../../sources/types";
 
@@ -127,27 +127,60 @@ export function convertCues(list: TextTrackCueList, prefix: string): SubtitleCue
     const rawText = "text" in c && typeof c.text === "string" ? c.text : "";
     const vc = c as Partial<VTTCue>;
     const horiz = vc.align === "left" || vc.align === "start" ? 0 : vc.align === "right" || vc.align === "end" ? 2 : 1;
-    const vert = typeof vc.line === "number" ? (vc.line >= 0 && vc.line <= 25 ? 7 : vc.line > 25 && vc.line <= 65 ? 4 : 1) : 1;
-    const align = (vert + horiz) as CueAlign;
-    if (rawText.includes("<")) {
+    let vert = 0; // 0 = bottom (1..3), 3 = middle (4..6), 6 = top (7..9)
+    let pos: { xPct: number; yPct: number } | undefined;
+    if (typeof vc.line === "number" && Number.isFinite(vc.line)) {
+      if (vc.snapToLines === false) {
+        const yPct = Math.max(0, Math.min(100, vc.line));
+        vert = yPct < 33.34 ? 6 : yPct <= 66.66 ? 3 : 0;
+        const xPct =
+          typeof vc.position === "number" && Number.isFinite(vc.position)
+            ? Math.max(0, Math.min(100, vc.position))
+            : undefined;
+        const isStandardBottom = yPct >= 78 && (xPct === undefined || (xPct >= 40 && xPct <= 60));
+        if (!isStandardBottom) {
+          pos = {
+            xPct: xPct ?? (horiz === 0 ? 15 : horiz === 2 ? 85 : 50),
+            yPct,
+          };
+        }
+      } else {
+        if (vc.line >= 0 && vc.line <= 5) vert = 6;
+        else if (vc.line > 5 && vc.line <= 10) vert = 3;
+        else vert = 0;
+      }
+    }
+    const baseAlign = (vert + horiz + 1) as CueAlign;
+    const needsInline = rawText.includes("<") || rawText.includes("{\\") || rawText.includes("&");
+    if (needsInline) {
       const parsed = parseSubtitles(`WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n${rawText}`, "vtt");
       const first = parsed.cues[0];
+      const finalAlign = first && first.align !== 2 ? first.align : baseAlign;
+      const finalPos = first?.pos ?? pos;
+      const finalText = first?.text ?? rawText;
+      const finalKind =
+        first?.kind && first.kind !== "dialogue" ? first.kind : classifyTextCue(finalText, finalAlign, finalPos);
       out.push({
         id: `${prefix}-${i}-${c.startTime}-${c.endTime}`,
         start: c.startTime,
         end: c.endTime,
-        text: first?.text ?? rawText,
+        text: finalText,
         spans: first?.spans ?? [{ text: rawText }],
-        align,
+        align: finalAlign,
+        ...(finalPos ? { pos: finalPos } : {}),
+        kind: finalKind,
       });
     } else {
+      const finalKind = classifyTextCue(rawText, baseAlign, pos);
       out.push({
         id: `${prefix}-${i}-${c.startTime}-${c.endTime}`,
         start: c.startTime,
         end: c.endTime,
         text: rawText,
         spans: [{ text: rawText }],
-        align,
+        align: baseAlign,
+        ...(pos ? { pos } : {}),
+        kind: finalKind,
       });
     }
   }
@@ -156,7 +189,9 @@ export function convertCues(list: TextTrackCueList, prefix: string): SubtitleCue
 
 export function cueSignature(cues: readonly SubtitleCue[]): string {
   if (!cues.length) return "";
-  return cues.map((c) => `${c.id}:${c.text}:${c.align}`).join("|");
+  return cues
+    .map((c) => `${c.id}:${c.text}:${c.align}:${c.kind ?? ""}:${c.pos ? `${c.pos.xPct},${c.pos.yPct}` : ""}`)
+    .join("|");
 }
 
 export const candKey = (c: { url: string; pageUrl?: string }): string => c.pageUrl ?? c.url;
