@@ -6,9 +6,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const archiveName = "ffmpeg-n8.1.3-35-gf1acb0a266-win64-lgpl-shared-8.1.zip";
-const archiveUrl = `https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/autobuild-2026-11-11-12-39/${archiveName}`;
-const archiveSha256 = "f7697c270197c04bf72759c65ada64fcaea663bcb80767c390752d2412ea2dcf";
+// Pin an end-of-month BtbN autobuild: daily mid-month releases are pruned after ~14 days,
+// while last-day-of-month archives are retained long-term.
+const archiveName = "ffmpeg-n8.1.3-27-g8dca1586f4-win64-lgpl-shared-8.1.zip";
+const archiveUrl = `https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/autobuild-2026-10-31-12-59/${archiveName}`;
+const archiveSha256 = "5cef7bc48e513f3cee7c881e8b2999d835541edb1846c3e89443a67f8f8556ab";
 const licenseSha256 = "e3a994d82e644b03a792a930f574002658412f62407f5fee083f2555c5f23118";
 const sourceUrl = "https://github.com/FFmpeg/FFmpeg/tree/n8.1.3";
 const cacheDir = path.join(root, "node_modules", ".cache", "abixcine-ffmpeg");
