@@ -1,9 +1,9 @@
 import { isTauri } from "@tauri-apps/api/core";
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
+import { useDownloadPrefs } from "../lib/downloadOverrides";
 import { rankDownloadOptions } from "../lib/downloadRank";
 import { startDownload } from "../lib/downloads";
-import { useSettings } from "../lib/settings";
 import type { MediaDetail, PlaybackRequest } from "../lib/types";
 import { candKey } from "../sources/registry";
 import { useSourceSession } from "../sources/useSourceSession";
@@ -26,12 +26,12 @@ export function SmartSource({
   onPlay: (server?: string) => void;
 }) {
   const { snap, recheck } = useSourceSession(req, 1);
-  const s = useSettings();
+  const dlPrefs = useDownloadPrefs(detail?.canonicalKey ?? req.media.key);
   const [all, setAll] = useState(false);
   const rows = useMemo(() => (snap ? boardRows(snap) : []), [snap]);
   const rankedBackups = useMemo(
-    () => (snap ? rankDownloadOptions(snap.candidates, s.preferredQuality) : []),
-    [snap, s.preferredQuality],
+    () => (snap ? rankDownloadOptions(snap.candidates, dlPrefs.quality) : []),
+    [snap, dlPrefs.quality],
   );
   if (!snap) {
     return (
@@ -92,7 +92,8 @@ export function SmartSource({
                 ? (c) =>
                     void startDownload(req, c, detail, undefined, {
                       fallbacks: rankedBackups.filter((x) => x !== c).slice(0, 6),
-                      preferredQuality: s.preferredQuality,
+                      preferredQuality: dlPrefs.quality,
+                      preferredFormat: dlPrefs.format,
                       replaceExisting: true,
                     })
                 : undefined

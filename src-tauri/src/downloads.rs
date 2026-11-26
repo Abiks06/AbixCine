@@ -86,6 +86,7 @@ pub enum DownloadStatus {
     Downloading,
     Remuxing,
     Paused,
+    AwaitingQuality,
     Completed,
     Failed,
     Cancelled,
@@ -154,6 +155,10 @@ pub struct DownloadStartReq {
     #[serde(default)]
     pub preferred_quality: Option<u32>,
     #[serde(default)]
+    pub preferred_format: Option<String>,
+    #[serde(default)]
+    pub quality_policy: Option<String>,
+    #[serde(default)]
     pub subtitles: Vec<DownloadSubtitleReq>,
     #[serde(default)]
     pub preferred_sub_langs: Vec<String>,
@@ -197,6 +202,8 @@ pub struct DownloadJob {
     pub quality_verified: bool,
     #[serde(default)]
     pub video_codec: Option<String>,
+    #[serde(default)]
+    pub container: Option<String>,
     pub provider_id: String,
     pub provider_name: String,
     pub url: String,
@@ -205,6 +212,14 @@ pub struct DownloadJob {
     pub headers: Hdrs,
     #[serde(default)]
     pub preferred_quality: Option<u32>,
+    #[serde(default)]
+    pub preferred_format: Option<String>,
+    #[serde(default)]
+    pub quality_policy: Option<String>,
+    #[serde(default)]
+    pub allow_below_target: bool,
+    #[serde(default)]
+    pub available_quality: Option<u32>,
     #[serde(default)]
     pub subtitles: Vec<DownloadSubtitleReq>,
     #[serde(default)]
@@ -264,9 +279,13 @@ pub struct DownloadJobView {
     pub audio: Option<String>,
     pub quality: Option<u32>,
     pub preferred_quality: Option<u32>,
+    pub preferred_format: Option<String>,
+    pub quality_policy: Option<String>,
+    pub available_quality: Option<u32>,
     pub resolved_quality: Option<u32>,
     pub quality_verified: bool,
     pub video_codec: Option<String>,
+    pub container: Option<String>,
     pub provider_id: String,
     pub provider_name: String,
     pub url: String,
@@ -308,9 +327,13 @@ impl From<&DownloadJob> for DownloadJobView {
             audio: j.audio.clone(),
             quality: j.quality,
             preferred_quality: j.preferred_quality,
+            preferred_format: j.preferred_format.clone(),
+            quality_policy: j.quality_policy.clone(),
+            available_quality: j.available_quality,
             resolved_quality: j.resolved_quality,
             quality_verified: j.quality_verified,
             video_codec: j.video_codec.clone(),
+            container: j.container.clone(),
             provider_id: j.provider_id.clone(),
             provider_name: j.provider_name.clone(),
             url: j.url.clone(),
@@ -362,6 +385,14 @@ pub struct DownloadedEntry {
     pub quality_verified: bool,
     #[serde(default)]
     pub video_codec: Option<String>,
+    #[serde(default)]
+    pub container: Option<String>,
+    #[serde(default)]
+    pub web_ready: bool,
+    #[serde(default)]
+    pub audio_codec: Option<String>,
+    #[serde(default)]
+    pub audio_channels: Option<u32>,
     pub provider_id: String,
     pub provider_name: String,
     pub file_path: String,
@@ -391,6 +422,15 @@ pub struct MigrateDownloadsResult {
     pub snapshot: DownloadSnapshot,
     pub moved_files: usize,
     pub migrated: bool,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizeVaultResult {
+    pub snapshot: DownloadSnapshot,
+    pub moved_files: usize,
+    pub adopted_files: usize,
+    pub total_items: usize,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -494,6 +534,256 @@ fn normalize_video_ext(ext: &str) -> &'static str {
         "m4v" => "m4v",
         "mov" => "mov",
         _ => "mp4",
+    }
+}
+
+pub(crate) fn normalize_preferred_format(raw: Option<&str>) -> &'static str {
+    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("mkv" | "matroska") => "mkv",
+        _ => "mp4",
+    }
+}
+
+pub(crate) fn normalize_quality_policy(raw: Option<&str>) -> &'static str {
+    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("strict") => "strict",
+        Some("best") => "best",
+        _ => "ask",
+    }
+}
+
+pub(crate) fn fmt_quality_short(q: u32) -> String {
+    if q >= 2160 {
+        "4K".to_string()
+    } else {
+        format!("{q}p")
+    }
+}
+
+pub(crate) fn container_from_path(path: &Path) -> String {
+    normalize_video_ext(path.extension().and_then(|e| e.to_str()).unwrap_or("mp4")).to_string()
+}
+
+pub(crate) fn select_ffprobe_video_stream(
+    streams: &[(usize, Option<u32>, u64)],
+    preferred_quality: Option<u32>,
+) -> Option<(usize, Option<u32>)> {
+    if streams.is_empty() {
+        return None;
+    }
+    if let Some(cap) = preferred_quality.filter(|&q| q > 0) {
+        if let Some(&(idx, h, _)) = streams
+            .iter()
+            .filter(|(_, h, _)| h.is_some_and(|v| v <= cap))
+            .max_by_key(|(_, h, br)| (h.unwrap_or(0), *br))
+        {
+            return Some((idx, h));
+        }
+        if let Some(&(idx, h, _)) = streams
+            .iter()
+            .filter(|(_, h, _)| h.is_some())
+            .min_by_key(|(_, h, br)| (h.unwrap_or(u32::MAX), std::cmp::Reverse(*br)))
+        {
+            return Some((idx, h));
+        }
+    }
+    streams
+        .iter()
+        .max_by_key(|(_, h, br)| (h.unwrap_or(0), *br))
+        .map(|&(idx, h, _)| (idx, h))
+}
+
+fn sanitize_header_val(raw: &str) -> String {
+    raw.replace(['\r', '\n'], "").trim().to_string()
+}
+
+fn build_ffmpeg_header_args(cmd: &mut std::process::Command, headers: &Hdrs) {
+    if let Some(ref ua) = headers.ua.as_deref().map(sanitize_header_val).filter(|s| !s.is_empty()) {
+        cmd.args(["-user_agent", ua]);
+    }
+    let mut hdr_lines = String::new();
+    if let Some(ref rf) = headers.referer.as_deref().map(sanitize_header_val).filter(|s| !s.is_empty()) {
+        hdr_lines.push_str(&format!("Referer: {rf}\r\n"));
+    }
+    if let Some(ref og) = headers.origin.as_deref().map(sanitize_header_val).filter(|s| !s.is_empty()) {
+        hdr_lines.push_str(&format!("Origin: {og}\r\n"));
+    }
+    if !hdr_lines.is_empty() {
+        cmd.args(["-headers", &hdr_lines]);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ParsedVaultFile {
+    pub title: String,
+    pub media_kind: String,
+    pub is_film: bool,
+    pub year: Option<u32>,
+    pub season: Option<u32>,
+    pub episode: Option<u32>,
+    pub audio: Option<String>,
+    pub quality: Option<u32>,
+}
+
+fn parse_season_ep_token(token: &str) -> Option<(u32, u32)> {
+    let up = token.to_ascii_uppercase();
+    let bytes = up.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] == b'S' {
+            let mut j = i + 1;
+            let mut s_val = 0u32;
+            let mut s_digits = 0;
+            while j < bytes.len() && bytes[j].is_ascii_digit() && s_digits < 3 {
+                s_val = s_val * 10 + u32::from(bytes[j] - b'0');
+                j += 1;
+                s_digits += 1;
+            }
+            if s_digits > 0 && j < bytes.len() && bytes[j] == b'E' {
+                let mut k = j + 1;
+                let mut e_val = 0u32;
+                let mut e_digits = 0;
+                while k < bytes.len() && bytes[k].is_ascii_digit() && e_digits < 4 {
+                    e_val = e_val * 10 + u32::from(bytes[k] - b'0');
+                    k += 1;
+                    e_digits += 1;
+                }
+                if e_digits > 0 {
+                    return Some((s_val, e_val));
+                }
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn parse_vault_filename(path: &Path, root: &Path) -> ParsedVaultFile {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    let comps: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let bucket_low = comps.first().map(|s| s.to_ascii_lowercase()).unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Untitled")
+        .trim()
+        .to_string();
+    let stem_low = stem.to_ascii_lowercase();
+
+    let quality = if stem_low.contains("2160") || stem_low.contains("4k") {
+        Some(2160)
+    } else if stem_low.contains("1440") {
+        Some(1440)
+    } else if stem_low.contains("1080") {
+        Some(1080)
+    } else if stem_low.contains("720") {
+        Some(720)
+    } else if stem_low.contains("480") {
+        Some(480)
+    } else if stem_low.contains("360") {
+        Some(360)
+    } else {
+        None
+    };
+
+    let audio = if stem_low.contains("[dual audio]") || stem_low.contains("dual-audio") {
+        Some("dual".to_string())
+    } else if stem_low.contains("[dub]") {
+        Some("dub".to_string())
+    } else if stem_low.contains("[sub]") {
+        Some("sub".to_string())
+    } else {
+        None
+    };
+
+    let se = comps.iter().find_map(|c| parse_season_ep_token(c));
+    let mut season = se.map(|(s, _)| s);
+    let episode = se.map(|(_, e)| e);
+    if season.is_none() {
+        for c in &comps {
+            let low = c.to_ascii_lowercase();
+            if let Some(rest) = low.strip_prefix("season ") {
+                if let Ok(n) = rest.trim().parse::<u32>() {
+                    season = Some(n);
+                    break;
+                }
+            } else if low == "specials" {
+                season = Some(0);
+                break;
+            }
+        }
+    }
+
+    let is_film = if bucket_low == "movies" {
+        true
+    } else if bucket_low == "series" || bucket_low == "anime" || episode.is_some() {
+        false
+    } else {
+        season.is_none()
+    };
+
+    let media_kind = if bucket_low == "anime" || audio.is_some() {
+        "anime".to_string()
+    } else if is_film {
+        "movie".to_string()
+    } else {
+        "tv".to_string()
+    };
+
+    let mut year: Option<u32> = None;
+    for candidate in comps.iter().rev() {
+        for part in candidate.split(['(', ')', '.', ' ', '[', ']', '-', '_']) {
+            if part.len() == 4 {
+                if let Ok(y) = part.parse::<u32>() {
+                    if (1900..=2100).contains(&y) {
+                        year = Some(y);
+                        break;
+                    }
+                }
+            }
+        }
+        if year.is_some() {
+            break;
+        }
+    }
+
+    // Extract title from folder name when organized under Movies/Series/Anime/<Title (Year)>,
+    // otherwise strip SxxExx / [Tags] / (Year) from filename stem.
+    let raw_title_src = if comps.len() >= 3 && matches!(bucket_low.as_str(), "movies" | "series" | "anime") {
+        comps[1].clone()
+    } else {
+        stem.clone()
+    };
+    let mut cleaned_title = raw_title_src;
+    if let Some(idx) = cleaned_title.find(" - S").or_else(|| cleaned_title.find(" - s")) {
+        cleaned_title.truncate(idx);
+    } else if let Some((s, e)) = episode.and_then(|e| season.map(|s| (s, e))) {
+        let pat1 = format!("S{s:02}E{e:02}");
+        let pat2 = format!("s{s:02}e{e:02}");
+        if let Some(idx) = cleaned_title.find(&pat1).or_else(|| cleaned_title.find(&pat2)) {
+            cleaned_title.truncate(idx);
+        }
+    }
+    if let Some(idx) = cleaned_title.find('[') {
+        cleaned_title.truncate(idx);
+    }
+    if let Some(y) = year {
+        let paren = format!("({y})");
+        cleaned_title = cleaned_title.replace(&paren, "");
+    }
+    cleaned_title = cleaned_title.replace('.', " ");
+    let title = sanitize_component(cleaned_title.trim().trim_end_matches('-').trim());
+
+    ParsedVaultFile {
+        title,
+        media_kind,
+        is_film,
+        year,
+        season,
+        episode,
+        audio,
+        quality,
     }
 }
 
@@ -665,6 +955,8 @@ struct HlsWorkState {
     #[serde(default)]
     available_heights: Vec<u32>,
     #[serde(default)]
+    preferred_quality: Option<u32>,
+    #[serde(default)]
     subtitles: Vec<HlsSubtitleRendition>,
 }
 
@@ -817,6 +1109,7 @@ pub(crate) fn parse_master_playlist_full(
     Ok((variants, audios, subtitles))
 }
 
+#[cfg(test)]
 pub(crate) fn parse_master_playlist(text: &str, base_url: &str) -> Result<(Vec<HlsVariant>, Vec<HlsAudioRendition>), String> {
     let (variants, audios, _) = parse_master_playlist_full(text, base_url)?;
     Ok((variants, audios))
@@ -1632,21 +1925,30 @@ struct JobSignals {
     pause: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
     replaced: Arc<AtomicBool>,
+    resume_requested: Arc<AtomicBool>,
     notify: Arc<Notify>,
 }
 
 impl JobSignals {
     fn signal_pause(&self) {
+        self.resume_requested.store(false, Ordering::Relaxed);
         self.pause.store(true, Ordering::Relaxed);
         self.notify.notify_waiters();
     }
 
+    fn signal_resume_pending(&self) {
+        self.pause.store(false, Ordering::Relaxed);
+        self.resume_requested.store(true, Ordering::Relaxed);
+    }
+
     fn signal_cancel(&self) {
+        self.resume_requested.store(false, Ordering::Relaxed);
         self.cancel.store(true, Ordering::Relaxed);
         self.notify.notify_waiters();
     }
 
     fn signal_replace(&self) {
+        self.resume_requested.store(false, Ordering::Relaxed);
         self.replaced.store(true, Ordering::Relaxed);
         self.notify.notify_waiters();
     }
@@ -1657,6 +1959,8 @@ struct PendingSourceSwitch {
     source: DownloadFallbackSource,
     extra_fallbacks: Vec<DownloadFallbackSource>,
     preferred_quality: Option<u32>,
+    preferred_format: Option<String>,
+    quality_policy: Option<String>,
 }
 
 struct ManagerState {
@@ -1741,7 +2045,9 @@ impl ManagerState {
         }
         let mut queued_any = false;
         for id in to_queue {
-            if !self.queue.iter().any(|q| q == &id) && !self.active.contains_key(&id) {
+            if let Some(sig) = self.active.get(&id) {
+                sig.signal_resume_pending();
+            } else if !self.queue.iter().any(|q| q == &id) {
                 self.queue.push_back(id);
                 queued_any = true;
             }
@@ -2011,11 +2317,20 @@ impl DownloadManager {
         job.quality = sw.source.quality;
         job.resolved_quality = None;
         job.quality_verified = false;
+        job.allow_below_target = false;
+        job.available_quality = None;
         job.video_codec = None;
+        job.container = None;
         let prev_subs = std::mem::take(&mut job.subtitles);
         job.subtitles = merge_subtitles_for_failover(&prev_subs, sw.source.subtitles);
         if let Some(pq) = sw.preferred_quality {
             job.preferred_quality = Some(pq);
+        }
+        if let Some(ref pf) = sw.preferred_format {
+            job.preferred_format = Some(normalize_preferred_format(Some(pf)).to_string());
+        }
+        if let Some(ref qp) = sw.quality_policy {
+            job.quality_policy = Some(normalize_quality_policy(Some(qp)).to_string());
         }
         job.fallbacks = deduped;
         job.tried_providers.clear();
@@ -2060,6 +2375,7 @@ impl DownloadManager {
                         | DownloadStatus::Downloading
                         | DownloadStatus::Remuxing
                         | DownloadStatus::Paused
+                        | DownloadStatus::AwaitingQuality
                         | DownloadStatus::Failed
                 )
         }) {
@@ -2079,7 +2395,15 @@ impl DownloadManager {
                     quality: req.quality,
                     subtitles: req.subtitles.clone(),
                 };
-                if let Some(view) = self.switch_source(app, &existing_id, src, req.fallbacks.clone(), req.preferred_quality)? {
+                if let Some(view) = self.switch_source(
+                    app,
+                    &existing_id,
+                    src,
+                    req.fallbacks.clone(),
+                    req.preferred_quality,
+                    req.preferred_format.clone(),
+                    req.quality_policy.clone(),
+                )? {
                     return Ok(view);
                 }
                 g = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -2131,12 +2455,17 @@ impl DownloadManager {
             resolved_quality: None,
             quality_verified: false,
             video_codec: None,
+            container: None,
             provider_id: req.provider_id,
             provider_name: req.provider_name,
             url: req.url,
             kind: req.kind,
             headers: req.headers,
             preferred_quality: req.preferred_quality,
+            preferred_format: Some(normalize_preferred_format(req.preferred_format.as_deref()).to_string()),
+            quality_policy: Some(normalize_quality_policy(req.quality_policy.as_deref()).to_string()),
+            allow_below_target: false,
+            available_quality: None,
             subtitles: req.subtitles,
             preferred_sub_langs: req.preferred_sub_langs,
             fallbacks,
@@ -2179,6 +2508,8 @@ impl DownloadManager {
         source: DownloadFallbackSource,
         extra_fallbacks: Vec<DownloadFallbackSource>,
         preferred_quality: Option<u32>,
+        preferred_format: Option<String>,
+        quality_policy: Option<String>,
     ) -> Result<Option<DownloadJobView>, String> {
         self.set_app(app);
         stream::validate_http_url(&source.url)?;
@@ -2190,6 +2521,8 @@ impl DownloadManager {
             source,
             extra_fallbacks: valid_fallbacks,
             preferred_quality,
+            preferred_format,
+            quality_policy,
         };
 
         let mut cleanup_target: Option<DownloadJob> = None;
@@ -2280,8 +2613,12 @@ impl DownloadManager {
                 }
                 out = Some(DownloadJobView::from(&*j));
             }
-            if requeue && !g.queue.iter().any(|q| q == id) && !g.active.contains_key(id) {
-                g.queue.push_back(id.to_string());
+            if requeue {
+                if let Some(sig) = g.active.get(id) {
+                    sig.signal_resume_pending();
+                } else if !g.queue.iter().any(|q| q == id) {
+                    g.queue.push_back(id.to_string());
+                }
             }
             Self::persist_locked(&g);
             (out, requeue)
@@ -2374,6 +2711,95 @@ impl DownloadManager {
             g.resume_all_locked(canonical_key, season)
         };
         for v in &updated_views {
+            self.emit_job(v);
+        }
+        if should_pump {
+            self.pump();
+        }
+        self.snapshot()
+    }
+
+    fn resolve_quality(
+        self: &Arc<Self>,
+        app: &tauri::AppHandle,
+        ids: Vec<String>,
+        action: &str,
+        new_preferred_quality: Option<u32>,
+    ) -> DownloadSnapshot {
+        self.set_app(app);
+        let id_set: HashSet<String> = ids.into_iter().collect();
+        if id_set.is_empty() {
+            return self.snapshot();
+        }
+        let ts = now_ms();
+        let act = action.trim().to_ascii_lowercase();
+        let (views, to_clean, should_pump) = {
+            let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut views = Vec::new();
+            let mut to_clean = Vec::new();
+            let mut pump_needed = false;
+
+            if act == "cancel" {
+                for id in &id_set {
+                    g.pending_replace.remove(id);
+                    if let Some(sig) = g.active.get(id) {
+                        sig.signal_cancel();
+                    }
+                }
+                g.queue.retain(|q| !id_set.contains(q));
+                let active_ids: HashSet<String> = g.active.keys().cloned().collect();
+                let mut kept = Vec::with_capacity(g.jobs.len());
+                for mut j in g.jobs.drain(..) {
+                    if !id_set.contains(&j.id) {
+                        kept.push(j);
+                    } else if active_ids.contains(&j.id) {
+                        j.status = DownloadStatus::Cancelled;
+                        j.stage = Some("Cancelling…".into());
+                        j.updated_at = ts;
+                        views.push(DownloadJobView::from(&j));
+                        kept.push(j);
+                    } else {
+                        let mut cancelled_view = DownloadJobView::from(&j);
+                        cancelled_view.status = DownloadStatus::Cancelled;
+                        views.push(cancelled_view);
+                        to_clean.push(j);
+                    }
+                }
+                g.jobs = kept;
+            } else {
+                let mut requeue = Vec::new();
+                for j in &mut g.jobs {
+                    if id_set.contains(&j.id) && j.status == DownloadStatus::AwaitingQuality {
+                        j.allow_below_target = true;
+                        if let Some(new_q) = new_preferred_quality.filter(|&q| q > 0) {
+                            j.preferred_quality = Some(new_q);
+                        } else if let Some(avail) = j.available_quality.filter(|&q| q > 0) {
+                            j.preferred_quality = Some(avail);
+                        }
+                        j.status = DownloadStatus::Queued;
+                        j.stage = Some("Queued (approved)…".into());
+                        j.error = None;
+                        j.updated_at = ts;
+                        views.push(DownloadJobView::from(&*j));
+                        requeue.push(j.id.clone());
+                    }
+                }
+                for id in requeue {
+                    if !g.queue.iter().any(|q| q == &id) && !g.active.contains_key(&id) {
+                        g.queue.push_back(id);
+                        pump_needed = true;
+                    }
+                }
+            }
+
+            Self::persist_locked(&g);
+            (views, to_clean, pump_needed)
+        };
+
+        for job in &to_clean {
+            cleanup_job_artifacts(job);
+        }
+        for v in &views {
             self.emit_job(v);
         }
         if should_pump {
@@ -2645,10 +3071,17 @@ impl DownloadManager {
 
             let mgr = self.clone();
             tauri::async_runtime::spawn(async move {
-                mgr.run_job(job, sig).await;
+                mgr.run_job(job, sig.clone()).await;
                 {
                     let mut g = mgr.state.lock().unwrap_or_else(|e| e.into_inner());
                     g.active.remove(&id);
+                    if sig.resume_requested.swap(false, Ordering::Relaxed) {
+                        if let Some(j) = g.jobs.iter().find(|j| j.id == id) {
+                            if j.status == DownloadStatus::Queued && !g.queue.iter().any(|q| q == &id) {
+                                g.queue.push_back(id.clone());
+                            }
+                        }
+                    }
                     Self::persist_locked(&g);
                 }
                 mgr.pump();
@@ -2680,7 +3113,7 @@ impl DownloadManager {
     async fn run_job(&self, mut job: DownloadJob, sig: JobSignals) {
         let root = PathBuf::from(&job.root);
         let mut best_low_res: Option<(u32, DownloadFallbackSource)> = None;
-        let mut allow_below_target = false;
+        let mut allow_below_target = job.allow_below_target;
         loop {
             self.update_job(&job.id, true, |j| {
                 j.status = DownloadStatus::Downloading;
@@ -2696,29 +3129,151 @@ impl DownloadManager {
 
             let outcome = if job.kind == "hls" {
                 self.run_hls_job(&mut job, &root, &sig, allow_below_target).await
+            } else if job.kind == "dash" {
+                self.run_dash_job(&mut job, &root, &sig, allow_below_target).await
             } else {
-                self.run_direct_job(&job, &root, &sig)
-                    .await
-                    .map(|(p, sz)| (p, sz, Vec::new()))
+                match self.run_direct_job(&job, &root, &sig, allow_below_target).await {
+                    Ok((dl_path, dl_size)) => self
+                        .maybe_remux_direct_to_preferred_format(&job, &dl_path, dl_size, &sig)
+                        .await
+                        .map(|(conv_path, conv_size)| (conv_path, conv_size, Vec::new())),
+                    Err(stop) => Err(stop),
+                }
             };
 
             match outcome {
-                Ok((final_path, final_size, hls_subs)) => {
+                Ok((final_path, mut final_size, hls_subs)) => {
                     let app_opt = self.app.lock().ok().and_then(|g| g.clone());
                     let probed = if let Some(ref app) = app_opt {
                         let app_c = app.clone();
                         let p_c = final_path.clone();
-                        tauri::async_runtime::spawn_blocking(move || probe_downloaded_video(&app_c, &p_c))
+                        tauri::async_runtime::spawn_blocking(move || probe_downloaded_media(&app_c, &p_c))
                             .await
                             .ok()
                             .flatten()
                     } else {
                         None
                     };
-                    let (probed_q, probed_codec) = probed.unwrap_or((None, None));
-                    let resolved_q = probed_q.or(job.resolved_quality).or(job.quality);
-                    let q_verified = probed_q.is_some() || job.quality_verified;
-                    let v_codec = probed_codec.or(job.video_codec.clone());
+                    let probed_m = probed.unwrap_or_default();
+                    let resolved_q = probed_m.quality.or(job.resolved_quality).or(job.quality);
+                    let q_verified = probed_m.quality.is_some() || job.quality_verified;
+                    let v_codec = probed_m.video_codec.clone().or(job.video_codec.clone());
+                    let final_container = container_from_path(&final_path);
+                    let mut audio_codec = probed_m.audio_codec.clone();
+                    let mut audio_channels = probed_m.audio_channels;
+                    let mut web_ready = is_media_web_ready(
+                        &final_container,
+                        probed_m.video_codec_raw.as_deref(),
+                        audio_codec.as_deref(),
+                        audio_channels,
+                    );
+
+                    // If an MP4 has incompatible or surround audio (e.g. AC3/EAC3 or 5.1/7.1), normalize
+                    // its primary audio track to stereo AAC during download so local playback starts instantly.
+                    let mut post_stop: Option<JobStop> = None;
+                    if final_container == "mp4" && !web_ready && probed_m.audio_stream_count == 1 {
+                        let audio_needs_fix = audio_channels.is_some_and(|ch| ch > 2)
+                            || audio_codec
+                                .as_deref()
+                                .is_some_and(|c| !matches!(c.to_ascii_lowercase().as_str(), "aac" | "mp3"));
+                        if audio_needs_fix {
+                            if let Some(ref app) = app_opt {
+                                if let Ok(ffmpeg) = crate::ffmpeg_tool(app, "ffmpeg") {
+                                    self.update_job(&job.id, true, |j| {
+                                        j.status = DownloadStatus::Remuxing;
+                                        j.stage = Some("Optimizing audio for instant playback…".into());
+                                        j.percent = 97.0;
+                                    });
+                                    let p_c = final_path.clone();
+                                    let ch = audio_channels.map(u64::from);
+                                    let cancel_c = sig.cancel.clone();
+                                    let replaced_c = sig.replaced.clone();
+                                    let pause_c = sig.pause.clone();
+                                    match tauri::async_runtime::spawn_blocking(move || {
+                                        normalize_mp4_audio_to_aac(&ffmpeg, &p_c, ch, &cancel_c, &replaced_c, &pause_c)
+                                    })
+                                    .await
+                                    {
+                                        Ok(Ok(Some(new_size))) => {
+                                            final_size = new_size;
+                                            audio_codec = Some("aac".into());
+                                            audio_channels = Some(2);
+                                            web_ready = is_media_web_ready(
+                                                &final_container,
+                                                probed_m.video_codec_raw.as_deref(),
+                                                audio_codec.as_deref(),
+                                                audio_channels,
+                                            );
+                                        }
+                                        Ok(Err(stop @ (JobStop::Cancelled | JobStop::Replaced | JobStop::Paused))) => {
+                                            post_stop = Some(stop);
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(stop) = post_stop {
+                        let _ = std::fs::remove_file(&final_path);
+                        match stop {
+                            JobStop::Paused => {
+                                if !sig.resume_requested.load(Ordering::Relaxed) {
+                                    self.update_job(&job.id, true, |j| {
+                                        j.status = DownloadStatus::Paused;
+                                        j.stage = Some("Paused".into());
+                                        j.speed_bps = 0;
+                                        j.eta_sec = None;
+                                    });
+                                }
+                            }
+                            JobStop::Replaced => {
+                                cleanup_job_artifacts(&job);
+                                let view = {
+                                    let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                                    let sw = g.pending_replace.remove(&job.id);
+                                    let mut out = None;
+                                    if let Some(sw) = sw {
+                                        if let Some(j) = g.jobs.iter_mut().find(|j| j.id == job.id) {
+                                            Self::apply_source_switch_to_job(j, sw);
+                                            j.updated_at = now_ms();
+                                            out = Some(DownloadJobView::from(&*j));
+                                        }
+                                        if !g.queue.iter().any(|q| q == &job.id) {
+                                            g.queue.push_back(job.id.clone());
+                                        }
+                                    }
+                                    Self::persist_locked(&g);
+                                    out
+                                };
+                                if let Some(v) = view {
+                                    self.emit_job(&v);
+                                }
+                            }
+                            JobStop::Cancelled => {
+                                cleanup_job_artifacts(&job);
+                                let view = {
+                                    let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                                    g.pending_replace.remove(&job.id);
+                                    let mut out = None;
+                                    if let Some(pos) = g.jobs.iter().position(|j| j.id == job.id) {
+                                        let mut removed = g.jobs.remove(pos);
+                                        removed.status = DownloadStatus::Cancelled;
+                                        removed.stage = Some("Cancelled".into());
+                                        out = Some(DownloadJobView::from(&removed));
+                                    }
+                                    Self::persist_locked(&g);
+                                    out
+                                };
+                                if let Some(v) = view {
+                                    self.emit_job(&v);
+                                }
+                            }
+                            _ => {}
+                        }
+                        break;
+                    }
 
                     let (mut subtitle_paths, (poster_path, backdrop_path)) = tokio::join!(
                         download_sidecar_subtitles(
@@ -2736,6 +3291,96 @@ impl DownloadManager {
                         )
                     );
                     merge_sidecar_paths(&mut subtitle_paths, discover_sidecars_for_video(&final_path));
+                    let mut mux_stop: Option<JobStop> = None;
+                    if final_container == "mkv" && !subtitle_paths.is_empty() {
+                        if let Some(ref app) = app_opt {
+                            if let Ok(ffmpeg) = crate::ffmpeg_tool(app, "ffmpeg") {
+                                self.update_job(&job.id, true, |j| {
+                                    j.status = DownloadStatus::Remuxing;
+                                    j.stage = Some("Embedding soft subtitles into MKV…".into());
+                                    j.percent = 98.0;
+                                });
+                                let p_c = final_path.clone();
+                                let subs_c = subtitle_paths.clone();
+                                let cancel_c = sig.cancel.clone();
+                                let replaced_c = sig.replaced.clone();
+                                match tauri::async_runtime::spawn_blocking(move || {
+                                    mux_subtitles_into_mkv(&ffmpeg, &p_c, &subs_c, &cancel_c, &replaced_c)
+                                })
+                                .await
+                                {
+                                    Ok(Ok(Some(new_size))) => {
+                                        final_size = new_size;
+                                    }
+                                    Ok(Err(stop @ (JobStop::Cancelled | JobStop::Replaced | JobStop::Paused))) => {
+                                        mux_stop = Some(stop);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    if let Some(stop) = mux_stop {
+                        let _ = std::fs::remove_file(&final_path);
+                        for s in &subtitle_paths {
+                            let _ = std::fs::remove_file(s);
+                        }
+                        cleanup_job_artifacts(&job);
+                        match stop {
+                            JobStop::Replaced => {
+                                let view = {
+                                    let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                                    let sw = g.pending_replace.remove(&job.id);
+                                    let mut out = None;
+                                    if let Some(sw) = sw {
+                                        if let Some(j) = g.jobs.iter_mut().find(|j| j.id == job.id) {
+                                            Self::apply_source_switch_to_job(j, sw);
+                                            j.updated_at = now_ms();
+                                            out = Some(DownloadJobView::from(&*j));
+                                        }
+                                        if !g.queue.iter().any(|q| q == &job.id) {
+                                            g.queue.push_back(job.id.clone());
+                                        }
+                                    }
+                                    Self::persist_locked(&g);
+                                    out
+                                };
+                                if let Some(v) = view {
+                                    self.emit_job(&v);
+                                }
+                            }
+                            JobStop::Cancelled => {
+                                let view = {
+                                    let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                                    g.pending_replace.remove(&job.id);
+                                    let mut out = None;
+                                    if let Some(pos) = g.jobs.iter().position(|j| j.id == job.id) {
+                                        let mut removed = g.jobs.remove(pos);
+                                        removed.status = DownloadStatus::Cancelled;
+                                        removed.stage = Some("Cancelled".into());
+                                        out = Some(DownloadJobView::from(&removed));
+                                    }
+                                    Self::persist_locked(&g);
+                                    out
+                                };
+                                if let Some(v) = view {
+                                    self.emit_job(&v);
+                                }
+                            }
+                            JobStop::Paused => {
+                                if !sig.resume_requested.load(Ordering::Relaxed) {
+                                    self.update_job(&job.id, true, |j| {
+                                        j.status = DownloadStatus::Paused;
+                                        j.stage = Some("Paused".into());
+                                        j.speed_bps = 0;
+                                        j.eta_sec = None;
+                                    });
+                                }
+                            }
+                            _ => {}
+                        }
+                        break;
+                    }
                     if let Some(ref app) = app_opt {
                         let scope = app.asset_protocol_scope();
                         let _ = scope.allow_file(&final_path);
@@ -2765,6 +3410,10 @@ impl DownloadManager {
                         quality: resolved_q,
                         quality_verified: q_verified,
                         video_codec: v_codec.clone(),
+                        container: Some(final_container.clone()),
+                        web_ready,
+                        audio_codec,
+                        audio_channels,
                         provider_id: job.provider_id.clone(),
                         provider_name: job.provider_name.clone(),
                         file_path: final_str.clone(),
@@ -2789,6 +3438,7 @@ impl DownloadManager {
                             j.resolved_quality = resolved_q;
                             j.quality_verified = q_verified;
                             j.video_codec = v_codec;
+                            j.container = Some(final_container);
                             j.speed_bps = 0;
                             j.eta_sec = Some(0);
                             j.percent = 100.0;
@@ -2805,12 +3455,14 @@ impl DownloadManager {
                     break;
                 }
                 Err(JobStop::Paused) => {
-                    self.update_job(&job.id, true, |j| {
-                        j.status = DownloadStatus::Paused;
-                        j.stage = Some("Paused".into());
-                        j.speed_bps = 0;
-                        j.eta_sec = None;
-                    });
+                    if !sig.resume_requested.load(Ordering::Relaxed) {
+                        self.update_job(&job.id, true, |j| {
+                            j.status = DownloadStatus::Paused;
+                            j.stage = Some("Paused".into());
+                            j.speed_bps = 0;
+                            j.eta_sec = None;
+                        });
+                    }
                     break;
                 }
                 Err(JobStop::Replaced) => {
@@ -2891,15 +3543,55 @@ impl DownloadManager {
                         job = next_job;
                         continue;
                     }
-                    if let Some((best_h, best_src)) = best_low_res.take() {
+                    let policy = normalize_quality_policy(job.quality_policy.as_deref());
+                    let fallback_pick = best_low_res.take().or_else(|| {
+                        Some((actual_height, fallback_from_job(&job, Some(actual_height))))
+                    });
+                    if let Some((best_h, best_src)) = fallback_pick {
+                        if policy == "strict" {
+                            cleanup_job_artifacts(&job);
+                            let err_msg = format!(
+                                "Exact {} unavailable (best found: {})",
+                                fmt_quality_short(target),
+                                fmt_quality_short(best_h)
+                            );
+                            self.update_job(&job.id, true, |j| {
+                                j.available_quality = Some(best_h);
+                                j.allow_below_target = false;
+                                j.status = DownloadStatus::Failed;
+                                j.stage = Some("Exact quality unavailable".into());
+                                j.speed_bps = 0;
+                                j.eta_sec = None;
+                                j.error = Some(err_msg);
+                            });
+                            break;
+                        }
+                        let hold_for_user = policy == "ask";
                         let view = {
                             let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
                             let mut out = None;
                             if let Some(j) = g.jobs.iter_mut().find(|j| j.id == job.id) {
                                 apply_deferred_low_res_fallback(j, best_src, best_h);
-                                j.status = DownloadStatus::Downloading;
-                                j.stage = Some(format!("Using best available ({} · {best_h}p)…", j.provider_name));
+                                j.available_quality = Some(best_h);
                                 j.updated_at = now_ms();
+                                if hold_for_user {
+                                    j.allow_below_target = false;
+                                    j.status = DownloadStatus::AwaitingQuality;
+                                    j.stage = Some(format!(
+                                        "No {} found · Best: {} ({})",
+                                        fmt_quality_short(target),
+                                        fmt_quality_short(best_h),
+                                        j.provider_name
+                                    ));
+                                } else {
+                                    j.allow_below_target = true;
+                                    j.status = DownloadStatus::Downloading;
+                                    j.stage = Some(format!(
+                                        "Using best available ({} · {})…",
+                                        j.provider_name,
+                                        fmt_quality_short(best_h)
+                                    ));
+                                }
                                 out = Some((j.clone(), DownloadJobView::from(&*j)));
                             }
                             Self::persist_locked(&g);
@@ -2907,6 +3599,9 @@ impl DownloadManager {
                         };
                         if let Some((restored, v)) = view {
                             self.emit_job(&v);
+                            if hold_for_user {
+                                break;
+                            }
                             job = restored;
                             allow_below_target = true;
                             continue;
@@ -2945,17 +3640,51 @@ impl DownloadManager {
                         }
                         if let Some((best_h, best_src)) = best_low_res.take() {
                             cleanup_job_artifacts(&job);
+                            let policy = normalize_quality_policy(job.quality_policy.as_deref());
+                            let target_q = job.preferred_quality.unwrap_or(1080);
+                            if policy == "strict" {
+                                let err_msg = format!(
+                                    "Exact {} unavailable (best found: {})",
+                                    fmt_quality_short(target_q),
+                                    fmt_quality_short(best_h)
+                                );
+                                self.update_job(&job.id, true, |j| {
+                                    j.available_quality = Some(best_h);
+                                    j.allow_below_target = false;
+                                    j.status = DownloadStatus::Failed;
+                                    j.stage = Some("Exact quality unavailable".into());
+                                    j.speed_bps = 0;
+                                    j.eta_sec = None;
+                                    j.error = Some(err_msg);
+                                });
+                                break;
+                            }
+                            let hold_for_user = policy == "ask";
                             let view = {
                                 let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
                                 let mut out = None;
                                 if let Some(j) = g.jobs.iter_mut().find(|j| j.id == job.id) {
                                     apply_deferred_low_res_fallback(j, best_src, best_h);
-                                    j.status = DownloadStatus::Downloading;
-                                    j.stage = Some(format!(
-                                        "Using best available ({} · {best_h}p)…",
-                                        j.provider_name
-                                    ));
+                                    j.available_quality = Some(best_h);
                                     j.updated_at = now_ms();
+                                    if hold_for_user {
+                                        j.allow_below_target = false;
+                                        j.status = DownloadStatus::AwaitingQuality;
+                                        j.stage = Some(format!(
+                                            "No {} found · Best: {} ({})",
+                                            fmt_quality_short(target_q),
+                                            fmt_quality_short(best_h),
+                                            j.provider_name
+                                        ));
+                                    } else {
+                                        j.allow_below_target = true;
+                                        j.status = DownloadStatus::Downloading;
+                                        j.stage = Some(format!(
+                                            "Using best available ({} · {})…",
+                                            j.provider_name,
+                                            fmt_quality_short(best_h)
+                                        ));
+                                    }
                                     out = Some((j.clone(), DownloadJobView::from(&*j)));
                                 }
                                 Self::persist_locked(&g);
@@ -2963,6 +3692,9 @@ impl DownloadManager {
                             };
                             if let Some((restored, v)) = view {
                                 self.emit_job(&v);
+                                if hold_for_user {
+                                    break;
+                                }
                                 job = restored;
                                 allow_below_target = true;
                                 continue;
@@ -2987,7 +3719,43 @@ impl DownloadManager {
         job: &DownloadJob,
         root: &Path,
         sig: &JobSignals,
+        allow_below_target: bool,
     ) -> Result<(PathBuf, u64), JobStop> {
+        if !allow_below_target {
+            if let Some(target) = job.preferred_quality.filter(|&q| q > 0) {
+                let mut known_h = if job.quality_verified {
+                    job.quality.filter(|&q| q > 0)
+                } else {
+                    None
+                };
+                if known_h.is_none() {
+                    if let Some(app) = self.app.lock().ok().and_then(|g| g.clone()) {
+                        if let Ok(ffprobe) = crate::ffmpeg_tool(&app, "ffprobe") {
+                            let url_c = job.url.clone();
+                            let hdrs_c = job.headers.clone();
+                            let cancel_c = sig.cancel.clone();
+                            let replaced_c = sig.replaced.clone();
+                            let pause_c = sig.pause.clone();
+                            known_h = tauri::async_runtime::spawn_blocking(move || {
+                                probe_remote_video_height(&ffprobe, &url_c, &hdrs_c, &cancel_c, &replaced_c, &pause_c)
+                            })
+                            .await
+                            .unwrap_or(Ok(None))?;
+                        }
+                    }
+                }
+                if let Some(actual_h) = known_h {
+                    let strict_or_ask = normalize_quality_policy(job.quality_policy.as_deref()) != "best";
+                    if actual_h < target && (strict_or_ask || has_better_untried_fallback(job, actual_h)) {
+                        return Err(JobStop::LowQuality {
+                            actual_height: actual_h,
+                            target,
+                        });
+                    }
+                }
+            }
+        }
+
         let req_meta = start_req_from_job(job);
         let init_ext = infer_direct_ext(&job.url, None);
         let (folder, mut final_path) = resolve_target_paths(root, &req_meta, init_ext);
@@ -3266,6 +4034,192 @@ impl DownloadManager {
         Ok((final_path, final_size))
     }
 
+    async fn maybe_remux_direct_to_preferred_format(
+        &self,
+        job: &DownloadJob,
+        dl_path: &Path,
+        dl_size: u64,
+        sig: &JobSignals,
+    ) -> Result<(PathBuf, u64), JobStop> {
+        let target_fmt = normalize_preferred_format(job.preferred_format.as_deref());
+        let cur_ext = container_from_path(dl_path);
+        if cur_ext == target_fmt {
+            return Ok((dl_path.to_path_buf(), dl_size));
+        }
+        let Some(app) = self.app.lock().ok().and_then(|g| g.clone()) else {
+            let _ = tokio::fs::remove_file(dl_path).await;
+            return Err(JobStop::Failed(format!(
+                "Cannot convert downloaded {} file to selected {} format (app unavailable).",
+                cur_ext.to_ascii_uppercase(),
+                target_fmt.to_ascii_uppercase()
+            )));
+        };
+        let Ok(ffmpeg) = crate::ffmpeg_tool(&app, "ffmpeg") else {
+            let _ = tokio::fs::remove_file(dl_path).await;
+            return Err(JobStop::Failed(format!(
+                "FFmpeg is required to save this stream as {} (source was {}).",
+                target_fmt.to_ascii_uppercase(),
+                cur_ext.to_ascii_uppercase()
+            )));
+        };
+
+        self.update_job(&job.id, true, |j| {
+            j.status = DownloadStatus::Remuxing;
+            j.stage = Some(format!("Converting to {}…", target_fmt.to_ascii_uppercase()));
+            j.speed_bps = 0;
+            j.percent = 95.0;
+        });
+
+        let dst_path = dl_path.with_extension(target_fmt);
+        let src_c = dl_path.to_path_buf();
+        let dst_c = dst_path.clone();
+        let fmt_s = target_fmt.to_string();
+        let cancel_c = sig.cancel.clone();
+        let replaced_c = sig.replaced.clone();
+        let pause_c = sig.pause.clone();
+
+        let converted = tauri::async_runtime::spawn_blocking(move || {
+            remux_direct_file(&ffmpeg, &src_c, &dst_c, &fmt_s, &cancel_c, &replaced_c, &pause_c)
+        })
+        .await
+        .map_err(|e| JobStop::Failed(e.to_string()))??;
+
+        if converted {
+            let final_size = tokio::fs::metadata(&dst_path)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(dl_size);
+            Ok((dst_path, final_size))
+        } else {
+            let _ = tokio::fs::remove_file(dl_path).await;
+            Err(JobStop::Failed(format!(
+                "Failed converting {} stream to selected {} format.",
+                cur_ext.to_ascii_uppercase(),
+                target_fmt.to_ascii_uppercase()
+            )))
+        }
+    }
+
+    async fn run_dash_job(
+        &self,
+        job: &mut DownloadJob,
+        root: &Path,
+        sig: &JobSignals,
+        allow_below_target: bool,
+    ) -> Result<(PathBuf, u64, Vec<HlsSubtitleRendition>), JobStop> {
+        let target_fmt = normalize_preferred_format(job.preferred_format.as_deref());
+        let app = self
+            .app
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .ok_or_else(|| JobStop::Failed("App handle unavailable for DASH download".into()))?;
+        let ffprobe = crate::ffmpeg_tool(&app, "ffprobe").map_err(JobStop::Failed)?;
+        let ffmpeg = crate::ffmpeg_tool(&app, "ffmpeg").map_err(JobStop::Failed)?;
+
+        self.update_job(&job.id, true, |j| {
+            j.status = DownloadStatus::Downloading;
+            j.stage = Some("Inspecting DASH streams…".into());
+        });
+
+        let url_c = job.url.clone();
+        let hdrs_c = job.headers.clone();
+        let (videos, audio_idx, duration_sec) =
+            tauri::async_runtime::spawn_blocking(move || probe_dash_streams(&ffprobe, &url_c, &hdrs_c))
+                .await
+                .map_err(|e| JobStop::Failed(e.to_string()))?
+                .map_err(JobStop::Failed)?;
+
+        let pref_q = job.preferred_quality.or(job.quality);
+        let (video_idx, picked_h) = select_ffprobe_video_stream(&videos, pref_q)
+            .ok_or_else(|| JobStop::Failed("No playable video stream found in DASH manifest".into()))?;
+
+        if !allow_below_target {
+            if let (Some(target), Some(actual_h)) = (job.preferred_quality.filter(|&q| q > 0), picked_h) {
+                let strict_or_ask = normalize_quality_policy(job.quality_policy.as_deref()) != "best";
+                if actual_h < target && (strict_or_ask || has_better_untried_fallback(job, actual_h)) {
+                    return Err(JobStop::LowQuality {
+                        actual_height: actual_h,
+                        target,
+                    });
+                }
+            }
+        }
+
+        if let Some(h) = picked_h {
+            job.resolved_quality = Some(h);
+            job.quality = Some(h);
+            job.quality_verified = true;
+            self.update_job(&job.id, true, |j| {
+                j.resolved_quality = Some(h);
+                j.quality = Some(h);
+                j.quality_verified = true;
+                j.stage = Some(format!(
+                    "Downloading DASH {h}p → {}…",
+                    target_fmt.to_ascii_uppercase()
+                ));
+            });
+        } else {
+            self.update_job(&job.id, true, |j| {
+                j.stage = Some(format!("Downloading DASH → {}…", target_fmt.to_ascii_uppercase()));
+            });
+        }
+
+        let req_meta = start_req_from_job(job);
+        let (folder, final_path) = resolve_target_paths(root, &req_meta, target_fmt);
+        tokio::fs::create_dir_all(&folder)
+            .await
+            .map_err(|e| JobStop::Failed(e.to_string()))?;
+
+        let tmp_path = final_path.with_extension(format!("abxdash.{target_fmt}"));
+        let url_dl = job.url.clone();
+        let hdrs_dl = job.headers.clone();
+        let fmt_s = target_fmt.to_string();
+        let tmp_c = tmp_path.clone();
+        let cancel_c = sig.cancel.clone();
+        let replaced_c = sig.replaced.clone();
+        let pause_c = sig.pause.clone();
+        let app_for_cb = manager().clone();
+        let job_id_c = job.id.clone();
+
+        tauri::async_runtime::spawn_blocking(move || {
+            let mut last_tick = Instant::now();
+            run_dash_ffmpeg(
+                &ffmpeg,
+                &url_dl,
+                &hdrs_dl,
+                video_idx,
+                audio_idx,
+                &fmt_s,
+                &tmp_c,
+                duration_sec,
+                &cancel_c,
+                &replaced_c,
+                &pause_c,
+                |bytes, pct| {
+                    if last_tick.elapsed() >= Duration::from_millis(350) {
+                        last_tick = Instant::now();
+                        app_for_cb.update_job(&job_id_c, true, |j| {
+                            j.bytes_downloaded = bytes;
+                            if pct > 0.0 {
+                                j.percent = pct;
+                            }
+                        });
+                    }
+                },
+            )
+        })
+        .await
+        .map_err(|e| JobStop::Failed(e.to_string()))??;
+
+        let _ = tokio::fs::remove_file(&final_path).await;
+        tokio::fs::rename(&tmp_path, &final_path)
+            .await
+            .map_err(|e| JobStop::Failed(format!("Could not finalize DASH file: {e}")))?;
+        let final_size = tokio::fs::metadata(&final_path).await.map(|m| m.len()).unwrap_or(0);
+        Ok((final_path, final_size, Vec::new()))
+    }
+
     async fn run_hls_job(
         &self,
         job: &mut DownloadJob,
@@ -3287,7 +4241,8 @@ impl DownloadManager {
         let state_path = work_dir.join("state.json");
         let mut work_state = if let Ok(bytes) = tokio::fs::read(&state_path).await {
             match serde_json::from_slice::<HlsWorkState>(&bytes) {
-                Ok(s) => s,
+                Ok(s) if s.preferred_quality == job.preferred_quality => s,
+                Ok(_) => self.fetch_and_save_hls_state(job, &state_path, sig, true).await?,
                 Err(_) => self.fetch_and_save_hls_state(job, &state_path, sig, false).await?,
             }
         } else {
@@ -3301,7 +4256,8 @@ impl DownloadManager {
                 job.preferred_quality.filter(|&q| q > 0),
                 work_state.selected_height,
             ) {
-                if actual_h < target && has_better_untried_fallback(job, actual_h) {
+                let strict_or_ask = normalize_quality_policy(job.quality_policy.as_deref()) != "best";
+                if actual_h < target && (strict_or_ask || has_better_untried_fallback(job, actual_h)) {
                     return Err(JobStop::LowQuality {
                         actual_height: actual_h,
                         target,
@@ -3369,7 +4325,8 @@ impl DownloadManager {
                         });
                         if !allow_below_target {
                             if let Some(target) = job.preferred_quality.filter(|&q| q > 0) {
-                                if probed_h < target && has_better_untried_fallback(job, probed_h) {
+                                let strict_or_ask = normalize_quality_policy(job.quality_policy.as_deref()) != "best";
+                                if probed_h < target && (strict_or_ask || has_better_untried_fallback(job, probed_h)) {
                                     return Err(JobStop::LowQuality {
                                         actual_height: probed_h,
                                         target,
@@ -3388,7 +4345,8 @@ impl DownloadManager {
 
         check_sig(sig)?;
 
-        let mut refreshed = false;
+        let mut refresh_count: u8 = 0;
+        let mut last_refresh = Instant::now() - Duration::from_secs(60);
         let total_bytes_done = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (video_maps, video_keys, audio_maps, audio_keys, total_segs) = loop {
             let (v_maps, v_keys) = download_aux_hls_assets(
@@ -3547,8 +4505,12 @@ impl DownloadManager {
                         || msg.contains("HTTP 403")
                         || msg.contains("HTTP 404")
                         || msg.contains("HTTP 410");
-                    if !refreshed && token_expired {
-                        refreshed = true;
+                    if refresh_count < 3
+                        && last_refresh.elapsed() >= Duration::from_secs(10)
+                        && token_expired
+                    {
+                        refresh_count += 1;
+                        last_refresh = Instant::now();
                         self.update_job(&job.id, true, |j| {
                             j.stage = Some("Refreshing expired stream links…".into());
                             j.speed_bps = 0;
@@ -3606,10 +4568,20 @@ impl DownloadManager {
         let work_dir_c = work_dir.clone();
         let mp4_path_c = mp4_path.clone();
         let mkv_path_c = mkv_path.clone();
+        let pref_fmt = normalize_preferred_format(job.preferred_format.as_deref()).to_string();
         let cancel_c = sig.cancel.clone();
         let replaced_c = sig.replaced.clone();
         let final_out = tauri::async_runtime::spawn_blocking(move || {
-            remux_local_hls(&ffmpeg, &work_dir_c, has_audio, &mp4_path_c, &mkv_path_c, &cancel_c, &replaced_c)
+            remux_local_hls(
+                &ffmpeg,
+                &work_dir_c,
+                has_audio,
+                &mp4_path_c,
+                &mkv_path_c,
+                &pref_fmt,
+                &cancel_c,
+                &replaced_c,
+            )
         })
         .await
         .map_err(|e| JobStop::Failed(e.to_string()))??;
@@ -3695,7 +4667,7 @@ impl DownloadManager {
         if force_refresh {
             if let Ok(old_bytes) = tokio::fs::read(state_path).await {
                 if let Ok(old_state) = serde_json::from_slice::<HlsWorkState>(&old_bytes) {
-                    if old_state.video.segments.len() != video.segments.len() {
+                    if should_purge_hls_segments_on_refresh(&old_state, video.segments.len(), selected_height, &video_url) {
                         if let Some(work_dir) = state_path.parent() {
                             if let Ok(mut entries) = tokio::fs::read_dir(work_dir).await {
                                 while let Ok(Some(ent)) = entries.next_entry().await {
@@ -3719,6 +4691,7 @@ impl DownloadManager {
             selected_height,
             selected_bandwidth,
             available_heights,
+            preferred_quality: job.preferred_quality,
             subtitles: matched_subs,
         };
         write_json_atomic(state_path, &state).map_err(JobStop::Failed)?;
@@ -3804,6 +4777,8 @@ fn start_req_from_job(job: &DownloadJob) -> DownloadStartReq {
         kind: job.kind.clone(),
         headers: job.headers.clone(),
         preferred_quality: job.preferred_quality,
+        preferred_format: job.preferred_format.clone(),
+        quality_policy: job.quality_policy.clone(),
         subtitles: job.subtitles.clone(),
         preferred_sub_langs: job.preferred_sub_langs.clone(),
         fallbacks: job.fallbacks.clone(),
@@ -3920,16 +4895,210 @@ fn cleanup_job_artifacts(job: &DownloadJob) {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct ProbedMedia {
+    quality: Option<u32>,
+    video_codec_raw: Option<String>,
+    video_codec: Option<String>,
+    audio_codec: Option<String>,
+    audio_channels: Option<u32>,
+    audio_stream_count: usize,
+}
+
+fn is_media_web_ready(
+    container: &str,
+    video_codec_raw: Option<&str>,
+    audio_codec: Option<&str>,
+    audio_channels: Option<u32>,
+) -> bool {
+    if audio_channels.is_some_and(|ch| ch > 2) {
+        return false;
+    }
+    let vc_ok = match video_codec_raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("h264" | "avc1" | "vp8" | "vp9" | "av1") => true,
+        Some(_) | None => false,
+    };
+    if !vc_ok {
+        return false;
+    }
+    let ac = audio_codec.map(|a| a.trim().to_ascii_lowercase());
+    match container.trim().to_ascii_lowercase().as_str() {
+        "mp4" | "m4v" | "mov" => matches!(ac.as_deref(), None | Some("aac" | "mp3")),
+        "mkv" => matches!(ac.as_deref(), None | Some("aac" | "mp3" | "opus" | "vorbis")),
+        "webm" => matches!(ac.as_deref(), None | Some("opus" | "vorbis")),
+        _ => false,
+    }
+}
+
+fn strip_url_query(url: &str) -> &str {
+    url.split(['?', '#']).next().unwrap_or(url)
+}
+
+fn should_purge_hls_segments_on_refresh(
+    old_state: &HlsWorkState,
+    new_seg_count: usize,
+    selected_height: Option<u32>,
+    new_video_url: &str,
+) -> bool {
+    old_state.video.segments.len() != new_seg_count
+        || old_state.selected_height != selected_height
+        || strip_url_query(&old_state.video_playlist_url) != strip_url_query(new_video_url)
+}
+
+fn spawn_bounded_stderr_drain(stderr: Option<std::process::ChildStderr>) -> Option<std::thread::JoinHandle<String>> {
+    use std::io::Read;
+    const MAX_STDERR_BYTES: usize = 64 * 1024;
+    stderr.map(|mut se| {
+        std::thread::spawn(move || {
+            let mut ring: Vec<u8> = Vec::new();
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = se.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                ring.extend_from_slice(&buf[..n]);
+                if ring.len() > MAX_STDERR_BYTES * 2 {
+                    let keep_from = ring.len().saturating_sub(MAX_STDERR_BYTES);
+                    ring.drain(..keep_from);
+                }
+            }
+            if ring.len() > MAX_STDERR_BYTES {
+                let keep_from = ring.len().saturating_sub(MAX_STDERR_BYTES);
+                ring.drain(..keep_from);
+            }
+            String::from_utf8_lossy(&ring).into_owned()
+        })
+    })
+}
+
+fn probe_remote_video_height(
+    ffprobe: &Path,
+    url: &str,
+    headers: &Hdrs,
+    cancel_flag: &AtomicBool,
+    replaced_flag: &AtomicBool,
+    pause_flag: &AtomicBool,
+) -> Result<Option<u32>, JobStop> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    if replaced_flag.load(Ordering::Relaxed) {
+        return Err(JobStop::Replaced);
+    }
+    if cancel_flag.load(Ordering::Relaxed) {
+        return Err(JobStop::Cancelled);
+    }
+    if pause_flag.load(Ordering::Relaxed) {
+        return Err(JobStop::Paused);
+    }
+    if stream::validate_http_url(url).is_err() {
+        return Ok(None);
+    }
+    let mut cmd = crate::background_command(ffprobe);
+    build_ffmpeg_header_args(&mut cmd, headers);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .args([
+            "-v",
+            "error",
+            "-analyzeduration",
+            "2000000",
+            "-probesize",
+            "2000000",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "json",
+        ])
+        .arg(url);
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(_) => return Ok(None),
+    };
+    let stdout_handle = child.stdout.take().map(|mut so| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = so.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let started = Instant::now();
+    let status = loop {
+        if replaced_flag.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(JobStop::Replaced);
+        }
+        if cancel_flag.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(JobStop::Cancelled);
+        }
+        if pause_flag.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(JobStop::Paused);
+        }
+        if started.elapsed() > Duration::from_secs(10) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => std::thread::sleep(Duration::from_millis(80)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(None);
+            }
+        }
+    };
+    if !status.success() {
+        return Ok(None);
+    }
+    let Some(bytes) = stdout_handle.and_then(|h| h.join().ok()) else {
+        return Ok(None);
+    };
+    let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Ok(None);
+    };
+    let Some(s0) = val.get("streams").and_then(|v| v.as_array()).and_then(|a| a.first()) else {
+        return Ok(None);
+    };
+    let w = s0.get("width").and_then(|v| v.as_u64()).map(|n| n as u32);
+    let h = s0.get("height").and_then(|v| v.as_u64()).map(|n| n as u32);
+    Ok(normalize_video_resolution(w, h).or(h))
+}
+
 fn probe_downloaded_video(app: &tauri::AppHandle, path: &Path) -> Option<(Option<u32>, Option<String>)> {
     let ffprobe = crate::ffmpeg_tool(app, "ffprobe").ok()?;
-    let mut cmd = crate::background_command(&ffprobe);
+    probe_video_with_ffprobe(&ffprobe, path)
+}
+
+fn probe_downloaded_media(app: &tauri::AppHandle, path: &Path) -> Option<ProbedMedia> {
+    let ffprobe = crate::ffmpeg_tool(app, "ffprobe").ok()?;
+    probe_media_with_ffprobe(&ffprobe, path)
+}
+
+fn probe_video_with_ffprobe(ffprobe: &Path, path: &Path) -> Option<(Option<u32>, Option<String>)> {
+    let m = probe_media_with_ffprobe(ffprobe, path)?;
+    if m.quality.is_none() && m.video_codec.is_none() {
+        return None;
+    }
+    Some((m.quality, m.video_codec))
+}
+
+fn probe_media_with_ffprobe(ffprobe: &Path, path: &Path) -> Option<ProbedMedia> {
+    let mut cmd = crate::background_command(ffprobe);
     cmd.args([
         "-v",
         "error",
-        "-select_streams",
-        "v:0",
         "-show_entries",
-        "stream=width,height,codec_name",
+        "stream=index,codec_type,codec_name,width,height,channels:stream_disposition=attached_pic",
         "-of",
         "json",
     ])
@@ -3939,18 +5108,103 @@ fn probe_downloaded_video(app: &tauri::AppHandle, path: &Path) -> Option<(Option
         return None;
     }
     let val: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    let stream0 = val.get("streams")?.as_array()?.first()?;
-    let w = stream0.get("width").and_then(|v| v.as_u64()).map(|n| n as u32);
-    let h = stream0.get("height").and_then(|v| v.as_u64()).map(|n| n as u32);
-    let codec = stream0
-        .get("codec_name")
-        .and_then(|v| v.as_str())
-        .and_then(friendly_video_codec);
-    let norm_q = normalize_video_resolution(w, h);
-    if norm_q.is_none() && codec.is_none() {
+    let streams = val.get("streams")?.as_array()?;
+    let video_stream = streams
+        .iter()
+        .find(|s| {
+            s.get("codec_type").and_then(|v| v.as_str()) == Some("video")
+                && s.get("disposition")
+                    .and_then(|d| d.get("attached_pic"))
+                    .and_then(|v| v.as_u64())
+                    != Some(1)
+        })
+        .or_else(|| streams.iter().find(|s| s.get("codec_type").and_then(|v| v.as_str()) == Some("video")));
+    let audio_streams: Vec<&serde_json::Value> = streams
+        .iter()
+        .filter(|s| s.get("codec_type").and_then(|v| v.as_str()) == Some("audio"))
+        .collect();
+
+    let (quality, video_codec_raw, video_codec) = if let Some(vs) = video_stream {
+        let w = vs.get("width").and_then(|v| v.as_u64()).map(|n| n as u32);
+        let h = vs.get("height").and_then(|v| v.as_u64()).map(|n| n as u32);
+        let raw = vs.get("codec_name").and_then(|v| v.as_str()).map(|s| s.to_ascii_lowercase());
+        let friendly = raw.as_deref().and_then(friendly_video_codec);
+        (normalize_video_resolution(w, h), raw, friendly)
+    } else {
+        (None, None, None)
+    };
+    let (audio_codec, audio_channels) = if let Some(as0) = audio_streams.first() {
+        let ac = as0.get("codec_name").and_then(|v| v.as_str()).map(|s| s.to_ascii_lowercase());
+        let ch = as0.get("channels").and_then(|v| v.as_u64()).map(|n| n as u32);
+        (ac, ch)
+    } else {
+        (None, None)
+    };
+    if quality.is_none() && video_codec_raw.is_none() && audio_codec.is_none() {
         return None;
     }
-    Some((norm_q, codec))
+    Some(ProbedMedia {
+        quality,
+        video_codec_raw,
+        video_codec,
+        audio_codec,
+        audio_channels,
+        audio_stream_count: audio_streams.len(),
+    })
+}
+
+fn normalize_mp4_audio_to_aac(
+    ffmpeg: &Path,
+    path: &Path,
+    channels: Option<u64>,
+    cancel_flag: &AtomicBool,
+    replaced_flag: &AtomicBool,
+    pause_flag: &AtomicBool,
+) -> Result<Option<u64>, JobStop> {
+    use std::process::Stdio;
+
+    let tmp = path.with_extension("abxaudio.mp4");
+    let _ = std::fs::remove_file(&tmp);
+    let mut cmd = crate::background_command(ffmpeg);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i"])
+        .arg(path)
+        .args(["-map", "0:V:0", "-map", "0:a:0", "-sn", "-dn", "-c:v", "copy"]);
+    if channels.unwrap_or(2) > 2 {
+        cmd.args([
+            "-af",
+            "pan=stereo|FL=0.5*FL+0.707*FC+0.35*BL+0.35*SL+0.35*LFE|FR=0.5*FR+0.707*FC+0.35*BR+0.35*SR+0.35*LFE",
+        ]);
+    }
+    cmd.args(["-c:a", "aac", "-ac", "2", "-b:a", "256k", "-map_metadata", "0", "-f", "mp4"])
+        .arg(&tmp);
+    let child = cmd
+        .spawn()
+        .map_err(|e| JobStop::Failed(format!("Failed starting audio optimization: {e}")))?;
+    match wait_ffmpeg_child(
+        child,
+        &tmp,
+        Duration::from_secs(240),
+        cancel_flag,
+        replaced_flag,
+        Some(pause_flag),
+    ) {
+        Ok(()) => {
+            let new_size = tmp.metadata().map(|m| m.len()).ok();
+            let _ = std::fs::remove_file(path);
+            std::fs::rename(&tmp, path).map_err(|e| JobStop::Failed(e.to_string()))?;
+            Ok(new_size)
+        }
+        Err(stop @ (JobStop::Cancelled | JobStop::Replaced | JobStop::Paused | JobStop::LowQuality { .. })) => {
+            Err(stop)
+        }
+        Err(JobStop::Failed(_)) => {
+            let _ = std::fs::remove_file(&tmp);
+            Ok(None)
+        }
+    }
 }
 
 async fn fetch_text_with_headers(url: &str, headers: &Hdrs, sig: &JobSignals) -> Result<String, JobStop> {
@@ -4138,12 +5392,83 @@ async fn download_single_segment(
     Err(JobStop::Failed(last_err))
 }
 
+fn wait_ffmpeg_child(
+    mut child: std::process::Child,
+    out_path: &Path,
+    timeout: Duration,
+    cancel_flag: &AtomicBool,
+    replaced_flag: &AtomicBool,
+    pause_flag: Option<&AtomicBool>,
+) -> Result<(), JobStop> {
+    let stderr_handle = spawn_bounded_stderr_drain(child.stderr.take());
+    let started = Instant::now();
+    let status = loop {
+        if replaced_flag.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            if let Some(h) = stderr_handle {
+                let _ = h.join();
+            }
+            let _ = std::fs::remove_file(out_path);
+            return Err(JobStop::Replaced);
+        }
+        if cancel_flag.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            if let Some(h) = stderr_handle {
+                let _ = h.join();
+            }
+            let _ = std::fs::remove_file(out_path);
+            return Err(JobStop::Cancelled);
+        }
+        if pause_flag.is_some_and(|p| p.load(Ordering::Relaxed)) {
+            let _ = child.kill();
+            let _ = child.wait();
+            if let Some(h) = stderr_handle {
+                let _ = h.join();
+            }
+            let _ = std::fs::remove_file(out_path);
+            return Err(JobStop::Paused);
+        }
+        if started.elapsed() > timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            if let Some(h) = stderr_handle {
+                let _ = h.join();
+            }
+            let _ = std::fs::remove_file(out_path);
+            return Err(JobStop::Failed("FFmpeg operation timed out".into()));
+        }
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => std::thread::sleep(Duration::from_millis(120)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                if let Some(h) = stderr_handle {
+                    let _ = h.join();
+                }
+                let _ = std::fs::remove_file(out_path);
+                return Err(JobStop::Failed(format!("FFmpeg process wait error: {e}")));
+            }
+        }
+    };
+
+    let stderr_buf = stderr_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+    if status.success() && out_path.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(out_path);
+    Err(JobStop::Failed(stderr_buf.trim().to_string()))
+}
+
 fn remux_local_hls(
     ffmpeg: &Path,
     work_dir: &Path,
     has_audio: bool,
     mp4_path: &Path,
     mkv_path: &Path,
+    preferred_format: &str,
     cancel_flag: &AtomicBool,
     replaced_flag: &AtomicBool,
 ) -> Result<PathBuf, JobStop> {
@@ -4159,8 +5484,7 @@ fn remux_local_hls(
     let _ = std::fs::remove_file(&tmp_mp4);
     let _ = std::fs::remove_file(&tmp_mkv);
 
-    let run_pass = |use_bsf: bool, format: &str, out_path: &Path| -> Result<(), JobStop> {
-        use std::io::Read;
+    let run_pass = |use_bsf: bool, transcode_audio: bool, format: &str, out_path: &Path| -> Result<(), JobStop> {
         use std::process::Stdio;
 
         let mut cmd = crate::background_command(ffmpeg);
@@ -4168,15 +5492,21 @@ fn remux_local_hls(
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
-            .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
+            .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-fflags", "+genpts"])
             .args(["-allowed_extensions", "ALL", "-protocol_whitelist", "file,crypto"])
             .args(["-i", "local.m3u8"]);
         if has_audio {
             cmd.args(["-allowed_extensions", "ALL", "-protocol_whitelist", "file,crypto"])
-                .args(["-i", "local_audio.m3u8", "-map", "0:v:0", "-map", "1:a:0"]);
+                .args(["-i", "local_audio.m3u8", "-map", "0:v:0", "-map", "1:a:0", "-sn", "-dn"]);
+        } else {
+            cmd.args(["-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn"]);
         }
-        cmd.args(["-c", "copy"]);
-        if use_bsf {
+        if transcode_audio {
+            cmd.args(["-c:v", "copy", "-c:a", "aac", "-ac", "2", "-b:a", "256k"]);
+        } else {
+            cmd.args(["-c", "copy"]);
+        }
+        if use_bsf && !transcode_audio {
             cmd.args(["-bsf:a", "aac_adtstoasc"]);
         }
         if format == "mp4" {
@@ -4186,80 +5516,399 @@ fn remux_local_hls(
         }
         cmd.arg(out_path);
 
-        let mut child = cmd
+        let child = cmd
             .spawn()
             .map_err(|e| JobStop::Failed(format!("Failed to start FFmpeg remux: {e}")))?;
+        wait_ffmpeg_child(child, out_path, Duration::from_secs(180), cancel_flag, replaced_flag, None)
+    };
 
+    let target = normalize_preferred_format(Some(preferred_format));
+    let mut last_err = String::new();
+    let (ff_fmt, dest_path, passes): (&str, &Path, [(bool, bool); 3]) = if target == "mkv" {
+        ("matroska", mkv_path, [(false, false), (true, false), (false, true)])
+    } else {
+        ("mp4", mp4_path, [(true, false), (false, false), (false, true)])
+    };
+    let tmp_out = if target == "mkv" { &tmp_mkv } else { &tmp_mp4 };
+
+    for (use_bsf, transcode_audio) in passes {
+        match run_pass(use_bsf, transcode_audio, ff_fmt, tmp_out) {
+            Ok(()) => {
+                std::fs::rename(tmp_out, dest_path).map_err(|e| JobStop::Failed(e.to_string()))?;
+                return Ok(dest_path.to_path_buf());
+            }
+            Err(stop @ (JobStop::Cancelled | JobStop::Replaced | JobStop::Paused | JobStop::LowQuality { .. })) => {
+                return Err(stop);
+            }
+            Err(JobStop::Failed(e)) => {
+                last_err = e;
+            }
+        }
+    }
+
+    Err(JobStop::Failed(format!(
+        "FFmpeg {} remux failed: {last_err}",
+        target.to_ascii_uppercase()
+    )))
+}
+
+fn remux_direct_file(
+    ffmpeg: &Path,
+    src_path: &Path,
+    dst_path: &Path,
+    target_fmt: &str,
+    cancel_flag: &AtomicBool,
+    replaced_flag: &AtomicBool,
+    pause_flag: &AtomicBool,
+) -> Result<bool, JobStop> {
+    use std::process::Stdio;
+    let tmp = dst_path.with_extension(format!("abxconv.{target_fmt}"));
+    let _ = std::fs::remove_file(&tmp);
+
+    let pass = |transcode_audio: bool| -> Result<(), JobStop> {
+        let mut cmd = crate::background_command(ffmpeg);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-fflags", "+genpts"])
+            .arg("-i")
+            .arg(src_path)
+            .args(["-map", "0:V:0", "-map", "0:a?", "-sn", "-dn"]);
+        if transcode_audio {
+            cmd.args(["-c:v", "copy", "-c:a", "aac", "-ac", "2", "-b:a", "256k"]);
+        } else {
+            cmd.args(["-c", "copy"]);
+        }
+        if target_fmt == "mp4" {
+            cmd.args(["-movflags", "+faststart", "-f", "mp4"]);
+        } else {
+            cmd.args(["-f", "matroska"]);
+        }
+        cmd.arg(&tmp);
+        let child = cmd
+            .spawn()
+            .map_err(|e| JobStop::Failed(format!("Failed starting FFmpeg container conversion: {e}")))?;
+        wait_ffmpeg_child(child, &tmp, Duration::from_secs(240), cancel_flag, replaced_flag, Some(pause_flag))
+    };
+
+    let ok = match pass(false) {
+        Ok(()) => true,
+        Err(stop @ (JobStop::Cancelled | JobStop::Replaced | JobStop::Paused | JobStop::LowQuality { .. })) => {
+            return Err(stop);
+        }
+        Err(JobStop::Failed(_)) => match pass(true) {
+            Ok(()) => true,
+            Err(stop @ (JobStop::Cancelled | JobStop::Replaced | JobStop::Paused | JobStop::LowQuality { .. })) => {
+                return Err(stop);
+            }
+            Err(JobStop::Failed(_)) => false,
+        },
+    };
+
+    if !ok {
+        let _ = std::fs::remove_file(&tmp);
+        return Ok(false);
+    }
+    if dst_path != src_path {
+        let _ = std::fs::remove_file(dst_path);
+    }
+    std::fs::rename(&tmp, dst_path).map_err(|e| JobStop::Failed(e.to_string()))?;
+    if dst_path != src_path {
+        let _ = std::fs::remove_file(src_path);
+    }
+    Ok(true)
+}
+
+fn mux_subtitles_into_mkv(
+    ffmpeg: &Path,
+    mkv_path: &Path,
+    subtitle_paths: &[String],
+    cancel_flag: &AtomicBool,
+    replaced_flag: &AtomicBool,
+) -> Result<Option<u64>, JobStop> {
+    use std::process::Stdio;
+
+    let valid_subs: Vec<(&Path, String)> = subtitle_paths
+        .iter()
+        .take(MAX_SUBTITLE_TRACKS)
+        .filter_map(|p| {
+            let path = Path::new(p);
+            if !path.is_file() {
+                return None;
+            }
+            let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+            if !matches!(ext.as_str(), "srt" | "vtt" | "ass" | "ssa") {
+                return None;
+            }
+            Some((path, ext))
+        })
+        .collect();
+    if valid_subs.is_empty() || !mkv_path.is_file() {
+        return Ok(None);
+    }
+
+    let tmp_mkv = mkv_path.with_extension("abxsub.mkv");
+    let _ = std::fs::remove_file(&tmp_mkv);
+
+    let mut cmd = crate::background_command(ffmpeg);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
+        .arg("-i")
+        .arg(mkv_path);
+    for (sub_p, _) in &valid_subs {
+        cmd.arg("-i").arg(sub_p);
+    }
+    cmd.args(["-map", "0:v", "-map", "0:a?"]);
+    for (idx, _) in valid_subs.iter().enumerate() {
+        cmd.args(["-map", &format!("{}:0", idx + 1)]);
+    }
+    cmd.args(["-c:v", "copy", "-c:a", "copy"]);
+    for (idx, (sub_p, ext)) in valid_subs.iter().enumerate() {
+        let s_codec = if ext == "vtt" { "srt" } else { "copy" };
+        cmd.args([&format!("-c:s:{idx}"), s_codec]);
+        // Extract language token from `<stem>.<lang>[.forced].<ext>` when present.
+        let fname = sub_p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let mut parts = fname.rsplit('.');
+        let tok1 = parts.next().unwrap_or("");
+        let lang_tok = if tok1.eq_ignore_ascii_case("forced") || tok1.chars().all(|c| c.is_ascii_digit()) {
+            parts.next().unwrap_or(tok1)
+        } else {
+            tok1
+        };
+        let norm = norm_sub_lang_key(lang_tok);
+        if !norm.is_empty() && norm.len() <= 3 && norm.chars().all(|c| c.is_ascii_alphabetic()) {
+            cmd.args([&format!("-metadata:s:s:{idx}"), &format!("language={norm}")]);
+        }
+    }
+    cmd.args(["-f", "matroska"]).arg(&tmp_mkv);
+
+    let child = cmd
+        .spawn()
+        .map_err(|e| JobStop::Failed(format!("Failed starting subtitle MKV mux: {e}")))?;
+    match wait_ffmpeg_child(child, &tmp_mkv, Duration::from_secs(120), cancel_flag, replaced_flag, None) {
+        Ok(()) => {
+            if tmp_mkv.metadata().map(|m| m.len() >= 1024).unwrap_or(false) {
+                let _ = std::fs::remove_file(mkv_path);
+                if std::fs::rename(&tmp_mkv, mkv_path).is_ok() {
+                    return Ok(mkv_path.metadata().ok().map(|m| m.len()));
+                }
+            }
+            let _ = std::fs::remove_file(&tmp_mkv);
+            Ok(None)
+        }
+        Err(stop @ (JobStop::Cancelled | JobStop::Replaced | JobStop::Paused)) => Err(stop),
+        Err(JobStop::Failed(_)) | Err(JobStop::LowQuality { .. }) => {
+            let _ = std::fs::remove_file(&tmp_mkv);
+            Ok(None)
+        }
+    }
+}
+
+fn probe_dash_streams(
+    ffprobe: &Path,
+    url: &str,
+    headers: &Hdrs,
+) -> Result<(Vec<(usize, Option<u32>, u64)>, Option<usize>, Option<f64>), String> {
+    let mut cmd = crate::background_command(ffprobe);
+    build_ffmpeg_header_args(&mut cmd, headers);
+    cmd.args([
+        "-v",
+        "error",
+        "-show_entries",
+        "stream=index,codec_type,width,height,bit_rate:format=duration",
+        "-of",
+        "json",
+        url,
+    ]);
+    let out = crate::run_background_output(&mut cmd).map_err(|e| format!("Failed starting ffprobe: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        if err.to_ascii_lowercase().contains("encrypt") || err.to_ascii_lowercase().contains("drm") {
+            return Err("DRM-protected DASH streams cannot be downloaded offline".into());
+        }
+        return Err(format!("Could not inspect DASH manifest: {}", err.trim()));
+    }
+    let val: serde_json::Value =
+        serde_json::from_slice(&out.stdout).map_err(|e| format!("Invalid ffprobe JSON: {e}"))?;
+    let duration_sec = val
+        .get("format")
+        .and_then(|f| f.get("duration"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|d| d.is_finite() && *d > 0.0);
+
+    let mut videos = Vec::new();
+    let mut audio_idx = None;
+    if let Some(arr) = val.get("streams").and_then(|s| s.as_array()) {
+        for st in arr {
+            let idx = st.get("index").and_then(|v| v.as_u64()).map(|n| n as usize).unwrap_or(0);
+            let kind = st.get("codec_type").and_then(|v| v.as_str()).unwrap_or("");
+            if kind == "video" {
+                let w = st.get("width").and_then(|v| v.as_u64()).map(|n| n as u32);
+                let h = st.get("height").and_then(|v| v.as_u64()).map(|n| n as u32);
+                let br = st
+                    .get("bit_rate")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                videos.push((idx, normalize_video_resolution(w, h).or(h), br));
+            } else if kind == "audio" && audio_idx.is_none() {
+                audio_idx = Some(idx);
+            }
+        }
+    }
+    Ok((videos, audio_idx, duration_sec))
+}
+
+fn run_dash_ffmpeg(
+    ffmpeg: &Path,
+    url: &str,
+    headers: &Hdrs,
+    video_idx: usize,
+    audio_idx: Option<usize>,
+    target_fmt: &str,
+    tmp_path: &Path,
+    duration_sec: Option<f64>,
+    cancel_flag: &AtomicBool,
+    replaced_flag: &AtomicBool,
+    pause_flag: &AtomicBool,
+    mut on_progress: impl FnMut(u64, f64),
+) -> Result<(), JobStop> {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    let pass = |transcode_audio: bool, format: &str, out_p: &Path, cb: &mut dyn FnMut(u64, f64)| -> Result<(), JobStop> {
+        let _ = std::fs::remove_file(out_p);
+        let mut cmd = crate::background_command(ffmpeg);
+        build_ffmpeg_header_args(&mut cmd, headers);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", url])
+            .args(["-map", &format!("0:{video_idx}")]);
+        if let Some(aidx) = audio_idx {
+            cmd.args(["-map", &format!("0:{aidx}?")]);
+        } else {
+            cmd.args(["-map", "0:a:0?"]);
+        }
+        if transcode_audio {
+            cmd.args(["-c:v", "copy", "-c:a", "aac", "-ac", "2", "-b:a", "256k"]);
+        } else {
+            cmd.args(["-c", "copy"]);
+        }
+        cmd.args(["-sn", "-dn"]);
+        if format == "mp4" {
+            cmd.args(["-movflags", "+faststart", "-f", "mp4"]);
+        } else {
+            cmd.args(["-f", "matroska"]);
+        }
+        cmd.args(["-progress", "pipe:1"]).arg(out_p);
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| JobStop::Failed(format!("Failed starting DASH FFmpeg download: {e}")))?;
+        let stderr_handle = spawn_bounded_stderr_drain(child.stderr.take());
+        let stdout = child.stdout.take();
         let started = Instant::now();
+        let (tx, rx) = std::sync::mpsc::channel::<(Option<u64>, Option<f64>)>();
+        if let Some(out) = stdout {
+            std::thread::spawn(move || {
+                let reader = BufReader::new(out);
+                let mut bytes = None;
+                let mut out_ms = None;
+                for line in reader.lines().map_while(Result::ok) {
+                    if let Some(val) = line.strip_prefix("total_size=") {
+                        bytes = val.trim().parse::<u64>().ok();
+                    } else if let Some(val) = line.strip_prefix("out_time_us=") {
+                        if let Ok(us) = val.trim().parse::<u64>() {
+                            out_ms = Some((us as f64) / 1_000_000.0);
+                        }
+                    } else if line.starts_with("progress=") {
+                        let _ = tx.send((bytes, out_ms));
+                    }
+                }
+            });
+        }
+
         let status = loop {
             if replaced_flag.load(Ordering::Relaxed) {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = std::fs::remove_file(out_path);
+                if let Some(h) = stderr_handle {
+                    let _ = h.join();
+                }
+                let _ = std::fs::remove_file(out_p);
                 return Err(JobStop::Replaced);
             }
             if cancel_flag.load(Ordering::Relaxed) {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = std::fs::remove_file(out_path);
+                if let Some(h) = stderr_handle {
+                    let _ = h.join();
+                }
+                let _ = std::fs::remove_file(out_p);
                 return Err(JobStop::Cancelled);
             }
-            if started.elapsed() > Duration::from_secs(180) {
+            if pause_flag.load(Ordering::Relaxed) {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = std::fs::remove_file(out_path);
-                return Err(JobStop::Failed("FFmpeg remux timed out".into()));
+                if let Some(h) = stderr_handle {
+                    let _ = h.join();
+                }
+                let _ = std::fs::remove_file(out_p);
+                return Err(JobStop::Paused);
+            }
+            while let Ok((b_opt, sec_opt)) = rx.try_recv() {
+                let b = b_opt.unwrap_or_else(|| out_p.metadata().map(|m| m.len()).unwrap_or(0));
+                let pct = match (sec_opt, duration_sec) {
+                    (Some(s), Some(tot)) if tot > 0.0 => (s / tot * 95.0).clamp(1.0, 95.0),
+                    _ => 0.0,
+                };
+                cb(b, pct);
+            }
+            if started.elapsed() > Duration::from_secs(600) {
+                let _ = child.kill();
+                let _ = child.wait();
+                if let Some(h) = stderr_handle {
+                    let _ = h.join();
+                }
+                let _ = std::fs::remove_file(out_p);
+                return Err(JobStop::Failed("DASH download timed out".into()));
             }
             match child.try_wait() {
                 Ok(Some(st)) => break st,
-                Ok(None) => std::thread::sleep(Duration::from_millis(120)),
+                Ok(None) => std::thread::sleep(Duration::from_millis(200)),
                 Err(e) => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    let _ = std::fs::remove_file(out_path);
-                    return Err(JobStop::Failed(format!("FFmpeg remux wait error: {e}")));
+                    if let Some(h) = stderr_handle {
+                        let _ = h.join();
+                    }
+                    let _ = std::fs::remove_file(out_p);
+                    return Err(JobStop::Failed(format!("DASH FFmpeg wait error: {e}")));
                 }
             }
         };
 
-        if status.success() && out_path.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+        let stderr_buf = stderr_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+        if status.success() && out_p.metadata().map(|m| m.len() >= DIRECT_MIN_VALID_BYTES).unwrap_or(false) {
             return Ok(());
         }
-        let mut stderr_buf = String::new();
-        if let Some(mut se) = child.stderr.take() {
-            let _ = se.read_to_string(&mut stderr_buf);
-        }
-        let _ = std::fs::remove_file(out_path);
+        let _ = std::fs::remove_file(out_p);
         Err(JobStop::Failed(stderr_buf.trim().to_string()))
     };
 
-    match run_pass(true, "mp4", &tmp_mp4) {
-        Ok(()) => {
-            std::fs::rename(&tmp_mp4, mp4_path).map_err(|e| JobStop::Failed(e.to_string()))?;
-            return Ok(mp4_path.to_path_buf());
-        }
-        Err(stop @ (JobStop::Cancelled | JobStop::Replaced | JobStop::Paused | JobStop::LowQuality { .. })) => {
-            return Err(stop)
-        }
-        Err(JobStop::Failed(_)) => {}
-    }
-    match run_pass(false, "mp4", &tmp_mp4) {
-        Ok(()) => {
-            std::fs::rename(&tmp_mp4, mp4_path).map_err(|e| JobStop::Failed(e.to_string()))?;
-            return Ok(mp4_path.to_path_buf());
-        }
-        Err(stop @ (JobStop::Cancelled | JobStop::Replaced | JobStop::Paused | JobStop::LowQuality { .. })) => {
-            return Err(stop)
-        }
-        Err(JobStop::Failed(_)) => {}
-    }
-    match run_pass(false, "matroska", &tmp_mkv) {
-        Ok(()) => {
-            std::fs::rename(&tmp_mkv, mkv_path).map_err(|e| JobStop::Failed(e.to_string()))?;
-            Ok(mkv_path.to_path_buf())
-        }
+    let ff_fmt = if normalize_preferred_format(Some(target_fmt)) == "mkv" {
+        "matroska"
+    } else {
+        "mp4"
+    };
+    match pass(false, ff_fmt, tmp_path, &mut on_progress) {
+        Ok(()) => Ok(()),
         Err(stop @ (JobStop::Cancelled | JobStop::Replaced | JobStop::Paused | JobStop::LowQuality { .. })) => Err(stop),
-        Err(JobStop::Failed(err)) => Err(JobStop::Failed(format!("FFmpeg remux failed: {err}"))),
+        Err(JobStop::Failed(_)) => pass(true, ff_fmt, tmp_path, &mut on_progress),
     }
 }
 
@@ -4808,6 +6457,8 @@ pub async fn download_switch_source(
     source: DownloadFallbackSource,
     extra_fallbacks: Option<Vec<DownloadFallbackSource>>,
     preferred_quality: Option<u32>,
+    preferred_format: Option<String>,
+    quality_policy: Option<String>,
 ) -> Result<Option<DownloadJobView>, String> {
     manager().switch_source(
         &app,
@@ -4815,6 +6466,8 @@ pub async fn download_switch_source(
         source,
         extra_fallbacks.unwrap_or_default(),
         preferred_quality,
+        preferred_format,
+        quality_policy,
     )
 }
 
@@ -4858,6 +6511,16 @@ pub fn download_cancel_all(canonical_key: Option<String>, season: Option<u32>) -
 }
 
 #[tauri::command]
+pub async fn download_resolve_quality(
+    app: tauri::AppHandle,
+    ids: Vec<String>,
+    action: String,
+    new_preferred_quality: Option<u32>,
+) -> Result<DownloadSnapshot, String> {
+    Ok(manager().resolve_quality(&app, ids, &action, new_preferred_quality))
+}
+
+#[tauri::command]
 pub async fn download_remove(id: String, delete_file: bool) -> Result<DownloadSnapshot, String> {
     tauri::async_runtime::spawn_blocking(move || manager().remove_entry(&id, delete_file))
         .await
@@ -4869,6 +6532,298 @@ pub async fn download_list() -> DownloadSnapshot {
     tauri::async_runtime::spawn_blocking(move || manager().reconcile_snapshot())
         .await
         .unwrap_or_else(|_| manager().snapshot())
+}
+
+fn is_vault_video_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let low = name.to_ascii_lowercase();
+    if low.starts_with('.') || low.contains(".abx") {
+        return false;
+    }
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| matches!(e.to_ascii_lowercase().as_str(), "mp4" | "mkv" | "webm" | "m4v" | "mov" | "avi"))
+        .unwrap_or(false)
+}
+
+fn collect_vault_videos(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for ent in entries.flatten() {
+        let p = ent.path();
+        let name = ent.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') || name.eq_ignore_ascii_case("subs") {
+            continue;
+        }
+        if p.is_dir() {
+            collect_vault_videos(&p, depth + 1, out);
+        } else if p.is_file() && is_vault_video_path(&p) {
+            out.push(p);
+        }
+    }
+}
+
+fn entry_req_for_organize(entry: &DownloadedEntry) -> DownloadStartReq {
+    DownloadStartReq {
+        root: String::new(),
+        media_key: entry.media_key.clone(),
+        canonical_key: entry.canonical_key.clone(),
+        title: entry.title.clone(),
+        media_kind: entry.media_kind.clone(),
+        is_film: entry.is_film,
+        year: entry.year,
+        season: entry.season,
+        episode: entry.episode,
+        episode_title: entry.episode_title.clone(),
+        audio: entry.audio.clone(),
+        quality: entry.quality,
+        provider_id: entry.provider_id.clone(),
+        provider_name: entry.provider_name.clone(),
+        url: String::new(),
+        kind: "direct".into(),
+        headers: Hdrs::default(),
+        preferred_quality: entry.quality,
+        preferred_format: entry.container.clone(),
+        quality_policy: None,
+        subtitles: Vec::new(),
+        preferred_sub_langs: Vec::new(),
+        fallbacks: Vec::new(),
+        replace_existing: false,
+        poster_url: None,
+        backdrop_url: None,
+        media_snapshot: serde_json::json!({}),
+    }
+}
+
+fn prune_empty_vault_dirs(dir: &Path, root: &Path) {
+    let mut cur = dir.parent().map(Path::to_path_buf);
+    while let Some(d) = cur {
+        let norm_d = normalize_cmp_path(&d);
+        let norm_r = normalize_cmp_path(root);
+        if norm_d == norm_r || !is_same_or_subpath(&norm_d, &norm_r) {
+            break;
+        }
+        if matches!(
+            d.file_name().and_then(|n| n.to_str()).unwrap_or("").to_ascii_lowercase().as_str(),
+            "movies" | "series" | "anime" | ".abixcine"
+        ) {
+            break;
+        }
+        if std::fs::remove_dir(&d).is_err() {
+            break;
+        }
+        cur = d.parent().map(Path::to_path_buf);
+    }
+}
+
+pub(crate) fn organize_vault_root(
+    root: &Path,
+    items: &mut Vec<DownloadedEntry>,
+    jobs: &mut Vec<DownloadJob>,
+    ffprobe: Option<&Path>,
+) -> (usize, usize) {
+    let mut indexed_paths: HashSet<String> = items
+        .iter()
+        .map(|it| normalize_cmp_path(Path::new(&it.file_path)))
+        .collect();
+    let active_paths: HashSet<String> = jobs
+        .iter()
+        .filter(|j| j.status != DownloadStatus::Completed)
+        .filter_map(|j| j.file_path.as_deref())
+        .map(|p| normalize_cmp_path(Path::new(p)))
+        .collect();
+
+    let mut found_videos = Vec::new();
+    collect_vault_videos(root, 0, &mut found_videos);
+
+    let mut adopted_files = 0usize;
+    let now = now_ms();
+    for video_path in found_videos {
+        let norm_v = normalize_cmp_path(&video_path);
+        if indexed_paths.contains(&norm_v) || active_paths.contains(&norm_v) {
+            continue;
+        }
+        let parsed = parse_vault_filename(&video_path, root);
+        let probed = ffprobe
+            .and_then(|fp| probe_media_with_ffprobe(fp, &video_path))
+            .unwrap_or_default();
+        let final_q = probed.quality.or(parsed.quality);
+        let q_verified = probed.quality.is_some();
+        let file_size = video_path.metadata().map(|m| m.len()).unwrap_or(0);
+        let subtitle_paths = discover_sidecars_for_video(&video_path);
+        let container = container_from_path(&video_path);
+        let web_ready = is_media_web_ready(
+            &container,
+            probed.video_codec_raw.as_deref(),
+            probed.audio_codec.as_deref(),
+            probed.audio_channels,
+        );
+        let fp_str = clean_native_path(&video_path.to_string_lossy()).to_string_lossy().into_owned();
+        let adopted_id = format!(
+            "adopted_{:016x}",
+            stable_id_hash(&[fp_str.as_bytes(), parsed.title.as_bytes()])
+        );
+        let canonical_key = format!("local:{adopted_id}");
+        items.push(DownloadedEntry {
+            id: adopted_id,
+            media_key: canonical_key.clone(),
+            canonical_key,
+            title: parsed.title,
+            media_kind: parsed.media_kind,
+            is_film: parsed.is_film,
+            year: parsed.year,
+            season: parsed.season,
+            episode: parsed.episode,
+            episode_title: None,
+            audio: parsed.audio,
+            quality: final_q,
+            quality_verified: q_verified,
+            video_codec: probed.video_codec,
+            container: Some(container),
+            web_ready,
+            audio_codec: probed.audio_codec,
+            audio_channels: probed.audio_channels,
+            provider_id: "local-vault".into(),
+            provider_name: "Local Vault".into(),
+            file_path: fp_str,
+            file_size,
+            subtitle_paths,
+            poster_path: None,
+            backdrop_path: None,
+            downloaded_at: now,
+            media_snapshot: serde_json::json!({}),
+        });
+        indexed_paths.insert(norm_v);
+        adopted_files += 1;
+    }
+
+    let mut moved_files = 0usize;
+    let mut path_updates: Vec<(String, String)> = Vec::new();
+    for it in items.iter_mut() {
+        let cur_path = clean_native_path(&it.file_path);
+        if !cur_path.is_file() {
+            continue;
+        }
+        let ext = container_from_path(&cur_path);
+        it.container = Some(ext.clone());
+        let meta = entry_req_for_organize(it);
+        let (_target_dir, target_path) = resolve_target_paths(root, &meta, &ext);
+        let cur_norm = normalize_cmp_path(&cur_path);
+        let dst_norm = normalize_cmp_path(&target_path);
+        if cur_norm == dst_norm || target_path.exists() {
+            continue;
+        }
+        let old_stem = cur_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let new_stem = target_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+
+        if move_single_file(&cur_path, &target_path).is_ok() {
+            moved_files += 1;
+            let old_str = it.file_path.clone();
+            let new_str = target_path.to_string_lossy().into_owned();
+            it.file_path = new_str.clone();
+            path_updates.push((old_str, new_str));
+
+            let mut updated_subs = Vec::with_capacity(it.subtitle_paths.len());
+            for sp in &it.subtitle_paths {
+                let sp_path = clean_native_path(sp);
+                if !sp_path.is_file() {
+                    continue;
+                }
+                let sp_stem = sp_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                let sp_ext = sp_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("srt");
+                if sp_path.parent() == cur_path.parent()
+                    && !old_stem.is_empty()
+                    && sp_stem.to_ascii_lowercase().starts_with(&old_stem)
+                {
+                    let suffix = &sp_stem[old_stem.len()..];
+                    let dst_sub = target_path
+                        .parent()
+                        .unwrap_or(root)
+                        .join(format!("{new_stem}{suffix}.{sp_ext}"));
+                    if !dst_sub.exists() && move_single_file(&sp_path, &dst_sub).is_ok() {
+                        moved_files += 1;
+                        updated_subs.push(dst_sub.to_string_lossy().into_owned());
+                        continue;
+                    }
+                }
+                updated_subs.push(sp.clone());
+            }
+            merge_sidecar_paths(&mut updated_subs, discover_sidecars_for_video(&target_path));
+            it.subtitle_paths = updated_subs;
+            prune_empty_vault_dirs(&cur_path, root);
+        }
+    }
+
+    for (old_fp, new_fp) in &path_updates {
+        for j in jobs.iter_mut() {
+            if j.file_path.as_deref() == Some(old_fp.as_str()) {
+                j.file_path = Some(new_fp.clone());
+            }
+        }
+    }
+
+    (moved_files, adopted_files)
+}
+
+#[tauri::command]
+pub async fn download_organize_vault(app: tauri::AppHandle) -> Result<OrganizeVaultResult, String> {
+    let ffprobe = crate::ffmpeg_tool(&app, "ffprobe").ok();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mgr = manager();
+        mgr.reconcile_snapshot();
+        let mut g = mgr.state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(root) = g.root.clone() else {
+            return Err("Choose a Downloads folder in Settings first.".into());
+        };
+        let mut items = g.items.clone();
+        let mut jobs = g.jobs.clone();
+        let (moved_files, adopted_files) =
+            organize_vault_root(&root, &mut items, &mut jobs, ffprobe.as_deref());
+        g.items = items;
+        g.jobs = jobs;
+        DownloadManager::persist_locked(&g);
+        let scope = app.asset_protocol_scope();
+        for it in &g.items {
+            let _ = scope.allow_file(Path::new(&it.file_path));
+            for sp in &it.subtitle_paths {
+                let _ = scope.allow_file(Path::new(sp));
+            }
+        }
+        let total_items = g.items.len();
+        let snapshot = DownloadSnapshot {
+            root: Some(root.to_string_lossy().into_owned()),
+            jobs: g.jobs.iter().map(DownloadJobView::from).collect(),
+            items: g.items.clone(),
+        };
+        Ok(OrganizeVaultResult {
+            snapshot,
+            moved_files,
+            adopted_files,
+            total_items,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -4926,6 +6881,8 @@ mod tests {
             kind: "hls".into(),
             headers: Hdrs::default(),
             preferred_quality: Some(1080),
+            preferred_format: Some("mp4".into()),
+            quality_policy: None,
             subtitles: Vec::new(),
             preferred_sub_langs: Vec::new(),
             fallbacks: Vec::new(),
@@ -5111,6 +7068,10 @@ seg2.m4s
             quality: Some(1080),
             quality_verified: true,
             video_codec: Some("H.264".into()),
+            container: Some("mp4".into()),
+            web_ready: true,
+            audio_codec: Some("aac".into()),
+            audio_channels: Some(2),
             provider_id: "vidlink".into(),
             provider_name: "VidLink".into(),
             file_path: base.join(format!("{id}.mp4")).to_string_lossy().into_owned(),
@@ -5237,12 +7198,17 @@ seg2.m4s
             resolved_quality: Some(1080),
             quality_verified: true,
             video_codec: Some("H.264".into()),
+            container: None,
             provider_id: "p1".into(),
             provider_name: "Server One".into(),
             url: "https://cdn1.example/v.m3u8".into(),
             kind: "hls".into(),
             headers: Hdrs::default(),
             preferred_quality: Some(1080),
+            preferred_format: Some("mp4".into()),
+            quality_policy: None,
+            allow_below_target: false,
+            available_quality: None,
             subtitles: Vec::new(),
             preferred_sub_langs: Vec::new(),
             fallbacks: vec![
@@ -5425,12 +7391,17 @@ seg2.m4s
                 resolved_quality: None,
                 quality_verified: false,
                 video_codec: None,
+                container: None,
                 provider_id: "p1".into(),
                 provider_name: "P1".into(),
                 url: "https://cdn.example/v.m3u8".into(),
                 kind: "hls".into(),
                 headers: Hdrs::default(),
                 preferred_quality: Some(1080),
+                preferred_format: Some("mp4".into()),
+                quality_policy: None,
+                allow_below_target: false,
+                available_quality: None,
                 subtitles: Vec::new(),
                 preferred_sub_langs: Vec::new(),
                 fallbacks: Vec::new(),
@@ -5541,6 +7512,10 @@ seg2.m4s
             quality: Some(1080),
             quality_verified: true,
             video_codec: Some("H.264".into()),
+            container: Some("mp4".into()),
+            web_ready: true,
+            audio_codec: Some("aac".into()),
+            audio_channels: Some(2),
             provider_id: "p1".into(),
             provider_name: "P1".into(),
             file_path: path.to_string_lossy().into_owned(),
@@ -5695,5 +7670,145 @@ seg2.m4s
         assert!(found.iter().any(|p| p.ends_with("English.srt")));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn normalizes_preferred_format_and_selects_dash_video_stream_by_cap() {
+        assert_eq!(normalize_preferred_format(Some("mkv")), "mkv");
+        assert_eq!(normalize_preferred_format(Some("MKV")), "mkv");
+        assert_eq!(normalize_preferred_format(Some("matroska")), "mkv");
+        assert_eq!(normalize_preferred_format(Some("mp4")), "mp4");
+        assert_eq!(normalize_preferred_format(None), "mp4");
+        assert_eq!(container_from_path(Path::new("C:/Vault/movie.MKV")), "mkv");
+        assert_eq!(container_from_path(Path::new("C:/Vault/movie.mp4")), "mp4");
+
+        let streams = vec![
+            (0usize, Some(480u32), 800_000u64),
+            (1, Some(720), 2_200_000),
+            (2, Some(1080), 4_800_000),
+            (3, Some(2160), 14_000_000),
+        ];
+        assert_eq!(select_ffprobe_video_stream(&streams, Some(720)), Some((1, Some(720))));
+        assert_eq!(select_ffprobe_video_stream(&streams, Some(1080)), Some((2, Some(1080))));
+        assert_eq!(select_ffprobe_video_stream(&streams, Some(360)), Some((0, Some(480))));
+        assert_eq!(select_ffprobe_video_stream(&streams, None), Some((3, Some(2160))));
+    }
+
+    #[test]
+    fn parses_vault_filenames_and_organizes_stray_files_into_canonical_dirs() {
+        let base = std::env::temp_dir().join(format!("abx_org_vault_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let stray_movie = base.join("Dune Part Two (2024) [1080p].mp4");
+        let stray_ep = base.join("Severance - S01E02 [720p].mkv");
+        let stray_sub = base.join("Severance - S01E02 [720p].en.srt");
+        std::fs::write(&stray_movie, b"moviebytes").unwrap();
+        std::fs::write(&stray_ep, b"epbytes").unwrap();
+        std::fs::write(&stray_sub, b"1\n00:00:01,000 --> 00:00:02,000\nSub\n").unwrap();
+
+        let parsed_ep = parse_vault_filename(&stray_ep, &base);
+        assert_eq!(parsed_ep.title, "Severance");
+        assert_eq!(parsed_ep.season, Some(1));
+        assert_eq!(parsed_ep.episode, Some(2));
+        assert!(!parsed_ep.is_film);
+
+        let mut items = Vec::new();
+        let mut jobs = Vec::new();
+        let (moved, adopted) = organize_vault_root(&base, &mut items, &mut jobs, None);
+        assert_eq!(adopted, 2);
+        assert!(moved >= 3);
+
+        let canon_movie = base.join("Movies").join("Dune Part Two (2024)").join("Dune Part Two (2024) [1080p].mp4");
+        let canon_ep = base.join("Series").join("Severance").join("Season 01").join("Severance - S01E02 [720p].mkv");
+        let canon_sub = base.join("Series").join("Severance").join("Season 01").join("Severance - S01E02 [720p].en.srt");
+        assert!(canon_movie.is_file());
+        assert!(canon_ep.is_file());
+        assert!(canon_sub.is_file());
+
+        // Second pass should be a clean idempotent no-op.
+        let (moved2, adopted2) = organize_vault_root(&base, &mut items, &mut jobs, None);
+        assert_eq!(moved2, 0);
+        assert_eq!(adopted2, 0);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn is_media_web_ready_checks_container_codecs_and_channels() {
+        assert!(is_media_web_ready("mp4", Some("h264"), Some("aac"), Some(2)));
+        assert!(is_media_web_ready("mp4", Some("vp9"), Some("mp3"), Some(2)));
+        assert!(is_media_web_ready("mkv", Some("h264"), Some("aac"), Some(2)));
+        assert!(is_media_web_ready("mkv", Some("vp9"), Some("opus"), Some(2)));
+        assert!(!is_media_web_ready("mp4", Some("h264"), Some("aac"), Some(6)));
+        assert!(!is_media_web_ready("mp4", Some("h264"), Some("ac3"), Some(2)));
+        assert!(!is_media_web_ready("mp4", Some("hevc"), Some("aac"), Some(2)));
+        assert!(!is_media_web_ready("mkv", Some("h264"), Some("eac3"), Some(2)));
+    }
+
+    #[test]
+    fn normalizes_quality_policy_and_serializes_awaiting_quality_status() {
+        assert_eq!(normalize_quality_policy(None), "ask");
+        assert_eq!(normalize_quality_policy(Some("unknown")), "ask");
+        assert_eq!(normalize_quality_policy(Some("ASK")), "ask");
+        assert_eq!(normalize_quality_policy(Some("strict")), "strict");
+        assert_eq!(normalize_quality_policy(Some("best")), "best");
+        assert_eq!(serde_json::to_string(&DownloadStatus::AwaitingQuality).unwrap(), "\"awaitingQuality\"");
+    }
+
+    #[test]
+    fn preserves_hls_segments_across_volatile_token_refreshes() {
+        let old = HlsWorkState {
+            video_playlist_url: "https://cdn.example/show/1080p/index.m3u8?exp=100&sig=abc".into(),
+            audio_playlist_url: None,
+            video: HlsMediaPlaylist {
+                target_duration: 6,
+                media_sequence: 0,
+                segments: vec![
+                    HlsSegment {
+                        index: 0,
+                        uri: "https://cdn.example/s0.ts".into(),
+                        duration: 6.0,
+                        byte_range: None,
+                        discontinuity: false,
+                        map_uri: None,
+                        key: None,
+                    },
+                    HlsSegment {
+                        index: 1,
+                        uri: "https://cdn.example/s1.ts".into(),
+                        duration: 6.0,
+                        byte_range: None,
+                        discontinuity: false,
+                        map_uri: None,
+                        key: None,
+                    },
+                ],
+            },
+            audio: None,
+            selected_height: Some(1080),
+            selected_bandwidth: None,
+            available_heights: vec![1080],
+            preferred_quality: Some(1080),
+            subtitles: Vec::new(),
+        };
+        assert!(!should_purge_hls_segments_on_refresh(
+            &old,
+            2,
+            Some(1080),
+            "https://cdn.example/show/1080p/index.m3u8?exp=200&sig=def"
+        ));
+        assert!(should_purge_hls_segments_on_refresh(
+            &old,
+            2,
+            Some(720),
+            "https://cdn.example/show/720p/index.m3u8?exp=200&sig=def"
+        ));
+        assert!(should_purge_hls_segments_on_refresh(
+            &old,
+            3,
+            Some(1080),
+            "https://cdn.example/show/1080p/index.m3u8?exp=200&sig=def"
+        ));
     }
 }

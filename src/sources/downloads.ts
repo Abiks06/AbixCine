@@ -49,21 +49,24 @@ export const downloadsProvider: SourceProvider = {
           entry.audio === "sub" || entry.audio === "dub" || entry.audio === "dual"
             ? entry.audio
             : undefined;
+        const container = (entry.container ?? "").toLowerCase();
         return buildLocalStreamCandidate(fakeFile, {
           providerId: "downloads",
           providerName: "Downloaded",
           quality: entry.quality,
           audio,
           signal,
+          skipSubtitleProbe: container === "mp4",
+          localWebReady: Boolean(entry.webReady),
         });
       }),
     );
 
-    if (signal?.aborted) return results;
+    if (signal?.aborted || results.length > 0) return results;
 
-    // Also inspect downloadsPath via scanLibrary in case files were added/organized there manually.
+    // Fallback scan for files manually placed in downloadsPath when not found in index.json.
     const root = s.downloadsPath;
-    const files = await scanLibrary([root]).catch(() => [] as LibFile[]);
+    const files = await scanLibrary([root], false, { registerRoots: false }).catch(() => [] as LibFile[]);
     if (signal?.aborted) return results;
 
     for (const f of files) {

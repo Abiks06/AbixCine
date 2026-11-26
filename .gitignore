@@ -10,3 +10,4 @@ src-tauri/resources/ffmpeg/*
 *.key.password
 .env
 .env.*
+.agents/

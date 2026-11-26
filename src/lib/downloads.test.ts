@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SubtitleTrack } from "../sources/types";
 import { getDetail, getSeasonEpisodes } from "./catalog";
+import { setDownloadFormatOverride, setDownloadQualityOverride } from "./downloadOverrides";
 import { __setDownloadsStateForTest, prioritizeDownloadSubtitles } from "./downloads";
+import { getDownloadQuality, getSettings, updateSettings } from "./settings";
 
 describe("download subtitle prioritization and offline catalog fallback", () => {
   afterEach(() => {
@@ -119,5 +121,21 @@ describe("download subtitle prioritization and offline catalog fallback", () => 
       title: "The Journey's End",
     });
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("persists downloadQuality and downloadFormat across settings and helpers", () => {
+    updateSettings({ preferredQuality: 1080, downloadQuality: undefined, downloadFormat: "mp4" });
+    expect(getDownloadQuality(getSettings())).toBe(1080);
+
+    setDownloadQualityOverride("tmdb:movie:1", 2160);
+    setDownloadFormatOverride("tmdb:movie:1", "mkv");
+    expect(getDownloadQuality(getSettings())).toBe(2160);
+    expect(getSettings().downloadFormat).toBe("mkv");
+    expect(getSettings().preferredQuality).toBe(1080);
+
+    setDownloadQualityOverride("tmdb:movie:1", null);
+    setDownloadFormatOverride("tmdb:movie:1", null);
+    expect(getDownloadQuality(getSettings())).toBe(1080);
+    expect(getSettings().downloadFormat).toBe("mp4");
   });
 });

@@ -19,40 +19,70 @@ export interface LibFile {
   subs?: string[];
 }
 
-let index: { at: number; key: string; files: LibFile[]; errors: ScanError[] } | null = null;
-
 export interface ScanError {
   path: string;
   message: string;
 }
 
+interface IndexCacheEntry {
+  at: number;
+  files: LibFile[];
+  errors: ScanError[];
+}
+
+const indexCache = new Map<string, IndexCacheEntry>();
+const scanningCache = new Map<string, Promise<LibFile[]>>();
+let lastScanErrors: ScanError[] = [];
+
+function normalizeScanKey(paths: string[]): string {
+  return [...new Set(paths.map((p) => p.replace(/[\\/]+$/, "").toLowerCase()).filter(Boolean))]
+    .sort()
+    .join("|");
+}
+
 /** Folders that failed on the last scan (unplugged drive, permissions). */
-export const scanErrors = () => index?.errors ?? [];
+export const scanErrors = () => lastScanErrors;
 
 /** Forget the directory scan cache so the next lookup re-walks the library folders. */
 export function clearLocalScanCache() {
-  index = null;
+  indexCache.clear();
+  lastScanErrors = [];
 }
 
-/** Scan the library folders (Rust side walks the disk) with a 5 minute cache. */
-let scanning: { key: string; p: Promise<LibFile[]> } | null = null;
-export async function scanLibrary(paths: string[], force = false): Promise<LibFile[]> {
+/** Scan the library folders (Rust side walks the disk) with a 5 minute cache per root set. */
+export async function scanLibrary(
+  paths: string[],
+  force = false,
+  opts?: { registerRoots?: boolean },
+): Promise<LibFile[]> {
   if (!isTauri() || !paths.length) return [];
-  const key = paths.join("|");
-  if (!force && index && index.key === key && Date.now() - index.at < 300_000) return index.files;
-  // Every source and screen asking at once shares one walk of the disk.
-  if (scanning && scanning.key === key && !force) return scanning.p;
-  const p = invoke<{ files: LibFile[]; errors: ScanError[] }>("scan_library", { paths })
+  const registerRoots = opts?.registerRoots ?? true;
+  const key = normalizeScanKey(paths);
+  const cached = indexCache.get(key);
+  if (!force && cached && Date.now() - cached.at < 300_000) {
+    lastScanErrors = cached.errors;
+    return cached.files;
+  }
+  const inflight = scanningCache.get(key);
+  // Every source and screen asking for the same roots shares one walk of the disk.
+  if (inflight && !force) return inflight;
+  const p = invoke<{ files: LibFile[]; errors: ScanError[] }>("scan_library", { paths, registerRoots })
     .then((r) => {
       // A scan where every folder failed (drive unplugged) isn't cached: plugging it back in works at once.
       const allFailed = !r.files.length && r.errors.length > 0;
-      index = { at: allFailed ? 0 : Date.now(), key, files: r.files, errors: r.errors };
+      const entry: IndexCacheEntry = {
+        at: allFailed ? 0 : Date.now(),
+        files: r.files,
+        errors: r.errors,
+      };
+      indexCache.set(key, entry);
+      if (registerRoots) lastScanErrors = r.errors;
       return r.files;
     })
     .finally(() => {
-      if (scanning?.p === p) scanning = null;
+      if (scanningCache.get(key) === p) scanningCache.delete(key);
     });
-  scanning = { key, p };
+  scanningCache.set(key, p);
   return p;
 }
 
@@ -105,7 +135,7 @@ export function parseEpisode(name: string, path = ""): EpisodeInfo {
 /** Title appears in the file/folder names as whole words ("Up" doesn't match "Upgrade" or "Backup"). */
 export function titleMatches(hay: string, req: Pick<PlaybackRequest, "media">) {
   const f = ` ${normTitle(hay)} `;
-  return [req.media.title, req.media.originalTitle]
+  return [req.media.title, req.media.originalTitle, ...(req.media.synonyms ?? [])]
     .filter((t): t is string => Boolean(t))
     .some((t) => {
       const n = normTitle(t);
@@ -249,13 +279,15 @@ export async function buildLocalStreamCandidate(
     quality?: number;
     audio?: "sub" | "dub" | "dual";
     signal?: AbortSignal;
+    skipSubtitleProbe?: boolean;
+    localWebReady?: boolean;
   },
 ): Promise<StreamCandidate> {
   const canProbe = isTauri();
   const isHls = file.path.toLowerCase().endsWith(".m3u8");
   const sidecars = file.subs?.map((p) => sidecarTrack(p, file.name)) ?? [];
   const rawEmbedded =
-    canProbe && !isHls && !opts.signal?.aborted
+    canProbe && !isHls && !opts.skipSubtitleProbe && !opts.signal?.aborted
       ? await probeEmbeddedSubtitles(file, opts.signal)
       : [];
   const embedded = Array.isArray(rawEmbedded)
@@ -272,6 +304,7 @@ export async function buildLocalStreamCandidate(
     kind: isHls ? "hls" : "file",
     via: "direct",
     ...(isHls ? {} : { localPath: file.path }),
+    ...(opts.localWebReady ? { localWebReady: true } : {}),
     quality: opts.quality ?? qualityOf(file.name),
     ...(opts.audio ? { audio: opts.audio } : {}),
     ...(file.subs !== undefined || subtitles.length ? { subtitles } : {}),

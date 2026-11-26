@@ -1,17 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { invoke, isTauri } from "@tauri-apps/api/core";
+import { openExternal } from "../lib/external";
 import { isYouTubeOrigin, parseTrailerMessage, trailerEmbedUrl, trailerWatchUrl } from "../lib/trailer";
 import { Icon } from "./Icon";
 
-/** Open a web link in the system browser (never through `target=_blank`, which WebView2 hands to the shell). */
-export function openExternal(url: string) {
-  if (isTauri()) {
-    void invoke("open_external", { url }).catch(() => {});
-  } else {
-    window.open(url, "_blank", "noopener,noreferrer");
-  }
-}
+export { openExternal };
 
 /** How long the player gets to report in before we offer the browser as a way out. */
 const SLOW_MS = 9000;

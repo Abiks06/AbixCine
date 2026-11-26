@@ -3,36 +3,67 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { useBatchDownloads } from "../lib/batchDownload";
 import { encodeKey } from "../lib/catalog";
+import { formatResolution } from "../lib/downloadRank";
 import {
   cancelAllDownloads,
   cancelDownload,
   clearFailedDownloads,
   ensureDownloadFolder,
+  entryContainer,
   fetchMissingDownloadSubtitles,
   fmtEta,
   fmtSpeed,
   formatDownloadQuality,
+  formatDownloadTransferLabel,
   formatQualityTag,
   groupDownloadedTitles,
   openDownloadsFolder,
+  organizeDownloadedVault,
   pauseAllDownloads,
   pauseDownload,
   refreshDownloads,
   removeDownloadedItem,
+  resolveQualityMismatch,
   resumeAllDownloads,
   resumeDownload,
+  sortDownloadedGroups,
   switchDownloadToNextServer,
   useDownloads,
   type DownloadedTitleGroup,
+  type DownloadVaultSort,
 } from "../lib/downloads";
 import { fmtSize, qualityBadge } from "../lib/library";
 import { useOnlineStatus } from "../lib/online";
+import { getProgress, isDone, useProgressStore } from "../lib/progress";
 import { useSettings } from "../lib/settings";
+import { toast } from "../lib/toast";
 import { Art } from "./Art";
+import { DownloadPrefsPill } from "./DownloadControl";
+import { openQualityReviewModal } from "./DownloadQualityModal";
 import { Icon } from "./Icon";
 import { SectionHead } from "./SectionHead";
 
 type KindFilter = "all" | "movie" | "tv" | "anime";
+type FormatFilter = "all" | "mp4" | "mkv";
+
+function pickPlayTarget(g: DownloadedTitleGroup): { entry: DownloadedTitleGroup["entries"][number] | undefined; resume: boolean } {
+  if (g.isFilm) {
+    const first = g.entries[0];
+    const p = first ? getProgress(g.canonicalKey, undefined, undefined, [g.media.key, first.mediaKey]) : undefined;
+    const resume = Boolean(p && p.position > 10 && !isDone(p.position, p.duration) && !p.finished);
+    return { entry: first, resume };
+  }
+  for (let i = 0; i < g.entries.length; i++) {
+    const ep = g.entries[i];
+    const p = getProgress(g.canonicalKey, ep.season ?? 1, ep.episode ?? 1, [g.media.key, ep.mediaKey]);
+    if (!p) continue;
+    if (p.upNext) return { entry: ep, resume: false };
+    if (!isDone(p.position, p.duration) && !p.finished) return { entry: ep, resume: p.position > 10 };
+    if (i + 1 < g.entries.length) return { entry: g.entries[i + 1], resume: false };
+    return { entry: ep, resume: false };
+  }
+  return { entry: g.entries[0], resume: false };
+}
 
 function playTargetUrl(g: DownloadedTitleGroup, ep?: DownloadedTitleGroup["entries"][number]): string {
   const chosen = ep ?? g.entries[0];
@@ -69,17 +100,42 @@ export function DownloadsVault({
   const { jobs, items, root, switchingIds } = useDownloads();
   const batch = useBatchDownloads();
   const nav = useNavigate();
+  useProgressStore();
 
   useEffect(() => {
     if (desktop && root) void refreshDownloads({ minIntervalMs: 1500 });
   }, [desktop, root]);
 
+  const [query, setQuery] = useState("");
   const [kindFilter, setKindFilter] = useState<KindFilter>("all");
+  const [formatFilter, setFormatFilter] = useState<FormatFilter>("all");
+  const [sortBy, setSortBy] = useState<DownloadVaultSort>("recent");
+  const [tidying, setTidying] = useState(false);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [confirmGroup, setConfirmGroup] = useState<string | null>(null);
   const [confirmEntry, setConfirmEntry] = useState<string | null>(null);
   const [confirmStopAll, setConfirmStopAll] = useState(false);
+  const [confirmSeasonKey, setConfirmSeasonKey] = useState<string | null>(null);
   const [fetchingSubId, setFetchingSubId] = useState<string | null>(null);
+
+  const handleTidyVault = async () => {
+    if (tidying) return;
+    setTidying(true);
+    try {
+      const res = await organizeDownloadedVault();
+      if (!res) return;
+      if (res.movedFiles > 0 || res.adoptedFiles > 0) {
+        toast(
+          `Vault organized · ${res.movedFiles} file${res.movedFiles === 1 ? "" : "s"} sorted, ${res.adoptedFiles} new adopted`,
+          { icon: "check" },
+        );
+      } else {
+        toast("Vault folders are already neatly sorted", { icon: "check" });
+      }
+    } finally {
+      setTidying(false);
+    }
+  };
 
   const handleFetchSubs = async (entry: DownloadedTitleGroup["entries"][number]) => {
     if (fetchingSubId) return;
@@ -99,6 +155,7 @@ export function DownloadsVault({
           j.status === "downloading" ||
           j.status === "remuxing" ||
           j.status === "paused" ||
+          j.status === "awaitingQuality" ||
           j.status === "failed",
       ),
     [jobs],
@@ -107,13 +164,29 @@ export function DownloadsVault({
     (j) => j.status === "queued" || j.status === "downloading" || j.status === "remuxing",
   ).length;
   const pausedCount = liveJobs.filter((j) => j.status === "paused").length;
+  const awaitingCount = liveJobs.filter((j) => j.status === "awaitingQuality").length;
   const failedCount = liveJobs.filter((j) => j.status === "failed").length;
 
   const groups = useMemo(() => groupDownloadedTitles(items), [items]);
   const filtered = useMemo(() => {
-    if (kindFilter === "all") return groups;
-    return groups.filter((g) => g.media.kind === kindFilter);
-  }, [groups, kindFilter]);
+    const q = compact ? "" : query.trim().toLowerCase();
+    const list = groups.filter((g) => {
+      if (!compact && kindFilter !== "all" && g.media.kind !== kindFilter) return false;
+      if (
+        !compact &&
+        formatFilter !== "all" &&
+        !g.entries.some((e) => entryContainer(e).toLowerCase() === formatFilter)
+      ) {
+        return false;
+      }
+      if (q) {
+        const hay = `${g.media.title} ${g.media.originalTitle ?? ""} ${g.media.year ?? ""}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+    return compact ? list : sortDownloadedGroups(list, sortBy);
+  }, [groups, compact, kindFilter, formatFilter, query, sortBy]);
 
   if (!desktop) return null;
 
@@ -150,6 +223,7 @@ export function DownloadsVault({
   const totalBytes = items.reduce((sum, e) => sum + (e.fileSize || 0), 0);
   const shown = limit ? filtered.slice(0, limit) : filtered;
   const presentKinds = new Set(groups.map((g) => g.media.kind));
+  const presentFormats = new Set(items.map((e) => entryContainer(e).toLowerCase()));
 
   const deleteGroup = async (g: DownloadedTitleGroup) => {
     for (const entry of g.entries) {
@@ -172,28 +246,67 @@ export function DownloadsVault({
               {groups.length} {groups.length === 1 ? "TITLE" : "TITLES"} · {items.length}{" "}
               {items.length === 1 ? "FILE" : "FILES"} · {fmtSize(totalBytes)}
             </span>
+            {!compact && <DownloadPrefsPill />}
             {!compact && root && (
-              <button
-                type="button"
-                className="btn glass sm"
-                onClick={() => void openDownloadsFolder(root)}
-                title={root}
-              >
-                <Icon name="folder" size={14} /> Open folder
-              </button>
+              <>
+                <button
+                  type="button"
+                  className="btn glass sm"
+                  disabled={tidying}
+                  onClick={() => void handleTidyVault()}
+                  title="Scan Downloads folder for unindexed video files and sort files into Movies/Series/Anime folders"
+                >
+                  <Icon name="refresh" size={14} /> {tidying ? "Tidying…" : "Tidy folders"}
+                </button>
+                <button
+                  type="button"
+                  className="btn glass sm"
+                  onClick={() => void openDownloadsFolder(root)}
+                  title={root}
+                >
+                  <Icon name="folder" size={14} /> Open folder
+                </button>
+              </>
             )}
           </div>
         }
       />
+
+      {!compact && (groups.length > 0 || liveJobs.length > 0) && (
+        <div className="dlv-overview" aria-label="Offline library overview">
+          <div className="dlv-ov-stat">
+            <span>Saved storage</span>
+            <strong>{fmtSize(totalBytes)} across {items.length} file{items.length === 1 ? "" : "s"}</strong>
+          </div>
+          <div className="dlv-ov-stat">
+            <span>Instant playback</span>
+            <strong>
+              {items.filter((e) => e.webReady).length}/{items.length} ready now
+            </strong>
+          </div>
+          <div className="dlv-ov-stat">
+            <span>Format mix</span>
+            <strong>
+              {[...presentFormats].map((f) => f.toUpperCase()).join(" · ") || "MP4"}
+            </strong>
+          </div>
+        </div>
+      )}
 
       {!compact && (liveJobs.length > 0 || batch.active) && (
         <div className="dlv-queue glass" aria-label="Active and failed transfers">
           <div className="dlv-queue-head">
             <span>
               TRANSFERS · {liveJobs.length}
+              {awaitingCount > 0 ? ` (${awaitingCount} NEEDS CHOICE)` : ""}
               {failedCount > 0 ? ` (${failedCount} FAILED)` : ""}
             </span>
             <div className="dlv-queue-acts">
+              {awaitingCount > 0 && (
+                <button type="button" className="chip dlq-badge-warn" onClick={() => openQualityReviewModal()}>
+                  <Icon name="info" size={11} /> Review quality ({awaitingCount})
+                </button>
+              )}
               {activeCount > 0 && (
                 <button type="button" className="chip" onClick={() => void pauseAllDownloads()}>
                   <Icon name="pause" size={11} /> Pause all
@@ -335,14 +448,35 @@ export function DownloadsVault({
                             <Icon name="play" size={11} /> Resume S{g.season}
                           </button>
                         )}
-                        <button
-                          type="button"
-                          className="chip danger"
-                          onClick={() => void cancelAllDownloads({ canonicalKey: g.cKey, season: g.season })}
-                          title={`Stop & clear Season ${g.season} downloads`}
-                        >
-                          <Icon name="x" size={11} /> Cancel S{g.season}
-                        </button>
+                        {confirmSeasonKey === `${g.cKey}|${g.season}` && (g.jobs.length > 1 || Boolean(bs)) ? (
+                          <>
+                            <button
+                              type="button"
+                              className="chip danger"
+                              onClick={() => {
+                                setConfirmSeasonKey(null);
+                                void cancelAllDownloads({ canonicalKey: g.cKey, season: g.season });
+                              }}
+                            >
+                              Confirm cancel
+                            </button>
+                            <button type="button" className="chip" onClick={() => setConfirmSeasonKey(null)}>
+                              Keep
+                            </button>
+                          </>
+                        ) : (
+                          <button
+                            type="button"
+                            className="chip danger"
+                            onClick={() => {
+                              if (g.jobs.length > 1 || Boolean(bs)) setConfirmSeasonKey(`${g.cKey}|${g.season}`);
+                              else void cancelAllDownloads({ canonicalKey: g.cKey, season: g.season });
+                            }}
+                            title={`Stop & clear Season ${g.season} downloads`}
+                          >
+                            <Icon name="x" size={11} /> Cancel S{g.season}
+                          </button>
+                        )}
                       </div>
                     </div>
                   );
@@ -383,7 +517,7 @@ export function DownloadsVault({
                         </span>
                       )}
                       {j.videoCodec && <span className="dlq-badge-dim">{j.videoCodec}</span>}
-                      <span className="dlq-badge-dim">{j.kind === "hls" ? "HLS→MP4" : "DIRECT"}</span>
+                      <span className="dlq-badge-dim">{formatDownloadTransferLabel(j)}</span>
                       {((j.attemptIndex ?? 1) > 1 || (j.totalSources ?? 1) > 1) && (
                         <span className="dlq-badge-dim">
                           Server {j.attemptIndex ?? 1}/{Math.max(j.attemptIndex ?? 1, j.totalSources ?? 1)}
@@ -412,7 +546,22 @@ export function DownloadsVault({
                     </div>
                   </div>
                   <div className="dlq-acts">
-                    {busy ? (
+                    {j.status === "awaitingQuality" ? (
+                      <button
+                        type="button"
+                        className="chip dlq-badge-warn"
+                        onClick={() =>
+                          void resolveQualityMismatch(
+                            [j.id],
+                            "accept",
+                            j.availableQuality ?? j.resolvedQuality ?? j.quality,
+                          )
+                        }
+                      >
+                        <Icon name="download" size={11} /> Download{" "}
+                        {formatResolution(j.availableQuality ?? j.resolvedQuality ?? j.quality) || "best"}
+                      </button>
+                    ) : busy ? (
                       <button
                         type="button"
                         className="chip"
@@ -452,35 +601,99 @@ export function DownloadsVault({
         </div>
       )}
 
-      {!compact && presentKinds.size > 1 && (
-        <div className="dlv-filters" role="tablist" aria-label="Filter downloads by type">
-          {([
-            ["all", "All", groups.length],
-            ["movie", "Films", groups.filter((g) => g.media.kind === "movie").length],
-            ["tv", "Series", groups.filter((g) => g.media.kind === "tv").length],
-            ["anime", "Anime", groups.filter((g) => g.media.kind === "anime").length],
-          ] as const)
-            .filter(([id, , count]) => id === "all" || count > 0)
-            .map(([id, label, count]) => (
-              <button
-                key={id}
-                type="button"
-                role="tab"
-                aria-selected={kindFilter === id}
-                className={`chip ${kindFilter === id ? "on" : ""}`}
-                onClick={() => setKindFilter(id)}
-              >
-                {label} · {count}
-              </button>
-            ))}
+      {!compact && groups.length > 0 && (
+        <div className="dlv-toolbar">
+          <div className="dlv-search">
+            <Icon name="search" size={14} />
+            <input
+              type="search"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Search downloads…"
+              aria-label="Search downloaded titles"
+            />
+          </div>
+          {presentKinds.size > 1 && (
+            <div className="dlv-filters" role="tablist" aria-label="Filter downloads by type">
+              {([
+                ["all", "All", groups.length],
+                ["movie", "Films", groups.filter((g) => g.media.kind === "movie").length],
+                ["tv", "Series", groups.filter((g) => g.media.kind === "tv").length],
+                ["anime", "Anime", groups.filter((g) => g.media.kind === "anime").length],
+              ] as const)
+                .filter(([id, , count]) => id === "all" || count > 0)
+                .map(([id, label, count]) => (
+                  <button
+                    key={id}
+                    type="button"
+                    role="tab"
+                    aria-selected={kindFilter === id}
+                    className={`chip ${kindFilter === id ? "on" : ""}`}
+                    onClick={() => setKindFilter(id)}
+                  >
+                    {label} · {count}
+                  </button>
+                ))}
+            </div>
+          )}
+          {(presentFormats.has("mp4") && presentFormats.has("mkv")) && (
+            <div className="dlv-filters" role="tablist" aria-label="Filter downloads by format">
+              {(["all", "mp4", "mkv"] as const).map((fmt) => (
+                <button
+                  key={fmt}
+                  type="button"
+                  role="tab"
+                  aria-selected={formatFilter === fmt}
+                  className={`chip ${formatFilter === fmt ? "on" : ""}`}
+                  onClick={() => setFormatFilter(fmt)}
+                >
+                  {fmt === "all" ? "Any format" : fmt.toUpperCase()}
+                </button>
+              ))}
+            </div>
+          )}
+          <select
+            className="ep-q-pick dlv-sort"
+            aria-label="Sort downloads"
+            value={sortBy}
+            onChange={(e) => setSortBy(e.target.value as DownloadVaultSort)}
+          >
+            <option value="recent">Recently saved</option>
+            <option value="title">Title A–Z</option>
+            <option value="year">Newest release</option>
+            <option value="size">Largest size</option>
+            <option value="quality">Highest quality</option>
+          </select>
         </div>
       )}
 
+      {groups.length === 0 ? (
+        <div className="empty dlv-filter-empty">
+          <p className="muted">Finished downloads will appear here automatically.</p>
+        </div>
+      ) : shown.length === 0 ? (
+        <div className="empty dlv-filter-empty">
+          <p className="muted">No downloaded titles match the current filters.</p>
+          <button
+            type="button"
+            className="btn glass sm"
+            onClick={() => {
+              setQuery("");
+              setKindFilter("all");
+              setFormatFilter("all");
+            }}
+          >
+            Clear filters
+          </button>
+        </div>
+      ) : (
       <div className="dlv-grid">
         {shown.map((g) => {
           const isExp = expanded === g.canonicalKey;
           const isConfirm = confirmGroup === g.canonicalKey;
           const qBadge = qualityBadge(g.bestQuality);
+          const playTarget = pickPlayTarget(g);
+          const playEntry = playTarget.entry;
           const summaryMeta = [
             g.isFilm ? "Film" : `${g.entries.length} episode${g.entries.length === 1 ? "" : "s"}`,
             g.media.year,
@@ -488,6 +701,7 @@ export function DownloadsVault({
           ]
             .filter(Boolean)
             .join(" · ");
+          const distinctFormats = [...new Set(g.entries.map((e) => entryContainer(e)))];
 
           return (
             <article key={g.canonicalKey} className={`dlv-card ${isExp ? "open" : ""}`}>
@@ -513,7 +727,7 @@ export function DownloadsVault({
                   </Link>
                   <div className="dlv-meta">{summaryMeta}</div>
                   {!g.isFilm && (() => {
-                    const primaryS = g.entries[0]?.season ?? 1;
+                    const primaryS = (playEntry ?? g.entries[0])?.season ?? 1;
                     const seasonObj = g.media.seasons?.find((sn) => sn.number === primaryS);
                     const totalInSeason =
                       seasonObj?.episodeCount ??
@@ -539,6 +753,11 @@ export function DownloadsVault({
                         {g.entries.some((e) => e.qualityVerified) ? " ✓" : ""}
                       </span>
                     )}
+                    {distinctFormats.map((fmt) => (
+                      <span key={fmt} className="badge dim">
+                        {fmt}
+                      </span>
+                    ))}
                     {g.entries[0]?.videoCodec && (
                       <span className="badge dim">{g.entries[0].videoCodec}</span>
                     )}
@@ -560,17 +779,21 @@ export function DownloadsVault({
                     type="button"
                     className="btn play sm"
                     onClick={() =>
-                      nav(playTargetUrl(g), { viewTransition: true, state: { from: "app", offline: true, quick: true } })
+                      nav(playTargetUrl(g, playEntry), { viewTransition: true, state: { from: "app", offline: true, quick: true } })
                     }
                     title={
                       g.isFilm
-                        ? `Play ${g.media.title}`
-                        : `Play S${g.entries[0]?.season ?? 1} E${g.entries[0]?.episode ?? 1}`
+                        ? `${playTarget.resume ? "Resume" : "Play"} ${g.media.title}`
+                        : `${playTarget.resume ? "Resume" : "Play"} S${playEntry?.season ?? 1} E${playEntry?.episode ?? 1}`
                     }
                   >
                     <Icon name="play" size={14} />
                     <span>
-                      {g.isFilm ? "Play" : `Play E${g.entries[0]?.episode ?? 1}`}
+                      {g.isFilm
+                        ? playTarget.resume
+                          ? "Resume"
+                          : "Play"
+                        : `${playTarget.resume ? "Resume" : "Play"} S${playEntry?.season ?? 1}E${playEntry?.episode ?? 1}`}
                     </span>
                   </button>
 
@@ -636,95 +859,108 @@ export function DownloadsVault({
 
               {!compact && isExp && (
                 <div className="dlv-eps">
-                  {g.entries.map((e) => {
-                    const epConfirm = confirmEntry === e.id;
-                    const code = `S${String(e.season ?? 1).padStart(2, "0")}E${String(e.episode ?? 1).padStart(2, "0")}`;
-                    return (
-                      <div key={e.id} className="dlv-ep">
-                        <div className="dlv-ep-main">
-                          <b>{code}</b>
-                          <span>{e.episodeTitle || `Episode ${e.episode ?? 1}`}</span>
-                          <small>
-                            {[
-                              formatQualityTag(e.quality, e.qualityVerified),
-                              e.videoCodec,
-                              e.audio?.toUpperCase(),
-                              fmtSize(e.fileSize),
-                              e.providerName,
-                            ]
-                              .filter(Boolean)
-                              .join(" · ")}
-                          </small>
-                        </div>
-                        <div className="dlv-ep-acts">
-                          {(e.subtitlePaths?.length ?? 0) > 0 ? (
-                            <span className="badge dim" title="Offline subtitles saved">
-                              SUBS
-                            </span>
-                          ) : online ? (
-                            <button
-                              type="button"
-                              className="chip"
-                              disabled={fetchingSubId === e.id}
-                              onClick={() => void handleFetchSubs(e)}
-                              title="Download offline subtitles for this episode"
-                            >
-                              <Icon name="subtitles" size={11} /> {fetchingSubId === e.id ? "Fetching…" : "Get subs"}
-                            </button>
-                          ) : null}
-                          <button
-                            type="button"
-                            className="chip"
-                            onClick={() =>
-                              nav(playTargetUrl(g, e), {
-                                viewTransition: true,
-                                state: { from: "app", offline: true, quick: true },
-                              })
-                            }
-                          >
-                            <Icon name="play" size={11} /> Play
-                          </button>
-                          {epConfirm ? (
-                            <>
-                              <button
-                                type="button"
-                                className="chip danger"
-                                onClick={() => {
-                                  setConfirmEntry(null);
-                                  void removeDownloadedItem(e.id, true);
-                                }}
-                              >
-                                Delete
-                              </button>
+                  {(() => {
+                    const seasonNums = new Set(g.entries.map((x) => x.season ?? 1));
+                    const showSeasonHdr = seasonNums.size > 1;
+                    let lastSeason: number | null = null;
+                    return g.entries.map((e) => {
+                      const epConfirm = confirmEntry === e.id;
+                      const sNum = e.season ?? 1;
+                      const needHdr = showSeasonHdr && sNum !== lastSeason;
+                      lastSeason = sNum;
+                      const code = `S${String(sNum).padStart(2, "0")}E${String(e.episode ?? 1).padStart(2, "0")}`;
+                      return (
+                        <div key={e.id}>
+                          {needHdr && <div className="dlv-ep-season">Season {sNum}</div>}
+                          <div className="dlv-ep">
+                            <div className="dlv-ep-main">
+                              <b>{code}</b>
+                              <span>{e.episodeTitle || `Episode ${e.episode ?? 1}`}</span>
+                              <small>
+                                {[
+                                  formatQualityTag(e.quality, e.qualityVerified),
+                                  entryContainer(e),
+                                  e.videoCodec,
+                                  e.audio?.toUpperCase(),
+                                  fmtSize(e.fileSize),
+                                  e.providerName,
+                                ]
+                                  .filter(Boolean)
+                                  .join(" · ")}
+                              </small>
+                            </div>
+                            <div className="dlv-ep-acts">
+                              {(e.subtitlePaths?.length ?? 0) > 0 ? (
+                                <span className="badge dim" title="Offline subtitles saved">
+                                  SUBS
+                                </span>
+                              ) : online ? (
+                                <button
+                                  type="button"
+                                  className="chip"
+                                  disabled={fetchingSubId === e.id}
+                                  onClick={() => void handleFetchSubs(e)}
+                                  title="Download offline subtitles for this episode"
+                                >
+                                  <Icon name="subtitles" size={11} /> {fetchingSubId === e.id ? "Fetching…" : "Get subs"}
+                                </button>
+                              ) : null}
                               <button
                                 type="button"
                                 className="chip"
-                                onClick={() => setConfirmEntry(null)}
+                                onClick={() =>
+                                  nav(playTargetUrl(g, e), {
+                                    viewTransition: true,
+                                    state: { from: "app", offline: true, quick: true },
+                                  })
+                                }
                               >
-                                Keep
+                                <Icon name="play" size={11} /> Play
                               </button>
-                            </>
-                          ) : (
-                            <button
-                              type="button"
-                              className="icon-btn"
-                              aria-label={`Delete ${code}`}
-                              title="Delete episode file"
-                              onClick={() => setConfirmEntry(e.id)}
-                            >
-                              <Icon name="x" size={13} />
-                            </button>
-                          )}
+                              {epConfirm ? (
+                                <>
+                                  <button
+                                    type="button"
+                                    className="chip danger"
+                                    onClick={() => {
+                                      setConfirmEntry(null);
+                                      void removeDownloadedItem(e.id, true);
+                                    }}
+                                  >
+                                    Delete
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="chip"
+                                    onClick={() => setConfirmEntry(null)}
+                                  >
+                                    Keep
+                                  </button>
+                                </>
+                              ) : (
+                                <button
+                                  type="button"
+                                  className="icon-btn"
+                                  aria-label={`Delete ${code}`}
+                                  title="Delete episode file"
+                                  onClick={() => setConfirmEntry(e.id)}
+                                >
+                                  <Icon name="x" size={13} />
+                                </button>
+                              )}
+                            </div>
+                          </div>
                         </div>
-                      </div>
-                    );
-                  })}
+                      );
+                    });
+                  })()}
                 </div>
               )}
             </article>
           );
         })}
       </div>
+      )}
     </section>
   );
 }

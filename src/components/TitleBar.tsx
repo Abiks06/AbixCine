@@ -3,6 +3,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useEffect, useMemo, useState } from "react";
 import { Link, NavLink, useLocation, useNavigate } from "react-router-dom";
 import { leaveGuest, signOut, useAuth } from "../lib/account";
+import { useDownloadBadgeState } from "../lib/downloads";
 import { useOnlineStatus } from "../lib/online";
 import { updateSettings, useSettings, type Settings } from "../lib/settings";
 import { THEMES, resolveTheme } from "../lib/themes";
@@ -23,7 +24,7 @@ const NAV = [
   { to: "/movies", code: "02", label: "Films", full: "Films", icon: "film" },
   { to: "/series", code: "03", label: "Series", full: "Series", icon: "tv" },
   { to: "/anime", code: "04", label: "Anime", full: "Anime", icon: "spark" },
-  { to: "/library", code: "05", label: "Vault", full: "Your drive", icon: "drive" },
+  { to: "/library", code: "05", label: "Vault", full: "Vault", icon: "drive" },
   { to: "/list", code: "06", label: "List", full: "My List", icon: "bookmark" },
 ] as const;
 
@@ -153,8 +154,20 @@ export function TitleBar({ onOpenPalette }: { onOpenPalette: () => void }) {
   const { user } = useAuth();
   const s = useSettings();
   const isOnline = useOnlineStatus();
-  const [menu, setMenu] = useState(false);
-  const [themesOpen, setThemesOpen] = useState(false);
+  const [activePop, setActivePop] = useState<"menu" | "themes" | "downloads" | null>(null);
+  const menu = activePop === "menu";
+  const themesOpen = activePop === "themes";
+  const downloadsOpen = activePop === "downloads";
+  const setMenu = (next: boolean | ((v: boolean) => boolean)) =>
+    setActivePop((cur) => {
+      const want = typeof next === "function" ? next(cur === "menu") : next;
+      return want ? "menu" : cur === "menu" ? null : cur;
+    });
+  const setThemesOpen = (next: boolean | ((v: boolean) => boolean)) =>
+    setActivePop((cur) => {
+      const want = typeof next === "function" ? next(cur === "themes") : next;
+      return want ? "themes" : cur === "themes" ? null : cur;
+    });
   const [now, setNow] = useState(() => new Date());
   const w = useMemo(appWindow, []);
   const showWin = showWindowButtons();
@@ -167,18 +180,16 @@ export function TitleBar({ onOpenPalette }: { onOpenPalette: () => void }) {
   }, []);
 
   useEffect(() => {
-    if (!menu && !themesOpen) return;
+    if (!activePop) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        setMenu(false);
-        setThemesOpen(false);
-      }
+      if (e.key === "Escape") setActivePop(null);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [menu, themesOpen]);
+  }, [activePop]);
 
   const online = useServerCount(s);
+  const { active: activeDownloads, awaiting: awaitingDownloads } = useDownloadBadgeState();
   const own = s.libraryPaths.length + (s.downloadsPath ? 1 : 0) + (s.jellyfin.enabled ? 1 : 0);
   const ready = isOnline ? online + own > 0 : own > 0;
   const status = !isOnline
@@ -189,8 +200,7 @@ export function TitleBar({ onOpenPalette }: { onOpenPalette: () => void }) {
       ? [online ? `${online} SERVER${online > 1 ? "S" : ""}` : null, own ? `${own} LOCAL` : null].filter(Boolean).join(" · ")
       : "SERVERS OFF";
   const go = (to: string) => {
-    setMenu(false);
-    setThemesOpen(false);
+    setActivePop(null);
     nav(to, { viewTransition: true });
   };
 
@@ -215,6 +225,26 @@ export function TitleBar({ onOpenPalette }: { onOpenPalette: () => void }) {
               <span className="rail-idx">{n.code}</span>
               <Icon name={n.icon} size={16} />
               <span className="rail-lbl">{n.label}</span>
+              {n.to === "/library" && (activeDownloads > 0 || awaitingDownloads > 0) && (
+                <span
+                  className={`rail-badge ${activeDownloads === 0 && awaitingDownloads > 0 ? "warn" : ""}`}
+                  aria-label={
+                    activeDownloads > 0
+                      ? `${activeDownloads} active download${activeDownloads === 1 ? "" : "s"}`
+                      : `${awaitingDownloads} download${awaitingDownloads === 1 ? "" : "s"} awaiting quality choice`
+                  }
+                  title={
+                    activeDownloads > 0
+                      ? `${activeDownloads} active download${activeDownloads === 1 ? "" : "s"}`
+                      : `${awaitingDownloads} download${awaitingDownloads === 1 ? "" : "s"} awaiting quality choice`
+                  }
+                >
+                  {(() => {
+                    const count = activeDownloads > 0 ? activeDownloads : awaitingDownloads;
+                    return count > 99 ? "99+" : count;
+                  })()}
+                </span>
+              )}
             </NavLink>
           ))}
         </nav>
@@ -305,7 +335,10 @@ export function TitleBar({ onOpenPalette }: { onOpenPalette: () => void }) {
         </div>
 
         <div className="topbar-right" data-tauri-drag-region>
-          <DownloadsPopover />
+          <DownloadsPopover
+            open={downloadsOpen}
+            onOpenChange={(next) => setActivePop((cur) => (next ? "downloads" : cur === "downloads" ? null : cur))}
+          />
           <div className="theme-studio">
             <button
               type="button"

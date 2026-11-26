@@ -196,7 +196,7 @@ export function matchTargetFor(req: PlaybackRequest, extra: { titles?: (string |
   const m = req.media as MediaDetail;
   const film =
     isFilm(m) || Boolean((req as { isAnimeMovie?: boolean }).isAnimeMovie) || Boolean((m as { isAnimeMovie?: boolean }).isAnimeMovie);
-  const titles = [m.title, m.originalTitle, ...(extra.titles ?? [])];
+  const titles = [m.title, m.originalTitle, ...(m.synonyms ?? []), ...(extra.titles ?? [])];
   if (film) return { titles, kind: "movie", year: m.year, imdbId: extra.imdbId, tmdbId: extra.tmdbId };
   const latest = seriesLatestYear(m, req.season);
   return {

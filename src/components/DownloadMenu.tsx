@@ -1,23 +1,27 @@
 import { isTauri } from "@tauri-apps/api/core";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { downloadFormatLabel, rankDownloadOptions } from "../lib/downloadRank";
+import { useDownloadPrefs } from "../lib/downloadOverrides";
+import { downloadFormatLabel, formatResolution, rankDownloadOptions } from "../lib/downloadRank";
 import {
   cancelDownload,
+  entryContainer,
   findDownloadedEntries,
   findDownloadJob,
   fmtEta,
   fmtSpeed,
   formatDownloadQuality,
+  formatDownloadTransferLabel,
   openDownloadsFolder,
   pauseDownload,
   removeDownloadedItem,
+  resolveQualityMismatch,
   resumeDownload,
   startDownload,
   switchDownloadToNextServer,
   useDownloads,
 } from "../lib/downloads";
 import { fmtSize } from "../lib/library";
-import { useSettings } from "../lib/settings";
+import type { DownloadFormat, DownloadQualityPolicy } from "../lib/settings";
 import type { MediaDetail, PlaybackRequest } from "../lib/types";
 import { candKey } from "../sources/registry";
 import { useSourceSession } from "../sources/useSourceSession";
@@ -25,8 +29,9 @@ import { Icon } from "./Icon";
 import { audioLabel, qualityLabel } from "./SourceBoard";
 
 /**
- * Title-page Download action + implicitly ranked server chooser popover.
- * Shares the active SourceSession with SmartSource so no extra server lookups are triggered.
+ * Netflix-Desktop-inspired split Download CTA:
+ * - Primary button triggers 1-click download in your chosen quality/format (or opens management when active/saved)
+ * - Attached chevron opens quality/format defaults, active transfer controls, and optional manual server picker
  */
 export function DownloadMenu({
   req,
@@ -40,23 +45,24 @@ export function DownloadMenu({
   episodeTitle?: string;
 }) {
   const desktop = isTauri();
-  const s = useSettings();
+  const dlPrefs = useDownloadPrefs();
   const { snap } = useSourceSession(desktop ? req : null, 1);
   const { jobs, items, root, switchingIds } = useDownloads();
   const [open, setOpen] = useState(false);
-  const [overrideQuality, setOverrideQuality] = useState<number | null>(null);
+  const [showServers, setShowServers] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const wrapRef = useRef<HTMLDivElement>(null);
 
-  const targetQuality = overrideQuality ?? s.preferredQuality;
+  const targetQuality = dlPrefs.quality;
+  const targetFormat = dlPrefs.format;
   const targetLabel = targetQuality >= 2160 ? "4K" : `${targetQuality}p`;
-  const defaultLabel = s.preferredQuality >= 2160 ? "4K" : `${s.preferredQuality}p`;
+  const formatLabel = targetFormat.toUpperCase();
 
   useEffect(() => {
-    setOverrideQuality(null);
-  }, [req.media.key, req.season, req.episode]);
-
-  useEffect(() => {
-    if (!open) return;
+    if (!open) {
+      setConfirmDelete(false);
+      return;
+    }
     const onDown = (e: MouseEvent) => {
       if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false);
     };
@@ -85,25 +91,72 @@ export function DownloadMenu({
     activeJob &&
     (activeJob.status === "queued" || activeJob.status === "downloading" || activeJob.status === "remuxing");
   const isPaused = activeJob?.status === "paused";
+  const isAwaiting = activeJob?.status === "awaitingQuality";
   const isFailed = activeJob?.status === "failed";
   const pct = activeJob ? Math.round(activeJob.percent) : 0;
   const activeQNum = activeJob?.resolvedQuality ?? activeJob?.quality ?? activeJob?.preferredQuality;
   const activeQStr = activeQNum ? (activeQNum >= 2160 ? "4K" : `${activeQNum}p`) : null;
+  const availQNum = activeJob?.availableQuality ?? activeJob?.resolvedQuality ?? activeJob?.quality;
+  const availQStr = formatResolution(availQNum) || "lower";
   const savedQLabel = saved?.quality ? (saved.quality >= 2160 ? "4K" : `${saved.quality}p`) : null;
+  const savedFmtLabel = saved ? entryContainer(saved) : null;
 
-  const btnLabel = isBusy
-    ? activeJob.status === "remuxing"
-      ? `Saving${activeQStr ? ` ${activeQStr}` : ""}…`
-      : activeJob.status === "queued"
-        ? `Queued${activeQStr ? ` · ${activeQStr}` : ""}`
-        : `${activeQStr ? `${activeQStr} · ` : ""}${pct}%`
-    : isFailed
-      ? "Retry"
-      : isPaused
-        ? `Paused · ${activeQStr ? `${activeQStr} · ` : ""}${pct}%`
-        : saved
-          ? `Saved${savedQLabel ? ` · ${savedQLabel}` : ""}`
-          : "Download";
+  const triggerQuickDownload = () => {
+    const top = ranked[0];
+    if (!top) {
+      setOpen(true);
+      return;
+    }
+    void startDownload(req, top, detail, episodeTitle, {
+      fallbacks: ranked.slice(1, 11),
+      preferredQuality: targetQuality,
+      preferredFormat: targetFormat,
+      qualityPolicy: dlPrefs.policy,
+      replaceExisting: true,
+    });
+  };
+
+  const mainLabel = isBusy ? (
+    activeJob.status === "remuxing" ? (
+      <span>Saving {activeQStr ?? ""}…</span>
+    ) : activeJob.status === "queued" ? (
+      <span>Queued{activeQStr ? ` · ${activeQStr}` : ""}</span>
+    ) : (
+      <span>{activeQStr ? `${activeQStr} · ` : ""}{pct}%</span>
+    )
+  ) : isAwaiting ? (
+    <span>No {targetLabel} · {availQStr}?</span>
+  ) : isFailed ? (
+    <span>Retry download</span>
+  ) : isPaused ? (
+    <span>Paused · {pct}%</span>
+  ) : saved ? (
+    <span>Saved · {[savedQLabel, savedFmtLabel].filter(Boolean).join(" ")}</span>
+  ) : (
+    <>
+      <span>Download</span>
+      <small className="dl-split-spec">{targetLabel} {formatLabel}</small>
+    </>
+  );
+
+  const mainIcon =
+    saved && !isBusy && !isPaused && !isAwaiting && !isFailed
+      ? "check"
+      : isAwaiting
+        ? "info"
+        : isFailed
+          ? "refresh"
+          : isPaused
+            ? "pause"
+            : "download";
+
+  const onMainClick = () => {
+    if (isBusy || isPaused || isAwaiting || isFailed || saved) {
+      setOpen((x) => !x);
+      return;
+    }
+    triggerQuickDownload();
+  };
 
   const activeQ = activeJob ? formatDownloadQuality(activeJob) : null;
   const activeSpeed = activeJob ? fmtSpeed(activeJob.speedBps) : "";
@@ -112,17 +165,36 @@ export function DownloadMenu({
 
   return (
     <div className={`dl-wrap ${open ? "open" : ""}`} ref={wrapRef}>
-      <button
-        type="button"
-        className={`btn glass ${saved ? "on" : ""} ${isBusy ? "busy" : ""}`}
-        aria-expanded={open}
-        aria-haspopup="dialog"
-        onClick={() => setOpen((x) => !x)}
-        title={saved ? `${what} saved offline` : `Download ${what}`}
-      >
-        <Icon name={saved && !isBusy && !isPaused ? "check" : isFailed ? "info" : isPaused ? "pause" : "download"} size={17} />
-        <span>{btnLabel}</span>
-      </button>
+      <div className={`dl-split ${saved && !isBusy && !isPaused && !isAwaiting && !isFailed ? "on" : ""} ${isBusy ? "busy" : ""} ${isAwaiting ? "awaiting" : ""} ${isFailed ? "failed" : ""}`}>
+        <button
+          type="button"
+          className="btn glass dl-split-main"
+          onClick={onMainClick}
+          title={
+            saved
+              ? `${what} saved offline — manage download`
+              : isBusy || isPaused || isAwaiting || isFailed
+                ? `Manage download for ${what}`
+                : `Download ${what} (${targetLabel} ${formatLabel})`
+          }
+        >
+          <Icon name={mainIcon} size={16} />
+          {mainLabel}
+        </button>
+        <button
+          type="button"
+          className={`btn glass dl-split-caret ${open ? "on" : ""}`}
+          aria-expanded={open}
+          aria-haspopup="dialog"
+          aria-label={`Download options for ${what}`}
+          title="Download quality, format, and servers"
+          onClick={() => setOpen((x) => !x)}
+        >
+          <svg viewBox="0 0 12 12" width="12" height="12" aria-hidden>
+            <path d="M2.5 4.5 6 8l3.5-3.5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        </button>
+      </div>
 
       {open && (
         <div className="dl-pop glass" role="dialog" aria-label={`Download options for ${what}`}>
@@ -134,7 +206,7 @@ export function DownloadMenu({
               <button
                 type="button"
                 className="link-btn"
-                onClick={() => void openDownloadsFolder()}
+                onClick={() => void openDownloadsFolder(saved?.filePath)}
                 title={root}
               >
                 Open folder
@@ -142,25 +214,63 @@ export function DownloadMenu({
             )}
           </div>
 
-          <div className="dl-qbar" aria-label="Download quality">
-            <span className="dl-qbar-lbl">
-              Download quality{" "}
-              <small>
-                ({overrideQuality != null && overrideQuality !== s.preferredQuality ? `${targetLabel} · default ${defaultLabel}` : `default: ${defaultLabel}`})
-              </small>
-            </span>
-            <div className="dl-qbar-pills">
-              {[2160, 1080, 720, 480].map((q) => (
-                <button
-                  key={q}
-                  type="button"
-                  className={`chip ${targetQuality === q ? "on" : ""}`}
-                  onClick={() => setOverrideQuality(q === s.preferredQuality ? null : q)}
-                  title={`Target ${q >= 2160 ? "4K" : `${q}p`} for this download`}
-                >
-                  {q >= 2160 ? "4K" : `${q}p`}
-                </button>
-              ))}
+          <div className="dl-qbar" aria-label="Download quality and format">
+            <div className="dl-qbar-row">
+              <span className="dl-qbar-lbl">Quality</span>
+              <div className="dl-qbar-pills">
+                {[2160, 1080, 720, 480].map((q) => (
+                  <button
+                    key={q}
+                    type="button"
+                    className={`chip ${targetQuality === q ? "on" : ""}`}
+                    onClick={() => dlPrefs.setQuality(q)}
+                    title={`Target ${q >= 2160 ? "4K" : `${q}p`}`}
+                  >
+                    {q >= 2160 ? "4K" : `${q}p`}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="dl-qbar-row">
+              <span className="dl-qbar-lbl">Format</span>
+              <div className="dl-qbar-pills">
+                {(["mp4", "mkv"] as DownloadFormat[]).map((fmt) => (
+                  <button
+                    key={fmt}
+                    type="button"
+                    className={`chip ${targetFormat === fmt ? "on" : ""}`}
+                    onClick={() => dlPrefs.setFormat(fmt)}
+                    title={
+                      fmt === "mkv"
+                        ? "MKV — Matroska with embedded soft subtitles"
+                        : "MP4 — Universal instant playback with stereo AAC audio"
+                    }
+                  >
+                    {fmt === "mp4" ? "MP4 · Instant" : "MKV · Soft subs"}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="dl-qbar-row">
+              <span className="dl-qbar-lbl">Fallback</span>
+              <div className="dl-qbar-pills">
+                {(
+                  [
+                    ["ask", "Ask me"],
+                    ["strict", "Exact only"],
+                    ["best", "Best available"],
+                  ] as [DownloadQualityPolicy, string][]
+                ).map(([pid, label]) => (
+                  <button
+                    key={pid}
+                    type="button"
+                    className={`chip ${dlPrefs.policy === pid ? "on" : ""}`}
+                    onClick={() => dlPrefs.setPolicy(pid)}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
             </div>
           </div>
 
@@ -168,13 +278,12 @@ export function DownloadMenu({
             <div className="dl-saved-card">
               <div>
                 <strong>
-                  Downloaded in {savedQLabel ?? "HD"}
+                  Saved offline · {savedQLabel ?? "HD"} {savedFmtLabel}
                   {saved.qualityVerified ? " ✓" : ""}
                 </strong>
                 <small>
                   {[
                     saved.providerName,
-                    savedQLabel ? `${savedQLabel}${saved.qualityVerified ? " verified" : ""}` : null,
                     saved.videoCodec,
                     fmtSize(saved.fileSize),
                   ]
@@ -182,20 +291,37 @@ export function DownloadMenu({
                     .join(" · ")}
                 </small>
               </div>
-              <button
-                type="button"
-                className="icon-btn"
-                title="Remove downloaded copy"
-                aria-label="Remove downloaded copy"
-                onClick={() => void removeDownloadedItem(saved.id, true)}
-              >
-                <Icon name="x" size={14} />
-              </button>
+              {confirmDelete ? (
+                <div className="dl-saved-confirm">
+                  <button
+                    type="button"
+                    className="chip danger"
+                    onClick={() => {
+                      setConfirmDelete(false);
+                      void removeDownloadedItem(saved.id, true);
+                    }}
+                  >
+                    Delete file
+                  </button>
+                  <button type="button" className="chip" onClick={() => setConfirmDelete(false)}>
+                    Keep
+                  </button>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  className="chip danger"
+                  title="Remove downloaded copy from disk"
+                  onClick={() => setConfirmDelete(true)}
+                >
+                  <Icon name="trash" size={12} /> Remove
+                </button>
+              )}
             </div>
           )}
 
-          {activeJob && (isBusy || isPaused || isFailed) && (
-            <div className={`dl-active-card ${isFailed ? "failed" : ""}`}>
+          {activeJob && (isBusy || isPaused || isAwaiting || isFailed) && (
+            <div className={`dl-active-card ${isFailed ? "failed" : ""} ${isAwaiting ? "awaiting" : ""}`}>
               <div className="dl-active-top">
                 <span>
                   <b>{activeJob.providerName}</b>
@@ -217,17 +343,17 @@ export function DownloadMenu({
                       .join(" · ")}
                   </small>
                 </span>
-                <b>{Math.round(activeJob.percent)}%</b>
+                <b>{isAwaiting ? availQStr : `${Math.round(activeJob.percent)}%`}</b>
               </div>
               <div className="dl-active-badges">
                 {activeQ && (
                   <span className={`dlq-badge-q ${activeQ.verified ? "verified" : ""}`} title={activeQ.title}>
-                    Downloading {activeQ.label}
+                    {activeQ.label}
                     {activeQ.verified ? " ✓" : ""}
                   </span>
                 )}
                 {activeJob.videoCodec && <span className="dlq-badge-dim">{activeJob.videoCodec}</span>}
-                <span className="dlq-badge-dim">{activeJob.kind === "hls" ? "HLS→MP4" : "DIRECT"}</span>
+                <span className="dlq-badge-dim">{formatDownloadTransferLabel(activeJob)}</span>
                 {((activeJob.attemptIndex ?? 1) > 1 || (activeJob.totalSources ?? 1) > 1) && (
                   <span className="dlq-badge-dim">
                     Server {activeJob.attemptIndex ?? 1}/{Math.max(activeJob.attemptIndex ?? 1, activeJob.totalSources ?? 1)}
@@ -239,11 +365,24 @@ export function DownloadMenu({
                   Backup switch after: {activeJob.failoverNotes[activeJob.failoverNotes.length - 1]}
                 </div>
               )}
-              <div className="dl-bar">
-                <i style={{ transform: `scaleX(${Math.max(0.02, activeJob.percent / 100)})` }} />
-              </div>
+              {!isAwaiting && (
+                <div className="dl-bar">
+                  <i style={{ transform: `scaleX(${Math.max(0.02, activeJob.percent / 100)})` }} />
+                </div>
+              )}
               <div className="dl-active-acts">
-                {isBusy ? (
+                {isAwaiting ? (
+                  <button
+                    type="button"
+                    className="btn play xs"
+                    onClick={() => {
+                      setOpen(false);
+                      void resolveQualityMismatch([activeJob.id], "accept", availQNum);
+                    }}
+                  >
+                    <Icon name="download" size={12} /> Download {availQStr}
+                  </button>
+                ) : isBusy ? (
                   <button
                     type="button"
                     className="chip"
@@ -264,94 +403,108 @@ export function DownloadMenu({
                   onClick={() => void switchDownloadToNextServer(activeJob)}
                   title="Switch to the next best working server"
                 >
-                  <Icon name="shuffle" size={12} /> {activeSwitching ? "Switching…" : "Switch server"}
+                  <Icon name="shuffle" size={12} /> {activeSwitching ? "Switching…" : "Next server"}
                 </button>
-                <button type="button" className="chip" onClick={() => void cancelDownload(activeJob.id)}>
+                <button
+                  type="button"
+                  className="chip danger"
+                  onClick={() =>
+                    void (isAwaiting ? resolveQualityMismatch([activeJob.id], "cancel") : cancelDownload(activeJob.id))
+                  }
+                >
                   Cancel
                 </button>
               </div>
             </div>
           )}
 
-          {ranked.length > 0 && !isBusy && !saved && (
-            <button
-              type="button"
-              className="dl-quick-cta"
-              onClick={() => {
-                const top = ranked[0];
-                void startDownload(req, top, detail, episodeTitle, {
-                  fallbacks: ranked.slice(1, 7),
-                  preferredQuality: targetQuality,
-                  replaceExisting: true,
-                });
-              }}
-            >
-              <Icon name="download" size={14} />
-              <span>
-                <strong>Quick download · {ranked[0].providerName}</strong>
-                <small>
-                  Target {targetLabel}
-                  {ranked.length > 1
-                    ? ` · ${Math.min(6, ranked.length - 1)} backup server${Math.min(6, ranked.length - 1) === 1 ? "" : "s"} ready`
-                    : ""}
-                </small>
-              </span>
-            </button>
-          )}
-
-          <div className="dl-pop-list">
-            {ranked.length > 0 ? (
-              ranked.map((c) => {
-                const q = qualityLabel(c);
-                const knownQ = c.probe?.quality ?? c.quality;
-                const belowTarget = knownQ != null && knownQ > 0 && knownQ < targetQuality;
-                const audio = audioLabel(c);
-                const fmt = downloadFormatLabel(c);
-                const subCount = c.subtitles?.length ?? 0;
-                const rowJob = findDownloadJob(req, c, jobs);
-                const rowBusy =
-                  rowJob &&
-                  (rowJob.status === "queued" || rowJob.status === "downloading" || rowJob.status === "remuxing");
-                return (
-                  <button
-                    key={candKey(c)}
-                    type="button"
-                    className="dl-opt"
-                    disabled={Boolean(rowBusy)}
-                    onClick={() => {
-                      void startDownload(req, c, detail, episodeTitle, {
-                        fallbacks: ranked.filter((x) => x !== c).slice(0, 6),
-                        preferredQuality: targetQuality,
-                        replaceExisting: true,
-                      });
-                    }}
-                  >
-                    <span className="dl-opt-main">
-                      <strong>{c.providerName}</strong>
-                      <small>
-                        {fmt}
-                        {subCount > 0 ? ` · ${subCount} sub${subCount > 1 ? "s" : ""}` : ""}
-                      </small>
-                    </span>
-                    <span className="dl-opt-tags">
-                      {q && <b className={belowTarget ? "dl-opt-warn" : undefined} title={belowTarget ? `Below your ${targetLabel} target` : undefined}>{q}</b>}
-                      {belowTarget && <b className="dl-opt-warn">low res</b>}
-                      {audio && <b>{audio}</b>}
-                    </span>
-                    <span className="dl-opt-act">
-                      {rowBusy ? `${Math.round(rowJob.percent)}%` : <Icon name="download" size={14} />}
-                    </span>
-                  </button>
-                );
-              })
+          {!isBusy && !isPaused && !isAwaiting && !isFailed && !saved && (
+            ranked.length > 0 ? (
+              <button type="button" className="dl-quick-cta" onClick={triggerQuickDownload}>
+                <Icon name="download" size={14} />
+                <span>
+                  <strong>Download now · {ranked[0].providerName}</strong>
+                  <small>
+                    {targetLabel} · {formatLabel}
+                    {ranked.length > 1
+                      ? ` · ${Math.min(6, ranked.length - 1)} backup server${Math.min(6, ranked.length - 1) === 1 ? "" : "s"}`
+                      : ""}
+                  </small>
+                </span>
+              </button>
             ) : (
               <div className="dl-pop-empty">
                 {snap?.busy
                   ? "Scanning servers for downloadable streams…"
-                  : "No direct or HLS download streams verified yet. Open a server on the right or try again shortly."}
+                  : "No direct or HLS download streams verified yet. Try again or check Servers."}
               </div>
-            )}
-          </div>
+            )
+          )}
+
+          {ranked.length > 0 && (
+            <div className="dl-servers-toggle">
+              <button
+                type="button"
+                className="link-btn dl-servers-btn"
+                aria-expanded={showServers}
+                onClick={() => setShowServers((s) => !s)}
+              >
+                <span>{showServers ? "Hide server list" : `Choose server manually (${ranked.length})`}</span>
+                <svg className={showServers ? "rot" : ""} viewBox="0 0 12 12" width="11" height="11" aria-hidden>
+                  <path d="M2.5 4.5 6 8l3.5-3.5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </button>
+
+              {showServers && (
+                <div className="dl-pop-list">
+                  {ranked.map((c) => {
+                    const q = qualityLabel(c);
+                    const knownQ = c.probe?.quality ?? c.quality;
+                    const belowTarget = knownQ != null && knownQ > 0 && knownQ < targetQuality;
+                    const audio = audioLabel(c);
+                    const fmt = downloadFormatLabel(c, targetFormat);
+                    const subCount = c.subtitles?.length ?? 0;
+                    const rowJob = findDownloadJob(req, c, jobs);
+                    const rowBusy =
+                      rowJob &&
+                      (rowJob.status === "queued" || rowJob.status === "downloading" || rowJob.status === "remuxing");
+                    return (
+                      <button
+                        key={candKey(c)}
+                        type="button"
+                        className="dl-opt"
+                        disabled={Boolean(rowBusy)}
+                        onClick={() => {
+                          void startDownload(req, c, detail, episodeTitle, {
+                            fallbacks: ranked.filter((x) => x !== c).slice(0, 6),
+                            preferredQuality: targetQuality,
+                            preferredFormat: targetFormat,
+                            replaceExisting: true,
+                          });
+                        }}
+                      >
+                        <span className="dl-opt-main">
+                          <strong>{c.providerName}</strong>
+                          <small>
+                            {fmt}
+                            {subCount > 0 ? ` · ${subCount} sub${subCount > 1 ? "s" : ""}` : ""}
+                          </small>
+                        </span>
+                        <span className="dl-opt-tags">
+                          {q && <b className={belowTarget ? "dl-opt-warn" : undefined} title={belowTarget ? `Below ${targetLabel} target` : undefined}>{q}</b>}
+                          {belowTarget && <b className="dl-opt-warn">low res</b>}
+                          {audio && <b>{audio}</b>}
+                        </span>
+                        <span className="dl-opt-act">
+                          {rowBusy ? `${Math.round(rowJob.percent)}%` : <Icon name="download" size={14} />}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>

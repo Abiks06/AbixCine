@@ -42,7 +42,6 @@ export function MyList() {
     <div className="page">
       <div className="page-head">
         <div>
-          <p className="overline">Saved for later</p>
           <h1 className="page-title">My <em>List</em></h1>
         </div>
         <span className="grow" />

@@ -4,7 +4,15 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { useSyncExternalStore } from "react";
 import { PROXY_URL_RX, unwrapProxyUrl, type StreamHeaders } from "../sources/native";
 import type { StreamCandidate, SubtitleTrack } from "../sources/types";
-import { getSettings, updateSettings } from "./settings";
+import {
+  getDownloadQuality,
+  getSettings,
+  normalizeDownloadFormat,
+  normalizeDownloadQualityPolicy,
+  updateSettings,
+  type DownloadFormat,
+  type DownloadQualityPolicy,
+} from "./settings";
 import { langBase, loadSubPref, type SubPref } from "./subtitles";
 import { toast } from "./toast";
 import { isUnairedEpisode } from "./normalizer";
@@ -15,6 +23,7 @@ export type DownloadStatus =
   | "downloading"
   | "remuxing"
   | "paused"
+  | "awaitingQuality"
   | "completed"
   | "failed"
   | "cancelled";
@@ -55,9 +64,13 @@ export interface DownloadJob {
   audio?: string;
   quality?: number;
   preferredQuality?: number;
+  preferredFormat?: DownloadFormat;
+  qualityPolicy?: DownloadQualityPolicy;
+  availableQuality?: number;
   resolvedQuality?: number;
   qualityVerified?: boolean;
   videoCodec?: string;
+  container?: string;
   providerId: string;
   providerName: string;
   url: string;
@@ -97,6 +110,10 @@ export interface DownloadedEntry {
   quality?: number;
   qualityVerified?: boolean;
   videoCodec?: string;
+  container?: string;
+  webReady?: boolean;
+  audioCodec?: string;
+  audioChannels?: number;
   providerId: string;
   providerName: string;
   filePath: string;
@@ -253,6 +270,43 @@ export function useOfflineCountForMedia(canonicalKey: string, mediaKey: string):
   );
 }
 
+let badgeSnap: { active: number; awaiting: number } = { active: 0, awaiting: 0 };
+
+function getBadgeSnapshot(): { active: number; awaiting: number } {
+  let active = 0;
+  let awaiting = 0;
+  for (const j of state.jobs) {
+    if (j.status === "queued" || j.status === "downloading" || j.status === "remuxing") active += 1;
+    else if (j.status === "awaitingQuality") awaiting += 1;
+  }
+  if (badgeSnap.active !== active || badgeSnap.awaiting !== awaiting) {
+    badgeSnap = { active, awaiting };
+  }
+  return badgeSnap;
+}
+
+/** Primitive selector returning how many downloads are currently queued, active, or remuxing. */
+export function useActiveDownloadCount(): number {
+  return useSyncExternalStore(
+    (cb) => {
+      listeners.add(cb);
+      return () => listeners.delete(cb);
+    },
+    () => getBadgeSnapshot().active,
+  );
+}
+
+/** Selector returning active download count alongside held quality-choice count for rail alerts. */
+export function useDownloadBadgeState(): { active: number; awaiting: number } {
+  return useSyncExternalStore(
+    (cb) => {
+      listeners.add(cb);
+      return () => listeners.delete(cb);
+    },
+    getBadgeSnapshot,
+  );
+}
+
 export function useDownloadSetupPrompt() {
   const prompt = useSyncExternalStore(
     (cb) => {
@@ -307,7 +361,8 @@ async function attachProgressListener() {
         autoRecoveryAttempted.delete(job.id);
         const epTag = !job.isFilm && job.episode != null ? ` S${String(job.season ?? 1).padStart(2, "0")}E${String(job.episode).padStart(2, "0")}` : "";
         const qInfo = formatDownloadQuality(job);
-        const qPart = qInfo.verified ? ` (${qInfo.label})` : "";
+        const fmtTag = (job.container || job.preferredFormat || "mp4").toUpperCase();
+        const qPart = qInfo.verified ? ` (${qInfo.label} ${fmtTag})` : ` (${fmtTag})`;
         toast(`Saved “${job.title}${epTag}”${qPart} for offline playback`, { icon: "check" });
         void refreshDownloads().then(() => notifyDownloadsChanged());
       } else if (job.status === "failed" && prev?.status !== "failed") {
@@ -626,7 +681,13 @@ export function buildDownloadSource(
 ): DownloadSourceReq {
   const rawSource = candidate.downloadUrl ?? candidate.url;
   const unwrapped = unwrapProxyUrl(rawSource);
-  const targetKind = candidate.downloadUrl ? "file" : candidate.kind === "hls" ? "hls" : "file";
+  const targetKind = candidate.downloadUrl
+    ? "file"
+    : candidate.kind === "hls"
+      ? "hls"
+      : candidate.kind === "dash"
+        ? "dash"
+        : "file";
   const headers = candidate.downloadUrl
     ? (candidate.headers ?? {})
     : { ...unwrapped.headers, ...candidate.headers };
@@ -924,6 +985,8 @@ export async function startDownload(
     silent?: boolean;
     fallbacks?: StreamCandidate[];
     preferredQuality?: number;
+    preferredFormat?: DownloadFormat;
+    qualityPolicy?: DownloadQualityPolicy;
     replaceExisting?: boolean;
   },
 ): Promise<DownloadJob | null> {
@@ -940,7 +1003,7 @@ export async function startDownload(
   const seenProviders = new Set<string>([primary.providerId]);
   const fallbacks: DownloadSourceReq[] = [];
   for (const fbCand of opts?.fallbacks ?? []) {
-    if (fallbacks.length >= 6) break;
+    if (fallbacks.length >= 10) break;
     const fb = buildDownloadSource(fbCand, pref);
     const low = fb.url.toLowerCase();
     if (seenUrls.has(low) || seenProviders.has(fb.providerId)) continue;
@@ -951,7 +1014,10 @@ export async function startDownload(
 
   await enrichDownloadSubtitles(req, primary, fallbacks, detail, pref);
 
-  const targetQuality = opts?.preferredQuality ?? getSettings().preferredQuality;
+  const settings = getSettings();
+  const targetQuality = opts?.preferredQuality ?? getDownloadQuality(settings);
+  const targetFormat = normalizeDownloadFormat(opts?.preferredFormat ?? settings.downloadFormat);
+  const qualityPolicy = normalizeDownloadQualityPolicy(opts?.qualityPolicy ?? settings.downloadQualityPolicy);
   const mediaDetail = detail ?? (req.media as Partial<MediaDetail>);
   const posterUrl = sizeTmdbArt(req.media.poster ?? detail?.poster, "w500");
   const backdropUrl = sizeTmdbArt(req.media.backdrop ?? detail?.backdrop, "w1280");
@@ -974,6 +1040,8 @@ export async function startDownload(
     kind: primary.kind,
     headers: primary.headers,
     preferredQuality: targetQuality,
+    preferredFormat: targetFormat,
+    qualityPolicy,
     subtitles: primary.subtitles,
     preferredSubLangs: preferredSubLangList(pref),
     fallbacks,
@@ -992,7 +1060,10 @@ export async function startDownload(
     if (!opts?.silent) {
       const qLabel = targetQuality >= 2160 ? "4K" : `${targetQuality}p`;
       const backupNote = fallbacks.length > 0 ? ` · ${fallbacks.length} backup${fallbacks.length === 1 ? "" : "s"}` : "";
-      toast(`Queued “${req.media.title}” (${candidate.providerName} · up to ${qLabel}${backupNote})`, { icon: "download" });
+      toast(
+        `Queued “${req.media.title}” (${candidate.providerName} · up to ${qLabel} ${targetFormat.toUpperCase()}${backupNote})`,
+        { icon: "download" },
+      );
     }
     return job;
   } catch (e: unknown) {
@@ -1008,6 +1079,7 @@ export async function switchDownloadSource(
   candidate: StreamCandidate,
   extraFallbacks: StreamCandidate[] = [],
   preferredQuality?: number,
+  preferredFormat?: DownloadFormat,
 ): Promise<DownloadJob | null> {
   if (!isTauri()) return null;
   const pref = loadSubPref();
@@ -1015,19 +1087,23 @@ export async function switchDownloadSource(
   const seenUrls = new Set<string>([source.url.toLowerCase()]);
   const fallbacks: DownloadSourceReq[] = [];
   for (const c of extraFallbacks) {
-    if (fallbacks.length >= 6) break;
+    if (fallbacks.length >= 10) break;
     const fb = buildDownloadSource(c, pref);
     const low = fb.url.toLowerCase();
     if (seenUrls.has(low) || fb.providerId === source.providerId) continue;
     seenUrls.add(low);
     fallbacks.push(fb);
   }
+  const existing = state.jobs.find((j) => j.id === id);
+  const fmt = normalizeDownloadFormat(preferredFormat ?? existing?.preferredFormat ?? getSettings().downloadFormat);
   try {
     const job = await invoke<DownloadJob | null>("download_switch_source", {
       id,
       source,
       extraFallbacks: fallbacks,
-      preferredQuality: preferredQuality ?? getSettings().preferredQuality,
+      preferredQuality: preferredQuality ?? existing?.preferredQuality ?? getDownloadQuality(getSettings()),
+      preferredFormat: fmt,
+      qualityPolicy: existing?.qualityPolicy ?? normalizeDownloadQualityPolicy(getSettings().downloadQualityPolicy),
     });
     if (job) {
       autoRecoveryAttempted.delete(job.id);
@@ -1083,6 +1159,7 @@ export async function switchDownloadToNextServer(
 
     const tried = new Set<string>([job.providerId, ...(job.triedProviders ?? [])]);
     const targetQ = job.preferredQuality ?? getSettings().preferredQuality;
+    const targetFmt = normalizeDownloadFormat(job.preferredFormat ?? getSettings().downloadFormat);
     const session = acquireSession(req);
     session.retain();
     session.start(3);
@@ -1143,7 +1220,7 @@ export async function switchDownloadToNextServer(
       return false;
     }
 
-    const updated = await switchDownloadSource(job.id, picked.next, picked.rest.slice(0, 5), targetQ);
+    const updated = await switchDownloadSource(job.id, picked.next, picked.rest.slice(0, 5), targetQ, targetFmt);
     if (updated) {
       toast(
         opts?.auto
@@ -1262,6 +1339,29 @@ export async function cancelAllDownloads(scope?: { canonicalKey?: string; season
     );
   } catch (e: unknown) {
     toast(`Couldn't stop downloads: ${e instanceof Error ? e.message : String(e)}`, { icon: "info" });
+  }
+}
+
+export async function resolveQualityMismatch(
+  ids: string[],
+  action: "accept" | "cancel",
+  newPreferredQuality?: number,
+): Promise<DownloadSnapshot | null> {
+  if (!isTauri() || ids.length === 0) return null;
+  try {
+    const snap = await invoke<DownloadSnapshot>("download_resolve_quality", {
+      ids,
+      action,
+      newPreferredQuality: newPreferredQuality ?? null,
+    });
+    applySnapshot({
+      ...snap,
+      jobs: (snap.jobs ?? []).filter((j) => j.status !== "cancelled"),
+    });
+    return snap;
+  } catch (e: unknown) {
+    toast(`Couldn't update held downloads: ${e instanceof Error ? e.message : String(e)}`, { icon: "info" });
+    return null;
   }
 }
 
@@ -1450,6 +1550,15 @@ export function findOfflineSeasonEpisodes(
     }));
 }
 
+const NATURAL_COLLATOR = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+
+/** Natural locale-aware comparison ("Ep 2" < "Ep 10", "S1E2" < "S1E12"). */
+export function naturalCompare(a: string, b: string): number {
+  return NATURAL_COLLATOR.compare(a, b);
+}
+
+export type DownloadVaultSort = "recent" | "title" | "year" | "size" | "quality";
+
 export interface DownloadedTitleGroup {
   canonicalKey: string;
   media: MediaDetail;
@@ -1473,7 +1582,11 @@ export function groupDownloadedTitles(items: DownloadedEntry[] = state.items): D
   const groups: DownloadedTitleGroup[] = [];
   for (const [canonicalKey, entries] of byKey) {
     const sorted = [...entries].sort(
-      (a, b) => (a.season ?? 0) - (b.season ?? 0) || (a.episode ?? 0) - (b.episode ?? 0) || b.downloadedAt - a.downloadedAt,
+      (a, b) =>
+        (a.season ?? 0) - (b.season ?? 0) ||
+        (a.episode ?? 0) - (b.episode ?? 0) ||
+        naturalCompare(a.episodeTitle || a.filePath, b.episodeTitle || b.filePath) ||
+        b.downloadedAt - a.downloadedAt,
     );
     const media = findOfflineDetail(canonicalKey, entries) ?? {
       key: sorted[0].mediaKey,
@@ -1504,7 +1617,50 @@ export function groupDownloadedTitles(items: DownloadedEntry[] = state.items): D
       latestAt,
     });
   }
-  return groups.sort((a, b) => b.latestAt - a.latestAt || a.media.title.localeCompare(b.media.title));
+  return groups.sort((a, b) => b.latestAt - a.latestAt || naturalCompare(a.media.title, b.media.title));
+}
+
+/** Sort offline vault groups by recency, natural title, year, size, or quality. */
+export function sortDownloadedGroups(
+  groups: DownloadedTitleGroup[],
+  sortBy: DownloadVaultSort,
+): DownloadedTitleGroup[] {
+  const copy = [...groups];
+  switch (sortBy) {
+    case "title":
+      return copy.sort((a, b) => naturalCompare(a.media.title, b.media.title) || b.latestAt - a.latestAt);
+    case "year":
+      return copy.sort((a, b) => (b.media.year ?? 0) - (a.media.year ?? 0) || naturalCompare(a.media.title, b.media.title));
+    case "size":
+      return copy.sort((a, b) => b.totalSize - a.totalSize || naturalCompare(a.media.title, b.media.title));
+    case "quality":
+      return copy.sort(
+        (a, b) => (b.bestQuality ?? 0) - (a.bestQuality ?? 0) || b.latestAt - a.latestAt || naturalCompare(a.media.title, b.media.title),
+      );
+    case "recent":
+    default:
+      return copy.sort((a, b) => b.latestAt - a.latestAt || naturalCompare(a.media.title, b.media.title));
+  }
+}
+
+export interface OrganizeVaultResult {
+  snapshot: DownloadSnapshot;
+  movedFiles: number;
+  adoptedFiles: number;
+  totalItems: number;
+}
+
+/** Tidy download vault folders: normalize paths into Movies/Series/Anime and adopt unindexed video files. */
+export async function organizeDownloadedVault(): Promise<OrganizeVaultResult | null> {
+  if (!isTauri()) return null;
+  try {
+    const res = await invoke<OrganizeVaultResult>("download_organize_vault");
+    applySnapshot(res.snapshot);
+    return res;
+  } catch (e: unknown) {
+    toast(`Couldn't organize vault: ${e instanceof Error ? e.message : String(e)}`, { icon: "info" });
+    return null;
+  }
 }
 
 /** Return the saved offline entry for a specific episode (and optional audio variant), if present. */
@@ -1548,6 +1704,7 @@ export interface SeasonDownloadProgress {
   completed: number;
   active: number;
   paused: number;
+  awaitingQuality: number;
   failed: number;
   percent: number;
   completedPercent: number;
@@ -1576,6 +1733,7 @@ export function computeSeasonDownloadProgress(
   let completed = 0;
   let active = 0;
   let paused = 0;
+  let awaitingQuality = 0;
   let failed = 0;
   let fractional = 0;
   let speedBps = 0;
@@ -1606,6 +1764,10 @@ export function computeSeasonDownloadProgress(
       failed++;
       continue;
     }
+    if (job.status === "awaitingQuality") {
+      awaitingQuality++;
+      continue;
+    }
     if (job.status === "paused") {
       paused++;
     } else {
@@ -1624,6 +1786,7 @@ export function computeSeasonDownloadProgress(
     completed,
     active,
     paused,
+    awaitingQuality,
     failed,
     percent,
     completedPercent,
@@ -1673,6 +1836,27 @@ export function formatDownloadQuality(
     return { label: `Up to ${pStr}`, verified: false, title: `Targeting ${pStr} quality` };
   }
   return { label: "Auto", verified: false, title: "Best available quality" };
+}
+
+/** Human-readable transfer badge reflecting picked output container (e.g. "HLS → MKV", "DASH → MP4", "MKV"). */
+export function formatDownloadTransferLabel(
+  job: Pick<DownloadJob, "kind" | "preferredFormat" | "container" | "filePath">,
+): string {
+  const out = (
+    job.container ||
+    (job.filePath ? job.filePath.match(/\.([a-z0-9]{2,5})$/i)?.[1] : undefined) ||
+    job.preferredFormat ||
+    "mp4"
+  ).toUpperCase();
+  if (job.kind === "hls") return `HLS → ${out}`;
+  if (job.kind === "dash") return `DASH → ${out}`;
+  return out;
+}
+
+/** Uppercase output container badge for a completed downloaded entry ("MP4", "MKV", ...). */
+export function entryContainer(entry: Pick<DownloadedEntry, "container" | "filePath">): string {
+  const raw = entry.container || entry.filePath.match(/\.([a-z0-9]{2,5})$/i)?.[1] || "mp4";
+  return raw.toUpperCase();
 }
 
 /** Seed test snapshot directly in Vitest without needing Tauri IPC. */

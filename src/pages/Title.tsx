@@ -5,7 +5,9 @@ import { AudioToggle } from "../components/AudioToggle";
 import { Ambient } from "../components/Ambient";
 import { Art, sized } from "../components/Art";
 import { Card, CardSkeleton, kindLabel } from "../components/Card";
+import { DownloadPrefsPill, EpisodeDownloadControl } from "../components/DownloadControl";
 import { DownloadMenu } from "../components/DownloadMenu";
+import { openQualityReviewModal } from "../components/DownloadQualityModal";
 import { Icon } from "../components/Icon";
 import { SmartSource } from "../components/SmartSource";
 import { TitleArt } from "../components/TitleArt";
@@ -13,7 +15,6 @@ import { TrailerModal } from "../components/TrailerModal";
 import {
   batchEpisodeKey,
   getBatchForSeason,
-  queueEpisodeDownload,
   queueSeasonDownloads,
   selectMissingEpisodes,
   useBatchDownloads,
@@ -24,16 +25,13 @@ import {
   findDownloadedEpisode,
   findOfflineDetail,
   fmtSpeed,
-  formatDownloadQuality,
-  formatQualityTag,
   pauseAllDownloads,
-  pauseDownload,
   refreshDownloads,
   resumeAllDownloads,
-  resumeDownload,
-  switchDownloadToNextServer,
   useDownloads,
 } from "../lib/downloads";
+import { openExternal } from "../lib/external";
+import { useSourceSession } from "../sources/useSourceSession";
 import { isYouTubeId } from "../lib/trailer";
 import {
   checkEpisodeAvailability,
@@ -51,6 +49,7 @@ import {
   resolvePlaybackRequest,
 } from "../lib/catalog";
 import { fmtAgo, fmtDate, fmtMoney, fmtRuntime, languageName } from "../lib/format";
+import { useDownloadPrefs } from "../lib/downloadOverrides";
 import { getProgress, useMatchedProgress, useProgressStore } from "../lib/progress";
 import { audioFor, setAudioFor, useSettings } from "../lib/settings";
 import { toast } from "../lib/toast";
@@ -60,7 +59,7 @@ import { useSlidingIndicator } from "../lib/useSlidingIndicator";
 import { burst } from "../lib/burst";
 import { toggleList, useSaved } from "../lib/watchlist";
 
-type Tab = "episodes" | "showcase" | "cast" | "details" | "more";
+type Tab = "showcase" | "cast" | "details" | "more";
 type EpView = "list" | "grid";
 
 const VIEW_KEY = "abx.epview";
@@ -90,13 +89,10 @@ export function Title() {
   const nav = useNavigate();
   const loc = useLocation();
 
-  const s = useSettings();
+  useSettings();
   const dl = useDownloads();
   const batch = useBatchDownloads();
   const desktop = isTauri();
-  const [dlQualityOverride, setDlQualityOverride] = useState<number | null>(null);
-  const dlTargetQuality = dlQualityOverride ?? s.preferredQuality;
-  const dlQualityLabel = dlTargetQuality >= 2160 ? "4K" : `${dlTargetQuality}p`;
 
   const { data: detail, error, reload } = useAsync(() => getDetail(key), [key]);
   const seed = (loc.state as { seed?: Media } | null)?.seed;
@@ -163,7 +159,6 @@ export function Title() {
     setPickedSeason(null);
     setTab(null);
     setJump("");
-    setDlQualityOverride(null);
   }, [key]);
 
   const activeSeasonObj: CanonicalSeason | undefined = useMemo(() => {
@@ -191,6 +186,11 @@ export function Title() {
   const swapTimer = useRef<number>();
   useEffect(() => () => clearTimeout(swapTimer.current), []);
   const [view, setView] = useState<EpView | null>(loadView);
+  const [synopsisFull, setSynopsisFull] = useState(false);
+
+  useEffect(() => {
+    setSynopsisFull(false);
+  }, [key]);
 
   const resumeEpisode = validProgress && (validProgress.season == null || validProgress.season === season) ? validProgress.episode ?? 1 : 1;
   useEffect(() => {
@@ -198,6 +198,11 @@ export function Title() {
   }, [key, season, resumeEpisode]);
 
   const canonicalKey = d?.canonicalKey ?? d?.key ?? key;
+  const dlPrefs = useDownloadPrefs(canonicalKey);
+  const dlTargetQuality = dlPrefs.quality;
+  const dlTargetFormat = dlPrefs.format;
+  const dlQualityLabel = dlTargetQuality >= 2160 ? "4K" : `${dlTargetQuality}p`;
+  const dlFormatLabel = dlTargetFormat.toUpperCase();
   const anime = key.startsWith("anilist:") || d?.kind === "anime";
   const audio = anime ? audioFor(canonicalKey, [key, d?.key]) : undefined;
 
@@ -206,7 +211,11 @@ export function Title() {
   const unreleasedFilm = film && ready && isUnreleasedMedia(d);
   const theatricalOnly = film && ready && !unreleasedFilm && isTheatricalOnly(d);
   const [checkAnyway, setCheckAnyway] = useState(false);
-  useEffect(() => setCheckAnyway(false), [key]);
+  const [confirmSeasonStop, setConfirmSeasonStop] = useState(false);
+  useEffect(() => {
+    setCheckAnyway(false);
+    setConfirmSeasonStop(false);
+  }, [key, season]);
   const hasPlayableEps = !!(
     isSeries &&
     ((d?.seasons && d.seasons.length > 0) ||
@@ -298,7 +307,6 @@ export function Title() {
   const what = film ? "this film" : startE != null ? `${startS != null ? (startS === 0 ? "Specials " : `S${startS} `) : ""}E${startE}` : "this film";
   const tabs: [Tab, string][] = showEpisodesTab
     ? [
-        ["episodes", "Episodes"],
         ["cast", anime ? "Characters & crew" : "Cast & crew"],
         ["details", "Technical sheet"],
         ["more", "More like this"],
@@ -309,7 +317,7 @@ export function Title() {
         ["details", "Technical sheet"],
         ["more", "More like this"],
       ];
-  const defaultTab: Tab = showEpisodesTab ? "episodes" : "showcase";
+  const defaultTab: Tab = showEpisodesTab ? "cast" : "showcase";
   const curTab: Tab = tab && tabs.some(([id]) => id === tab) ? tab : defaultTab;
 
   const changeAudio = (a: "sub" | "dub") => {
@@ -373,7 +381,7 @@ export function Title() {
           <Icon name="back" size={16} /> Back
         </button>
 
-        {/* 3-zone theatrical gallery masthead */}
+        {/* Netflix-Desktop-inspired 2-column cinematic dossier */}
         <div className="tp-top">
           <div className="tp-poster-col">
             <div className="tp-poster gate-frame">
@@ -400,30 +408,14 @@ export function Title() {
             {d.originalTitle && d.originalTitle !== d.title && <div className="tp-orig">{d.originalTitle}</div>}
             {d.tagline && <div className="tagline">“{d.tagline}”</div>}
 
-            <div className="tp-telemetry">
+            <div className="tp-meta-bar">
               {d.rating ? (
-                <div className="tp-gauge" title={`Rated ${d.rating.toFixed(1)}/10 on ${key.startsWith("anilist:") ? "AniList" : "TMDB"}`}>
-                  <svg viewBox="0 0 40 40" aria-hidden>
-                    <circle className="gauge-track" cx="20" cy="20" r="16" />
-                    <circle className="gauge-arc" cx="20" cy="20" r="16" style={{ ["--p" as string]: Math.min(1, Math.max(0.04, d.rating / 10)) }} />
-                  </svg>
-                  <div className="tp-gauge-val">
-                    <b>{d.rating.toFixed(1)}</b>
-                  </div>
-                  <div className="tp-gauge-meta">
-                    <span>{key.startsWith("anilist:") ? "AniList" : "TMDB"}</span>
-                    {d.voteCount ? <small>{d.voteCount >= 1000 ? `${(d.voteCount / 1000).toFixed(1)}k votes` : `${d.voteCount} votes`}</small> : null}
-                  </div>
-                </div>
+                <span className="tp-rating-chip" title={`Rated ${d.rating.toFixed(1)}/10 on ${key.startsWith("anilist:") ? "AniList" : "TMDB"}`}>
+                  <Icon name="star" size={13} />
+                  <b>{d.rating.toFixed(1)}</b>
+                  {d.voteCount ? <small>{d.voteCount >= 1000 ? `${(d.voteCount / 1000).toFixed(1)}k` : d.voteCount}</small> : null}
+                </span>
               ) : null}
-
-              {endsAt && (
-                <div className="tp-end-stamp">
-                  <span>{film ? "FINISHES" : "1 EP ENDS"}</span>
-                  <b>{endsAt}</b>
-                </div>
-              )}
-
               <div className="specs">
                 {d.year ? <span>{d.year}</span> : null}
                 {d.certification && <span className="cert">{d.certification}</span>}
@@ -431,8 +423,25 @@ export function Title() {
                 {!film && d.runtime ? <span>{d.runtime}m/ep</span> : null}
                 {d.status && <span>{nice(d.status)}</span>}
                 {anime && <span className="hi">Sub · Dub</span>}
+                {endsAt && <span>{film ? `Ends ${endsAt}` : `1 ep ends ${endsAt}`}</span>}
               </div>
             </div>
+
+            {d.overview && (
+              <div className="tp-hero-plot">
+                <p className={`tp-synopsis-hero ${synopsisFull ? "expanded" : ""}`}>{d.overview}</p>
+                {d.overview.length > 220 && (
+                  <button
+                    type="button"
+                    className="link-btn tp-plot-more"
+                    onClick={() => setSynopsisFull((x) => !x)}
+                    aria-expanded={synopsisFull}
+                  >
+                    {synopsisFull ? "Show less" : "Read more"}
+                  </button>
+                )}
+              </div>
+            )}
 
             {unreleasedFilm && (
               <div className="airing"><Icon name="clock" size={14} /> {d.releaseDate ? `Releases ${fmtDate(d.releaseDate)}` : "Not released yet"}</div>
@@ -453,14 +462,28 @@ export function Title() {
               ) : !ready ? (
                 <button className="btn play" disabled><span className="mini-spin" /> Loading</button>
               ) : null}
+              {req && <DownloadMenu req={req} detail={d} what={what} />}
+              {audio && <AudioToggle value={audio} onChange={changeAudio} />}
               <button className={`btn glass ${saved ? "on" : ""}`} onClick={(e) => { if (!saved) burst(e.currentTarget); toggleList(d); }} aria-pressed={saved}>
                 <Icon name={saved ? "check" : "bookmark"} size={17} /> {saved ? "In My List" : "My List"}
               </button>
-              {req && <DownloadMenu req={req} detail={d} what={what} />}
-              {audio && <AudioToggle value={audio} onChange={changeAudio} />}
               {isYouTubeId(d.trailerYouTubeId) && (
                 <button type="button" className="btn glass" onClick={() => setTrailerOpen(true)} aria-haspopup="dialog"><Icon name="film" size={17} /> Trailer</button>
               )}
+              <ServersPopover
+                req={req}
+                detail={d}
+                what={what}
+                ready={ready}
+                unreleasedFilm={unreleasedFilm}
+                theatricalOnly={theatricalOnly}
+                isSeries={isSeries}
+                hasPlayableEps={hasPlayableEps}
+                releaseDate={d.releaseDate}
+                digitalReleaseDate={d.digitalReleaseDate}
+                onCheckAnyway={() => setCheckAnyway(true)}
+                onPlay={(srv) => watch(startS, startE, srv)}
+              />
             </div>
 
             {resumePct != null && validProgress && (
@@ -470,276 +493,449 @@ export function Title() {
               </div>
             )}
           </div>
-
-          {req ? (
-            <SmartSource req={req} detail={d} what={what} onPlay={(srv) => watch(startS, startE, srv)} />
-          ) : (
-            <aside className="smart">
-              <div className="h"><span><Icon name="layers" size={16} /> Servers</span></div>
-              <div className="smart-note">
-                {!ready
-                  ? "Finding where this plays…"
-                  : unreleasedFilm
-                    ? d.releaseDate
-                      ? `Not out yet — releases ${fmtDate(d.releaseDate)}. Servers will appear once it's available.`
-                      : "Not released yet — servers will appear once it's available."
-                    : theatricalOnly
-                      ? (
-                          <>
-                            {d.digitalReleaseDate
-                              ? `Still in cinemas — digital release ${fmtDate(d.digitalReleaseDate)}. Servers rarely carry it before then.`
-                              : "Still in cinemas — servers rarely carry a film before its digital release."}{" "}
-                            <button type="button" className="btn glass sm" onClick={() => setCheckAnyway(true)}>Check servers anyway</button>
-                          </>
-                        )
-                    : isSeries && !hasPlayableEps
-                      ? "No aired episodes available yet."
-                      : "Loading season…"}
-              </div>
-            </aside>
-          )}
         </div>
 
-        {/* Always-visible Monograph Editorial Spread */}
-        {(d.overview || creativeSlate.length > 0 || ready) && (
-          <section className="tp-monograph" aria-label="Editorial monograph">
-            <div className="tp-story">
-              <p className="overline">Synopsis // Monograph</p>
-              {d.overview ? <p className="tp-synopsis">{d.overview}</p> : <p className="muted">No synopsis listed.</p>}
+        {/* Promoted Netflix-style Episodes section for Series & Anime */}
+        {showEpisodesTab && ready && (() => {
+          const paged = epList.length > PAGE;
+          const pages = Math.max(1, Math.ceil(epList.length / PAGE));
+          const safePage = Math.max(0, Math.min(page, pages - 1));
+          const shown = paged ? epList.slice(safePage * PAGE, safePage * PAGE + PAGE) : epList;
+          const upNext = validProgress?.episode != null ? validProgress.episode : undefined;
+          const waiting = eps.loading && !eps.data;
+          const hasStills = shown.some((e) => e.still) || !!d.backdrop;
+          const layout = !hasStills ? "compact" : (view ?? "list") === "list" ? "list" : "";
+          const missingEps = epList.length > 0
+            ? selectMissingEpisodes(epList, {
+                canonicalKey,
+                season,
+                audio,
+                items: dl.items,
+                jobs: dl.jobs,
+                airedCount,
+                seriesStatus: d.status,
+              })
+            : [];
+          const batchForSeason = desktop ? getBatchForSeason(batch, canonicalKey, season) : undefined;
+          const seasonProg = desktop
+            ? computeSeasonDownloadProgress(epList, {
+                canonicalKey,
+                season,
+                audio,
+                items: dl.items,
+                jobs: dl.jobs,
+                airedCount,
+                seriesStatus: d.status,
+              })
+            : null;
+          const hasLiveSeasonJobs = Boolean(
+            seasonProg &&
+              (seasonProg.active > 0 ||
+                seasonProg.paused > 0 ||
+                seasonProg.awaitingQuality > 0 ||
+                seasonProg.failed > 0),
+          );
+          const showSeasonBar =
+            Boolean(desktop && seasonProg && seasonProg.total > 0) &&
+            ((seasonProg?.completed ?? 0) > 0 || hasLiveSeasonJobs || Boolean(batchForSeason));
 
-              {creativeSlate.length > 0 && (
-                <div className="tp-slate">
-                  {creativeSlate.map(({ role, person }) => (
-                    <div key={`${role}-${person.name}`} className="tp-credit">
-                      <span className="tp-credit-av" style={person.photo ? { backgroundImage: `url(${person.photo})` } : undefined}>
-                        {!person.photo && person.name[0]}
-                      </span>
-                      <div>
-                        <small>{role}</small>
-                        <strong>{person.name}</strong>
-                      </div>
+          return (
+            <section className="tp-episodes" aria-label="Episodes">
+              <div className="tp-eps-head">
+                <div className="tp-eps-left">
+                  <h2 className="tp-eps-title">Episodes</h2>
+                  {hasMultipleSelectors && (
+                    <div className="season-pick" role="group" aria-label="Seasons" ref={seasonInd}>
+                      {(d.seasons ?? []).map((s) => {
+                        const courNote = s.cours && s.cours.length > 1 ? ` · ${s.cours.length} parts merged` : "";
+                        return (
+                          <button key={s.number} className={s.number === season ? "on" : ""} aria-pressed={s.number === season} title={`${s.name}${s.year ? ` (${s.year})` : ""} · ${s.episodeCount} episodes${courNote}`} onClick={() => pickSeason(s.number)}>
+                            S{s.number}
+                          </button>
+                        );
+                      })}
+                      {(d.specials ?? []).map((sp) => (
+                        <button key={`special-${sp.number}`} className={season === sp.number ? "on" : ""} aria-pressed={season === sp.number} title={`${sp.name} · ${sp.episodeCount} special${sp.episodeCount === 1 ? "" : "s"}`} onClick={() => pickSeason(sp.number)}>
+                          {(d.specials?.length ?? 0) > 1 ? sp.name : "Specials"}
+                        </button>
+                      ))}
+                      {(d.upcomingSeasons ?? []).map((u) => (
+                        <span key={`upcoming-${u.number}-${u.name}`} className="chip muted" title={`${u.name}${u.year ? ` (${u.year})` : ""} · Unaired / TBA`} aria-disabled="true">
+                          S{u.number} TBA
+                        </span>
+                      ))}
                     </div>
-                  ))}
+                  )}
                 </div>
-              )}
-            </div>
 
-            <aside className="tp-telemetry-card">
-              <p className="overline">Production &amp; Release</p>
-
-              {hasRoi && (
-                <div className="tp-roi">
-                  <div className="tp-roi-head">
-                    <span>Box Office Performance</span>
-                    <b>{roiRatio.toFixed(1)}× budget</b>
+                <div className="tabbar-end">
+                  <div className="view-pick" role="group" aria-label="Episode layout" ref={viewInd}>
+                    <button className={view !== "grid" ? "on" : ""} aria-pressed={view !== "grid"} title="Editorial list" aria-label="Editorial list" onClick={() => chooseView("list")}><Icon name="rows" size={15} /></button>
+                    <button className={view === "grid" ? "on" : ""} aria-pressed={view === "grid"} title="Compact grid" aria-label="Compact grid" onClick={() => chooseView("grid")}><Icon name="grid" size={15} /></button>
                   </div>
-                  <div className="tp-roi-bars">
-                    <div className="tp-roi-row">
-                      <span>Budget</span>
-                      <div className="tp-roi-track"><i style={{ width: `${Math.max(8, Math.round((d.budget! / maxMoney) * 100))}%` }} /></div>
-                      <b>{fmtMoney(d.budget)}</b>
-                    </div>
-                    <div className="tp-roi-row rev">
-                      <span>Revenue</span>
-                      <div className="tp-roi-track"><i style={{ width: `${Math.max(8, Math.round((d.revenue! / maxMoney) * 100))}%` }} /></div>
-                      <b>{fmtMoney(d.revenue)}</b>
-                    </div>
-                  </div>
+                  {desktop && epList.length > 0 && (
+                    <>
+                      <DownloadPrefsPill />
+                      {batchForSeason || (seasonProg?.active ?? 0) > 0 ? (() => {
+                        const seasonJobTotal = (seasonProg?.active ?? 0) + (seasonProg?.paused ?? 0) + (seasonProg?.awaitingQuality ?? 0) + (seasonProg?.failed ?? 0);
+                        const needsConfirm = Boolean(batchForSeason) || seasonJobTotal > 1;
+                        return confirmSeasonStop && needsConfirm ? (
+                          <div className="ep-season-confirm">
+                            <button
+                              type="button"
+                              className="btn glass sm danger"
+                              onClick={() => {
+                                setConfirmSeasonStop(false);
+                                void cancelAllDownloads({ canonicalKey, season });
+                              }}
+                            >
+                              Confirm stop S{season}
+                            </button>
+                            <button type="button" className="btn glass sm" onClick={() => setConfirmSeasonStop(false)}>
+                              Keep
+                            </button>
+                          </div>
+                        ) : (
+                          <button
+                            type="button"
+                            className="btn glass sm ep-season-dl active"
+                            onClick={() => {
+                              if (needsConfirm) setConfirmSeasonStop(true);
+                              else void cancelAllDownloads({ canonicalKey, season });
+                            }}
+                            title={`Click to stop & clear all Season ${season} downloads`}
+                          >
+                            <span className="mini-spin" />
+                            <span>
+                              {batchForSeason
+                                ? `Stop S${season} (${batchForSeason.queued}/${batchForSeason.total})`
+                                : `Stop S${season} (${seasonProg?.completed ?? 0}/${seasonProg?.total ?? 0})`}
+                            </span>
+                          </button>
+                        );
+                      })() : missingEps.length === 0 && !hasLiveSeasonJobs ? (
+                        <span className="ep-season-done" title={`All aired episodes in Season ${season} are saved offline`}>
+                          <Icon name="check" size={13} /> S{season} offline
+                        </span>
+                      ) : missingEps.length === 0 && hasLiveSeasonJobs ? (() => {
+                        const heldCount = (seasonProg?.paused ?? 0) + (seasonProg?.awaitingQuality ?? 0) + (seasonProg?.failed ?? 0);
+                        return confirmSeasonStop && heldCount > 1 ? (
+                          <div className="ep-season-confirm">
+                            <button
+                              type="button"
+                              className="btn glass sm danger"
+                              onClick={() => {
+                                setConfirmSeasonStop(false);
+                                void cancelAllDownloads({ canonicalKey, season });
+                              }}
+                            >
+                              Confirm clear S{season}
+                            </button>
+                            <button type="button" className="btn glass sm" onClick={() => setConfirmSeasonStop(false)}>
+                              Keep
+                            </button>
+                          </div>
+                        ) : (
+                          <button
+                            type="button"
+                            className="btn glass sm ep-season-dl active"
+                            onClick={() => {
+                              if (heldCount > 1) setConfirmSeasonStop(true);
+                              else void cancelAllDownloads({ canonicalKey, season });
+                            }}
+                            title={`Stop & clear Season ${season} held/paused/failed queue`}
+                          >
+                            <Icon name="x" size={14} />
+                            <span>Stop S{season} ({heldCount})</span>
+                          </button>
+                        );
+                      })() : (
+                        <button
+                          type="button"
+                          className="btn glass sm ep-season-dl"
+                          onClick={() =>
+                            void queueSeasonDownloads(
+                              d,
+                              season,
+                              epList,
+                              audio,
+                              airedCount,
+                              dl.items,
+                              dl.jobs,
+                              dlTargetQuality,
+                              dlTargetFormat,
+                              dlPrefs.policy,
+                            )
+                          }
+                          title={`Queue ${missingEps.length} episode${missingEps.length === 1 ? "" : "s"} in ${dlQualityLabel} ${dlFormatLabel} for offline download`}
+                        >
+                          <Icon name="download" size={14} />
+                          <span>
+                            {missingEps.length < epList.length
+                              ? `Download S${season} (${missingEps.length})`
+                              : `Download S${season}`}
+                          </span>
+                        </button>
+                      )}
+                    </>
+                  )}
                 </div>
-              )}
-
-              <div className="tp-timeline">
-                {film ? (
-                  <>
-                    {d.theatricalReleaseDate && (
-                      <div><span>Theatrical</span><b>{fmtDate(d.theatricalReleaseDate)}</b></div>
-                    )}
-                    {d.digitalReleaseDate ? (
-                      <div><span>{isFutureIsoDate(d.digitalReleaseDate) ? "Digital release" : "On digital"}</span><b>{fmtDate(d.digitalReleaseDate)}</b></div>
-                    ) : d.releaseDate ? (
-                      <div><span>{isUnreleasedMedia(d) ? "Releases" : "Released"}</span><b>{fmtDate(d.releaseDate)}</b></div>
-                    ) : null}
-                  </>
-                ) : (
-                  <>
-                    {d.releaseDate && <div><span>First aired</span><b>{fmtDate(d.releaseDate)}</b></div>}
-                    {d.endDate && <div><span>Last aired</span><b>{fmtDate(d.endDate)}</b></div>}
-                    {d.nextEpisode && (
-                      <div><span>Next episode</span><b>S{d.nextEpisode.season}·E{d.nextEpisode.episode}</b></div>
-                    )}
-                  </>
-                )}
-                {(d.companies?.length || d.networks?.length) && (
-                  <div>
-                    <span>{anime ? "Studio" : film ? "Studio" : "Network"}</span>
-                    <b>{(anime ? d.companies : d.networks?.length ? d.networks : d.companies)?.slice(0, 2).join(", ")}</b>
-                  </div>
-                )}
-                {d.originalLanguage && (
-                  <div><span>Language</span><b>{languageName(d.originalLanguage)}</b></div>
-                )}
-                {d.collection && (
-                  <div><span>Collection</span><b>{d.collection}</b></div>
-                )}
               </div>
 
-              {(d.imdbId || d.homepage) && (
-                <div className="tp-ext">
-                  {d.imdbId && <a className="btn glass sm" href={`https://www.imdb.com/title/${d.imdbId}/`} target="_blank" rel="noreferrer">IMDb <Icon name="arrowUR" size={13} /></a>}
-                  {d.homepage && <a className="btn glass sm" href={d.homepage} target="_blank" rel="noreferrer">Official site <Icon name="arrowUR" size={13} /></a>}
+              {showSeasonBar && seasonProg && (
+                <div className="ep-season-prog" role="region" aria-label={`Season ${season} download progress`}>
+                  <div className="ep-sp-head">
+                    <span className="ep-sp-stat">
+                      <strong>Season {season} downloads</strong>
+                      <small>
+                        {seasonProg.completed}/{seasonProg.total} offline
+                        {batchForSeason ? ` · queueing E${batchForSeason.currentEp ?? "…"} (${batchForSeason.queued}/${batchForSeason.total})` : ""}
+                        {seasonProg.active > 0 ? ` · ${seasonProg.active} downloading` : ""}
+                        {seasonProg.awaitingQuality > 0 ? ` · ${seasonProg.awaitingQuality} awaiting choice` : ""}
+                        {seasonProg.paused > 0 ? ` · ${seasonProg.paused} paused` : ""}
+                        {seasonProg.failed > 0 ? ` · ${seasonProg.failed} failed` : ""}
+                        {fmtSpeed(seasonProg.speedBps) ? ` · ${fmtSpeed(seasonProg.speedBps)}` : ""}
+                      </small>
+                    </span>
+                    <span className="ep-sp-right">
+                      {seasonProg.awaitingQuality > 0 && (
+                        <button
+                          type="button"
+                          className="chip dlq-badge-warn ep-sp-stop"
+                          onClick={() => openQualityReviewModal()}
+                        >
+                          <Icon name="info" size={11} /> Review quality ({seasonProg.awaitingQuality})
+                        </button>
+                      )}
+                      {seasonProg.downloadingQualities.map((ql) => (
+                        <span key={`dl-${ql}`} className="dlq-badge-q" title={`Currently downloading in ${ql}`}>
+                          Downloading {ql}
+                        </span>
+                      ))}
+                      {seasonProg.downloadedQualities.map((ql) => (
+                        <span key={`sv-${ql}`} className="dlq-badge-q verified" title={`Saved offline in ${ql}`}>
+                          Saved {ql}
+                        </span>
+                      ))}
+                      <b>{Math.round(seasonProg.percent)}%</b>
+                      {seasonProg.active > 0 && (
+                        <button
+                          type="button"
+                          className="chip ep-sp-stop"
+                          title={`Pause active Season ${season} downloads`}
+                          onClick={() => void pauseAllDownloads({ canonicalKey, season })}
+                        >
+                          <Icon name="pause" size={11} /> Pause S{season}
+                        </button>
+                      )}
+                      {(seasonProg.paused > 0 || seasonProg.failed > 0) && (
+                        <button
+                          type="button"
+                          className="chip ep-sp-stop"
+                          title={`Resume or retry Season ${season} downloads`}
+                          onClick={() => void resumeAllDownloads({ canonicalKey, season })}
+                        >
+                          <Icon name="play" size={11} /> Resume S{season}
+                        </button>
+                      )}
+                      {(batchForSeason || hasLiveSeasonJobs) && (() => {
+                        const seasonJobTotal = (seasonProg?.active ?? 0) + (seasonProg?.paused ?? 0) + (seasonProg?.awaitingQuality ?? 0) + (seasonProg?.failed ?? 0);
+                        const needsConfirm = Boolean(batchForSeason) || seasonJobTotal > 1;
+                        return confirmSeasonStop && needsConfirm ? (
+                          <>
+                            <button
+                              type="button"
+                              className="chip danger ep-sp-stop"
+                              onClick={() => {
+                                setConfirmSeasonStop(false);
+                                void cancelAllDownloads({ canonicalKey, season });
+                              }}
+                            >
+                              Confirm stop
+                            </button>
+                            <button type="button" className="chip ep-sp-stop" onClick={() => setConfirmSeasonStop(false)}>
+                              Keep
+                            </button>
+                          </>
+                        ) : (
+                          <button
+                            type="button"
+                            className="chip danger ep-sp-stop"
+                            title={`Stop & clear all Season ${season} transfers`}
+                            onClick={() => {
+                              if (needsConfirm) setConfirmSeasonStop(true);
+                              else void cancelAllDownloads({ canonicalKey, season });
+                            }}
+                          >
+                            <Icon name="x" size={11} /> Stop S{season}
+                          </button>
+                        );
+                      })()}
+                    </span>
+                  </div>
+                  <div className="ep-sp-track" aria-hidden>
+                    <div className="ep-sp-active" style={{ transform: `scaleX(${Math.max(0.01, seasonProg.percent / 100)})` }} />
+                    <div className="ep-sp-done" style={{ transform: `scaleX(${Math.max(0, seasonProg.completedPercent / 100)})` }} />
+                  </div>
                 </div>
               )}
-            </aside>
-          </section>
-        )}
+
+              {!waiting && epList.length === 0 ? (
+                <div className="empty" style={{ padding: "40px 0" }}>
+                  <p>No aired episodes available for this season yet.</p>
+                  {firstSeason && season !== firstSeason.number && (
+                    <button className="btn glass sm" onClick={() => pickSeason(firstSeason.number)}>Go to Season {firstSeason.number}</button>
+                  )}
+                </div>
+              ) : (
+                <>
+                  {(paged || (airedCount ?? epList.length) > 12) && (
+                    <div className="ep-tools">
+                      {paged && (
+                        <div className="season-strip" ref={stripRef}>
+                          {Array.from({ length: pages }, (_, p) => (
+                            <button key={p} className={p === safePage ? "on" : ""} onClick={() => setPage(p)}>{p * PAGE + 1}–{Math.min(epList.length, (p + 1) * PAGE)}</button>
+                          ))}
+                        </div>
+                      )}
+                      <form
+                        className="ep-jump"
+                        onSubmit={(ev) => {
+                          ev.preventDefault();
+                          const raw = Number(jump);
+                          const maxEp = airedCount ?? epList.length;
+                          if (!raw || raw < 1 || maxEp < 1) return;
+                          if (raw > maxEp) {
+                            toast(`Only ${maxEp} aired episode${maxEp === 1 ? "" : "s"} available so far`, { icon: "info" });
+                            return;
+                          }
+                          const clamped = clampEpisode(activeSeasonObj, raw, epList.length);
+                          if (clamped != null) watch(season, clamped);
+                        }}
+                      >
+                        <Icon name="search" size={14} />
+                        <input value={jump} onChange={(ev) => setJump(ev.target.value.replace(/\D/g, ""))} placeholder="Jump to episode" inputMode="numeric" aria-label="Jump to episode number" />
+                        {jump && <button className="chip" type="submit">Play E{jump}</button>}
+                      </form>
+                    </div>
+                  )}
+
+                  <div className={`ep-grid swap ${swap ? "out" : ""} ${layout}`} key={`${season}-${audio}-${safePage}`}>
+                    {waiting && Array.from({ length: 6 }, (_, i) => <div key={i} className="ep-card skeleton" />)}
+                    {!waiting && shown.map((e, i) => {
+                      const unaired = isUnairedEpisode(e, { airedCount, seriesStatus: d.status });
+                      const still = e.still ?? sized(d.backdrop, "w780");
+                      const fallback = e.airDate
+                        ? new Date(`${e.airDate}T12:00:00`).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })
+                        : audio ? (audio === "dub" ? "English dub" : "Japanese audio · English subtitles") : "";
+                      if (unaired) {
+                        const airLabel = e.airDate
+                          ? `Airs ${new Date(`${e.airDate}T12:00:00`).toLocaleDateString(undefined, { month: "short", day: "numeric" })}`
+                          : "TBA";
+                        return (
+                          <div
+                            key={e.number}
+                            className="ep-card unaired"
+                            aria-disabled="true"
+                            style={{ ["--i" as string]: Math.min(i, 8) }}
+                            title={e.airDate ? `Episode ${e.number} airs ${fmtDate(e.airDate)}` : `Episode ${e.number} hasn't aired yet`}
+                          >
+                            <div className="ec-th">
+                              {still && <img src={still} alt="" loading="lazy" decoding="async" className="dim" />}
+                              <span className="ec-num">{e.number}</span>
+                              <span className="ec-ribbon muted">{airLabel}</span>
+                              {e.runtime ? <span className="ec-rt">{e.runtime}m</span> : null}
+                            </div>
+                            <div className="ec-tx">
+                              <div className="ec-t">{e.title}</div>
+                              <div className="ec-d">{e.overview || fallback}</div>
+                            </div>
+                          </div>
+                        );
+                      }
+                      const pKey = e.sourceKey ?? d.key;
+                      const pEp = e.courEpisode ?? e.number;
+                      const p = getProgress(canonicalKey, season, e.number, [d.key, pKey]) ?? getProgress(pKey, undefined, pEp);
+                      const isCur = upNext === e.number && (validProgress?.season ?? season) === season;
+                      const watched = !!p && p.duration > 0 && p.position / p.duration > 0.92;
+                      const left = p && p.duration > 0 && !watched ? Math.max(1, Math.round((p.duration - p.position) / 60)) : null;
+
+                      const epEntry = desktop ? findDownloadedEpisode(canonicalKey, season, e.number, audio, dl.items) : undefined;
+                      const epJob = desktop
+                        ? dl.jobs.find(
+                            (j) =>
+                              !j.isFilm &&
+                              j.status !== "cancelled" &&
+                              j.status !== "completed" &&
+                              (j.canonicalKey === canonicalKey || j.mediaKey === canonicalKey) &&
+                              (j.season == null || j.season === season) &&
+                              j.episode === e.number &&
+                              (!audio || !j.audio || j.audio === "dual" || j.audio === audio),
+                          )
+                        : undefined;
+                      const epBusy =
+                        epJob && (epJob.status === "queued" || epJob.status === "downloading" || epJob.status === "remuxing");
+                      const epPaused = epJob?.status === "paused";
+                      const epResolving = desktop && batch.pendingKeys.has(batchEpisodeKey(canonicalKey, season, e.number, audio));
+
+                      const cardEl = (
+                        <button
+                          key={desktop ? undefined : e.number}
+                          className={`ep-card ${isCur ? "cur" : ""} ${watched ? "seen" : ""}`}
+                          style={{ ["--i" as string]: Math.min(i, 8) }}
+                          onClick={() => watch(season, e.number)}
+                        >
+                          <div className="ec-th">
+                            {still && <img src={still} alt="" loading="lazy" decoding="async" className={e.still ? "" : "dim"} />}
+                            <span className="ec-num">{e.number}</span>
+                            {isCur && <span className="ec-ribbon">{p && p.position > 30 ? "Resume" : "Up next"}</span>}
+                            {watched && <span className="ec-seen" aria-label="Watched"><Icon name="check" size={12} /></span>}
+                            {e.runtime ? <span className="ec-rt">{e.runtime}m</span> : null}
+                            <span className="ec-play"><Icon name="play" size={18} /></span>
+                            {p && p.duration > 0 && !watched && <div className="ec-bar"><i style={{ transform: `scaleX(${Math.min(1, p.position / p.duration)})` }} /></div>}
+                            {(epBusy || epPaused) && epJob && (
+                              <div className="ec-dl-bar" aria-hidden>
+                                <i style={{ transform: `scaleX(${Math.max(0.03, (epJob.percent || 0) / 100)})` }} />
+                              </div>
+                            )}
+                          </div>
+                          <div className="ec-tx">
+                            <div className="ec-t">{e.title}</div>
+                            <div className="ec-d">{layout === "list" ? [left != null ? `${left}m left` : null, e.overview || fallback].filter(Boolean).join(" · ") : left != null ? `${left}m left` : e.overview || fallback}</div>
+                          </div>
+                        </button>
+                      );
+
+                      if (!desktop) return cardEl;
+
+                      return (
+                        <div key={e.number} className="ep-slot">
+                          {cardEl}
+                          <EpisodeDownloadControl
+                            detail={d}
+                            season={season}
+                            ep={e}
+                            audio={audio}
+                            entry={epEntry}
+                            job={epJob}
+                            resolving={epResolving}
+                            onPlayOffline={() => watch(season, e.number, "downloads")}
+                          />
+                        </div>
+                      );
+                    })}
+                  </div>
+                </>
+              )}
+            </section>
+          );
+        })()}
 
         {/* Interactive Lower Explorer */}
         <div className="tabbar" role="tablist" ref={tabInd}>
           {tabs.map(([id, label]) => (
             <button key={id} role="tab" aria-selected={curTab === id} className={curTab === id ? "on" : ""} onClick={() => setTab(id)}>{label}</button>
           ))}
-          {curTab === "episodes" && ready && (
-            <div className="tabbar-end">
-              {hasMultipleSelectors && (
-                <div className="season-pick" role="group" aria-label="Seasons" ref={seasonInd}>
-                  {(d.seasons ?? []).map((s) => {
-                    const courNote = s.cours && s.cours.length > 1 ? ` · ${s.cours.length} parts merged` : "";
-                    return (
-                      <button key={s.number} className={s.number === season ? "on" : ""} aria-pressed={s.number === season} title={`${s.name}${s.year ? ` (${s.year})` : ""} · ${s.episodeCount} episodes${courNote}`} onClick={() => pickSeason(s.number)}>
-                        S{s.number}
-                      </button>
-                    );
-                  })}
-                  {(d.specials ?? []).map((sp) => (
-                    <button key={`special-${sp.number}`} className={season === sp.number ? "on" : ""} aria-pressed={season === sp.number} title={`${sp.name} · ${sp.episodeCount} special${sp.episodeCount === 1 ? "" : "s"}`} onClick={() => pickSeason(sp.number)}>
-                      {(d.specials?.length ?? 0) > 1 ? sp.name : "Specials"}
-                    </button>
-                  ))}
-                  {(d.upcomingSeasons ?? []).map((u) => (
-                    <span key={`upcoming-${u.number}-${u.name}`} className="chip muted" title={`${u.name}${u.year ? ` (${u.year})` : ""} · Unaired / TBA`} aria-disabled="true">
-                      S{u.number} TBA
-                    </span>
-                  ))}
-                </div>
-              )}
-              <div className="view-pick" role="group" aria-label="Episode layout" ref={viewInd}>
-                <button className={view !== "grid" ? "on" : ""} aria-pressed={view !== "grid"} title="Editorial list" aria-label="Editorial list" onClick={() => chooseView("list")}><Icon name="rows" size={15} /></button>
-                <button className={view === "grid" ? "on" : ""} aria-pressed={view === "grid"} title="Compact grid" aria-label="Compact grid" onClick={() => chooseView("grid")}><Icon name="grid" size={15} /></button>
-              </div>
-              {desktop && epList.length > 0 && (() => {
-                const missingEps = selectMissingEpisodes(epList, {
-                  canonicalKey,
-                  season,
-                  audio,
-                  items: dl.items,
-                  jobs: dl.jobs,
-                  airedCount,
-                  seriesStatus: d.status,
-                });
-                const seasonProgTop = computeSeasonDownloadProgress(epList, {
-                  canonicalKey,
-                  season,
-                  audio,
-                  items: dl.items,
-                  jobs: dl.jobs,
-                  airedCount,
-                  seriesStatus: d.status,
-                });
-                const batchForSeason = getBatchForSeason(batch, canonicalKey, season);
-                const hasLiveSeasonJobs = seasonProgTop.active > 0 || seasonProgTop.paused > 0 || seasonProgTop.failed > 0;
-                const qPicker = (
-                  <select
-                    className="ep-q-pick"
-                    aria-label="Season download quality"
-                    title={`Download quality (${dlQualityLabel}; defaults to your streaming setting)`}
-                    value={dlTargetQuality}
-                    onChange={(ev) => {
-                      const val = Number(ev.target.value);
-                      setDlQualityOverride(val === s.preferredQuality ? null : val);
-                    }}
-                  >
-                    {[2160, 1080, 720, 480].map((q) => (
-                      <option key={q} value={q}>
-                        {q >= 2160 ? "4K" : `${q}p`}
-                      </option>
-                    ))}
-                  </select>
-                );
-                if (batchForSeason || seasonProgTop.active > 0) {
-                  return (
-                    <>
-                      {qPicker}
-                      <button
-                        type="button"
-                        className="btn glass sm ep-season-dl active"
-                        onClick={() => void cancelAllDownloads({ canonicalKey, season })}
-                        title={`Click to stop & clear all Season ${season} downloads`}
-                      >
-                        <span className="mini-spin" />
-                        <span>
-                          {batchForSeason
-                            ? `Stop S${season} (${batchForSeason.queued}/${batchForSeason.total})`
-                            : `Stop S${season} (${seasonProgTop.completed}/${seasonProgTop.total})`}
-                        </span>
-                      </button>
-                    </>
-                  );
-                }
-                if (missingEps.length === 0 && !hasLiveSeasonJobs) {
-                  return (
-                    <span className="ep-season-done" title={`All aired episodes in Season ${season} are saved offline`}>
-                      <Icon name="check" size={13} /> S{season} offline
-                    </span>
-                  );
-                }
-                if (missingEps.length === 0 && hasLiveSeasonJobs) {
-                  return (
-                    <>
-                      {qPicker}
-                      <button
-                        type="button"
-                        className="btn glass sm ep-season-dl active"
-                        onClick={() => void cancelAllDownloads({ canonicalKey, season })}
-                        title={`Stop & clear Season ${season} paused/failed queue`}
-                      >
-                        <Icon name="x" size={14} />
-                        <span>Stop S{season} ({seasonProgTop.paused + seasonProgTop.failed})</span>
-                      </button>
-                    </>
-                  );
-                }
-                return (
-                  <>
-                    {qPicker}
-                    <button
-                      type="button"
-                      className="btn glass sm ep-season-dl"
-                      onClick={() =>
-                        void queueSeasonDownloads(
-                          d,
-                          season,
-                          epList,
-                          audio,
-                          airedCount,
-                          dl.items,
-                          dl.jobs,
-                          dlTargetQuality,
-                        )
-                      }
-                      title={`Queue ${missingEps.length} episode${missingEps.length === 1 ? "" : "s"} in ${dlQualityLabel} for offline download`}
-                    >
-                      <Icon name="download" size={14} />
-                      <span>
-                        {missingEps.length < epList.length
-                          ? `Download S${season} (${missingEps.length})`
-                          : `Download S${season}`}
-                      </span>
-                    </button>
-                  </>
-                );
-              })()}
-            </div>
-          )}
         </div>
 
         <div className="tp-section" key={curTab}>
@@ -792,305 +988,6 @@ export function Title() {
             </div>
           )}
 
-          {curTab === "episodes" && (() => {
-            const paged = epList.length > PAGE;
-            const pages = Math.max(1, Math.ceil(epList.length / PAGE));
-            const safePage = Math.max(0, Math.min(page, pages - 1));
-            const shown = paged ? epList.slice(safePage * PAGE, safePage * PAGE + PAGE) : epList;
-            const upNext = validProgress?.episode != null ? validProgress.episode : undefined;
-            const waiting = !ready || (eps.loading && !eps.data);
-
-            if (!waiting && epList.length === 0) {
-              return (
-                <div className="empty" style={{ padding: "40px 0" }}>
-                  <p>No aired episodes available for this season yet.</p>
-                  {firstSeason && season !== firstSeason.number && (
-                    <button className="btn glass sm" onClick={() => pickSeason(firstSeason.number)}>Go to Season {firstSeason.number}</button>
-                  )}
-                </div>
-              );
-            }
-
-            const hasStills = shown.some((e) => e.still) || !!d.backdrop;
-            const layout = !hasStills ? "compact" : (view ?? (epList.length > 30 ? "grid" : "list")) === "list" ? "list" : "";
-            const batchForSeason = desktop ? getBatchForSeason(batch, canonicalKey, season) : undefined;
-            const seasonProg = desktop
-              ? computeSeasonDownloadProgress(epList, {
-                  canonicalKey,
-                  season,
-                  audio,
-                  items: dl.items,
-                  jobs: dl.jobs,
-                  airedCount,
-                  seriesStatus: d.status,
-                })
-              : null;
-            const showSeasonBar =
-              Boolean(desktop && seasonProg && seasonProg.total > 0) &&
-              ((seasonProg?.completed ?? 0) > 0 ||
-                (seasonProg?.active ?? 0) > 0 ||
-                (seasonProg?.paused ?? 0) > 0 ||
-                (seasonProg?.failed ?? 0) > 0 ||
-                Boolean(batchForSeason));
-
-            return (
-              <>
-                {showSeasonBar && seasonProg && (
-                  <div className="ep-season-prog" role="region" aria-label={`Season ${season} download progress`}>
-                    <div className="ep-sp-head">
-                      <span className="ep-sp-stat">
-                        <strong>Season {season} downloads</strong>
-                        <small>
-                          {seasonProg.completed}/{seasonProg.total} offline
-                          {batchForSeason ? ` · queueing E${batchForSeason.currentEp ?? "…"} (${batchForSeason.queued}/${batchForSeason.total})` : ""}
-                          {seasonProg.active > 0 ? ` · ${seasonProg.active} downloading` : ""}
-                          {seasonProg.paused > 0 ? ` · ${seasonProg.paused} paused` : ""}
-                          {seasonProg.failed > 0 ? ` · ${seasonProg.failed} failed` : ""}
-                          {fmtSpeed(seasonProg.speedBps) ? ` · ${fmtSpeed(seasonProg.speedBps)}` : ""}
-                        </small>
-                      </span>
-                      <span className="ep-sp-right">
-                        {seasonProg.downloadingQualities.map((ql) => (
-                          <span key={`dl-${ql}`} className="dlq-badge-q" title={`Currently downloading in ${ql}`}>
-                            Downloading {ql}
-                          </span>
-                        ))}
-                        {seasonProg.downloadedQualities.map((ql) => (
-                          <span key={`sv-${ql}`} className="dlq-badge-q verified" title={`Saved offline in ${ql}`}>
-                            Saved {ql}
-                          </span>
-                        ))}
-                        <b>{Math.round(seasonProg.percent)}%</b>
-                        {seasonProg.active > 0 && (
-                          <button
-                            type="button"
-                            className="chip ep-sp-stop"
-                            title={`Pause active Season ${season} downloads`}
-                            onClick={() => void pauseAllDownloads({ canonicalKey, season })}
-                          >
-                            <Icon name="pause" size={11} /> Pause S{season}
-                          </button>
-                        )}
-                        {(seasonProg.paused > 0 || seasonProg.failed > 0) && (
-                          <button
-                            type="button"
-                            className="chip ep-sp-stop"
-                            title={`Resume or retry Season ${season} downloads`}
-                            onClick={() => void resumeAllDownloads({ canonicalKey, season })}
-                          >
-                            <Icon name="play" size={11} /> Resume S{season}
-                          </button>
-                        )}
-                        {(batchForSeason || seasonProg.active > 0 || seasonProg.paused > 0 || seasonProg.failed > 0) && (
-                          <button
-                            type="button"
-                            className="chip danger ep-sp-stop"
-                            title={`Stop & clear all Season ${season} transfers`}
-                            onClick={() => void cancelAllDownloads({ canonicalKey, season })}
-                          >
-                            <Icon name="x" size={11} /> Stop S{season}
-                          </button>
-                        )}
-                      </span>
-                    </div>
-                    <div className="ep-sp-track" aria-hidden>
-                      <div className="ep-sp-active" style={{ transform: `scaleX(${Math.max(0.01, seasonProg.percent / 100)})` }} />
-                      <div className="ep-sp-done" style={{ transform: `scaleX(${Math.max(0, seasonProg.completedPercent / 100)})` }} />
-                    </div>
-                  </div>
-                )}
-                {(paged || (airedCount ?? epList.length) > 12) && (
-                  <div className="ep-tools">
-                    {paged && (
-                      <div className="season-strip" ref={stripRef}>
-                        {Array.from({ length: pages }, (_, p) => (
-                          <button key={p} className={p === safePage ? "on" : ""} onClick={() => setPage(p)}>{p * PAGE + 1}–{Math.min(epList.length, (p + 1) * PAGE)}</button>
-                        ))}
-                      </div>
-                    )}
-                    <form
-                      className="ep-jump"
-                      onSubmit={(ev) => {
-                        ev.preventDefault();
-                        const raw = Number(jump);
-                        const maxEp = airedCount ?? epList.length;
-                        if (!raw || raw < 1 || maxEp < 1) return;
-                        if (raw > maxEp) {
-                          toast(`Only ${maxEp} aired episode${maxEp === 1 ? "" : "s"} available so far`, { icon: "info" });
-                          return;
-                        }
-                        const clamped = clampEpisode(activeSeasonObj, raw, epList.length);
-                        if (clamped != null) watch(season, clamped);
-                      }}
-                    >
-                      <Icon name="search" size={14} />
-                      <input value={jump} onChange={(ev) => setJump(ev.target.value.replace(/\D/g, ""))} placeholder="Jump to episode" inputMode="numeric" aria-label="Jump to episode number" />
-                      {jump && <button className="chip" type="submit">Play E{jump}</button>}
-                    </form>
-                  </div>
-                )}
-                <div className={`ep-grid swap ${swap ? "out" : ""} ${layout}`} key={`${season}-${audio}-${safePage}`}>
-                  {waiting && Array.from({ length: 6 }, (_, i) => <div key={i} className="ep-card skeleton" />)}
-                  {!waiting && shown.map((e, i) => {
-                    const unaired = isUnairedEpisode(e, { airedCount, seriesStatus: d.status });
-                    const still = e.still ?? sized(d.backdrop, "w780");
-                    const fallback = e.airDate
-                      ? new Date(`${e.airDate}T12:00:00`).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })
-                      : audio ? (audio === "dub" ? "English dub" : "Japanese audio · English subtitles") : "";
-                    if (unaired) {
-                      const airLabel = e.airDate
-                        ? `Airs ${new Date(`${e.airDate}T12:00:00`).toLocaleDateString(undefined, { month: "short", day: "numeric" })}`
-                        : "TBA";
-                      return (
-                        <div
-                          key={e.number}
-                          className="ep-card unaired"
-                          aria-disabled="true"
-                          style={{ ["--i" as string]: Math.min(i, 8) }}
-                          title={e.airDate ? `Episode ${e.number} airs ${fmtDate(e.airDate)}` : `Episode ${e.number} hasn't aired yet`}
-                        >
-                          <div className="ec-th">
-                            {still && <img src={still} alt="" loading="lazy" decoding="async" className="dim" />}
-                            <span className="ec-num">{e.number}</span>
-                            <span className="ec-ribbon muted">{airLabel}</span>
-                            {e.runtime ? <span className="ec-rt">{e.runtime}m</span> : null}
-                          </div>
-                          <div className="ec-tx">
-                            <div className="ec-t">{e.title}</div>
-                            <div className="ec-d">{e.overview || fallback}</div>
-                          </div>
-                        </div>
-                      );
-                    }
-                    const pKey = e.sourceKey ?? d.key;
-                    const pEp = e.courEpisode ?? e.number;
-                    const p = getProgress(canonicalKey, season, e.number, [d.key, pKey]) ?? getProgress(pKey, undefined, pEp);
-                    const isCur = upNext === e.number && (validProgress?.season ?? season) === season;
-                    const watched = !!p && p.duration > 0 && p.position / p.duration > 0.92;
-                    const left = p && p.duration > 0 && !watched ? Math.max(1, Math.round((p.duration - p.position) / 60)) : null;
-
-                    const epEntry = desktop ? findDownloadedEpisode(canonicalKey, season, e.number, audio, dl.items) : undefined;
-                    const epSaved = Boolean(epEntry);
-                    const savedQTag = formatQualityTag(epEntry?.quality, epEntry?.qualityVerified);
-                    const epJob = desktop
-                      ? dl.jobs.find(
-                          (j) =>
-                            !j.isFilm &&
-                            j.status !== "cancelled" &&
-                            j.status !== "completed" &&
-                            (j.canonicalKey === canonicalKey || j.mediaKey === canonicalKey) &&
-                            (j.season == null || j.season === season) &&
-                            j.episode === e.number &&
-                            (!audio || !j.audio || j.audio === "dual" || j.audio === audio),
-                        )
-                      : undefined;
-                    const epBusy =
-                      epJob && (epJob.status === "queued" || epJob.status === "downloading" || epJob.status === "remuxing");
-                    const epPaused = epJob?.status === "paused";
-                    const epFailed = epJob?.status === "failed";
-                    const epResolving = desktop && batch.pendingKeys.has(batchEpisodeKey(canonicalKey, season, e.number, audio));
-                    const epQShort = epJob ? formatDownloadQuality(epJob).label.replace(/^Up to /, "") : null;
-
-                    const cardEl = (
-                      <button
-                        key={desktop ? undefined : e.number}
-                        className={`ep-card ${isCur ? "cur" : ""} ${watched ? "seen" : ""}`}
-                        style={{ ["--i" as string]: Math.min(i, 8) }}
-                        onClick={() => watch(season, e.number)}
-                      >
-                        <div className="ec-th">
-                          {still && <img src={still} alt="" loading="lazy" decoding="async" className={e.still ? "" : "dim"} />}
-                          <span className="ec-num">{e.number}</span>
-                          {epSaved && (
-                            <span
-                              className={`ec-offline ${savedQTag ? "has-q" : ""}`}
-                              title={savedQTag ? `Saved offline (${savedQTag}${epEntry?.videoCodec ? ` · ${epEntry.videoCodec}` : ""})` : "Saved offline"}
-                            >
-                              <Icon name="download" size={10} />
-                              {savedQTag && <span>{savedQTag}</span>}
-                            </span>
-                          )}
-                          {isCur && <span className="ec-ribbon">{p && p.position > 30 ? "Resume" : "Up next"}</span>}
-                          {watched && <span className="ec-seen" aria-label="Watched"><Icon name="check" size={12} /></span>}
-                          {e.runtime ? <span className="ec-rt">{e.runtime}m</span> : null}
-                          <span className="ec-play"><Icon name="play" size={18} /></span>
-                          {p && p.duration > 0 && !watched && <div className="ec-bar"><i style={{ transform: `scaleX(${Math.min(1, p.position / p.duration)})` }} /></div>}
-                          {(epBusy || epPaused) && epJob && (
-                            <div className="ec-dl-bar" aria-hidden>
-                              <i style={{ transform: `scaleX(${Math.max(0.03, (epJob.percent || 0) / 100)})` }} />
-                            </div>
-                          )}
-                        </div>
-                        <div className="ec-tx">
-                          <div className="ec-t">{e.title}</div>
-                          <div className="ec-d">{layout === "list" ? [left != null ? `${left}m left` : null, e.overview || fallback].filter(Boolean).join(" · ") : left != null ? `${left}m left` : e.overview || fallback}</div>
-                        </div>
-                      </button>
-                    );
-
-                    if (!desktop) return cardEl;
-
-                    const epDlLabel = epBusy
-                      ? epJob.status === "remuxing"
-                        ? `Saving E${e.number}${epQShort ? ` · ${epQShort}` : ""} (${epJob.providerName})…`
-                        : `Pause E${e.number} · Downloading ${epQShort ? `${epQShort} · ` : ""}${Math.round(epJob.percent)}% (${epJob.providerName})`
-                      : epPaused
-                        ? `Resume E${e.number}${epQShort ? ` · ${epQShort}` : ""} (${epJob.providerName})`
-                        : epFailed
-                          ? `Retry / Switch server for E${e.number}${epJob?.error ? ` (${epJob.error})` : ""}`
-                          : epResolving
-                            ? `Finding stream for E${e.number}…`
-                            : epSaved
-                              ? `E${e.number} saved offline${savedQTag ? ` (${savedQTag})` : ""}`
-                              : `Download E${e.number} (${dlQualityLabel})`;
-
-                    return (
-                      <div key={e.number} className="ep-slot">
-                        {cardEl}
-                        <button
-                          type="button"
-                          className={`ep-dl ${epBusy || epResolving ? "busy" : ""} ${epPaused ? "paused" : ""} ${epFailed ? "failed" : ""} ${epSaved ? "saved" : ""}`}
-                          title={epDlLabel}
-                          aria-label={epDlLabel}
-                          disabled={epJob?.status === "remuxing" || epResolving || (epSaved && !epBusy && !epPaused)}
-                          onClick={() => {
-                            if (epBusy && epJob) {
-                              void pauseDownload(epJob.id);
-                            } else if (epFailed && epJob) {
-                              void switchDownloadToNextServer(epJob);
-                            } else if (epPaused && epJob) {
-                              void resumeDownload(epJob.id);
-                            } else if (!epSaved && !epResolving) {
-                              void queueEpisodeDownload(d, season, e, audio, dlTargetQuality);
-                            }
-                          }}
-                        >
-                          {epResolving ? (
-                            <span className="mini-spin" />
-                          ) : epBusy ? (
-                            <span>
-                              {epJob.status === "remuxing"
-                                ? `${epQShort ?? ""}…`
-                                : `${epQShort ? `${epQShort} · ` : ""}${Math.round(epJob.percent)}%`}
-                            </span>
-                          ) : epPaused ? (
-                            <Icon name="play" size={12} />
-                          ) : epFailed ? (
-                            <Icon name="refresh" size={12} />
-                          ) : epSaved ? (
-                            <Icon name="check" size={13} />
-                          ) : (
-                            <Icon name="download" size={13} />
-                          )}
-                        </button>
-                      </div>
-                    );
-                  })}
-                </div>
-              </>
-            );
-          })()}
-
           {curTab === "cast" && (
             <div className="people">
               {!ready && Array.from({ length: 8 }, (_, i) => <div key={i} className="person"><div className="person-img sk" /></div>)}
@@ -1118,7 +1015,52 @@ export function Title() {
             </div>
           )}
 
-          {curTab === "details" && <Details d={d} anime={anime} />}
+          {curTab === "details" && (
+            <div className="tp-details-wrap">
+              {(creativeSlate.length > 0 || hasRoi) && (
+                <div className="tp-monograph compact">
+                  {creativeSlate.length > 0 && (
+                    <div className="tp-slate">
+                      {creativeSlate.map(({ role, person }) => (
+                        <div key={`${role}-${person.name}`} className="tp-credit">
+                          <span className="tp-credit-av" style={person.photo ? { backgroundImage: `url(${person.photo})` } : undefined}>
+                            {!person.photo && person.name[0]}
+                          </span>
+                          <div>
+                            <small>{role}</small>
+                            <strong>{person.name}</strong>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {hasRoi && (
+                    <aside className="tp-telemetry-card">
+                      <div className="tp-roi">
+                        <div className="tp-roi-head">
+                          <span>Box Office Performance</span>
+                          <b>{roiRatio.toFixed(1)}× budget</b>
+                        </div>
+                        <div className="tp-roi-bars">
+                          <div className="tp-roi-row">
+                            <span>Budget</span>
+                            <div className="tp-roi-track"><i style={{ width: `${Math.max(8, Math.round((d.budget! / maxMoney) * 100))}%` }} /></div>
+                            <b>{fmtMoney(d.budget)}</b>
+                          </div>
+                          <div className="tp-roi-row rev">
+                            <span>Revenue</span>
+                            <div className="tp-roi-track"><i style={{ width: `${Math.max(8, Math.round((d.revenue! / maxMoney) * 100))}%` }} /></div>
+                            <b>{fmtMoney(d.revenue)}</b>
+                          </div>
+                        </div>
+                      </div>
+                    </aside>
+                  )}
+                </div>
+              )}
+              <Details d={d} anime={anime} />
+            </div>
+          )}
 
           {curTab === "more" && (
             <div className="grid">
@@ -1132,6 +1074,124 @@ export function Title() {
       </div>
       {trailerOpen && isYouTubeId(d.trailerYouTubeId) && (
         <TrailerModal id={d.trailerYouTubeId} title={d.title} onClose={() => setTrailerOpen(false)} />
+      )}
+    </div>
+  );
+}
+
+/** On-demand Servers button + anchored drawer keeping hero actions focused and uncluttered. */
+function ServersPopover({
+  req,
+  detail,
+  what,
+  ready,
+  unreleasedFilm,
+  theatricalOnly,
+  isSeries,
+  hasPlayableEps,
+  releaseDate,
+  digitalReleaseDate,
+  onCheckAnyway,
+  onPlay,
+}: {
+  req: ReturnType<typeof resolvePlaybackRequest>;
+  detail: MediaDetail;
+  what: string;
+  ready: boolean;
+  unreleasedFilm: boolean;
+  theatricalOnly: boolean;
+  isSeries: boolean;
+  hasPlayableEps: boolean;
+  releaseDate?: string;
+  digitalReleaseDate?: string;
+  onCheckAnyway: () => void;
+  onPlay: (server?: string) => void;
+}) {
+  const { snap } = useSourceSession(req, 1);
+  const [open, setOpen] = useState(false);
+  const wrapRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("mousedown", onDown);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", onDown);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  const readyCount = snap?.ready ?? 0;
+  const busy = Boolean(snap?.busy);
+  const statusText = req
+    ? readyCount > 0
+      ? `${readyCount} ready`
+      : busy
+        ? "Scanning…"
+        : `${snap?.waiting ?? 0} standby`
+    : !ready
+      ? "Loading"
+      : "Unavailable";
+
+  return (
+    <div className={`tp-servers-wrap ${open ? "open" : ""}`} ref={wrapRef}>
+      <button
+        type="button"
+        className={`btn glass tp-servers-btn ${open ? "on" : ""}`}
+        aria-expanded={open}
+        aria-haspopup="dialog"
+        onClick={() => setOpen((o) => !o)}
+        title="Inspect streaming servers & quality sources"
+      >
+        <i className={`tp-srv-dot ${readyCount > 0 ? "ok" : busy ? "busy" : ""}`} aria-hidden />
+        <span>Servers</span>
+        <small>{statusText}</small>
+      </button>
+
+      {open && (
+        <div className="tp-servers-pop" role="dialog" aria-label={`Streaming servers for ${detail.title}`}>
+          {req ? (
+            <SmartSource
+              req={req}
+              detail={detail}
+              what={what}
+              onPlay={(srv) => {
+                setOpen(false);
+                onPlay(srv);
+              }}
+            />
+          ) : (
+            <aside className="smart">
+              <div className="h"><span><Icon name="layers" size={16} /> Servers</span></div>
+              <div className="smart-note">
+                {!ready
+                  ? "Finding where this plays…"
+                  : unreleasedFilm
+                    ? releaseDate
+                      ? `Not out yet — releases ${fmtDate(releaseDate)}. Servers will appear once it's available.`
+                      : "Not released yet — servers will appear once it's available."
+                    : theatricalOnly
+                      ? (
+                          <>
+                            {digitalReleaseDate
+                              ? `Still in cinemas — digital release ${fmtDate(digitalReleaseDate)}. Servers rarely carry it before then.`
+                              : "Still in cinemas — servers rarely carry a film before its digital release."}{" "}
+                            <button type="button" className="btn glass sm" onClick={onCheckAnyway}>Check servers anyway</button>
+                          </>
+                        )
+                    : isSeries && !hasPlayableEps
+                      ? "No aired episodes available yet."
+                      : "Loading season…"}
+              </div>
+            </aside>
+          )}
+        </div>
       )}
     </div>
   );
@@ -1190,8 +1250,24 @@ function Details({ d, anime }: { d: MediaDetail; anime: boolean }) {
         </dl>
       )}
       <div className="facts-foot">
-        {d.imdbId && <a className="btn glass sm" href={`https://www.imdb.com/title/${d.imdbId}/`} target="_blank" rel="noreferrer">IMDb <Icon name="arrowUR" size={13} /></a>}
-        {d.homepage && <a className="btn glass sm" href={d.homepage} target="_blank" rel="noreferrer">Official site <Icon name="arrowUR" size={13} /></a>}
+        {d.imdbId && (
+          <button
+            type="button"
+            className="btn glass sm"
+            onClick={() => openExternal(`https://www.imdb.com/title/${d.imdbId}/`)}
+          >
+            IMDb <Icon name="arrowUR" size={13} />
+          </button>
+        )}
+        {d.homepage && (
+          <button
+            type="button"
+            className="btn glass sm"
+            onClick={() => openExternal(d.homepage!)}
+          >
+            Official site <Icon name="arrowUR" size={13} />
+          </button>
+        )}
         <span className="muted">
           Data from {d.key.startsWith("anilist:") ? "AniList" : "TMDB"}
           {d.fetchedAt ? ` · updated ${fmtAgo(d.fetchedAt)}` : ""}

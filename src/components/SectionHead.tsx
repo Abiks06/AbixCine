@@ -2,9 +2,9 @@ import type { ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { Icon } from "./Icon";
 
-/** A section header: mono kicker above an editorial display title (optional italic serif accent) and right tools. */
+/** A section header: editorial display title (optional italic serif accent) and right tools. */
 export function SectionHead({
-  eyebrow,
+  eyebrow: _eyebrow,
   title,
   accentWord,
   to,
@@ -19,7 +19,6 @@ export function SectionHead({
   return (
     <header className="shelf-head">
       <div className="shelf-title">
-        {eyebrow && <p className="shelf-eyebrow">{eyebrow}</p>}
         <h2>
           {title}
           {accentWord && <> <em>{accentWord}</em></>}

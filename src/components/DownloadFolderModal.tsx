@@ -1,5 +1,6 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { useDownloadSetupPrompt } from "../lib/downloads";
+import { useModalFocusTrap } from "../lib/useModalFocusTrap";
 import { Icon } from "./Icon";
 
 /**
@@ -8,17 +9,20 @@ import { Icon } from "./Icon";
  */
 export function DownloadFolderModal() {
   const { open, defaultDir, busy, chooseFolder, useDefault, cancel } = useDownloadSetupPrompt();
+  const modalRef = useRef<HTMLDivElement>(null);
+  useModalFocusTrap(open, modalRef);
 
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape" && !busy) {
         e.preventDefault();
+        e.stopPropagation();
         cancel();
       }
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
   }, [open, busy, cancel]);
 
   if (!open) return null;
@@ -33,7 +37,7 @@ export function DownloadFolderModal() {
         if (e.target === e.currentTarget && !busy) cancel();
       }}
     >
-      <div className="dl-modal glass">
+      <div className="dl-modal glass" ref={modalRef} tabIndex={-1}>
         <div className="dl-modal-head">
           <span className="dl-modal-ic" aria-hidden>
             <Icon name="folder" size={20} />

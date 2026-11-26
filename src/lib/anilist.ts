@@ -94,20 +94,32 @@ async function gql<T = unknown>(query: string, variables: Record<string, unknown
   return req;
 }
 
-const FIELDS = `id idMal title { romaji english native } description(asHtml: false) seasonYear startDate { year month day } averageScore genres
+const FIELDS = `id idMal title { romaji english native } synonyms description(asHtml: false) seasonYear startDate { year month day } averageScore genres
   coverImage { extraLarge color } bannerImage nextAiringEpisode { episode airingAt } episodes duration format status`;
 
 const isoDate = (d?: { year?: number | null; month?: number | null; day?: number | null } | null) =>
   d?.year ? `${d.year}-${String(d.month ?? 1).padStart(2, "0")}-${String(d.day ?? 1).padStart(2, "0")}` : undefined;
 
 function toMedia(m: AnilistMediaItem): Media {
+  const title = m.title?.english || m.title?.romaji || "Untitled";
+  const originalTitle = m.title?.romaji ?? undefined;
+  const known = new Set(
+    [title, originalTitle].filter((s): s is string => Boolean(s)).map((s) => s.trim().toLowerCase()),
+  );
+  const synonyms = [...new Set(
+    [m.title?.native, ...(m.synonyms ?? [])]
+      .filter((s): s is string => typeof s === "string" && s.trim().length > 1)
+      .map((s) => s.trim())
+      .filter((s) => !known.has(s.toLowerCase())),
+  )];
   return {
     key: `anilist:${m.id}`,
     kind: "anime",
     anilistId: m.id,
     malId: m.idMal ?? undefined,
-    title: m.title?.english || m.title?.romaji || "Untitled",
-    originalTitle: m.title?.romaji ?? undefined,
+    title,
+    originalTitle,
+    ...(synonyms.length ? { synonyms } : {}),
     overview: stripHtml(m.description ?? ""),
     year: m.seasonYear ?? m.startDate?.year ?? undefined,
     releaseDate: isoDate(m.startDate),
@@ -319,7 +331,7 @@ export async function animeFranchiseNodes(key: string): Promise<RawAnilistNode[]
       if (ids.size > 40) break;
     }
     const d = await gql<{ Page?: { media?: RawAnilistNode[] } }>(
-      `query($ids:[Int]){ Page(perPage:50){ media(id_in:$ids,type:ANIME){ id idMal format status episodes duration seasonYear startDate { year month day } title { romaji english native } nextAiringEpisode { episode airingAt } } } }`,
+      `query($ids:[Int]){ Page(perPage:50){ media(id_in:$ids,type:ANIME){ id idMal format status episodes duration seasonYear startDate { year month day } title { romaji english native } synonyms nextAiringEpisode { episode airingAt } } } }`,
       { ids: [...ids] },
     );
     const nodes: RawAnilistNode[] = (d.Page?.media ?? []).filter(

@@ -1,3 +1,4 @@
+import { naturalCompare } from "./downloads";
 import { normTitle } from "./format";
 import { cached } from "./cache";
 import { searchAll } from "./search";
@@ -77,7 +78,30 @@ export function groupDrive(files: LibFile[]): DriveTitle[] {
       map.set(id, { id, title, year, files: [f], size: f.size, isShow, season: ep.season, ...t });
     }
   }
-  return [...map.values()].sort((a, b) => a.title.localeCompare(b.title));
+  for (const g of map.values()) {
+    g.files.sort((a, b) => {
+      const ea = parseEpisode(a.name, a.path);
+      const eb = parseEpisode(b.name, b.path);
+      return (ea.season ?? 0) - (eb.season ?? 0) || (ea.episode ?? 0) - (eb.episode ?? 0) || naturalCompare(a.name, b.name);
+    });
+  }
+  return [...map.values()].sort((a, b) => naturalCompare(a.title, b.title));
+}
+
+export type DriveSort = "title" | "count" | "size";
+
+/** Sort grouped Drive library entries by natural title, episode/file count, or disk size. */
+export function sortDriveGroups(titles: DriveTitle[], sortBy: DriveSort): DriveTitle[] {
+  const copy = [...titles];
+  switch (sortBy) {
+    case "count":
+      return copy.sort((a, b) => b.files.length - a.files.length || naturalCompare(a.title, b.title));
+    case "size":
+      return copy.sort((a, b) => b.size - a.size || naturalCompare(a.title, b.title));
+    case "title":
+    default:
+      return copy.sort((a, b) => naturalCompare(a.title, b.title));
+  }
 }
 
 /** Find the catalog entry for a title on disk, cached for a week. */
@@ -122,11 +146,43 @@ export function useDrive(force = 0) {
         const errs = scanErrors();
         const warning = errs.length ? `Couldn't read ${errs.map((e) => e.path).join(", ")} (${errs[0].message})` : undefined;
         setState({ loading: false, titles, files: files.length, at: Date.now(), warning });
-        titles.forEach((t) =>
-          matchDrive(t)
-            .then((media) => live && media && setState((x) => ({ ...x, titles: x.titles.map((y) => (y.id === t.id ? { ...y, media } : y)) })))
-            .catch(() => {}),
-        );
+        const pending = new Map<string, Media>();
+        let flushTimer: number | undefined;
+        const flush = () => {
+          flushTimer = undefined;
+          if (!live || pending.size === 0) return;
+          const batch = new Map(pending);
+          pending.clear();
+          setState((x) => ({
+            ...x,
+            titles: x.titles.map((y) => {
+              const media = batch.get(y.id);
+              return media ? { ...y, media } : y;
+            }),
+          }));
+        };
+        const queue = [...titles];
+        const concurrency = Math.min(3, queue.length);
+        const runWorker = async () => {
+          while (live && queue.length > 0) {
+            const t = queue.shift();
+            if (!t) break;
+            try {
+              const media = await matchDrive(t);
+              if (!live || !media) continue;
+              pending.set(t.id, media);
+              if (flushTimer === undefined) {
+                flushTimer = window.setTimeout(flush, 150);
+              }
+            } catch {
+              // Ignore failed metadata match for a single local title
+            }
+          }
+        };
+        void Promise.all(Array.from({ length: concurrency }, runWorker)).then(() => {
+          if (flushTimer !== undefined) window.clearTimeout(flushTimer);
+          flush();
+        });
       })
       .catch((e) => live && setState({ loading: false, titles: [], files: 0, error: String(e?.message ?? e) }));
     return () => {

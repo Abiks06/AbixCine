@@ -631,6 +631,8 @@ export interface StreamCandidate {
   quality?: number;
   /** Absolute path for a library file; desktop playback normalizes unsupported audio codecs. */
   localPath?: string;
+  /** True when a local/downloaded file is already verified browser-playable without FFmpeg remuxing. */
+  localWebReady?: boolean;
   subtitles?: SubtitleTrack[];
   /**
    * What audio this stream carries. "dual" means it has both and the player picks the track;
@@ -662,6 +664,10 @@ export interface StreamCandidate {
    * the server list can show what a server actually found.
    */
   matched?: { title: string; year?: number };
+  /** Stream container/codec may not play directly in HTML5 <video> (e.g. MKV/HEVC/TrueHD), though downloadable via FFmpeg. */
+  notWebReady?: boolean;
+  /** Optional file size hint in bytes (from Stremio/HTTP stream metadata). */
+  sizeBytes?: number;
   /**
    * Is the stream really this title? Its length compared with the catalog runtime (filled in by
    * the session). "mismatch": far too short or too long, probably a different title or a trailer.

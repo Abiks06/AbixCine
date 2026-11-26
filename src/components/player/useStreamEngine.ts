@@ -7,6 +7,7 @@
 import type Hls from "hls.js";
 import type shaka from "shaka-player";
 import { convertFileSrc, invoke, isTauri } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useRef } from "react";
 import { DashCueCollector } from "../../lib/dashCues";
 import { langLabel, preferredAudioTrackIndex } from "../../lib/subtitles";
@@ -70,6 +71,7 @@ export interface StreamEngineContext {
   setNativeSubs: (tracks: UnifiedSubTrack[]) => void;
   setPlaying: React.Dispatch<React.SetStateAction<boolean>>;
   setPreparingLocal: React.Dispatch<React.SetStateAction<boolean>>;
+  setLocalPreparePct: React.Dispatch<React.SetStateAction<number | null>>;
   setPreparingTorrent: React.Dispatch<React.SetStateAction<boolean>>;
   setRecovering: React.Dispatch<React.SetStateAction<boolean>>;
   setRetrySeq: React.Dispatch<React.SetStateAction<number>>;
@@ -138,6 +140,7 @@ export function useStreamEngine(ctx: StreamEngineContext) {
     setNativeSubs,
     setPlaying,
     setPreparingLocal,
+    setLocalPreparePct,
     setPreparingTorrent,
     setRecovering,
     setRetrySeq,
@@ -373,10 +376,21 @@ export function useStreamEngine(ctx: StreamEngineContext) {
   /* ---------------------------------------------------------- attach source */
 
   const lastRefreshedAtRef = useRef(new Map<string, number>());
+  const localDirectPathRef = useRef<string | null>(null);
+  const localRemuxAttemptedRef = useRef(false);
+  const localRetryFnRef = useRef<(() => void) | null>(null);
+  const localPathTrackRef = useRef<string | null>(null);
 
   useEffect(() => {
     const c = curRef.current;
     if (!c) return;
+    if (localPathTrackRef.current !== (c.localPath ?? null)) {
+      localRemuxAttemptedRef.current = false;
+      localPathTrackRef.current = c.localPath ?? null;
+    }
+    localDirectPathRef.current = null;
+    localRetryFnRef.current = null;
+    let unlistenProgress: UnlistenFn | null = null;
     activeSessionRef.current += 1;
     attachStartRef.current = performance.now();
     started.current = false;
@@ -387,6 +401,7 @@ export function useStreamEngine(ctx: StreamEngineContext) {
     setFatal(null);
     setEnded(false);
     setPreparingLocal(false);
+    setLocalPreparePct(null);
     setPreparingTorrent(false);
     stopActiveTorrent();
     setAudioTracks([]);
@@ -844,39 +859,96 @@ export function useStreamEngine(ctx: StreamEngineContext) {
           }
         })();
       } else if (target.localPath) {
-        setPreparingLocal(true);
         const localPath = target.localPath;
         const audioIndex = localAudioRef.current;
-        invoke<string>("prepare_local_media", { path: localPath, ...(audioIndex != null ? { audioIndex } : {}) })
-          .then((path) => {
+        const shouldFastPath = Boolean(
+          target.localWebReady && audioIndex == null && !localRemuxAttemptedRef.current,
+        );
+
+        const loadLocalAudioTracks = () => {
+          invoke<{ index: number; codec: string; channels?: number; language?: string; title?: string; isDefault: boolean }[]>(
+            "probe_local_audio",
+            { path: localPath },
+          )
+            .then((list) => {
+              if (cancelled || list.length < 2) return;
+              localAudioModeRef.current = true;
+              setAudioTracks(
+                list.map((a) => {
+                  const ch = a.channels === 6 ? " 5.1" : a.channels === 8 ? " 7.1" : a.channels === 1 ? " mono" : "";
+                  const base = a.title || (a.language ? langLabel(a.language) : `Track ${a.index + 1}`);
+                  return { id: a.index, label: `${base}${ch}`, lang: a.language ?? "und" };
+                }),
+              );
+              setSelectedAudioTrack(audioIndex ?? Math.max(0, list.findIndex((a) => a.isDefault)));
+            })
+            .catch(() => {});
+        };
+
+        const runPrepareLocal = (forceRemux = false) => {
+          let prepareActive = false;
+          localDirectPathRef.current = null;
+          setLocalPreparePct(null);
+          setPreparingLocal(true);
+          prepareActive = true;
+          let activeUnlisten: UnlistenFn | null = null;
+          void listen<{ path: string; percent: number }>("abx://local-prepare-progress", (e) => {
             if (cancelled) return;
-            setPreparingLocal(false);
-            loadFile(convertFileSrc(path));
-            // Offer the file's audio tracks (WebView2 can't list or switch them itself).
-            invoke<{ index: number; codec: string; channels?: number; language?: string; title?: string; isDefault: boolean }[]>(
-              "probe_local_audio",
-              { path: localPath },
-            )
-              .then((list) => {
-                if (cancelled || list.length < 2) return;
-                localAudioModeRef.current = true;
-                setAudioTracks(
-                  list.map((a) => {
-                    const ch = a.channels === 6 ? " 5.1" : a.channels === 8 ? " 7.1" : a.channels === 1 ? " mono" : "";
-                    const base = a.title || (a.language ? langLabel(a.language) : `Track ${a.index + 1}`);
-                    return { id: a.index, label: `${base}${ch}`, lang: a.language ?? "und" };
-                  }),
-                );
-                setSelectedAudioTrack(audioIndex ?? Math.max(0, list.findIndex((a) => a.isDefault)));
-              })
-              .catch(() => {});
+            if (e.payload?.path === localPath && Number.isFinite(e.payload.percent)) {
+              setLocalPreparePct(e.payload.percent);
+            }
           })
-          .catch((error: unknown) => {
-            if (cancelled) return;
-            setPreparingLocal(false);
-            setWaiting(false);
-            failover(`audio conversion failed: ${error instanceof Error ? error.message : String(error)}`);
-          });
+            .then((fn) => {
+              if (cancelled) {
+                fn();
+                return;
+              }
+              activeUnlisten = fn;
+              unlistenProgress = fn;
+            })
+            .catch(() => {});
+
+          invoke<string>("prepare_local_media", {
+            path: localPath,
+            ...(audioIndex != null ? { audioIndex } : {}),
+            ...(forceRemux ? { forceRemux: true } : {}),
+          })
+            .then((preparedPath) => {
+              prepareActive = false;
+              activeUnlisten?.();
+              if (unlistenProgress === activeUnlisten) unlistenProgress = null;
+              if (cancelled) return;
+              setPreparingLocal(false);
+              setLocalPreparePct(null);
+              loadFile(convertFileSrc(preparedPath));
+              loadLocalAudioTracks();
+            })
+            .catch((error: unknown) => {
+              prepareActive = false;
+              activeUnlisten?.();
+              if (unlistenProgress === activeUnlisten) unlistenProgress = null;
+              if (cancelled) return;
+              setPreparingLocal(false);
+              setLocalPreparePct(null);
+              setWaiting(false);
+              failover(`audio conversion failed: ${error instanceof Error ? error.message : String(error)}`);
+            });
+          void prepareActive;
+        };
+
+        if (shouldFastPath) {
+          localDirectPathRef.current = localPath;
+          localRetryFnRef.current = () => {
+            localRemuxAttemptedRef.current = true;
+            localDirectPathRef.current = null;
+            runPrepareLocal(true);
+          };
+          loadFile(convertFileSrc(localPath));
+          loadLocalAudioTracks();
+        } else {
+          localRetryFnRef.current = null;
+          runPrepareLocal(false);
+        }
       } else {
         loadFile(playbackUrl(target.url));
       }
@@ -909,6 +981,14 @@ export function useStreamEngine(ctx: StreamEngineContext) {
         });
       return () => {
         cancelled = true;
+        if (c.kind === "file" && isTauri()) {
+          void invoke("cancel_local_prepare").catch(() => {});
+        }
+        unlistenProgress?.();
+        unlistenProgress = null;
+        localDirectPathRef.current = null;
+        localRetryFnRef.current = null;
+        setLocalPreparePct(null);
         refreshCtl.abort();
         if (refreshCtlRef.current === refreshCtl) refreshCtlRef.current = null;
         v.removeEventListener("loadedmetadata", seekAndPlay);
@@ -921,6 +1001,11 @@ export function useStreamEngine(ctx: StreamEngineContext) {
     attachStream(c);
     return () => {
       cancelled = true;
+      unlistenProgress?.();
+      unlistenProgress = null;
+      localDirectPathRef.current = null;
+      localRetryFnRef.current = null;
+      setLocalPreparePct(null);
       refreshCtlRef.current?.abort();
       refreshCtlRef.current = null;
       v.removeEventListener("loadedmetadata", seekAndPlay);
@@ -931,5 +1016,30 @@ export function useStreamEngine(ctx: StreamEngineContext) {
     };
   }, [cur?.url, cur?.kind, cur?.localPath, retrySeq, failover, clearStall, stopActiveTorrent]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  return { armStall, chooseAudioTrack };
+  const handleLocalMediaError = useCallback((): boolean => {
+    if (
+      !localDirectPathRef.current ||
+      localRemuxAttemptedRef.current ||
+      started.current ||
+      !localRetryFnRef.current
+    ) {
+      return false;
+    }
+    const v = video.current;
+    if (v) {
+      try {
+        v.pause();
+        v.removeAttribute("src");
+        v.load();
+      } catch {
+        /* ignore */
+      }
+    }
+    const retry = localRetryFnRef.current;
+    localRetryFnRef.current = null;
+    retry();
+    return true;
+  }, [started, video]);
+
+  return { armStall, chooseAudioTrack, handleLocalMediaError };
 }

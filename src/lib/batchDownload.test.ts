@@ -19,6 +19,7 @@ import {
   type DownloadedEntry,
   type DownloadJob,
 } from "./downloads";
+import { normalizeDownloadQualityPolicy } from "./settings";
 import type { Episode } from "./types";
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -234,11 +235,30 @@ describe("groupDownloadedTitles & formatting helpers", () => {
       canonicalKey: "tmdb:tv:100",
       season: 1,
       items: [saved],
-      jobs: [activeJob],
+      jobs: [
+        activeJob,
+        {
+          ...activeJob,
+          id: "j3",
+          episode: 3,
+          status: "awaitingQuality",
+          percent: 0,
+        },
+      ],
     });
     expect(prog.total).toBe(3);
     expect(prog.completed).toBe(1);
     expect(prog.active).toBe(1);
+    expect(prog.awaitingQuality).toBe(1);
+    expect(normalizeDownloadQualityPolicy(undefined)).toBe("ask");
+    expect(normalizeDownloadQualityPolicy("STRICT")).toBe("strict");
+    expect(normalizeDownloadQualityPolicy("best")).toBe("best");
+    expect(selectMissingEpisodes(eps, {
+      canonicalKey: "tmdb:tv:100",
+      season: 1,
+      items: [saved],
+      jobs: [activeJob, { ...activeJob, id: "j3", episode: 3, status: "awaitingQuality", percent: 0 }],
+    })).toEqual([]);
     expect(Math.round(prog.completedPercent)).toBe(33);
     expect(Math.round(prog.percent)).toBe(53);
     expect(prog.speedBps).toBe(4_000_000);
@@ -316,5 +336,32 @@ describe("groupDownloadedTitles & formatting helpers", () => {
     const afterAll = __getBatchSnapshotForTest();
     expect(afterAll.active).toBe(false);
     expect(afterAll.total).toBe(0);
+  });
+
+  it("does not drop a newly queued season immediately after unscoped cancellation", () => {
+    const show = {
+      key: "tmdb:tv:200",
+      canonicalKey: "tmdb:tv:200",
+      kind: "tv" as const,
+      title: "Severance",
+      overview: "",
+      genres: [],
+      cast: [],
+      crew: [],
+      related: [],
+    };
+    __seedBatchQueueForTest([
+      { detail: show, season: 1, episodes: [{ season: 1, number: 1, title: "S1E1" }] },
+    ]);
+    expect(cancelBatchDownloads({ silent: true })).toBe(true);
+
+    __seedBatchQueueForTest([
+      { detail: show, season: 2, episodes: [{ season: 2, number: 1, title: "S2E1" }] },
+    ]);
+    const snap = __getBatchSnapshotForTest();
+    expect(snap.active).toBe(true);
+    expect(snap.total).toBe(1);
+    expect(getBatchForSeason(snap, "tmdb:tv:200", 2)?.total).toBe(1);
+    cancelBatchDownloads({ silent: true });
   });
 });

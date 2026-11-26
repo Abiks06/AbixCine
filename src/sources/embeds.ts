@@ -108,13 +108,43 @@ export const availableSources: VideoSource[] = [
     },
   },
   {
-    id: "aether",
-    name: "Aether",
+    id: "vidcore",
+    name: "VidCore",
     isFrench: false,
-    headers: serverHeaders("https://aether.ist"),
+    headers: serverHeaders("https://vidcore.io"),
     urls: {
-      movie: "https://aether.ist/media/tmdb-movie-{id}",
-      tv: "https://aether.ist/media/tmdb-tv-{id}/{season}/{episode}",
+      movie: "https://vidcore.io/movie/{id}",
+      tv: "https://vidcore.io/tv/{id}/{season}/{episode}",
+    },
+  },
+  {
+    id: "autoembedpro",
+    name: "AutoEmbed",
+    isFrench: false,
+    headers: serverHeaders("https://autoembed.pro"),
+    urls: {
+      movie: "https://autoembed.pro/embed/movie/{id}",
+      tv: "https://autoembed.pro/embed/tv/{id}/{season}/{episode}",
+    },
+  },
+  {
+    id: "nontongo",
+    name: "NontonGo",
+    isFrench: false,
+    headers: serverHeaders("https://nontongo.win"),
+    urls: {
+      movie: "https://nontongo.win/embed/movie/{id}",
+      tv: "https://nontongo.win/embed/tv/{id}/{season}/{episode}",
+    },
+  },
+  {
+    id: "spencerdevs",
+    name: "SpencerDevs",
+    isFrench: false,
+    headers: serverHeaders("https://spencerdevs.xyz"),
+    urls: {
+      movie: "https://spencerdevs.xyz/movie/{id}",
+      tv: "https://spencerdevs.xyz/tv/{id}/{season}/{episode}",
     },
   },
   {

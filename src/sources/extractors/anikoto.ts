@@ -9,8 +9,12 @@ import {
   isAbortError,
   isAnimeRequest,
   isDirectExtractorEnabled,
-  titleSimilarity,
   isMovieRequest,
+  matchTargetFor,
+  normalizeMatchTitle,
+  pickTitleMatch,
+  splitSeasonSuffix,
+  titleSimilarity,
 } from "./common";
 import { decryptMegaPlayEnc, resolveMegaPlayEmbed } from "./megaplay";
 
@@ -133,31 +137,64 @@ export function parseAnikotoServers(html: string, groups: string[]): { name: str
   return out.sort((a, b) => rank(a.name) - rank(b.name));
 }
 
+function cardSeason(card: AnikotoCard): number | undefined {
+  for (const t of [card.title, card.altTitle]) {
+    const norm = normalizeMatchTitle(t);
+    if (!norm) continue;
+    const split = splitSeasonSuffix(norm);
+    if (split.season != null) return split.season;
+  }
+  return undefined;
+}
+
 function pickBestCard(cards: AnikotoCard[], req: PlaybackRequest, wantDub: boolean): AnikotoCard | null {
   const pool = wantDub ? cards.filter((c) => c.hasDub) : cards;
   if (pool.length === 0) return null;
 
-  const targets = [req.media.title, req.media.originalTitle].filter((t): t is string => Boolean(t?.trim()));
   const isMovie = isMovieRequest(req);
+  const wantSeason = req.season ?? 1;
+  const target = {
+    ...matchTargetFor(req),
+    year: undefined,
+    yearRange: undefined,
+    ...(isMovie ? {} : { season: wantSeason, strictSeason: true }),
+  };
+
+  const strictHit = pickTitleMatch(pool, target, (card) => ({
+    titles: [card.title, card.altTitle],
+    kind: card.isMovie ? "movie" : "tv",
+  }));
+  if (strictHit) return strictHit.item;
+
+  // Exclude cards labeled for another season or wrong movie/series format when falling back.
+  const seasonCompatible = pool.filter((c) => {
+    if (isMovie !== c.isMovie && isMovie) return true;
+    const cs = cardSeason(c);
+    return isMovie || cs == null || cs === wantSeason;
+  });
+  if (seasonCompatible.length === 0) return null;
+
+  const targets = target.titles.filter((t): t is string => Boolean(t?.trim()));
   let best: AnikotoCard | null = null;
   let bestScore = -1;
 
-  for (const card of pool) {
+  for (const card of seasonCompatible) {
     let sim = 0;
     for (const ct of [card.title, card.altTitle].filter(Boolean)) {
-      for (const target of targets) {
-        sim = Math.max(sim, titleSimilarity(ct, target));
+      for (const tgt of targets) {
+        sim = Math.max(sim, titleSimilarity(ct, tgt));
       }
     }
     if (isMovie && card.isMovie) sim += 0.08;
     if (isMovie && !card.isMovie) sim -= 0.15;
+    if (!isMovie && cardSeason(card) === wantSeason) sim += 0.12;
     if (sim > bestScore) {
       bestScore = sim;
       best = card;
     }
   }
 
-  return bestScore >= 0.45 ? best : null;
+  return bestScore >= 0.72 ? best : null;
 }
 
 /**

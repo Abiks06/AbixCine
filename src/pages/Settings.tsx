@@ -18,7 +18,7 @@ import {
   openDownloadsFolder,
   useDownloads,
 } from "../lib/downloads";
-import { toggleSource, updateSettings, useSettings } from "../lib/settings";
+import { getDownloadQuality, normalizeDownloadFormat, normalizeDownloadQualityPolicy, toggleSource, updateSettings, useSettings } from "../lib/settings";
 import { resolveTheme, THEMES } from "../lib/themes";
 import { clearSubtitleSearchCache } from "../lib/subtitleProviders";
 import {
@@ -647,7 +647,6 @@ export function Settings() {
   return (
     <div className="page settings" ref={indicators}>
       <div className="set-head">
-        <p className="overline">Make it yours</p>
         <h1 className="page-title">Settings</h1>
       </div>
       <nav className="set-nav" aria-label="Settings sections">
@@ -1041,8 +1040,8 @@ export function Settings() {
           </form>
           <div className="preset-head">
             <div>
-              <strong>Public HTTP stream addons</strong>
-              <span className="muted">Direct streams, no Debrid key needed. Checked working on 2026-11-15.</span>
+              <strong>Public HTTP & subtitle addons</strong>
+              <span className="muted">Direct streams & multi-source subtitles, no Debrid key needed.</span>
             </div>
             {missingPresets.length > 1 && (
               <button type="button" className="btn btn-glass sm" onClick={() => void handleInstallStremioPresets()} disabled={stremioBusy}>
@@ -1283,10 +1282,75 @@ export function Settings() {
           <AudioToggle value={s.animeAudio} onChange={(a) => updateSettings({ animeAudio: a })} />
         </div>
         <div className="setting-line">
-          <div><strong>Preferred quality</strong><span className="muted">Used to rank streams and target download quality (picks closest resolution up to this limit).</span></div>
+          <div><strong>Streaming quality</strong><span className="muted">Target resolution cap when auto-selecting live playback streams.</span></div>
           <div className="tabs">
             {[2160, 1080, 720, 480].map((q) => (
               <button key={q} className={`chip ${s.preferredQuality === q ? "on" : ""}`} onClick={() => updateSettings({ preferredQuality: q })}>{q === 2160 ? "4K" : `${q}p`}</button>
+            ))}
+          </div>
+        </div>
+        <div className="setting-line">
+          <div><strong>Download quality</strong><span className="muted">Target resolution when saving episodes or films offline.</span></div>
+          <div className="tabs">
+            {[2160, 1080, 720, 480].map((q) => (
+              <button
+                key={q}
+                type="button"
+                aria-pressed={getDownloadQuality(s) === q}
+                className={`chip ${getDownloadQuality(s) === q ? "on" : ""}`}
+                onClick={() => updateSettings({ downloadQuality: q })}
+              >
+                {q === 2160 ? "4K" : `${q}p`}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="setting-line">
+          <div>
+            <strong>Download format</strong>
+            <span className="muted">Container strictly enforced for every offline download. MP4 optimizes audio for instant playback; MKV keeps embedded soft subtitles.</span>
+          </div>
+          <div className="tabs">
+            {(
+              [
+                ["mp4", "MP4 · Instant play"],
+                ["mkv", "MKV · With soft subs"],
+              ] as const
+            ).map(([fmt, label]) => (
+              <button
+                key={fmt}
+                type="button"
+                aria-pressed={normalizeDownloadFormat(s.downloadFormat) === fmt}
+                className={`chip ${normalizeDownloadFormat(s.downloadFormat) === fmt ? "on" : ""}`}
+                onClick={() => updateSettings({ downloadFormat: fmt })}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="setting-line">
+          <div>
+            <strong>If download quality unavailable</strong>
+            <span className="muted">Choose what happens when no server offers your target download resolution.</span>
+          </div>
+          <div className="tabs">
+            {(
+              [
+                ["ask", "Ask me"],
+                ["strict", "Exact quality only"],
+                ["best", "Best available"],
+              ] as const
+            ).map(([pid, label]) => (
+              <button
+                key={pid}
+                type="button"
+                aria-pressed={normalizeDownloadQualityPolicy(s.downloadQualityPolicy) === pid}
+                className={`chip ${normalizeDownloadQualityPolicy(s.downloadQualityPolicy) === pid ? "on" : ""}`}
+                onClick={() => updateSettings({ downloadQualityPolicy: pid })}
+              >
+                {label}
+              </button>
             ))}
           </div>
         </div>

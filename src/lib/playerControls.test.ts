@@ -166,6 +166,7 @@ describe("loadingStage", () => {
   it("says what is actually happening, most specific first", () => {
     expect(loadingStage({ ...base, hasStarted: true })).toBe("Buffering");
     expect(loadingStage({ ...base, preparingLocal: true })).toBe("Preparing the audio track");
+    expect(loadingStage({ ...base, preparingLocal: true, localPreparePct: 42.4 })).toBe("Optimizing audio track (42%)");
     expect(loadingStage({ ...base, preparingTorrent: true })).toBe("Starting torrent stream");
     expect(loadingStage({ ...base, recovering: true, hasStarted: true })).toBe("Finding another server");
   });

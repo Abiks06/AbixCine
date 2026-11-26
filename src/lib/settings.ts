@@ -4,6 +4,24 @@ import { clearSubTrackMemory } from "./subtitles";
 import type { ThemeId } from "./themes";
 
 export type Audio = "sub" | "dub";
+export type DownloadFormat = "mp4" | "mkv";
+export type DownloadQualityPolicy = "ask" | "strict" | "best";
+
+export function normalizeDownloadFormat(raw: unknown): DownloadFormat {
+  return typeof raw === "string" && raw.trim().toLowerCase() === "mkv" ? "mkv" : "mp4";
+}
+
+export function normalizeDownloadQualityPolicy(raw: unknown): DownloadQualityPolicy {
+  if (typeof raw !== "string") return "ask";
+  const v = raw.trim().toLowerCase();
+  if (v === "strict") return "strict";
+  if (v === "best") return "best";
+  return "ask";
+}
+
+export function getDownloadQuality(s: Pick<Settings, "preferredQuality" | "downloadQuality">): number {
+  return s.downloadQuality ?? s.preferredQuality;
+}
 
 export interface SyncedSubtitlePref {
   on?: boolean;
@@ -29,6 +47,12 @@ export interface Settings {
   downloadsPath?: string;
   jellyfin: { url: string; apiKey: string; enabled: boolean };
   preferredQuality: number; // 2160 | 1080 | 720 | 480
+  /** Preferred resolution for offline downloads; falls back to preferredQuality if unset. */
+  downloadQuality?: number;
+  /** Preferred container format for offline downloads ("mp4" or "mkv"). */
+  downloadFormat?: DownloadFormat;
+  /** Behavior when no server provides the chosen download quality: "ask" | "strict" | "best". */
+  downloadQualityPolicy?: DownloadQualityPolicy;
   autoplayNext: boolean;
   reduceMotion: boolean;
   /** Default audio for anime. */
@@ -56,6 +80,9 @@ export interface Settings {
 /** Settings that follow the account. Library folders and server credentials stay on this device. */
 const SYNCED: (keyof Settings)[] = [
   "preferredQuality",
+  "downloadQuality",
+  "downloadFormat",
+  "downloadQualityPolicy",
   "autoplayNext",
   "reduceMotion",
   "animeAudio",
@@ -67,13 +94,15 @@ const SYNCED: (keyof Settings)[] = [
   "dynamicLight",
 ];
 
-const EXTRA_IDS = ["vidsrccc", "vidsrcto", "2embed", "multiembed", "embedsu", "vidsrcrip", "frembed"];
+const EXTRA_IDS = ["vidsrccc", "vidsrcto", "2embed", "multiembed", "vidsrcrip"];
 
 const DEFAULTS: Settings = {
   tmdbKey: import.meta.env.VITE_TMDB_KEY ?? "",
   libraryPaths: [],
   jellyfin: { url: "", apiKey: "", enabled: false },
   preferredQuality: 1080,
+  downloadFormat: "mp4",
+  downloadQualityPolicy: "ask",
   autoplayNext: true,
   reduceMotion: false,
   animeAudio: "sub",
@@ -165,6 +194,8 @@ function load(): Settings {
       return {
         ...DEFAULTS,
         ...parsed,
+        downloadFormat: normalizeDownloadFormat(parsed.downloadFormat),
+        downloadQualityPolicy: normalizeDownloadQualityPolicy(parsed.downloadQualityPolicy),
         ...(subtitlePref ? { subtitlePref } : { subtitlePref: undefined }),
         ...normalizeSourceToggles(parsed, DEFAULTS),
       };
@@ -189,6 +220,8 @@ function apply(patch: Partial<Settings>) {
   current = {
     ...current,
     ...rest,
+    downloadFormat: normalizeDownloadFormat(rest.downloadFormat ?? current.downloadFormat),
+    downloadQualityPolicy: normalizeDownloadQualityPolicy(rest.downloadQualityPolicy ?? current.downloadQualityPolicy),
     ...(subtitlePref !== undefined ? { subtitlePref } : {}),
     ...toggles,
   };

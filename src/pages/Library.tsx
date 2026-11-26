@@ -16,7 +16,7 @@ export function Library() {
     <div className="page">
       <div className="page-head">
         <div>
-          <p className="overline">{online ? "Local first" : "Offline mode · Ready on this PC"}</p>
+          {!online && <p className="overline">Offline mode · Ready on this PC</p>}
           <h1 className="page-title">Your <em>vault</em></h1>
         </div>
         <div className="grow" />

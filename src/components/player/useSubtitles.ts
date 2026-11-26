@@ -16,6 +16,7 @@ import {
   searchOnlineSubtitles,
   type OnlineSubtitleResult,
 } from "../../lib/subtitleProviders";
+import { normalizeMatchTitle } from "../../sources/titleMatch";
 import { getSettings, updateSettings, type Audio } from "../../lib/settings";
 import { refreshDownloads } from "../../lib/downloads";
 import type { StreamCandidate, SubtitleFormat } from "../../sources/types";
@@ -665,54 +666,73 @@ export function useSubtitles(ctx: SubtitlesContext) {
     }
   }, []);
 
-  const searchOnline = useCallback(async (rawTitle: string, lang: string) => {
-    searchCtlRef.current?.abort();
-    const ctl = new AbortController();
-    searchCtlRef.current = ctl;
-    const gen = sourceGenRef.current;
+  const searchOnline = useCallback(
+    async (rawTitle: string, lang: string, epOverride?: { season?: number; episode?: number }) => {
+      searchCtlRef.current?.abort();
+      const ctl = new AbortController();
+      searchCtlRef.current = ctl;
+      const gen = sourceGenRef.current;
 
-    const qTitle = (rawTitle || media?.title || title || "").trim();
-    const qLang = lang || prefRef.current.lang || "en";
-    const kind: "movie" | "tv" | "anime" | undefined =
-      media?.kind === "tv" || media?.kind === "anime" || media?.kind === "movie"
-        ? media.kind
-        : epNumber != null
-          ? "tv"
-          : undefined;
+      const typedTitle = rawTitle.trim();
+      const mediaTitle = (media?.title || title || "").trim();
+      const qTitle = (typedTitle || mediaTitle).trim();
+      const customQuery =
+        Boolean(typedTitle) &&
+        normalizeMatchTitle(typedTitle) !== normalizeMatchTitle(mediaTitle) &&
+        normalizeMatchTitle(typedTitle) !== normalizeMatchTitle(media?.originalTitle);
 
-    setOnlineLoading(true);
-    setOnlineError(null);
-    try {
-      const results = await searchOnlineSubtitles(
-        {
-          tmdbId: media?.tmdbId,
-          imdbId: media?.imdbId,
-          title: qTitle || undefined,
-          year: media?.year,
-          kind,
-          season: epSeason,
-          episode: epNumber,
-          languages: [qLang],
-          preferHearingImpaired: prefRef.current.preferHearingImpaired,
-          localPath: curRef.current?.localPath,
-          subdlApiKey: readOptionalSubdlApiKey(),
-        },
-        ctl.signal,
-      );
-      if (ctl.signal.aborted || gen !== sourceGenRef.current || !mountedRef.current) return;
-      setOnlineResults(results);
-      setOnlineSearched(true);
-    } catch (e) {
-      if (ctl.signal.aborted || (e instanceof DOMException && e.name === "AbortError")) return;
-      if (gen !== sourceGenRef.current || !mountedRef.current) return;
-      setOnlineError(e instanceof Error ? e.message : "Failed to search online subtitles");
-      setOnlineSearched(true);
-    } finally {
-      if (!ctl.signal.aborted && gen === sourceGenRef.current && mountedRef.current) {
-        setOnlineLoading(false);
+      const qLang = lang || prefRef.current.lang || "en";
+      const secLang = prefRef.current.secondaryLang?.trim();
+      const languages = [...new Set([qLang, ...(secLang ? [secLang] : [])])];
+      const kind: "movie" | "tv" | "anime" | undefined =
+        media?.kind === "tv" || media?.kind === "anime" || media?.kind === "movie"
+          ? media.kind
+          : (epOverride?.episode ?? epNumber) != null
+            ? "tv"
+            : undefined;
+
+      setOnlineLoading(true);
+      setOnlineError(null);
+      try {
+        const results = await searchOnlineSubtitles(
+          {
+            ...(customQuery
+              ? {}
+              : {
+                  tmdbId: media?.tmdbId,
+                  imdbId: media?.imdbId,
+                  anilistId: media?.anilistId,
+                  malId: media?.malId,
+                  mediaKey: media?.key,
+                  year: media?.year,
+                }),
+            title: qTitle || undefined,
+            kind: customQuery ? undefined : kind,
+            season: epOverride?.season ?? epSeason,
+            episode: epOverride?.episode ?? epNumber,
+            languages,
+            preferHearingImpaired: prefRef.current.preferHearingImpaired,
+            localPath: customQuery ? undefined : curRef.current?.localPath,
+            subdlApiKey: readOptionalSubdlApiKey(),
+          },
+          ctl.signal,
+        );
+        if (ctl.signal.aborted || gen !== sourceGenRef.current || !mountedRef.current) return;
+        setOnlineResults(results);
+        setOnlineSearched(true);
+      } catch (e) {
+        if (ctl.signal.aborted || (e instanceof DOMException && e.name === "AbortError")) return;
+        if (gen !== sourceGenRef.current || !mountedRef.current) return;
+        setOnlineError(e instanceof Error ? e.message : "Failed to search online subtitles");
+        setOnlineSearched(true);
+      } finally {
+        if (!ctl.signal.aborted && gen === sourceGenRef.current && mountedRef.current) {
+          setOnlineLoading(false);
+        }
       }
-    }
-  }, [media?.tmdbId, media?.imdbId, media?.title, media?.year, media?.kind, title, epSeason, epNumber, readOptionalSubdlApiKey]);
+    },
+    [media?.tmdbId, media?.imdbId, media?.anilistId, media?.malId, media?.key, media?.title, media?.originalTitle, media?.year, media?.kind, title, epSeason, epNumber, readOptionalSubdlApiKey],
+  );
 
   const loadOnlineResult = useCallback(async (res: OnlineSubtitleResult, asSecondary: boolean) => {
     const existingTrackId = loadedOnlineMap.get(res.id);

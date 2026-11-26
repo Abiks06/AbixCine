@@ -1,4 +1,4 @@
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
   COMMON_SUB_LANGS,
   langBase,
@@ -9,7 +9,7 @@ import {
   type SubSignLayout,
   type SubtitleCue,
 } from "../lib/subtitles";
-import type { OnlineSubtitleResult } from "../lib/subtitleProviders";
+import type { OnlineSubtitleProvider, OnlineSubtitleResult } from "../lib/subtitleProviders";
 import type { SubtitleFormat, SubtitleSource } from "../sources/types";
 import { Icon } from "./Icon";
 
@@ -31,7 +31,7 @@ export interface UnifiedSubTrack {
   /** Shaka text track id (DASH streams). */
   dashTrackId?: number;
   nativeTrack?: TextTrack;
-  provider?: "wyzie" | "opensubtitles" | "subdl";
+  provider?: OnlineSubtitleProvider;
   release?: string;
   cues?: SubtitleCue[];
   loading?: boolean;
@@ -67,7 +67,7 @@ export interface SubtitleSheetProps {
   onlineLoading: boolean;
   onlineSearched: boolean;
   onlineError: string | null;
-  onSearchOnline: (title: string, lang: string) => void;
+  onSearchOnline: (title: string, lang: string, epOverride?: { season?: number; episode?: number }) => void;
   onLoadOnline: (res: OnlineSubtitleResult, asSecondary: boolean) => void;
   loadingOnlineId: string | null;
   loadedOnlineMap: ReadonlyMap<string, string>;
@@ -104,11 +104,16 @@ const ORIGIN_LABELS: Record<SubTrackOrigin, string> = {
   user: "File",
 };
 
-const PROVIDER_LABELS: Record<OnlineSubtitleResult["provider"], string> = {
+const PROVIDER_LABELS: Record<OnlineSubtitleProvider, string> = {
   wyzie: "Wyzie",
   opensubtitles: "OpenSubs",
   subdl: "SubDL",
+  subsense: "SubSense",
+  meowtv: "MeowSubs",
+  stremio: "Addon",
 };
+
+type OnlineResultFilter = "all" | "no-sdh" | "ass" | "srt";
 
 export const SubtitleSheet = memo(function SubtitleSheet({
   isEmbed,
@@ -146,6 +151,10 @@ export const SubtitleSheet = memo(function SubtitleSheet({
 }: SubtitleSheetProps) {
   const [searchTitle, setSearchTitle] = useState(media?.title ?? "");
   const [searchLang, setSearchLang] = useState(subPref.lang || "en");
+  const [searchSeason, setSearchSeason] = useState(season != null ? String(season) : "");
+  const [searchEpisode, setSearchEpisode] = useState(episode != null ? String(episode) : "");
+  const [resFilter, setResFilter] = useState<OnlineResultFilter>("all");
+  const autoSearchedRef = useRef(false);
 
   useEffect(() => {
     setSearchTitle(media?.title ?? "");
@@ -154,6 +163,59 @@ export const SubtitleSheet = memo(function SubtitleSheet({
   useEffect(() => {
     if (subPref.lang) setSearchLang(subPref.lang);
   }, [subPref.lang]);
+
+  useEffect(() => {
+    setSearchSeason(season != null ? String(season) : "");
+  }, [season]);
+
+  useEffect(() => {
+    setSearchEpisode(episode != null ? String(episode) : "");
+  }, [episode]);
+
+  const showEpisodeInputs = media?.kind !== "movie" || episode != null || season != null;
+  const parsedEpOverride = useMemo(() => {
+    const sRaw = searchSeason.trim();
+    const eRaw = searchEpisode.trim();
+    const sNum = sRaw && Number.isFinite(Number(sRaw)) ? Math.max(0, Math.trunc(Number(sRaw))) : undefined;
+    const eNum = eRaw && Number.isFinite(Number(eRaw)) ? Math.max(1, Math.trunc(Number(eRaw))) : undefined;
+    return sNum != null || eNum != null ? { season: sNum, episode: eNum } : undefined;
+  }, [searchSeason, searchEpisode]);
+
+  useEffect(() => {
+    if (isEmbed || autoSearchedRef.current || onlineSearched || onlineLoading) return;
+    if (!media?.title?.trim() && !media?.imdbId && !media?.tmdbId) return;
+    const wantLang = langBase(subPref.lang || "en");
+    if (wantLang !== "und" && tracks.some((t) => langBase(t.lang) === wantLang)) return;
+    autoSearchedRef.current = true;
+    onSearchOnline(searchTitle, searchLang, parsedEpOverride);
+  }, [
+    isEmbed,
+    onlineSearched,
+    onlineLoading,
+    media?.title,
+    media?.imdbId,
+    media?.tmdbId,
+    tracks,
+    subPref.lang,
+    searchTitle,
+    searchLang,
+    parsedEpOverride,
+    onSearchOnline,
+  ]);
+
+  const filteredOnlineResults = useMemo(() => {
+    switch (resFilter) {
+      case "no-sdh":
+        return onlineResults.filter((r) => !r.hearingImpaired);
+      case "ass":
+        return onlineResults.filter((r) => r.format === "ass" || r.format === "ssa");
+      case "srt":
+        return onlineResults.filter((r) => r.format === "srt" || r.format === "vtt");
+      case "all":
+      default:
+        return onlineResults;
+    }
+  }, [onlineResults, resFilter]);
 
   if (isEmbed) {
     return (
@@ -361,7 +423,7 @@ export const SubtitleSheet = memo(function SubtitleSheet({
           className="sub-online-form"
           onSubmit={(e) => {
             e.preventDefault();
-            onSearchOnline(searchTitle, searchLang);
+            onSearchOnline(searchTitle, searchLang, parsedEpOverride);
           }}
         >
           <input
@@ -371,6 +433,28 @@ export const SubtitleSheet = memo(function SubtitleSheet({
             placeholder="Title to search…"
             aria-label="Subtitle search title"
           />
+          {showEpisodeInputs && (
+            <div className="sub-ep-row">
+              <input
+                type="number"
+                min={0}
+                value={searchSeason}
+                onChange={(e) => setSearchSeason(e.target.value)}
+                placeholder="S"
+                aria-label="Season number"
+                title="Season number"
+              />
+              <input
+                type="number"
+                min={1}
+                value={searchEpisode}
+                onChange={(e) => setSearchEpisode(e.target.value)}
+                placeholder="E"
+                aria-label="Episode number"
+                title="Episode number"
+              />
+            </div>
+          )}
           <select
             className="sub-select"
             value={searchLang}
@@ -389,14 +473,39 @@ export const SubtitleSheet = memo(function SubtitleSheet({
           </button>
         </form>
 
+        {onlineResults.length > 0 && (
+          <div className="sub-filter-pills" role="group" aria-label="Filter subtitle results">
+            {(
+              [
+                ["all", `All · ${onlineResults.length}`],
+                ["no-sdh", "No SDH"],
+                ["ass", "ASS/SSA"],
+                ["srt", "SRT/VTT"],
+              ] as const
+            ).map(([id, label]) => (
+              <button
+                key={id}
+                type="button"
+                className={`chip ${resFilter === id ? "on" : ""}`}
+                onClick={() => setResFilter(id)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        )}
+
         {onlineError && <p className="ps-note" role="status">{onlineError}</p>}
         {onlineSearched && !onlineLoading && !onlineError && onlineResults.length === 0 && (
           <p className="ps-note">No online subtitles matched that search. Try another language or title.</p>
         )}
+        {onlineResults.length > 0 && filteredOnlineResults.length === 0 && (
+          <p className="ps-note">No results match that filter. Pick All to see all {onlineResults.length}.</p>
+        )}
 
-        {onlineResults.length > 0 && (
+        {filteredOnlineResults.length > 0 && (
           <div className="sub-online-list">
-            {onlineResults.map((r) => {
+            {filteredOnlineResults.map((r) => {
               const busy = loadingOnlineId === r.id;
               const loadedTrackId = loadedOnlineMap.get(r.id);
               const loadedTrack = loadedTrackId ? tracks.find((t) => t.id === loadedTrackId) : undefined;

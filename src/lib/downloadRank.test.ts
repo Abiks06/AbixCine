@@ -14,11 +14,13 @@ const makeCand = (overrides: Partial<StreamCandidate> = {}): StreamCandidate => 
 });
 
 describe("isDownloadableCandidate", () => {
-  it("excludes local files, embeds, dash, magnets, mismatches, and expired links", () => {
+  it("excludes local files, embeds, magnets, mismatches, and expired links while allowing non-DRM DASH", () => {
     expect(isDownloadableCandidate(makeCand({ providerId: "local", kind: "file" }))).toBe(false);
     expect(isDownloadableCandidate(makeCand({ providerId: "downloads", kind: "file" }))).toBe(false);
     expect(isDownloadableCandidate(makeCand({ kind: "embed", via: "embed" }))).toBe(false);
-    expect(isDownloadableCandidate(makeCand({ kind: "dash", url: "https://cdn.example/a.mpd" }))).toBe(false);
+    expect(isDownloadableCandidate(makeCand({ kind: "dash", url: "https://cdn.example/a.mpd" }))).toBe(true);
+    expect(isDownloadableCandidate(makeCand({ kind: "file", url: "https://cdn.example/video.mkv", notWebReady: true }))).toBe(true);
+    expect(isDownloadableCandidate(makeCand({ kind: "file", url: "magnet:?xt=urn:btih:123", notWebReady: true }))).toBe(false);
     expect(isDownloadableCandidate(makeCand({ kind: "file", url: "magnet:?xt=urn:btih:123" }))).toBe(false);
     expect(isDownloadableCandidate(makeCand({ identity: { status: "mismatch" } }))).toBe(false);
     expect(
@@ -129,12 +131,84 @@ describe("rankDownloadOptions", () => {
 
     const ranked = rankDownloadOptions([sd480File, sd640File, unknownFile, hdSniffedHls], 1080);
     expect(ranked[0].providerId).toBe("hd-hls");
-    expect(ranked[ranked.length - 1].providerId).toBe("low480");
+    expect(ranked[1].providerId).toBe("low640");
+    expect(ranked[2].providerId).toBe("low480");
+    expect(ranked[ranked.length - 1].providerId).toBe("unknown-file");
   });
 
-  it("formats neutral delivery tags without Best/Worst judgements", () => {
-    expect(downloadFormatLabel(makeCand({ downloadUrl: "http://jf/Download" }))).toBe("Original");
-    expect(downloadFormatLabel(makeCand({ kind: "file", url: "https://cdn/movie.mkv?t=1" }))).toBe("MKV");
-    expect(downloadFormatLabel(makeCand({ kind: "hls" }))).toBe("HLS → MP4");
+  it("ranks verified 1080p ahead of unknown-resolution HLS when targeting 4K, and prefers sticky season provider at equal quality", () => {
+    const unknownHls = makeCand({
+      providerId: "mystery-hls",
+      url: "https://cdn.example/mystery.m3u8",
+      kind: "hls",
+      via: "direct",
+      probe: { ok: true, latencyMs: 50 },
+    });
+    const verified1080 = makeCand({
+      providerId: "solid-1080",
+      url: "https://cdn.example/1080.m3u8",
+      kind: "hls",
+      via: "direct",
+      probe: { ok: true, latencyMs: 180, quality: 1080 },
+    });
+    const verified720 = makeCand({
+      providerId: "solid-720",
+      url: "https://cdn.example/720.m3u8",
+      kind: "hls",
+      via: "direct",
+      probe: { ok: true, latencyMs: 120, quality: 720 },
+    });
+    const ranked4k = rankDownloadOptions([unknownHls, verified720, verified1080], 2160);
+    expect(ranked4k.map((c) => c.providerId)).toEqual(["solid-1080", "solid-720", "mystery-hls"]);
+
+    const peerA = makeCand({
+      providerId: "alpha",
+      url: "https://cdn.example/alpha.m3u8",
+      probe: { ok: true, latencyMs: 400, quality: 2160 },
+    });
+    const peerB = makeCand({
+      providerId: "beta",
+      url: "https://cdn.example/beta.m3u8",
+      probe: { ok: true, latencyMs: 90, quality: 2160 },
+    });
+    const stickyRanked = rankDownloadOptions([peerB, peerA], 2160, { preferredProviderId: "alpha" });
+    expect(stickyRanked[0].providerId).toBe("alpha");
+  });
+
+  it("prefers adaptive HLS/DASH capable of hitting 720p/480p over oversized fixed MP4 files", () => {
+    const fixed1080File = makeCand({
+      providerId: "fixed-1080",
+      url: "https://cdn.example/movie-1080p.mp4",
+      kind: "file",
+      via: "direct",
+      probe: { ok: true, latencyMs: 50, quality: 1080 },
+    });
+    const adaptiveHls = makeCand({
+      providerId: "adaptive-hls",
+      url: "https://cdn.example/master.m3u8",
+      kind: "hls",
+      via: "direct",
+      probe: { ok: true, latencyMs: 120, quality: 1080 },
+    });
+    const adaptiveDash = makeCand({
+      providerId: "adaptive-dash",
+      url: "https://cdn.example/manifest.mpd",
+      kind: "dash",
+      via: "direct",
+      probe: { ok: true, latencyMs: 130, quality: 1080 },
+    });
+
+    const ranked720 = rankDownloadOptions([fixed1080File, adaptiveDash, adaptiveHls], 720);
+    expect(ranked720[0].providerId).toBe("adaptive-hls");
+    expect(ranked720[1].providerId).toBe("adaptive-dash");
+    expect(ranked720[2].providerId).toBe("fixed-1080");
+  });
+
+  it("formats neutral delivery tags respecting picked target container format", () => {
+    expect(downloadFormatLabel(makeCand({ downloadUrl: "http://jf/Download" }), "mkv")).toBe("Original");
+    expect(downloadFormatLabel(makeCand({ kind: "file", url: "https://cdn/movie.mkv?t=1" }), "mp4")).toBe("MKV → MP4");
+    expect(downloadFormatLabel(makeCand({ kind: "file", url: "https://cdn/movie.mp4" }), "mkv")).toBe("MP4 → MKV");
+    expect(downloadFormatLabel(makeCand({ kind: "hls" }), "mkv")).toBe("HLS → MKV");
+    expect(downloadFormatLabel(makeCand({ kind: "dash", url: "https://cdn/m.mpd" }), "mp4")).toBe("DASH → MP4");
   });
 });

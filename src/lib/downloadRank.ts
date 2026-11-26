@@ -1,14 +1,15 @@
 import { isUrlTokenExpired, unwrapProxyUrl } from "../sources/native";
 import type { StreamCandidate } from "../sources/types";
+import type { DownloadFormat } from "./settings";
 
 /**
  * Determine whether a server candidate can be saved for offline playback.
- * Web embeds (not yet sniffed), local/downloaded files, manual torrents,
+ * Unsniffed embeds, local/downloaded files, manual torrents,
  * suspect title mismatches, and expired links are excluded.
  */
 export function isDownloadableCandidate(c: StreamCandidate): boolean {
   if (c.providerId === "local" || c.providerId === "downloads") return false;
-  if (c.kind === "embed" || c.kind === "dash") return false;
+  if (c.kind === "embed") return false;
   if (/^(?:magnet:|asset:|https?:\/\/asset\.localhost)/i.test(c.url)) return false;
   if (c.identity?.status === "mismatch") return false;
   // Require a verified ready candidate (or a candidate with an explicit direct download endpoint)
@@ -16,47 +17,89 @@ export function isDownloadableCandidate(c: StreamCandidate): boolean {
   const rawUrl = unwrapProxyUrl(c.downloadUrl ?? c.url).url;
   if (!/^https?:\/\//i.test(rawUrl)) return false;
   if (isUrlTokenExpired(c.url)) return false;
-  return c.kind === "file" || c.kind === "hls" || Boolean(c.downloadUrl);
+  return c.kind === "file" || c.kind === "hls" || c.kind === "dash" || Boolean(c.downloadUrl);
+}
+
+/** Format vertical height as a readable resolution badge ("4K", "1080p", etc.). */
+export function formatResolution(q?: number): string {
+  if (!q || !Number.isFinite(q) || q <= 0) return "";
+  return q >= 2160 ? "4K" : `${Math.round(q)}p`;
+}
+
+/** Highest verified or declared vertical height for a candidate, if known. */
+export function bestKnownQuality(c: StreamCandidate): number | undefined {
+  const q = c.probe?.quality ?? c.quality;
+  return q != null && Number.isFinite(q) && q > 0 ? q : undefined;
 }
 
 /** Check whether a candidate's known resolution meets or exceeds the requested target quality. */
 export function candidateMeetsTargetQuality(c: StreamCandidate, preferredQuality = 1080): boolean {
-  const q = c.probe?.quality ?? c.quality;
+  const q = bestKnownQuality(c);
   return q != null && q >= preferredQuality;
 }
 
 /**
- * Quality-first server scoring for offline downloads.
- * Resolution fit against the target quality always dominates so a low-res 480p/640p direct file
- * never outranks a verified 1080p HLS stream; delivery method breaks ties at equal resolution.
+ * Resolution-exact server scoring for offline downloads.
+ *
+ * Verified high resolutions strictly outrank unverified/unknown streams so picking 4K
+ * falls back predictably (e.g. 1080p -> 720p) instead of picking an unknown 640p stream.
+ * Passing `preferredProviderId` helps lock bulk season downloads to one reliable server.
  */
-export function downloadScore(c: StreamCandidate, preferredQuality = 1080): number {
+export function downloadScore(
+  c: StreamCandidate,
+  preferredQuality = 1080,
+  opts?: { preferredProviderId?: string },
+): number {
   let pts = 0;
+  const target = Math.max(240, preferredQuality || 1080);
+  const q = bestKnownQuality(c);
+  const isFixedFile = Boolean(c.downloadUrl || c.kind === "file");
 
-  // 1. Resolution fit against the requested target quality (primary signal)
-  const q = c.probe?.quality ?? c.quality;
   if (q != null && q > 0) {
-    if (q >= preferredQuality) {
-      // Meets or exceeds target; slight preference for exact match over oversized 4K when targeting 1080p
-      const overPenalty = Math.min(22, ((q - preferredQuality) / Math.max(preferredQuality, 1)) * 16);
-      pts += 180 - overPenalty;
+    if (isFixedFile) {
+      if (q === target) {
+        // Exact match on a fixed direct file is ideal (zero muxing needed if container matches).
+        pts += 200;
+      } else if (q > target) {
+        // Fixed files cannot pick a lower adaptive bitrate variant; penalize oversized files so
+        // an adaptive HLS/DASH stream with a matching variant wins first.
+        const ratioOver = (q - target) / target;
+        pts += Math.max(125, 185 - ratioOver * 35);
+      } else {
+        // Verified lower resolution stays well above unknown-resolution guesses.
+        pts += 120 + Math.pow(q / target, 0.85) * 68;
+      }
     } else {
-      // Steep drop for below-target streams so 480p/640p never beats 1080p/720p
-      pts += Math.pow(q / Math.max(preferredQuality, 1), 1.8) * 160;
+      // Adaptive HLS / DASH: any stream with max resolution >= target can pick the <= target variant.
+      if (q >= target) {
+        const tinyOver = Math.min(4, ((q - target) / target) * 2);
+        pts += 200 - tinyOver;
+      } else {
+        pts += 120 + Math.pow(q / target, 0.85) * 68;
+      }
     }
   } else {
-    // Unknown resolution: cautious mid score — below verified HD, above known 480p/640p
-    pts += c.kind === "hls" ? 94 : 68;
+    // Unknown resolution ranks strictly below verified HD/SD streams.
+    pts += isFixedFile ? 72 : 108;
   }
 
-  // 2. Source delivery method (tie-breaker at equal resolution: Original > Direct file > Direct HLS > Sniffed HLS)
-  if (c.downloadUrl || c.kind === "file") {
-    pts += c.providerId === "jellyfin" ? 28 : 20;
+  // Delivery method tie-breaker at equal resolution fit
+  if (isFixedFile) {
+    if (c.providerId === "jellyfin") pts += 24;
+    else if (q == null || q <= target) pts += 18;
+    else pts += 4;
   } else if (c.kind === "hls") {
-    pts += c.via === "direct" ? 12 : 4;
+    pts += c.via === "direct" ? 15 : 8;
+  } else if (c.kind === "dash") {
+    pts += 11;
   }
 
-  // 3. Measured server speed + subtitle availability + dual-audio richness
+  // Season consistency bonus: keeps episodes locked onto the same verified server when available.
+  if (opts?.preferredProviderId && c.providerId === opts.preferredProviderId) {
+    pts += q != null && q >= target ? 24 : 5;
+  }
+
+  // Measured latency, subtitle availability & audio richness
   const latencyMs = c.probe?.latencyMs ?? 1200;
   const speedPts = (1 - Math.min(latencyMs, 8000) / 8000) * 14;
   pts += speedPts;
@@ -72,10 +115,14 @@ export function downloadScore(c: StreamCandidate, preferredQuality = 1080): numb
 }
 
 /** Deduplicate identical target streams and rank downloadable servers best-to-worst implicitly. */
-export function rankDownloadOptions(candidates: StreamCandidate[], preferredQuality = 1080): StreamCandidate[] {
+export function rankDownloadOptions(
+  candidates: StreamCandidate[],
+  preferredQuality = 1080,
+  opts?: { preferredProviderId?: string },
+): StreamCandidate[] {
   const ranked = candidates
     .filter(isDownloadableCandidate)
-    .map((c) => ({ c, s: downloadScore(c, preferredQuality) }))
+    .map((c) => ({ c, s: downloadScore(c, preferredQuality, opts) }))
     .sort((a, b) => b.s - a.s);
 
   const seen = new Set<string>();
@@ -89,13 +136,28 @@ export function rankDownloadOptions(candidates: StreamCandidate[], preferredQual
   return out;
 }
 
-/** Neutral container/delivery format label shown beside each server option. */
-export function downloadFormatLabel(c: StreamCandidate): string {
-  if (c.downloadUrl) return "Original";
-  if (c.kind === "hls") return "HLS → MP4";
-  const raw = unwrapProxyUrl(c.url).url.split(/[?#]/)[0].toLowerCase();
-  if (raw.endsWith(".mkv")) return "MKV";
-  if (raw.endsWith(".webm")) return "WebM";
-  if (raw.endsWith(".mp4") || raw.endsWith(".m4v")) return "MP4";
-  return "Direct";
+/** Detect source container extension from candidate URL when known. */
+export function sourceContainerExt(c: StreamCandidate): string {
+  const raw = unwrapProxyUrl(c.downloadUrl ?? c.url).url.split(/[?#]/)[0].toLowerCase();
+  if (raw.endsWith(".mkv")) return "mkv";
+  if (raw.endsWith(".webm")) return "webm";
+  if (raw.endsWith(".mov")) return "mov";
+  if (raw.endsWith(".m4v")) return "m4v";
+  if (raw.endsWith(".mp4")) return "mp4";
+  return "";
+}
+
+/** Container/delivery format label shown beside each server option, reflecting user's target format. */
+export function downloadFormatLabel(c: StreamCandidate, targetFormat: DownloadFormat = "mp4"): string {
+  const dst = targetFormat.toUpperCase();
+  if (c.downloadUrl) {
+    const ext = sourceContainerExt(c).toUpperCase();
+    if (!ext) return "Original";
+    return ext !== dst ? `${ext} → ${dst}` : ext;
+  }
+  if (c.kind === "hls") return `HLS → ${dst}`;
+  if (c.kind === "dash") return `DASH → ${dst}`;
+  const srcExt = sourceContainerExt(c).toUpperCase();
+  if (srcExt) return srcExt !== dst ? `${srcExt} → ${dst}` : srcExt;
+  return `Direct → ${dst}`;
 }

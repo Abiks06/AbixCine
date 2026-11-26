@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   __setDownloadsStateForTest,
@@ -12,7 +13,11 @@ import type { SourceProvider, StreamCandidate } from "./types";
 
 vi.mock("@tauri-apps/api/core", () => ({
   isTauri: () => true,
-  invoke: vi.fn(async (cmd: string) => (cmd === "scan_library" ? { files: [], errors: [] } : [])),
+  invoke: vi.fn(async (cmd: string) => {
+    if (cmd === "scan_library") return { files: [], errors: [] };
+    if (cmd === "stream_gateway") return null;
+    return [];
+  }),
   convertFileSrc: (p: string) => `asset://localhost/${encodeURIComponent(p)}`,
 }));
 
@@ -38,6 +43,8 @@ describe("downloads offline store & local server provider", () => {
           episode: 2,
           episodeTitle: "Half Loop",
           quality: 1080,
+          container: "mp4",
+          webReady: true,
           providerId: "vidlink-direct",
           providerName: "VidLink",
           filePath: "C:/Downloads/Series/Severance (2022)/Season 01/Severance - S01E02 [1080p].mp4",
@@ -82,6 +89,9 @@ describe("downloads offline store & local server provider", () => {
       },
     ]);
 
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockClear();
+
     const cands = await downloadsProvider.find(
       {
         media: { key: "tmdb:tv:95396", kind: "tv", title: "Severance", overview: "", genres: [] },
@@ -94,7 +104,10 @@ describe("downloads offline store & local server provider", () => {
     expect(cands).toHaveLength(1);
     expect(cands[0].providerId).toBe("downloads");
     expect(cands[0].localPath).toContain("S01E02");
+    expect(cands[0].localWebReady).toBe(true);
     expect(cands[0].subtitles?.[0]?.source).toBe("sidecar");
+    expect(invokeMock).not.toHaveBeenCalledWith("scan_library", expect.anything());
+    expect(invokeMock).not.toHaveBeenCalledWith("probe_local_subtitles", expect.anything());
   });
 
   it("resolves downloadsProvider first in SourceSession and fast-paths offline", async () => {

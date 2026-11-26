@@ -8,14 +8,21 @@ import {
   zipEntryEpisodeScore,
 } from "./subtitleProviders";
 
-const { mockInvoke, mockIsTauri } = vi.hoisted(() => ({
+const { mockInvoke, mockIsTauri, mockListStremioAddons, mockFetchStremioSubtitles } = vi.hoisted(() => ({
   mockInvoke: vi.fn(),
   mockIsTauri: vi.fn(() => false),
+  mockListStremioAddons: vi.fn(() => [] as unknown[]),
+  mockFetchStremioSubtitles: vi.fn(async () => [] as unknown[]),
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: mockInvoke,
   isTauri: mockIsTauri,
+}));
+
+vi.mock("../sources/stremio", () => ({
+  listStremioAddons: mockListStremioAddons,
+  fetchStremioSubtitles: mockFetchStremioSubtitles,
 }));
 
 vi.mock("../sources/native", async (importOriginal) => {
@@ -36,6 +43,10 @@ beforeEach(() => {
   mockHttpFetchBytes.mockReset();
   mockInvoke.mockReset();
   mockIsTauri.mockReturnValue(false);
+  mockListStremioAddons.mockReset();
+  mockListStremioAddons.mockReturnValue([]);
+  mockFetchStremioSubtitles.mockReset();
+  mockFetchStremioSubtitles.mockResolvedValue([]);
   localStorage.removeItem("abx.subdl.apiKey");
   localStorage.removeItem("abx.settings.v1");
 });
@@ -188,6 +199,12 @@ describe("searchOnlineSubtitles", () => {
           }),
         };
       }
+      if (url.startsWith("https://subsense.nepiraw.com/")) {
+        return { status: 200, url, body: JSON.stringify({ subtitles: [] }) };
+      }
+      if (url.startsWith("https://api.meowtv.ru/subs/")) {
+        return { status: 200, url, body: "[]" };
+      }
       throw new Error(`Unexpected URL: ${url}`);
     });
 
@@ -201,7 +218,8 @@ describe("searchOnlineSubtitles", () => {
       preferHearingImpaired: "avoid",
     });
 
-    expect(mockHttpFetch).toHaveBeenCalledTimes(2);
+    const callsAfterFirst = mockHttpFetch.mock.calls.length;
+    expect(callsAfterFirst).toBeGreaterThanOrEqual(2);
     // Preferred language pt-br comes first, then full English ASS (deduplicated), then Forced English, then Spanish SDH
     expect(results.map((r) => r.lang)).toEqual(["pt-br", "en", "en", "es"]);
     expect(results[0].langName).toBe("Portuguese (Brazil)");
@@ -220,7 +238,7 @@ describe("searchOnlineSubtitles", () => {
       preferHearingImpaired: "avoid",
     });
     expect(cached).toHaveLength(4);
-    expect(mockHttpFetch).toHaveBeenCalledTimes(2);
+    expect(mockHttpFetch).toHaveBeenCalledTimes(callsAfterFirst);
   });
 
   it("falls back from sub.wyzie.io to sub.wyzie.ru on failure", async () => {
@@ -234,6 +252,9 @@ describe("searchOnlineSubtitles", () => {
           url,
           body: JSON.stringify([{ id: "ru1", url: "https://cdn.wyzie.example/fallback.srt", language: "en", format: "srt" }]),
         };
+      }
+      if (url.startsWith("https://api.meowtv.ru/subs/")) {
+        return { status: 200, url, body: "[]" };
       }
       throw new Error(`Unexpected URL: ${url}`);
     });
@@ -251,6 +272,9 @@ describe("searchOnlineSubtitles", () => {
     mockHttpFetch.mockImplementation(async (url) => {
       if (url.startsWith("https://sub.wyzie.")) {
         return { status: 200, url, body: "[]" };
+      }
+      if (url.startsWith("https://subsense.nepiraw.com/")) {
+        return { status: 200, url, body: JSON.stringify({ subtitles: [] }) };
       }
       if (url.startsWith("https://opensubtitles-v3.strem.io/subtitles/movie/tt0137523/")) {
         expect(url).toContain("videoHash=8e245d9679d31e12");
@@ -302,6 +326,7 @@ describe("searchOnlineSubtitles", () => {
     mockHttpFetch.mockImplementation(async (url) => {
       if (url.startsWith("https://sub.wyzie.")) return { status: 200, url, body: "[]" };
       if (url.startsWith("https://opensubtitles-v3.strem.io/")) return { status: 200, url, body: JSON.stringify({ subtitles: [] }) };
+      if (url.startsWith("https://subsense.nepiraw.com/")) return { status: 200, url, body: JSON.stringify({ subtitles: [] }) };
       if (url.startsWith("https://api.subdl.com/api/v1/subtitles")) {
         expect(url).toContain("api_key=test-subdl-key");
         expect(url).toContain("imdb_id=tt0944947");
@@ -371,6 +396,9 @@ describe("searchOnlineSubtitles", () => {
       if (url.startsWith("https://sub.wyzie.")) {
         return { status: 503, url, body: "not json" };
       }
+      if (url.startsWith("https://subsense.nepiraw.com/")) {
+        return { status: 502, url, body: "bad gateway" };
+      }
       if (url === "https://opensubtitles-v3.strem.io/subtitles/movie/tt0245429.json") {
         return {
           status: 200,
@@ -394,6 +422,69 @@ describe("searchOnlineSubtitles", () => {
     expect(results).toHaveLength(1);
     expect(results[0].url).toBe("https://os.example/en.vtt");
     expect(results[0].format).toBe("vtt");
+  });
+
+  it("enriches missing IMDb IDs via Cinemeta, parses SubSense/MeowSubs, and does not throw when only Wyzie fails TLS", async () => {
+    mockHttpFetch.mockImplementation(async (url) => {
+      if (url.startsWith("https://v3-cinemeta.strem.io/catalog/movie/top/search=")) {
+        return {
+          status: 200,
+          url,
+          body: JSON.stringify({
+            metas: [{ id: "tt15239678", name: "Dune: Part Two", releaseInfo: "2024" }],
+          }),
+        };
+      }
+      if (url.startsWith("https://sub.wyzie.")) {
+        throw new Error("TLS handshake failed");
+      }
+      if (url === "https://opensubtitles-v3.strem.io/subtitles/movie/tt15239678.json") {
+        return { status: 200, url, body: JSON.stringify({ subtitles: [] }) };
+      }
+      if (url === "https://subsense.nepiraw.com/languages=eng|noredirect/subtitles/movie/tt15239678.json") {
+        return {
+          status: 200,
+          url,
+          body: JSON.stringify({
+            subtitles: [
+              {
+                id: "ss-1",
+                url: "https://dl.opensubtitles.org/en/dune2.srt",
+                lang: "eng",
+                fileName: "Dune.Part.Two.2024.WEB-DL.srt",
+              },
+            ],
+          }),
+        };
+      }
+      if (url === "https://api.meowtv.ru/subs/movie/693134") {
+        return {
+          status: 200,
+          url,
+          body: JSON.stringify([{ label: "English", file: "https://rezesubs.com/dune2.vtt" }]),
+        };
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+
+    const results = await searchOnlineSubtitles({
+      title: "Dune: Part Two",
+      year: 2024,
+      tmdbId: 693134,
+      kind: "movie",
+      languages: ["en"],
+    });
+    expect(results.some((r) => r.provider === "subsense" && r.url.includes("dune2.srt"))).toBe(true);
+    expect(results.some((r) => r.provider === "meowtv" && r.format === "vtt")).toBe(true);
+
+    clearSubtitleSearchCache();
+    mockHttpFetch.mockImplementation(async (url) => {
+      if (url.startsWith("https://sub.wyzie.")) throw new Error("TLS reset");
+      if (url.startsWith("https://subsense.nepiraw.com/")) return { status: 200, url, body: JSON.stringify({ subtitles: [] }) };
+      if (url.startsWith("https://opensubtitles-v3.strem.io/")) return { status: 200, url, body: JSON.stringify({ subtitles: [] }) };
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    await expect(searchOnlineSubtitles({ imdbId: "tt15239678", languages: ["en"] })).resolves.toEqual([]);
   });
 
   it("reports a total outage as an error (not 'no matches') and does not cache failed searches", async () => {

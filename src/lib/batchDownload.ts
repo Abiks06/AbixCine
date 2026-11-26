@@ -1,8 +1,9 @@
 import { isTauri } from "@tauri-apps/api/core";
 import { useSyncExternalStore } from "react";
 import { acquireSession } from "../sources/session";
+import type { StreamCandidate } from "../sources/types";
 import { isUnairedEpisode, resolvePlaybackRequest } from "./catalog";
-import { candidateMeetsTargetQuality, rankDownloadOptions } from "./downloadRank";
+import { bestKnownQuality, candidateMeetsTargetQuality, formatResolution, rankDownloadOptions } from "./downloadRank";
 import {
   ensureDownloadFolder,
   hasDownloadedEpisode,
@@ -11,9 +12,17 @@ import {
   type DownloadedEntry,
   type DownloadJob,
 } from "./downloads";
-import { getSettings, type Audio } from "./settings";
+import {
+  getDownloadQuality,
+  getSettings,
+  normalizeDownloadFormat,
+  normalizeDownloadQualityPolicy,
+  type Audio,
+  type DownloadFormat,
+  type DownloadQualityPolicy,
+} from "./settings";
 import { toast } from "./toast";
-import type { Episode, MediaDetail } from "./types";
+import type { Episode, MediaDetail, PlaybackRequest } from "./types";
 
 interface QueuedEpisodeTask {
   taskKey: string;
@@ -24,6 +33,8 @@ interface QueuedEpisodeTask {
   episode: Episode;
   audio?: Audio;
   preferredQuality?: number;
+  preferredFormat?: DownloadFormat;
+  qualityPolicy?: DownloadQualityPolicy;
 }
 
 export interface BatchSeasonSummary {
@@ -50,16 +61,46 @@ export interface BatchDownloadState {
   seasons: Readonly<Record<string, BatchSeasonSummary>>;
 }
 
-const RESOLVE_TIMEOUT_MS = 12_000;
-const EXTRA_SETTLE_GRACE_MS = 1600;
+export interface BatchQualityPrompt {
+  id: string;
+  title: string;
+  canonicalKey: string;
+  season: number;
+  episodeNumber: number;
+  episodeTitle: string;
+  targetQuality: number;
+  bestQuality: number;
+  providerName: string;
+  totalEpisodes: number;
+  remainingEpisodes: number;
+  format: DownloadFormat;
+}
+
+export type BatchQualityDecision = "switch_season" | "accept_once" | "skip_keep_target" | "cancel";
+
+const RESOLVE_TIMEOUT_MS = 20_000;
+const EXTRA_SETTLE_GRACE_MS = 2_000;
+const QUALITY_CHECK_ALL_AT_MS = 2_500;
+const QUALITY_WAIT_GRACE_MS = 8_000;
 
 let batchQueue: QueuedEpisodeTask[] = [];
 const batchSeasons = new Map<string, BatchSeasonSummary>();
+const seasonStickyProviders = new Map<string, string>();
+const seasonPolicyOverrides = new Map<
+  string,
+  { preferredQuality?: number; qualityPolicy?: DownloadQualityPolicy }
+>();
+const seasonFirstChecked = new Set<string>();
 let working = false;
-let stoppedAll = false;
+let drainGen = 0;
 let currentTask: QueuedEpisodeTask | null = null;
 let currentTaskAborted = false;
 let activeAbort: (() => void) | null = null;
+
+let activePrompt: BatchQualityPrompt | null = null;
+let promptResolver: ((d: BatchQualityDecision) => void) | null = null;
+const promptListeners = new Set<() => void>();
+const emitPrompt = () => promptListeners.forEach((fn) => fn());
 
 let batchState: BatchDownloadState = {
   active: false,
@@ -99,7 +140,33 @@ export function useBatchDownloads(): BatchDownloadState {
   );
 }
 
-/** Filter a season's episodes to aired episodes not already saved or queued/active/paused. */
+export function useBatchQualityPrompt(): BatchQualityPrompt | null {
+  return useSyncExternalStore(
+    (cb) => {
+      promptListeners.add(cb);
+      return () => promptListeners.delete(cb);
+    },
+    () => activePrompt,
+  );
+}
+
+export function resolveBatchQualityPrompt(choice: BatchQualityDecision): void {
+  const res = promptResolver;
+  promptResolver = null;
+  activePrompt = null;
+  emitPrompt();
+  res?.(choice);
+}
+
+function askBatchQualityDecision(prompt: BatchQualityPrompt): Promise<BatchQualityDecision> {
+  return new Promise((resolve) => {
+    activePrompt = prompt;
+    promptResolver = resolve;
+    emitPrompt();
+  });
+}
+
+/** Filter a season's episodes to aired episodes not already saved or queued/active/paused/held. */
 export function selectMissingEpisodes(
   episodes: Episode[],
   opts: {
@@ -131,28 +198,49 @@ export function selectMissingEpisodes(
   });
 }
 
-const QUALITY_WAIT_GRACE_MS = 5500;
+interface ResolveServerOutcome {
+  status: "ready" | "below_target" | "empty" | "aborted";
+  req?: PlaybackRequest;
+  chosen?: StreamCandidate;
+  fallbacks?: StreamCandidate[];
+  bestQuality?: number;
+  targetQuality: number;
+  format: DownloadFormat;
+  policy: DownloadQualityPolicy;
+}
 
 function resolveBestDownloadServer(
   detail: MediaDetail,
   season: number | undefined,
   episode: Episode,
+  seasonKey: string,
   audio?: Audio,
   preferredQuality?: number,
-) {
-  return new Promise<{ ok: boolean }>((resolve) => {
+  preferredFormat?: DownloadFormat,
+  qualityPolicy?: DownloadQualityPolicy,
+): Promise<ResolveServerOutcome> {
+  return new Promise((resolve) => {
+    const settings = getSettings();
+    const targetQ = preferredQuality ?? getDownloadQuality(settings);
+    const targetFmt = normalizeDownloadFormat(preferredFormat ?? settings.downloadFormat);
+    const policy = normalizeDownloadQualityPolicy(qualityPolicy ?? settings.downloadQualityPolicy);
+
     const req = resolvePlaybackRequest(detail, season, episode.number, audio);
     if (!req) {
-      resolve({ ok: false });
+      resolve({ status: "empty", targetQuality: targetQ, format: targetFmt, policy });
       return;
     }
-    const targetQ = preferredQuality ?? getSettings().preferredQuality;
+
+    const stickyProvider = seasonStickyProviders.get(seasonKey);
+    const resolveGen = drainGen;
     const session = acquireSession(req);
     session.retain();
-    session.start(2);
+    session.start(6);
 
     let done = false;
+    let expandedAll = false;
     let hardTimer: ReturnType<typeof setTimeout> | undefined;
+    let expandTimer: ReturnType<typeof setTimeout> | undefined;
     let graceTimer: ReturnType<typeof setTimeout> | undefined;
     let qualityTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -160,53 +248,107 @@ function resolveBestDownloadServer(
       if (done) return;
       done = true;
       clearTimeout(hardTimer);
+      clearTimeout(expandTimer);
       clearTimeout(graceTimer);
       clearTimeout(qualityTimer);
       unsub();
       activeAbort = null;
 
       const snap = session.getSnapshot();
-      const ranked = rankDownloadOptions(snap.candidates, targetQ);
+      const ranked = rankDownloadOptions(snap.candidates, targetQ, { preferredProviderId: stickyProvider });
       const chosen = ranked[candidateIndex];
-      const backups = ranked.filter((c) => c !== chosen).slice(0, 6);
+      const fallbacks = ranked.filter((c) => c !== chosen).slice(0, 10);
       session.release();
 
-      if (!chosen || candidateIndex < 0 || stoppedAll || currentTaskAborted) {
-        resolve({ ok: false });
+      if (candidateIndex < 0 || resolveGen !== drainGen || currentTaskAborted) {
+        resolve({ status: "aborted", targetQuality: targetQ, format: targetFmt, policy });
         return;
       }
-      void startDownload(req, chosen, detail, episode.title, {
-        silent: true,
-        fallbacks: backups,
-        preferredQuality: targetQ,
-        replaceExisting: true,
-      }).then((job) => {
-        resolve({ ok: Boolean(job) });
+      if (!chosen) {
+        resolve({ status: "empty", targetQuality: targetQ, format: targetFmt, policy });
+        return;
+      }
+
+      const topKnownQ = ranked.reduce<number | undefined>((max, c) => {
+        const q = bestKnownQuality(c);
+        return q != null && (max == null || q > max) ? q : max;
+      }, undefined);
+
+      if (topKnownQ != null && topKnownQ < targetQ) {
+        resolve({
+          status: "below_target",
+          req,
+          chosen,
+          fallbacks,
+          bestQuality: topKnownQ,
+          targetQuality: targetQ,
+          format: targetFmt,
+          policy,
+        });
+        return;
+      }
+
+      resolve({
+        status: "ready",
+        req,
+        chosen,
+        fallbacks,
+        bestQuality: topKnownQ,
+        targetQuality: targetQ,
+        format: targetFmt,
+        policy,
       });
     };
 
+    const ensureCheckAll = () => {
+      if (!expandedAll) {
+        expandedAll = true;
+        session.checkAll();
+      }
+    };
+
+    expandTimer = setTimeout(() => {
+      const snap = session.getSnapshot();
+      const hasTarget = snap.candidates.some((c) => candidateMeetsTargetQuality(c, targetQ));
+      if (!hasTarget) ensureCheckAll();
+    }, QUALITY_CHECK_ALL_AT_MS);
+
     const check = () => {
-      if (stoppedAll || currentTaskAborted) {
+      if (resolveGen !== drainGen || currentTaskAborted) {
         finish(-1);
         return;
       }
       const snap = session.getSnapshot();
-      const ranked = rankDownloadOptions(snap.candidates, targetQ);
+      const ranked = rankDownloadOptions(snap.candidates, targetQ, { preferredProviderId: stickyProvider });
       if (!snap.busy) {
+        if (!expandedAll && !ranked.some((c) => candidateMeetsTargetQuality(c, targetQ))) {
+          ensureCheckAll();
+          if (session.getSnapshot().busy) return;
+        }
         finish(ranked.length > 0 ? 0 : -1);
         return;
       }
+
       if (ranked.length > 0) {
         const topMeetsTarget = candidateMeetsTargetQuality(ranked[0], targetQ);
-        if (topMeetsTarget && (ranked.length >= 2 || (snap.pick && ranked.includes(snap.pick)))) {
+        const stickyStillPending =
+          Boolean(stickyProvider) &&
+          ranked[0].providerId !== stickyProvider &&
+          snap.lanes.some(
+            (l) => l.providerId === stickyProvider && l.status === "searching",
+          );
+
+        if (topMeetsTarget && !stickyStillPending && (ranked.length >= 2 || (snap.pick && ranked.includes(snap.pick)))) {
           finish(0);
           return;
         }
         if (topMeetsTarget) {
           if (!graceTimer) graceTimer = setTimeout(() => finish(0), EXTRA_SETTLE_GRACE_MS);
-        } else if (!qualityTimer) {
-          // Top candidate so far is below the requested resolution; keep scanning other servers briefly.
-          qualityTimer = setTimeout(() => finish(0), QUALITY_WAIT_GRACE_MS);
+        } else {
+          if (!expandedAll) ensureCheckAll();
+          if (!qualityTimer) {
+            qualityTimer = setTimeout(() => finish(0), QUALITY_WAIT_GRACE_MS);
+          }
         }
       }
     };
@@ -258,82 +400,209 @@ function buildStateFromSeasons(
   };
 }
 
+function finalizeSeasonBatch(seasonKey: string) {
+  const cur = batchSeasons.get(seasonKey);
+  if (!cur) return;
+  const moreInSeason = batchQueue.some((q) => q.seasonKey === seasonKey);
+  if (moreInSeason) return;
+
+  batchSeasons.delete(seasonKey);
+  seasonFirstChecked.delete(seasonKey);
+  seasonPolicyOverrides.delete(seasonKey);
+  seasonStickyProviders.delete(seasonKey);
+
+  if (cur.total > 1) {
+    if (cur.queued > 0 && cur.failed === 0) {
+      toast(`Queued ${cur.queued} episodes of “${cur.title}” (S${cur.season}) for download`, {
+        icon: "download",
+      });
+    } else if (cur.queued > 0) {
+      toast(
+        `Queued ${cur.queued}/${cur.total} episodes of “${cur.title}” (S${cur.season}; ${cur.failed} unavailable)`,
+        { icon: "info" },
+      );
+    } else if (cur.failed > 0) {
+      toast(`Couldn't find downloadable streams for “${cur.title}” S${cur.season}`, { icon: "info" });
+    }
+  } else if (cur.total === 1 && cur.failed > 0) {
+    toast(`No downloadable server found for E${cur.currentEp ?? ""}`, { icon: "info" });
+  }
+}
+
 async function drainBatchQueue() {
   if (working) return;
   working = true;
-  stoppedAll = false;
+  const myGen = drainGen;
 
-  while (batchQueue.length > 0 && !stoppedAll) {
-    const task = batchQueue.shift()!;
-    currentTask = task;
-    currentTaskAborted = false;
-    const sSummary = batchSeasons.get(task.seasonKey);
-    if (sSummary) sSummary.currentEp = task.episode.number;
-    batchState = buildStateFromSeasons(task, batchState.pendingKeys);
-    emit();
+  try {
+    while (batchQueue.length > 0 && myGen === drainGen) {
+      const task = batchQueue.shift()!;
+      currentTask = task;
+      currentTaskAborted = false;
+      const sSummary = batchSeasons.get(task.seasonKey);
+      if (sSummary) sSummary.currentEp = task.episode.number;
+      batchState = buildStateFromSeasons(task, batchState.pendingKeys);
+      emit();
 
-    const { ok } = await resolveBestDownloadServer(
-      task.detail,
-      task.season,
-      task.episode,
-      task.audio,
-      task.preferredQuality,
-    );
-    const wasAborted = currentTaskAborted;
-    currentTask = null;
-    currentTaskAborted = false;
-    if (stoppedAll) break;
+      const seasonOverride = seasonPolicyOverrides.get(task.seasonKey);
+      const effectiveQ = seasonOverride?.preferredQuality ?? task.preferredQuality;
+      const effectivePolicy = seasonOverride?.qualityPolicy ?? task.qualityPolicy;
 
-    const nextPending = new Set(batchState.pendingKeys);
-    nextPending.delete(task.taskKey);
+      const outcome = await resolveBestDownloadServer(
+        task.detail,
+        task.season,
+        task.episode,
+        task.seasonKey,
+        task.audio,
+        effectiveQ,
+        task.preferredFormat,
+        effectivePolicy,
+      );
 
-    if (!wasAborted) {
-      const cur = batchSeasons.get(task.seasonKey);
-      if (cur) {
-        if (ok) cur.queued++;
-        else cur.failed++;
-        const moreInSeason = batchQueue.some((q) => q.seasonKey === task.seasonKey);
-        if (!moreInSeason) {
-          batchSeasons.delete(task.seasonKey);
-          if (cur.total > 1) {
-            if (cur.queued > 0 && cur.failed === 0) {
-              toast(`Queued ${cur.queued} episodes of “${cur.title}” (S${cur.season}) for download`, {
-                icon: "download",
-              });
-            } else if (cur.queued > 0) {
-              toast(
-                `Queued ${cur.queued}/${cur.total} episodes of “${cur.title}” (S${cur.season}; ${cur.failed} unavailable)`,
-                { icon: "info" },
-              );
-            } else if (cur.failed > 0) {
-              toast(`Couldn't find downloadable streams for “${cur.title}” S${cur.season}`, { icon: "info" });
+      const isFirstSeasonCheck = !seasonFirstChecked.has(task.seasonKey);
+      if (outcome.status === "ready" || outcome.status === "below_target") {
+        seasonFirstChecked.add(task.seasonKey);
+      }
+
+      let ok = false;
+      let countResult = true;
+
+      if (myGen === drainGen && !currentTaskAborted && outcome.status !== "aborted") {
+        if (
+          outcome.status === "below_target" &&
+          outcome.chosen &&
+          outcome.req &&
+          outcome.bestQuality &&
+          outcome.policy === "ask" &&
+          isFirstSeasonCheck &&
+          (sSummary?.total ?? 0) > 1
+        ) {
+          const remainingCount = batchQueue.filter((q) => q.seasonKey === task.seasonKey).length;
+          const decision = await askBatchQualityDecision({
+            id: task.taskKey,
+            title: task.detail.title,
+            canonicalKey: task.canonicalKey,
+            season: task.season,
+            episodeNumber: task.episode.number,
+            episodeTitle: task.episode.title,
+            targetQuality: outcome.targetQuality,
+            bestQuality: outcome.bestQuality,
+            providerName: outcome.chosen.providerName,
+            totalEpisodes: sSummary?.total ?? 1,
+            remainingEpisodes: remainingCount,
+            format: outcome.format,
+          });
+
+          if (myGen !== drainGen || currentTaskAborted || decision === "cancel") {
+            countResult = false;
+            if (decision === "cancel" && myGen === drainGen) {
+              const nextPending = new Set(batchState.pendingKeys);
+              nextPending.delete(task.taskKey);
+              batchState = buildStateFromSeasons(null, nextPending);
+              currentTask = null;
+              emit();
+              cancelBatchDownloads({ silent: true, canonicalKey: task.canonicalKey, season: task.season });
+              continue;
             }
-          } else if (cur.total === 1 && cur.failed > 0) {
-            toast(`No downloadable server found for E${cur.currentEp ?? ""}`, { icon: "info" });
+          } else if (decision === "switch_season") {
+            seasonPolicyOverrides.set(task.seasonKey, {
+              preferredQuality: outcome.bestQuality,
+              qualityPolicy: "best",
+            });
+            seasonStickyProviders.set(task.seasonKey, outcome.chosen.providerId);
+            for (const queuedTask of batchQueue) {
+              if (queuedTask.seasonKey === task.seasonKey) {
+                queuedTask.preferredQuality = outcome.bestQuality;
+                queuedTask.qualityPolicy = "best";
+              }
+            }
+            const job = await startDownload(outcome.req, outcome.chosen, task.detail, task.episode.title, {
+              silent: true,
+              fallbacks: outcome.fallbacks,
+              preferredQuality: outcome.bestQuality,
+              preferredFormat: outcome.format,
+              qualityPolicy: "best",
+              replaceExisting: true,
+            });
+            ok = Boolean(job);
+            toast(
+              `Switched Season ${task.season} downloads to ${formatResolution(outcome.bestQuality)} (${outcome.chosen.providerName})`,
+              { icon: "download" },
+            );
+          } else if (decision === "accept_once") {
+            const job = await startDownload(outcome.req, outcome.chosen, task.detail, task.episode.title, {
+              silent: true,
+              fallbacks: outcome.fallbacks,
+              preferredQuality: outcome.bestQuality,
+              preferredFormat: outcome.format,
+              qualityPolicy: "best",
+              replaceExisting: true,
+            });
+            ok = Boolean(job);
+          } else if (decision === "skip_keep_target") {
+            countResult = true;
+            ok = false;
           }
+        } else if (outcome.chosen && outcome.req) {
+          if (outcome.status === "ready") {
+            seasonStickyProviders.set(task.seasonKey, outcome.chosen.providerId);
+          }
+          const job = await startDownload(outcome.req, outcome.chosen, task.detail, task.episode.title, {
+            silent: true,
+            fallbacks: outcome.fallbacks,
+            preferredQuality: outcome.targetQuality,
+            preferredFormat: outcome.format,
+            qualityPolicy: outcome.policy,
+            replaceExisting: true,
+          });
+          ok = Boolean(job);
         }
       }
+
+      const wasAborted = currentTaskAborted;
+      currentTask = null;
+      currentTaskAborted = false;
+      if (myGen !== drainGen) break;
+
+      const nextPending = new Set(batchState.pendingKeys);
+      nextPending.delete(task.taskKey);
+
+      if (!wasAborted && countResult) {
+        const cur = batchSeasons.get(task.seasonKey);
+        if (cur) {
+          if (ok) cur.queued++;
+          else cur.failed++;
+          finalizeSeasonBatch(task.seasonKey);
+        }
+      } else if (!wasAborted) {
+        finalizeSeasonBatch(task.seasonKey);
+      }
+
+      batchState = buildStateFromSeasons(null, nextPending);
+      emit();
     }
-
-    batchState = buildStateFromSeasons(null, nextPending);
-    emit();
+  } finally {
+    currentTask = null;
+    currentTaskAborted = false;
+    working = false;
+    if (myGen === drainGen && batchQueue.length === 0) {
+      batchSeasons.clear();
+      seasonFirstChecked.clear();
+      seasonPolicyOverrides.clear();
+      seasonStickyProviders.clear();
+      batchState = {
+        active: false,
+        total: 0,
+        queued: 0,
+        failed: 0,
+        pendingKeys: new Set(),
+        seasons: {},
+      };
+      emit();
+    } else if (batchQueue.length > 0) {
+      void drainBatchQueue();
+    }
   }
-
-  batchQueue = [];
-  batchSeasons.clear();
-  currentTask = null;
-  currentTaskAborted = false;
-  working = false;
-  stoppedAll = false;
-  batchState = {
-    active: false,
-    total: 0,
-    queued: 0,
-    failed: 0,
-    pendingKeys: new Set(),
-    seasons: {},
-  };
-  emit();
 }
 
 export async function queueEpisodeDownload(
@@ -342,6 +611,8 @@ export async function queueEpisodeDownload(
   episode: Episode,
   audio?: Audio,
   preferredQuality?: number,
+  preferredFormat?: DownloadFormat,
+  qualityPolicy?: DownloadQualityPolicy,
 ): Promise<void> {
   if (!isTauri()) {
     toast("Offline downloads work in the AbixCine desktop app.", { icon: "info" });
@@ -367,6 +638,8 @@ export async function queueEpisodeDownload(
     episode,
     audio,
     preferredQuality,
+    preferredFormat,
+    qualityPolicy,
   });
 
   const prevS = batchSeasons.get(sKey);
@@ -395,6 +668,8 @@ export async function queueSeasonDownloads(
   items?: DownloadedEntry[],
   jobs?: DownloadJob[],
   preferredQuality?: number,
+  preferredFormat?: DownloadFormat,
+  qualityPolicy?: DownloadQualityPolicy,
 ): Promise<void> {
   if (!isTauri()) {
     toast("Offline downloads work in the AbixCine desktop app.", { icon: "info" });
@@ -423,6 +698,23 @@ export async function queueSeasonDownloads(
     return;
   }
 
+  const targetQ = preferredQuality ?? getDownloadQuality(getSettings());
+  // Seed sticky provider from any existing episode of this season that already hit target resolution.
+  if (items && !seasonStickyProviders.has(sKey)) {
+    const existingGood = items.find(
+      (it) =>
+        !it.isFilm &&
+        (it.canonicalKey === cKey || it.mediaKey === cKey) &&
+        (it.season ?? 1) === season &&
+        it.qualityVerified &&
+        (it.quality ?? 0) >= targetQ &&
+        it.providerId !== "local-vault",
+    );
+    if (existingGood) {
+      seasonStickyProviders.set(sKey, existingGood.providerId);
+    }
+  }
+
   const nextPending = new Set(batchState.pendingKeys);
   let added = 0;
   for (const ep of missing) {
@@ -438,6 +730,8 @@ export async function queueSeasonDownloads(
       episode: ep,
       audio,
       preferredQuality,
+      preferredFormat,
+      qualityPolicy,
     });
     added++;
   }
@@ -472,10 +766,16 @@ export function cancelBatchDownloads(opts?: {
 
   const scoped = Boolean(opts?.canonicalKey != null || opts?.season != null);
   if (!scoped) {
-    stoppedAll = true;
+    drainGen += 1;
     batchQueue = [];
     batchSeasons.clear();
+    seasonFirstChecked.clear();
+    seasonPolicyOverrides.clear();
+    seasonStickyProviders.clear();
     currentTaskAborted = true;
+    if (activePrompt) {
+      resolveBatchQualityPrompt("cancel");
+    }
     const abortFn = activeAbort;
     batchState = {
       active: false,
@@ -508,8 +808,16 @@ export function cancelBatchDownloads(opts?: {
   for (const [k, s] of batchSeasons.entries()) {
     if (taskMatchesScope({ canonicalKey: s.canonicalKey, season: s.season }, opts)) {
       batchSeasons.delete(k);
+      seasonFirstChecked.delete(k);
+      seasonPolicyOverrides.delete(k);
+      seasonStickyProviders.delete(k);
       matched = true;
     }
+  }
+
+  if (activePrompt && taskMatchesScope(activePrompt, opts)) {
+    resolveBatchQualityPrompt("cancel");
+    matched = true;
   }
 
   let abortFn: (() => void) | null = null;
@@ -540,9 +848,12 @@ export function __seedBatchQueueForTest(
 ): void {
   batchQueue = [];
   batchSeasons.clear();
+  seasonFirstChecked.clear();
+  seasonPolicyOverrides.clear();
+  seasonStickyProviders.clear();
   currentTask = null;
   currentTaskAborted = false;
-  stoppedAll = false;
+  drainGen += 1;
   const nextPending = new Set<string>();
   for (const e of entries) {
     const cKey = e.detail.canonicalKey ?? e.detail.key;

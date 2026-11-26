@@ -5,7 +5,7 @@
    specular bevels and composited frost grain on scrolling cards.
    ========================================================= */
 
-/* ---------- composited frost-grain glass panes (scrollable card grids) ---------- */
+/* ---------- matte elevated archival cards & containers ---------- */
 .panel,
 .facts,
 .file,
@@ -15,25 +15,7 @@
 .tt-ticket,
 .dlv-card,
 .theme-card,
-.race-grid-wrap {
-  position: relative;
-  background-color: var(--glass-bg-pane);
-  background-image: var(--frost-grain), var(--glass-sheen);
-  background-size: var(--glass-size);
-  background-repeat: var(--glass-repeat);
-  border: 0;
-  box-shadow: var(--glass-rim), var(--card-shadow);
-}
-
-a.file:hover,
-.preset-card:hover,
-.theme-card:hover,
-.dlv-card:hover {
-  background-color: color-mix(in oklab, var(--fg) 7%, var(--glass-bg-pane));
-  box-shadow: var(--glass-rim-hi), var(--card-hover-shadow);
-}
-
-/* ---------- focal real backdrop-filter glass panels ---------- */
+.race-grid-wrap,
 .smart,
 .tp-telemetry-card,
 .nw-spotlight,
@@ -46,18 +28,24 @@ a.file:hover,
 .dlv-queue,
 .ep-season-prog {
   position: relative;
-  background-color: var(--glass-bg-pane);
-  background-image: var(--frost-grain), var(--glass-sheen);
-  background-size: var(--glass-size);
-  background-repeat: var(--glass-repeat);
-  backdrop-filter: var(--glass-blur);
-  -webkit-backdrop-filter: var(--glass-blur);
-  border: 0;
-  box-shadow: var(--glass-rim), var(--card-shadow);
+  background-color: var(--s0);
+  background-image: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  border: 1px solid var(--line);
+  box-shadow: var(--card-shadow);
 }
 
-.hero-plinth,
-.smart {
+a.file:hover,
+.preset-card:hover,
+.theme-card:hover,
+.dlv-card:hover {
+  background-color: var(--s1);
+  border-color: var(--line-3);
+  box-shadow: var(--card-hover-shadow);
+}
+
+.hero-plinth {
   box-shadow: var(--glass-rim), var(--glass-shadow);
 }
 
@@ -93,7 +81,7 @@ a.file:hover,
   box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.24), inset 0 0 0 1px color-mix(in oklab, var(--tone) 42%, transparent), 0 16px 36px -18px var(--glow);
 }
 
-/* ---------- masked 1px Apple liquid-glass directional specular bevel rim ---------- */
+/* ---------- masked 1px liquid-glass directional specular bevel rim (floating overlays only) ---------- */
 :is(
   .hero-plinth,
   .palette,
@@ -103,15 +91,7 @@ a.file:hover,
   .dl-pop,
   .auth-card,
   .search-box,
-  .smart,
-  .tp-telemetry-card,
-  .nw-spotlight,
-  .lp-card,
-  .panel,
   .taste-ribbon,
-  .filmreel,
-  .spread-lead,
-  .top-hit,
   .pbot,
   .psheet,
   .hover-preview
@@ -129,7 +109,7 @@ a.file:hover,
   z-index: 4;
 }
 
-/* ---------- pointer-reactive liquid glass catch-light (lib/pointerLight.ts) ---------- */
+/* ---------- pointer-reactive catch-light (lib/pointerLight.ts) ---------- */
 :is(
   .hero-plinth,
   .topbar-search,
@@ -146,6 +126,19 @@ a.file:hover,
   .dl-modal,
   .qd-drawer,
   .auth-card,
+  .pbot,
+  .psheet,
+  .hover-preview
+).lit {
+  background-image:
+    radial-gradient(300px circle at var(--gx, 50%) var(--gy, 0%), var(--glass-spot), transparent 68%),
+    var(--frost-grain),
+    var(--glass-sheen);
+  background-size: 100% 100%, var(--glass-size);
+  background-repeat: no-repeat, var(--glass-repeat);
+}
+
+:is(
   .smart,
   .tp-telemetry-card,
   .nw-spotlight,
@@ -158,17 +151,11 @@ a.file:hover,
   .dlv-setup,
   .dlv-queue,
   .ep-season-prog,
-  .top-hit,
-  .pbot,
-  .psheet,
-  .hover-preview
+  .top-hit
 ).lit {
-  background-image:
-    radial-gradient(300px circle at var(--gx, 50%) var(--gy, 0%), var(--glass-spot), transparent 68%),
-    var(--frost-grain),
-    var(--glass-sheen);
-  background-size: 100% 100%, var(--glass-size);
-  background-repeat: no-repeat, var(--glass-repeat);
+  background-image: radial-gradient(300px circle at var(--gx, 50%) var(--gy, 0%), color-mix(in oklab, var(--tone) 8%, transparent), transparent 68%);
+  background-size: 100% 100%;
+  background-repeat: no-repeat;
 }
 
 /* ---------- optical corner registration brackets ---------- */
@@ -283,14 +270,14 @@ a.file:hover,
 .view-pick { --ind-bg: var(--s3); --ind-shadow: inset 0 1px 0 rgb(255 255 255 / 0.16), inset 0 0 0 1px var(--line-2); }
 .pal-list {
   --ind-r: var(--r-sm);
-  --ind-bg: color-mix(in oklab, var(--fg) 10%, transparent);
-  --ind-shadow: inset 0 1px 0 rgb(255 255 255 / 0.18), inset 2px 0 0 var(--tone);
+  --ind-bg: color-mix(in oklab, var(--tone) 11%, var(--s1));
+  --ind-shadow: inset 0 0 0 1px color-mix(in oklab, var(--tone) 32%, var(--line-2));
 }
 .pal-list[data-ind="live"]::before { transition-duration: var(--base); }
 .set-nav {
   --ind-r: 10px;
-  --ind-bg: color-mix(in oklab, var(--fg) 10%, var(--glass-bg-subtle));
-  --ind-shadow: var(--glass-rim), inset 2.5px 0 0 var(--tone);
+  --ind-bg: color-mix(in oklab, var(--tone) 12%, var(--s1));
+  --ind-shadow: inset 0 0 0 1px color-mix(in oklab, var(--tone) 36%, var(--line-2));
 }
 .tabbar[data-ind]::before {
   top: auto;

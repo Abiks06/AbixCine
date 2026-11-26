@@ -1,7 +1,8 @@
+import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { encodeKey } from "../lib/catalog";
 import { openDossier, registerMedia } from "../lib/dossier";
-import { fmtSize, qualityBadge, useDrive, type DriveTitle } from "../lib/library";
+import { fmtSize, qualityBadge, sortDriveGroups, useDrive, type DriveSort, type DriveTitle } from "../lib/library";
 import { previewLight } from "../lib/light";
 import { useSettings } from "../lib/settings";
 import { Art } from "./Art";
@@ -77,8 +78,26 @@ export function DriveTile({ t, i = 0 }: { t: DriveTitle; i?: number }) {
 export function DriveSection({ limit, rescan = 0, bare = false }: { limit?: number; rescan?: number; bare?: boolean }) {
   const s = useSettings();
   const drive = useDrive(rescan);
+  const [query, setQuery] = useState("");
+  const [kindFilter, setKindFilter] = useState<"all" | "movie" | "show">("all");
+  const [sortBy, setSortBy] = useState<DriveSort>("title");
+
   const where = s.libraryPaths.length === 1 ? folderLabel(s.libraryPaths[0]) : s.libraryPaths.length ? `${s.libraryPaths.length} folders` : "your drive";
-  const shown = limit ? drive.titles.slice(0, limit) : drive.titles;
+
+  const filtered = useMemo(() => {
+    if (limit) return drive.titles;
+    const q = query.trim().toLowerCase();
+    const matched = drive.titles.filter((t) => {
+      if (kindFilter === "movie" && t.isShow) return false;
+      if (kindFilter === "show" && !t.isShow) return false;
+      if (q && !t.title.toLowerCase().includes(q) && !String(t.year ?? "").includes(q)) return false;
+      return true;
+    });
+    return sortDriveGroups(matched, sortBy);
+  }, [drive.titles, limit, query, kindFilter, sortBy]);
+
+  const shown = limit ? filtered.slice(0, limit) : filtered;
+  const showToolbar = !limit && drive.titles.length > 0;
 
   return (
     <section className="shelf vault-bay" id="drive">
@@ -113,10 +132,60 @@ export function DriveSection({ limit, rescan = 0, bare = false }: { limit?: numb
         <div className="drive">{Array.from({ length: limit ?? 6 }, (_, i) => <div key={i} className="file skeleton" />)}</div>
       ) : drive.error || (drive.warning && !drive.titles.length) ? (
         <p className="muted">Couldn't scan: {drive.error ?? drive.warning}</p>
-      ) : shown.length === 0 ? (
+      ) : drive.titles.length === 0 ? (
         <p className="muted drive-note">No video files found in {where} yet. Names like “Movie (2021).mkv” or “Show S01E02.mp4” are picked up on the next scan.</p>
       ) : (
-        <div className="drive">{shown.map((t, i) => <DriveTile key={t.id} t={t} i={i} />)}</div>
+        <>
+          {showToolbar && (
+            <div className="dlv-toolbar drive-toolbar">
+              <div className="dlv-search">
+                <Icon name="search" size={14} />
+                <input
+                  type="search"
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="Filter local titles…"
+                  aria-label="Filter local files"
+                />
+              </div>
+              <div className="dlv-filters" role="tablist" aria-label="Filter local files by kind">
+                {(
+                  [
+                    ["all", "All"],
+                    ["movie", "Films"],
+                    ["show", "Series"],
+                  ] as const
+                ).map(([id, label]) => (
+                  <button
+                    key={id}
+                    type="button"
+                    role="tab"
+                    aria-selected={kindFilter === id}
+                    className={`chip ${kindFilter === id ? "on" : ""}`}
+                    onClick={() => setKindFilter(id)}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <select
+                className="ep-q-pick dlv-sort"
+                aria-label="Sort local library"
+                value={sortBy}
+                onChange={(e) => setSortBy(e.target.value as DriveSort)}
+              >
+                <option value="title">Title A–Z</option>
+                <option value="count">Most files</option>
+                <option value="size">Largest</option>
+              </select>
+            </div>
+          )}
+          {shown.length === 0 ? (
+            <p className="muted drive-note">No local titles match “{query}”.</p>
+          ) : (
+            <div className="drive">{shown.map((t, i) => <DriveTile key={t.id} t={t} i={i} />)}</div>
+          )}
+        </>
       )}
     </section>
   );

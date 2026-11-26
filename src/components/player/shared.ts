@@ -18,6 +18,7 @@ export interface PlayerMedia {
   malId?: number;
   anilistId?: number;
   title: string;
+  originalTitle?: string;
   logo?: string;
   overview?: string;
   year?: number;

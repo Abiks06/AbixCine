@@ -126,7 +126,7 @@ export function initStreamGateway(): Promise<void> {
   gatewayInit ??= (async () => {
     try {
       const base = await invoke<string | null>("stream_gateway");
-      if (!base) return;
+      if (typeof base !== "string" || !/^https?:\/\//i.test(base)) return;
       const ctl = new AbortController();
       const t = setTimeout(() => ctl.abort(), 2000);
       try {

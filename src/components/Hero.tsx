@@ -40,6 +40,7 @@ export function Hero({ items, label, onActive, loading = true }: { items: Media[
   const picks = useFeatured(items.filter((m) => m.backdrop || m.poster || m.hue != null).slice(0, 6));
   const [i, setI] = useState(0);
   const [paused, setPaused] = useState(false);
+  const [userPaused, setUserPaused] = useState(false);
   const [trailer, setTrailer] = useState<{ id: string; title: string } | null>(null);
   const n = picks.length;
   const cur = n ? i % n : 0;
@@ -77,7 +78,7 @@ export function Hero({ items, label, onActive, loading = true }: { items: Media[
       document.removeEventListener("visibilitychange", sync);
     };
   }, [ready]);
-  const hold = paused || away || !!trailer;
+  const hold = paused || userPaused || away || !!trailer;
 
   const still = useSettings().reduceMotion || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
   const advance = () => n > 1 && setI((x) => (x + 1) % n);
@@ -125,30 +126,42 @@ export function Hero({ items, label, onActive, loading = true }: { items: Media[
           </div>
 
           {n > 1 && (
-            <div className="hero-strip" role="tablist" aria-label="Programme slides">
-              {picks.map((p, j) => (
-                <button
-                  key={p.key}
-                  role="tab"
-                  aria-selected={j === cur}
-                  className={`hs-btn ${j === cur ? "on" : j < cur ? "done" : ""}`}
-                  onClick={() => setI(j)}
-                  title={`${pad2(j + 1)} · ${p.title}`}
-                  aria-label={`Show ${p.title}`}
-                >
-                  <span className="hs-thumb" aria-hidden><Art media={p} variant="backdrop" size="xs" eager /></span>
-                  <span className="hs-num">{pad2(j + 1)}</span>
-                  <span className="hs-title">{p.title}</span>
-                  {j === cur && !still && (
-                    <i
-                      key={cur}
-                      className="hs-bar"
-                      onAnimationEnd={advance}
-                      style={{ animationPlayState: hold ? "paused" : "running", animationDuration: `${SLIDE_MS}ms` }}
-                    />
-                  )}
-                </button>
-              ))}
+            <div className="hero-strip-row">
+              <div className="hero-strip" role="tablist" aria-label="Programme slides">
+                {picks.map((p, j) => (
+                  <button
+                    key={p.key}
+                    role="tab"
+                    aria-selected={j === cur}
+                    className={`hs-btn ${j === cur ? "on" : j < cur ? "done" : ""}`}
+                    onClick={() => setI(j)}
+                    title={`${pad2(j + 1)} · ${p.title}`}
+                    aria-label={`Show ${p.title}`}
+                  >
+                    <span className="hs-thumb" aria-hidden><Art media={p} variant="backdrop" size="xs" eager /></span>
+                    <span className="hs-num">{pad2(j + 1)}</span>
+                    <span className="hs-title">{p.title}</span>
+                    {j === cur && !still && (
+                      <i
+                        key={cur}
+                        className="hs-bar"
+                        onAnimationEnd={advance}
+                        style={{ animationPlayState: hold ? "paused" : "running", animationDuration: `${SLIDE_MS}ms` }}
+                      />
+                    )}
+                  </button>
+                ))}
+              </div>
+              <button
+                type="button"
+                className={`hero-pause ${userPaused ? "on" : ""}`}
+                onClick={() => setUserPaused((v) => !v)}
+                aria-label={userPaused ? "Resume slide rotation" : "Pause slide rotation"}
+                aria-pressed={userPaused}
+                title={userPaused ? "Resume slide rotation" : "Pause slide rotation"}
+              >
+                <Icon name={userPaused ? "play" : "pause"} size={12} />
+              </button>
             </div>
           )}
         </div>

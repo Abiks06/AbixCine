@@ -91,7 +91,13 @@ export const vidrockProvider: SourceProvider = {
           const enc = typeof val === "string" ? val : val?.url;
           if (!enc || enc === "error" || enc === "null") return null;
           const url = await decryptVidrockUrl(enc);
-          if (!url) return null;
+          if (
+            !url
+            || !/^https?:\/\//i.test(url)
+            || /(?:bigbuckbunny|test-streams\.mux\.dev|sample[-_.]?video|payments\.stravo|\/error\.m3u8|\/placeholder\b)/i.test(url)
+          ) {
+            return null;
+          }
           const hintType = typeof val === "object" && val ? val.type : undefined;
           const quality = normalizeQuality(typeof val === "object" && val ? val.quality : undefined) ?? normalizeQuality(url);
           const kind = inferStreamKind(url, hintType);

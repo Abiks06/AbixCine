@@ -3,17 +3,21 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { useBatchDownloads } from "../lib/batchDownload";
 import { encodeKey } from "../lib/catalog";
+import { formatResolution } from "../lib/downloadRank";
 import {
   cancelAllDownloads,
   cancelDownload,
   clearFailedDownloads,
+  entryContainer,
   fmtEta,
   fmtSpeed,
   formatDownloadQuality,
+  formatDownloadTransferLabel,
   formatQualityTag,
   openDownloadsFolder,
   pauseAllDownloads,
   pauseDownload,
+  resolveQualityMismatch,
   resumeAllDownloads,
   resumeDownload,
   switchDownloadToNextServer,
@@ -21,6 +25,7 @@ import {
   type DownloadJob,
 } from "../lib/downloads";
 import { fmtSize } from "../lib/library";
+import { openQualityReviewModal } from "./DownloadQualityModal";
 import { Icon } from "./Icon";
 
 const isJobActive = (j: DownloadJob) =>
@@ -35,16 +40,30 @@ function epChip(j: { isFilm: boolean; season?: number; episode?: number }): stri
  * Compact topbar Downloads indicator & live transfer queue popover.
  * Hidden until the user has at least one active, queued, paused, or saved download.
  */
-export function DownloadsPopover() {
+export function DownloadsPopover({
+  open: controlledOpen,
+  onOpenChange,
+}: {
+  open?: boolean;
+  onOpenChange?: (next: boolean) => void;
+} = {}) {
   const desktop = isTauri();
   const { jobs, items, root, switchingIds } = useDownloads();
   const batch = useBatchDownloads();
-  const [open, setOpen] = useState(false);
+  const [internalOpen, setInternalOpen] = useState(false);
+  const open = controlledOpen !== undefined ? controlledOpen : internalOpen;
+  const setOpen = (next: boolean | ((cur: boolean) => boolean)) => {
+    const val = typeof next === "function" ? next(open) : next;
+    if (controlledOpen === undefined) setInternalOpen(val);
+    onOpenChange?.(val);
+  };
   const [confirmStopAll, setConfirmStopAll] = useState(false);
+  const [confirmSeasonKey, setConfirmSeasonKey] = useState<string | null>(null);
 
   useEffect(() => {
     if (!open) {
       setConfirmStopAll(false);
+      setConfirmSeasonKey(null);
       return;
     }
     const onKey = (e: KeyboardEvent) => {
@@ -52,14 +71,15 @@ export function DownloadsPopover() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [open]);
+  }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!desktop) return null;
 
   const activeJobs = jobs.filter(isJobActive);
   const pausedJobs = jobs.filter((j) => j.status === "paused");
+  const awaitingJobs = jobs.filter((j) => j.status === "awaitingQuality");
   const failedJobs = jobs.filter((j) => j.status === "failed");
-  const visibleJobs = [...activeJobs, ...pausedJobs, ...failedJobs];
+  const visibleJobs = [...activeJobs, ...awaitingJobs, ...pausedJobs, ...failedJobs];
 
   if (visibleJobs.length === 0 && !batch.active && items.length === 0) return null;
 
@@ -76,7 +96,7 @@ export function DownloadsPopover() {
     <div className="dlq-wrap">
       <button
         type="button"
-        className={`topbar-dl ${activeJobs.length > 0 || batch.active ? "active" : ""} ${failedJobs.length > 0 && activeJobs.length === 0 ? "has-failed" : ""} ${open ? "on" : ""}`}
+        className={`topbar-dl ${activeJobs.length > 0 || batch.active ? "active" : ""} ${awaitingJobs.length > 0 && activeJobs.length === 0 ? "has-awaiting" : ""} ${failedJobs.length > 0 && activeJobs.length === 0 ? "has-failed" : ""} ${open ? "on" : ""}`}
         aria-haspopup="dialog"
         aria-expanded={open}
         aria-label="Downloads queue"
@@ -85,9 +105,11 @@ export function DownloadsPopover() {
             ? `${activeJobs.length} downloading · ${Math.round(avgPct)}%${speedText ? ` (${speedText})` : ""}`
             : batch.active
               ? `Finding servers for ${batch.title ?? "season"}`
-              : failedJobs.length > 0
-                ? `${failedJobs.length} download${failedJobs.length === 1 ? "" : "s"} need attention`
-                : `${items.length} saved offline`
+              : awaitingJobs.length > 0
+                ? `${awaitingJobs.length} download${awaitingJobs.length === 1 ? "" : "s"} awaiting quality choice`
+                : failedJobs.length > 0
+                  ? `${failedJobs.length} download${failedJobs.length === 1 ? "" : "s"} need attention`
+                  : `${items.length} saved offline`
         }
         onClick={() => setOpen((o) => !o)}
       >
@@ -112,6 +134,13 @@ export function DownloadsPopover() {
               {activeJobs.length > 0 ? `${Math.round(avgPct)}%` : `${batch.queued}/${batch.total}`}
             </span>
             {speedText && <span className="dl-spd">{speedText}</span>}
+          </>
+        ) : awaitingJobs.length > 0 ? (
+          <>
+            <Icon name="info" size={13} />
+            <span className="dl-pct">
+              {awaitingJobs.length} {awaitingJobs.length === 1 ? "choice" : "choices"}
+            </span>
           </>
         ) : failedJobs.length > 0 ? (
           <>
@@ -140,9 +169,13 @@ export function DownloadsPopover() {
                 DOWNLOADS{" "}
                 {activeJobs.length > 0
                   ? `· ${activeJobs.length} ACTIVE`
-                  : failedJobs.length > 0
-                    ? `· ${failedJobs.length} FAILED`
-                    : ""}
+                  : awaitingJobs.length > 0
+                    ? `· ${awaitingJobs.length} CHOICE${awaitingJobs.length === 1 ? "" : "S"}`
+                    : pausedJobs.length > 0
+                      ? `· ${pausedJobs.length} PAUSED`
+                      : failedJobs.length > 0
+                        ? `· ${failedJobs.length} FAILED`
+                        : ""}
               </span>
               <span className="dlq-links">
                 {failedJobs.length > 0 && (
@@ -185,6 +218,18 @@ export function DownloadsPopover() {
                 {activeJobs.length > 0 && (
                   <button type="button" className="chip" onClick={() => void pauseAllDownloads()}>
                     <Icon name="pause" size={11} /> Pause all
+                  </button>
+                )}
+                {awaitingJobs.length > 0 && (
+                  <button
+                    type="button"
+                    className="chip dlq-badge-warn"
+                    onClick={() => {
+                      setOpen(false);
+                      openQualityReviewModal();
+                    }}
+                  >
+                    <Icon name="info" size={11} /> Review quality ({awaitingJobs.length})
                   </button>
                 )}
                 {(pausedJobs.length > 0 || failedJobs.length > 0) && (
@@ -296,14 +341,35 @@ export function DownloadsPopover() {
                             <Icon name="play" size={11} />
                           </button>
                         )}
-                        <button
-                          type="button"
-                          className="chip danger dlq-sb-stop"
-                          title={`Stop & clear ${g.title} Season ${g.season} downloads`}
-                          onClick={() => void cancelAllDownloads({ canonicalKey: g.cKey, season: g.season })}
-                        >
-                          Stop S{g.season}
-                        </button>
+                        {confirmSeasonKey === `${g.cKey}|${g.season}` && (g.jobs.length > 1 || Boolean(bs)) ? (
+                          <>
+                            <button
+                              type="button"
+                              className="chip danger dlq-sb-stop"
+                              onClick={() => {
+                                setConfirmSeasonKey(null);
+                                void cancelAllDownloads({ canonicalKey: g.cKey, season: g.season });
+                              }}
+                            >
+                              Confirm stop
+                            </button>
+                            <button type="button" className="chip dlq-sb-stop" onClick={() => setConfirmSeasonKey(null)}>
+                              Keep
+                            </button>
+                          </>
+                        ) : (
+                          <button
+                            type="button"
+                            className="chip danger dlq-sb-stop"
+                            title={`Stop & clear ${g.title} Season ${g.season} downloads`}
+                            onClick={() => {
+                              if (g.jobs.length > 1 || Boolean(bs)) setConfirmSeasonKey(`${g.cKey}|${g.season}`);
+                              else void cancelAllDownloads({ canonicalKey: g.cKey, season: g.season });
+                            }}
+                          >
+                            Stop S{g.season}
+                          </button>
+                        )}
                       </span>
                     </div>
                     <div className="dl-bar">
@@ -356,7 +422,7 @@ export function DownloadsPopover() {
                           )}
                           {j.videoCodec && <span className="dlq-badge-dim">{j.videoCodec}</span>}
                           {j.audio && <span className="dlq-badge-dim">{j.audio.toUpperCase()}</span>}
-                          <span className="dlq-badge-dim">{j.kind === "hls" ? "HLS→MP4" : "DIRECT"}</span>
+                          <span className="dlq-badge-dim">{formatDownloadTransferLabel(j)}</span>
                           {((j.attemptIndex ?? 1) > 1 || (j.totalSources ?? 1) > 1) && (
                             <span className="dlq-badge-dim">
                               Server {j.attemptIndex ?? 1}/{Math.max(j.attemptIndex ?? 1, j.totalSources ?? 1)}
@@ -374,7 +440,23 @@ export function DownloadsPopover() {
                         </div>
                       </div>
                       <div className="dlq-acts">
-                        {active ? (
+                        {j.status === "awaitingQuality" ? (
+                          <button
+                            type="button"
+                            className="chip dlq-badge-warn"
+                            title={`Download at best available (${formatResolution(j.availableQuality ?? j.resolvedQuality ?? j.quality) || "lower"})`}
+                            onClick={() =>
+                              void resolveQualityMismatch(
+                                [j.id],
+                                "accept",
+                                j.availableQuality ?? j.resolvedQuality ?? j.quality,
+                              )
+                            }
+                          >
+                            <Icon name="download" size={11} />{" "}
+                            {formatResolution(j.availableQuality ?? j.resolvedQuality ?? j.quality) || "Accept"}
+                          </button>
+                        ) : active ? (
                           <button
                             type="button"
                             className="icon-btn"
@@ -438,6 +520,7 @@ export function DownloadsPopover() {
                           {[
                             chip,
                             formatQualityTag(it.quality, it.qualityVerified),
+                            entryContainer(it),
                             it.videoCodec,
                             fmtSize(it.fileSize),
                             it.providerName,

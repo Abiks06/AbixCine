@@ -48,9 +48,9 @@ export const THEMES: readonly ThemeMeta[] = [
   {
     id: "violet",
     name: "A24 Dusk",
-    tagline: "Ultraviolet studio night, orchid & glacier blue",
+    tagline: "Studio slate indigo, periwinkle & twilight blue",
     mode: "dark",
-    swatches: ["#090612", "#161026", "#c485ff", "#f3effb"],
+    swatches: ["#090a12", "#131524", "#9aa8f2", "#f0f2fa"],
   },
   {
     id: "solstice",

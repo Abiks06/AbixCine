@@ -27,8 +27,7 @@ import {
   normalizeQuality,
   xsalsa20Poly1305Seal,
 } from "./common";
-import { primesrcProvider } from "./primesrc";
-import { vaplayerProvider } from "./vaplayer";
+import { flixnestProvider } from "./flixnest";
 import { encryptVidLinkToken, vidlinkProvider } from "./vidlink";
 import { decryptVidrockUrl, vidrockProvider } from "./vidrock";
 import { buildVixMasterUrl, extractVixTokenData, parseVixMasterPlaylist, vixsrcProvider } from "./vixsrc";
@@ -310,78 +309,60 @@ describe("zxcstreamsProvider", () => {
   });
 });
 
-describe("vaplayerProvider", () => {
-  it("extracts IMDb TV streams and subtitles", async () => {
-    mockHttpFetch.mockResolvedValue({
-      status: 200,
-      url: "https://streamdata.vaplayer.ru/api.php",
-      body: JSON.stringify({
-        status_code: 200,
-        data: { stream_urls: ["https://cdn.va.example/s1e2/master.m3u8"] },
-        default_subs: [
-          { url: "https://cdn.va.example/subs/en.vtt", lang: "en", label: "English", default: true },
-        ],
-      }),
-    });
-
-    const req = makeReq({
-      media: makeMedia({ key: "tmdb:tv:1399", kind: "tv", title: "Game of Thrones", imdbId: "tt0944947" }),
-      season: 1,
-      episode: 2,
-    });
-    const out = await vaplayerProvider.find(req, makeSettings(), new AbortController().signal);
-    expect(mockHttpFetch).toHaveBeenCalledWith(
-      expect.stringContaining("imdb=tt0944947&type=tv&season=1&episode=2"),
-      expect.objectContaining({ Referer: "https://nextgencloudfabric.com/embed/tv/tt0944947/1/2" }),
-      undefined,
-    );
-    expect(out).toHaveLength(1);
-    expect(out[0].kind).toBe("hls");
-    expect(out[0].subtitles).toHaveLength(1);
-    expect(out[0].subtitles?.[0]?.isDefault).toBe(true);
-  });
-
-  it("returns [] on non-200 status_code or anime dub", async () => {
-    mockHttpFetch.mockResolvedValue({
-      status: 200,
-      url: "https://streamdata.vaplayer.ru/api.php",
-      body: JSON.stringify({ status_code: 404, error: "Not found" }),
-    });
-    expect(await vaplayerProvider.find(makeReq(), makeSettings(), new AbortController().signal)).toEqual([]);
-
-    const dubReq = makeReq({ media: makeMedia({ kind: "anime" }), audio: "dub" });
-    expect(await vaplayerProvider.find(dubReq, makeSettings(), new AbortController().signal)).toEqual([]);
-  });
-});
-
-describe("primesrcProvider", () => {
-  it("resolves multi-server IMDb links and survives partial server failure", async () => {
+describe("flixnestProvider", () => {
+  it("resolves HTTP/MKV and HLS streams, filters promos/mismatches, and prefers web-ready first", async () => {
     mockHttpFetch.mockImplementation(async (url: string) => {
-      if (url.includes("/api/v1/s?")) {
+      if (url === "https://free.flixnest.app/stream/movie/tt15239678.json") {
         return {
           status: 200,
           url,
           body: JSON.stringify({
-            servers: [
-              { key: "k1", name: "Filemoon", quality: "1080p" },
-              { key: "k2", name: "Broken", quality: "720p" },
-              { key: "k3", name: "Direct", quality: "4K" },
+            streams: [
+              {
+                name: "4KHDHub 2160P",
+                url: "https://free.flixnest.app/api/4khdhub/media/video.mkv?t=abc",
+                behaviorHints: {
+                  filename: "Dune.Part.Two.2024.2160p.REMUX.mkv",
+                  notWebReady: true,
+                  videoSize: 32_000_000_000,
+                  proxyHeaders: { request: { noiseheader: "ignore", Referer: "https://hub.example/" } },
+                },
+              },
+              {
+                name: "WrongYear 1080P",
+                url: "https://cdn.example/old.mp4",
+                behaviorHints: { filename: "Dune.2019.1080p.mp4" },
+              },
+              {
+                name: "FastHLS 1080P",
+                url: "https://cdn.example/master.m3u8",
+                behaviorHints: { filename: "Dune.Part.Two.2024.1080p.m3u8" },
+              },
+              {
+                name: "FlixNest",
+                externalUrl: "https://flixnest.app/flix-streams",
+              },
             ],
           }),
         };
       }
-      if (url.includes("key=k1")) return { status: 200, url, body: JSON.stringify({ link: "https://cdn.p/1080.m3u8" }) };
-      if (url.includes("key=k2")) return { status: 500, url, body: "" };
-      if (url.includes("key=k3")) return { status: 200, url, body: JSON.stringify({ link: "https://cdn.p/movie.mp4" }) };
       return { status: 404, url, body: "" };
     });
 
-    const out = await primesrcProvider.find(makeReq(), makeSettings(), new AbortController().signal);
+    const out = await flixnestProvider.find(
+      makeReq({
+        media: makeMedia({ key: "tmdb:movie:693134", title: "Dune: Part Two", year: 2024, imdbId: "tt15239678" }),
+      }),
+      makeSettings(),
+      new AbortController().signal,
+    );
     expect(out).toHaveLength(2);
-    expect(out[0].quality).toBe(2160);
-    expect(out[0].kind).toBe("file");
-    expect(out[1].quality).toBe(1080);
-    expect(out[1].kind).toBe("hls");
+    expect(out[0].kind).toBe("hls");
+    expect(out[0].notWebReady).toBeUndefined();
+    expect(out[1].kind).toBe("file");
+    expect(out[1].notWebReady).toBe(true);
+    expect(out[1].quality).toBe(2160);
+    expect(unwrapProxyUrl(out[1].url).headers.referer).toBe("https://hub.example/");
   });
 });
 
@@ -727,5 +708,33 @@ describe("vidrockProvider", () => {
     expect(out[0].label).toContain("alpha");
     expect(out[0].quality).toBe(1080);
     expect(unwrapProxyUrl(out[0].url).url).toBe("https://cdn.vr.example/stream/1080p.m3u8");
+  });
+
+  it("rejects placeholder/bait URLs after decryption", async () => {
+    const keyHex = "7f3e9c2a8b5d1f4e6a9c3b7d2e5f8a1c4b6d9e2f5a8c1b4d7e9f2a5c8b1d4e7f";
+    const keyBytes = new Uint8Array(keyHex.match(/.{2}/g)!.map((h) => parseInt(h, 16)));
+    const cryptoKey = await crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["encrypt"]);
+    const encStr = async (s: string) => {
+      const nonce = new Uint8Array(12).fill(3);
+      const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce }, cryptoKey, new TextEncoder().encode(s)));
+      const combined = new Uint8Array(nonce.length + ct.length);
+      combined.set(nonce, 0);
+      combined.set(ct, nonce.length);
+      return bytesToB64(combined).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    };
+
+    mockHttpFetch.mockResolvedValue({
+      status: 200,
+      url: "https://vidrock.net/api/movie/550",
+      body: JSON.stringify({
+        bait: await encStr("https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"),
+        paywall: await encStr("https://payments.stravo.site/sample.mp4"),
+        good: await encStr("https://cdn.vr.example/real/master.m3u8"),
+      }),
+    });
+
+    const out = await vidrockProvider.find(makeReq(), makeSettings(), new AbortController().signal);
+    expect(out).toHaveLength(1);
+    expect(out[0].label).toContain("good");
   });
 });

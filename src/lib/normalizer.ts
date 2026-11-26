@@ -19,6 +19,7 @@ export interface RawAnilistNode {
   seasonYear?: number | null;
   startDate?: { year?: number | null; month?: number | null; day?: number | null } | null;
   title?: { romaji?: string | null; english?: string | null; native?: string | null } | null;
+  synonyms?: (string | null)[] | null;
   nextAiringEpisode?: { episode: number; airingAt?: number } | null;
 }
 

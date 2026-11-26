@@ -23,6 +23,7 @@ import { toggleList, useSaved } from "../lib/watchlist";
 import { Art } from "./Art";
 import { AudioToggle } from "./AudioToggle";
 import { kindLabel, seedState } from "./Card";
+import { DownloadMenu } from "./DownloadMenu";
 import { Icon } from "./Icon";
 import { TitleArt } from "./TitleArt";
 import { TrailerModal } from "./TrailerModal";
@@ -74,6 +75,7 @@ function DrawerBody({ media, closing }: { media: Media; closing: boolean }) {
     [detail, media],
   );
   const [trailerOpen, setTrailerOpen] = useState(false);
+  const [serversOpen, setServersOpen] = useState(false);
   const closeRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
@@ -217,6 +219,13 @@ function DrawerBody({ media, closing }: { media: Media; closing: boolean }) {
                     <Icon name="play" size={14} /> Play now
                   </button>
                 )}
+                {req && (
+                  <DownloadMenu
+                    req={req}
+                    detail={d}
+                    what={film ? "this film" : `S${startS ?? 1} E${startE ?? 1}`}
+                  />
+                )}
                 <button type="button" className="btn glass sm" onClick={openMonograph}>
                   Full dossier <Icon name="arrowR" size={14} />
                 </button>
@@ -246,9 +255,24 @@ function DrawerBody({ media, closing }: { media: Media; closing: boolean }) {
 
               {req && (
                 <div className="qd-sources">
-                  <Suspense fallback={<aside className="smart" aria-busy><div className="smart-note">Checking servers…</div></aside>}>
-                    <LazySmartSource req={req} what={film ? "this film" : `S${startS ?? 1} E${startE ?? 1}`} onPlay={watchNow} />
-                  </Suspense>
+                  <button
+                    type="button"
+                    className={`qd-srv-toggle ${serversOpen ? "on" : ""}`}
+                    aria-expanded={serversOpen}
+                    onClick={() => setServersOpen((s) => !s)}
+                  >
+                    <span>
+                      <Icon name="layers" size={14} /> Streaming servers
+                    </span>
+                    <svg className={serversOpen ? "rot" : ""} viewBox="0 0 12 12" width="11" height="11" aria-hidden>
+                      <path d="M2.5 4.5 6 8l3.5-3.5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                  </button>
+                  {serversOpen && (
+                    <Suspense fallback={<aside className="smart" aria-busy><div className="smart-note">Checking servers…</div></aside>}>
+                      <LazySmartSource req={req} detail={d} what={film ? "this film" : `S${startS ?? 1} E${startE ?? 1}`} onPlay={watchNow} />
+                    </Suspense>
+                  )}
                 </div>
               )}
             </div>

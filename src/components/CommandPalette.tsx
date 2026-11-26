@@ -134,7 +134,7 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
       { id: "movies", group: "Actions", label: "Go to Films", icon: "film", run: go("/movies") },
       { id: "series", group: "Actions", label: "Go to Series", icon: "tv", run: go("/series") },
       { id: "anime", group: "Actions", label: "Go to Anime", icon: "spark", run: go("/anime") },
-      { id: "drive", group: "Actions", label: "Open your drive", icon: "drive", run: go("/library") },
+      { id: "drive", group: "Actions", label: "Open Vault (downloads & drive)", icon: "drive", run: go("/library") },
       { id: "list", group: "Actions", label: "Open My List", icon: "bookmark", run: go("/list") },
       { id: "settings", group: "Actions", label: "Settings", icon: "gear", run: go("/settings") },
       { id: "sources", group: "Actions", label: "Add a media folder", icon: "folder", run: go("/settings#sources") },

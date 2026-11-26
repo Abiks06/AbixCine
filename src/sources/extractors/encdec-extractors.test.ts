@@ -17,7 +17,6 @@ import { cinejoyProvider, clearCinejoyServerCache, orderCinejoyServers } from ".
 import { encDec, resetEncDecCooldown } from "./encdec";
 import { clearHexaTokenCache, hexaProvider } from "./hexa";
 import { meowtvProvider, trimMeowSubtitles } from "./meowtv";
-import { extractVidupToken, vidupProvider } from "./vidup";
 
 const ok = (url: string, body: unknown) => ({ status: 200, url, body: typeof body === "string" ? body : JSON.stringify(body) });
 const encOk = (url: string, result: unknown) => ok(url, { status: 200, result });
@@ -213,53 +212,6 @@ describe("hexaProvider", () => {
     );
     expect(out).toEqual([]);
     expect(mockHttpFetch).not.toHaveBeenCalled();
-  });
-});
-
-describe("vidupProvider", () => {
-  it("extracts the escaped page token", () => {
-    expect(extractVidupToken(String.raw`self.__next_f.push([1,"{\"en\":\"abc_DEF-123\"}"])`)).toBe("abc_DEF-123");
-    expect(extractVidupToken("<html></html>")).toBeNull();
-  });
-
-  it("runs both stages, resolves servers in parallel, and keeps the vidup Referer", async () => {
-    const STAGE = "https://vidup.to/likzi/coc/v/x";
-    mockHttpFetch.mockImplementation(async (url: string, headers: Record<string, string> = {}, init?: { body?: string }) => {
-      if (url === "https://vidup.to/movie/550/") return ok(url, String.raw`{\"en\":\"PAGE_TOKEN\"}`);
-      if (url === "https://enc-dec.app/api/enc-vidup?text=PAGE_TOKEN&stage=1") return encOk(url, { stage1: `${STAGE}/s1`, token: "" });
-      if (url === `${STAGE}/s1`) return ok(url, "STAGE1_TEXT");
-      if (url === "https://enc-dec.app/api/enc-vidup?text=STAGE1_TEXT&stage=2") {
-        return encOk(url, { servers: `${STAGE}/servers`, stream: `${STAGE}/stream`, token: "csrf2" });
-      }
-      if (url === `${STAGE}/servers`) {
-        expect(headers["X-CSRF-Token"]).toBe("csrf2");
-        return ok(url, "SERVERS_ENC");
-      }
-      if (url === `${STAGE}/stream/aaa`) return ok(url, "STREAM_A");
-      if (url === `${STAGE}/stream/bbb`) return ok(url, "STREAM_B");
-      if (url === "https://enc-dec.app/api/dec-vidup") {
-        const text = JSON.parse(init!.body!).text;
-        if (text === "SERVERS_ENC") return encOk(url, [{ name: "Euro", data: "aaa" }, { name: "Zenith", data: "bbb" }, { name: "Bad", data: "../x" }]);
-        if (text === "STREAM_A") return encOk(url, { url: "https://moon.example/vd/master.m3u8", noReferrer: false, tracks: [] });
-        if (text === "STREAM_B") return encOk(url, { url: "https://moon.example/vdb/master.m3u8", noReferrer: true });
-      }
-      return notFound(url);
-    });
-
-    const out = await vidupProvider.find(movieReq(), makeSettings(), signal());
-    expect(out.map((c) => c.label)).toEqual(["Vidup · Euro · HLS", "Vidup · Zenith · HLS"]);
-    expect(unwrapProxyUrl(out[0].url).headers.referer).toBe("https://vidup.to/");
-    expect(unwrapProxyUrl(out[1].url).headers.referer).toBeUndefined();
-  });
-
-  it("refuses stage URLs that point away from vidup", async () => {
-    mockHttpFetch.mockImplementation(async (url: string) => {
-      if (url === "https://vidup.to/movie/550/") return ok(url, String.raw`{\"en\":\"T\"}`);
-      if (url.startsWith("https://enc-dec.app/api/enc-vidup")) return encOk(url, { stage1: "https://evil.example/s1", token: "" });
-      return notFound(url);
-    });
-    expect(await vidupProvider.find(movieReq(), makeSettings(), signal())).toEqual([]);
-    expect(mockHttpFetch.mock.calls.some(([u]) => String(u).startsWith("https://evil.example"))).toBe(false);
   });
 });
 

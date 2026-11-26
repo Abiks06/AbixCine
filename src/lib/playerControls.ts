@@ -120,12 +120,18 @@ export function loadingStage(s: {
   recovering: boolean;
   preparingTorrent: boolean;
   preparingLocal: boolean;
+  localPreparePct?: number | null;
   hasStarted: boolean;
   server?: string;
 }): string {
   if (s.recovering) return "Finding another server";
   if (s.preparingTorrent) return "Starting torrent stream";
-  if (s.preparingLocal) return "Preparing the audio track";
+  if (s.preparingLocal) {
+    if (s.localPreparePct != null && Number.isFinite(s.localPreparePct) && s.localPreparePct > 0) {
+      return `Optimizing audio track (${Math.round(s.localPreparePct)}%)`;
+    }
+    return "Preparing the audio track";
+  }
   if (s.hasStarted) return "Buffering";
   return `Connecting to ${s.server || "server"}`;
 }

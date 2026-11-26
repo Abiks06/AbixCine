@@ -5,6 +5,7 @@ import { createHashRouter, Outlet, RouterProvider, useLocation, useNavigationTyp
 import { CardHoverPreview } from "./components/CardHoverPreview";
 import { CommandPalette } from "./components/CommandPalette";
 import { DownloadFolderModal } from "./components/DownloadFolderModal";
+import { DownloadQualityModal } from "./components/DownloadQualityModal";
 import { QuickDossier } from "./components/QuickDossier";
 import { Splash } from "./components/Splash";
 import { TitleBar } from "./components/TitleBar";
@@ -264,6 +265,7 @@ function Shell() {
           <QuickDossier />
           <CardHoverPreview />
           <DownloadFolderModal />
+          <DownloadQualityModal />
           <CommandPalette open={palette} onClose={() => setPalette(false)} />
           {!watching && <UpdateToast />}
           <Toasts />

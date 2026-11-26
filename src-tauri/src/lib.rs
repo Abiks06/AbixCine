@@ -8,16 +8,60 @@ mod torrent;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 static LIBRARY_ROOTS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
 static DOWNLOADS_ROOT: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 static MEDIA_PREPARE_LOCK: Mutex<()> = Mutex::new(());
 static ACTIVE_MEDIA_PIDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+static LOCAL_PREPARE_GEN: AtomicU64 = AtomicU64::new(0);
+static LOCAL_PREPARE_PID: OnceLock<Mutex<Option<(u64, u32)>>> = OnceLock::new();
+const LOCAL_MEDIA_CACHE_CAP_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 fn active_media_pids() -> &'static Mutex<HashSet<u32>> {
     ACTIVE_MEDIA_PIDS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn local_prepare_pid_slot() -> &'static Mutex<Option<(u64, u32)>> {
+    LOCAL_PREPARE_PID.get_or_init(|| Mutex::new(None))
+}
+
+fn terminate_pid(pid: u32) {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+        unsafe {
+            if let Ok(handle) = OpenProcess(PROCESS_TERMINATE, false, pid) {
+                let _ = TerminateProcess(handle, 1);
+                let _ = CloseHandle(handle);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+    }
+}
+
+#[tauri::command]
+fn cancel_local_prepare() {
+    let gen = LOCAL_PREPARE_GEN.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+    let pid_opt = {
+        let mut slot = local_prepare_pid_slot().lock().unwrap_or_else(|e| e.into_inner());
+        match *slot {
+            Some((owner_gen, pid)) if owner_gen < gen => {
+                *slot = None;
+                Some(pid)
+            }
+            _ => None,
+        }
+    };
+    if let Some(pid) = pid_opt {
+        terminate_pid(pid);
+    }
 }
 
 pub(crate) struct ActivePidGuard(u32);
@@ -317,7 +361,12 @@ struct ScanError {
 /// The asset protocol starts with an empty scope (see tauri.conf.json); only folders the user
 /// chose as library folders are opened to it here, so the webview can never read arbitrary files.
 #[tauri::command]
-async fn scan_library(app: tauri::AppHandle, paths: Vec<String>) -> Result<ScanResult, String> {
+async fn scan_library(
+    app: tauri::AppHandle,
+    paths: Vec<String>,
+    register_roots: Option<bool>,
+) -> Result<ScanResult, String> {
+    let should_register = register_roots.unwrap_or(true);
     let scope = app.asset_protocol_scope();
     let mut roots = Vec::new();
     let mut allowed_roots = Vec::new();
@@ -344,10 +393,12 @@ async fn scan_library(app: tauri::AppHandle, paths: Vec<String>) -> Result<ScanR
             Err(e) => errors.push(ScanError { path: p, message: e.to_string() }),
         }
     }
-    *LIBRARY_ROOTS
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .map_err(|e| e.to_string())? = allowed_roots;
+    if should_register {
+        *LIBRARY_ROOTS
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .map_err(|e| e.to_string())? = allowed_roots;
+    }
     let files = tauri::async_runtime::spawn_blocking(move || {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
@@ -478,7 +529,7 @@ fn ensure_in_allowed_roots(path: &Path, allowed_roots: &[PathBuf]) -> Result<Pat
     Ok(canonical)
 }
 
-fn ensure_in_library_roots(path: &Path) -> Result<PathBuf, String> {
+fn all_allowed_roots() -> Result<Vec<PathBuf>, String> {
     let mut allowed_roots = LIBRARY_ROOTS
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
@@ -494,6 +545,11 @@ fn ensure_in_library_roots(path: &Path) -> Result<PathBuf, String> {
             allowed_roots.push(dl_root);
         }
     }
+    Ok(allowed_roots)
+}
+
+fn ensure_in_library_roots(path: &Path) -> Result<PathBuf, String> {
+    let allowed_roots = all_allowed_roots()?;
     ensure_in_allowed_roots(path, &allowed_roots)
 }
 
@@ -575,11 +631,11 @@ fn has_multichannel_audio(probe: &serde_json::Value) -> bool {
         .any(|s| s.get("channels").and_then(serde_json::Value::as_u64).is_some_and(|ch| ch > 2))
 }
 
-fn audio_downmix_filter(channels: Option<u64>) -> &'static str {
+fn audio_downmix_filter(channels: Option<u64>) -> Option<&'static str> {
     if channels.unwrap_or(2) > 2 {
-        "pan=stereo|FL=0.5*FL+0.707*FC+0.35*BL+0.35*SL+0.35*LFE|FR=0.5*FR+0.707*FC+0.35*BR+0.35*SR+0.35*LFE,dynaudnorm=f=150:g=15:p=0.92:m=4"
+        Some("pan=stereo|FL=0.5*FL+0.707*FC+0.35*BL+0.35*SL+0.35*LFE|FR=0.5*FR+0.707*FC+0.35*BR+0.35*SR+0.35*LFE")
     } else {
-        "dynaudnorm=f=150:g=15:p=0.92:m=4"
+        None
     }
 }
 
@@ -588,17 +644,36 @@ fn media_needs_audio_conversion(path: &Path, probe: &serde_json::Value) -> bool 
         return true;
     }
     let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-    let audio_codecs: Vec<&str> = probe
+    let streams = probe
         .get("streams")
         .and_then(serde_json::Value::as_array)
         .into_iter()
         .flatten()
+        .collect::<Vec<_>>();
+    let video_codecs: Vec<String> = streams
+        .iter()
+        .filter(|s| s.get("codec_type").and_then(serde_json::Value::as_str) == Some("video"))
+        .filter_map(|s| s.get("codec_name").and_then(serde_json::Value::as_str))
+        .map(|s| s.trim().to_ascii_lowercase())
+        .collect();
+    let audio_codecs: Vec<String> = streams
+        .iter()
         .filter(|s| s.get("codec_type").and_then(serde_json::Value::as_str) == Some("audio"))
         .filter_map(|s| s.get("codec_name").and_then(serde_json::Value::as_str))
+        .map(|s| s.trim().to_ascii_lowercase())
         .collect();
     match extension.as_str() {
-        "mp4" | "m4v" | "mov" => audio_codecs.iter().any(|c| !["aac", "mp3"].contains(c)),
-        "webm" => audio_codecs.iter().any(|c| !["opus", "vorbis"].contains(c)),
+        "mp4" | "m4v" | "mov" => audio_codecs.iter().any(|c| !["aac", "mp3"].contains(&c.as_str())),
+        "mkv" => {
+            video_codecs.is_empty()
+                || video_codecs
+                    .iter()
+                    .any(|c| !["h264", "avc1", "vp8", "vp9", "av1"].contains(&c.as_str()))
+                || audio_codecs
+                    .iter()
+                    .any(|c| !["aac", "mp3", "opus", "vorbis"].contains(&c.as_str()))
+        }
+        "webm" => audio_codecs.iter().any(|c| !["opus", "vorbis"].contains(&c.as_str())),
         _ => true,
     }
 }
@@ -644,6 +719,44 @@ fn sweep_partials(dir: &Path) {
     }
 }
 
+/// Evict oldest completed conversions in `local-media` once total size exceeds `max_bytes`.
+fn prune_local_media_cache(cache_dir: &Path, max_bytes: u64, preserve: Option<&Path>) {
+    let Ok(entries) = std::fs::read_dir(cache_dir) else { return };
+    let mut files: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
+    let mut total: u64 = 0;
+    for ent in entries.flatten() {
+        let path = ent.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = ent.file_name().to_string_lossy().into_owned();
+        if name.contains(".partial.") || !name.to_ascii_lowercase().ends_with(".mp4") {
+            continue;
+        }
+        let Ok(meta) = ent.metadata() else { continue };
+        let len = meta.len();
+        total = total.saturating_add(len);
+        if preserve.is_some_and(|p| p == path) {
+            continue;
+        }
+        let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        files.push((path, len, modified));
+    }
+    if total <= max_bytes {
+        return;
+    }
+    files.sort_by_key(|(_, _, modified)| *modified);
+    for (path, len, _) in files {
+        if total <= max_bytes {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(len);
+        }
+    }
+}
+
+#[cfg(test)]
 fn compatible_subtitle_indices(probe: &serde_json::Value) -> Vec<u64> {
     probe
         .get("streams")
@@ -681,7 +794,11 @@ mod local_media_tests {
         ));
         assert!(media_needs_audio_conversion(
             Path::new("Film.mkv"),
-            &probe(&[("video", "h264"), ("audio", "aac")]),
+            &probe(&[("video", "h264"), ("audio", "ac3")]),
+        ));
+        assert!(media_needs_audio_conversion(
+            Path::new("Film.mkv"),
+            &probe(&[("video", "hevc"), ("audio", "aac")]),
         ));
     }
 
@@ -690,6 +807,14 @@ mod local_media_tests {
         assert!(!media_needs_audio_conversion(
             Path::new("Film.mp4"),
             &probe(&[("video", "h264"), ("audio", "aac")]),
+        ));
+        assert!(!media_needs_audio_conversion(
+            Path::new("Film.mkv"),
+            &probe(&[("video", "h264"), ("audio", "aac")]),
+        ));
+        assert!(!media_needs_audio_conversion(
+            Path::new("Film.mkv"),
+            &probe(&[("video", "vp9"), ("audio", "opus")]),
         ));
         assert!(!media_needs_audio_conversion(
             Path::new("Clip.webm"),
@@ -708,10 +833,9 @@ mod local_media_tests {
         assert!(has_multichannel_audio(&surround));
         assert!(!mp4_audio_compatible(&surround));
         assert!(media_needs_audio_conversion(Path::new("Film.mp4"), &surround));
-        assert!(audio_downmix_filter(Some(6)).contains("pan=stereo"));
-        assert!(audio_downmix_filter(Some(6)).contains("dynaudnorm="));
-        assert!(!audio_downmix_filter(Some(2)).contains("pan=stereo"));
-        assert!(audio_downmix_filter(Some(2)).contains("dynaudnorm="));
+        assert!(media_needs_audio_conversion(Path::new("Film.mkv"), &surround));
+        assert!(audio_downmix_filter(Some(6)).is_some_and(|f| f.contains("pan=stereo")));
+        assert!(audio_downmix_filter(Some(2)).is_none());
     }
 
     #[test]
@@ -938,9 +1062,38 @@ mod local_media_tests {
         )
         .is_err());
 
+        // Stripped Windows root (matching register_downloads_root) is accepted alongside canonical paths
+        let stripped_root = strip_verbatim_prefix(canonical_root.clone());
+        let saved2 = save_sidecar_subtitle_in_roots(
+            &video,
+            "Film.fr.srt",
+            "1\n",
+            &[stripped_root],
+        )
+        .unwrap();
+        assert!(saved2.ends_with("Film.fr.srt"));
+
         // Oversized > 10 MiB rejected
         let too_big = "a".repeat(MAX_SAVED_SUB_BYTES + 1);
         assert!(save_sidecar_subtitle_in_roots(&video, "Film.en.srt", &too_big, &[canonical_root]).is_err());
+    }
+
+    #[test]
+    fn prunes_oldest_local_media_cache_files_when_over_budget() {
+        let dir = TempDirGuard::new("local-media-prune");
+        let f1 = dir.0.join("old.mp4");
+        let f2 = dir.0.join("mid.mp4");
+        let f3 = dir.0.join("new.mp4");
+        std::fs::write(&f1, vec![1u8; 60]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        std::fs::write(&f2, vec![2u8; 60]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        std::fs::write(&f3, vec![3u8; 60]).unwrap();
+
+        prune_local_media_cache(&dir.0, 120, Some(&f1));
+        assert!(f1.is_file(), "preserved file should not be evicted");
+        assert!(!f2.is_file(), "oldest non-preserved file should be evicted");
+        assert!(f3.is_file(), "newest file should remain under budget");
     }
 
     #[test]
@@ -1079,13 +1232,31 @@ fn audio_stream_count(probe: &serde_json::Value) -> u32 {
         .count() as u32
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalPrepareProgress {
+    path: String,
+    percent: f64,
+}
+
+fn is_prepare_superseded(expected_gen: Option<u64>) -> bool {
+    expected_gen.is_some_and(|g| LOCAL_PREPARE_GEN.load(Ordering::SeqCst) != g)
+}
+
 fn prepare_local_media_file(
+    app: Option<tauri::AppHandle>,
+    raw_path: Option<String>,
     path: PathBuf,
     cache_dir: PathBuf,
     ffmpeg: Result<PathBuf, String>,
     ffprobe: PathBuf,
     audio_index: Option<u32>,
+    force_remux: bool,
+    expected_gen: Option<u64>,
 ) -> Result<String, String> {
+    use std::io::{BufRead, BufReader, Read};
+    use std::process::Stdio;
+
     let canonical = ensure_in_library_roots(&path)?;
     let extension = canonical.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     if !ext_in(&canonical, VIDEO_EXTS) || extension == "m3u8" {
@@ -1094,7 +1265,14 @@ fn prepare_local_media_file(
 
     let mut probe_cmd = background_command(&ffprobe);
     probe_cmd
-        .args(["-v", "error", "-show_entries", "stream=index,codec_type,codec_name,channels", "-of", "json"])
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration:stream=index,codec_type,codec_name,channels",
+            "-of",
+            "json",
+        ])
         .arg(&canonical);
     let probe = run_background_output(&mut probe_cmd)
         .map_err(|e| format!("Could not inspect local media: {e}"))?;
@@ -1102,14 +1280,19 @@ fn prepare_local_media_file(
         return Err(format!("Could not inspect local media: {}", String::from_utf8_lossy(&probe.stderr)));
     }
     let probe: serde_json::Value = serde_json::from_slice(&probe.stdout).map_err(|e| e.to_string())?;
+    let duration_sec = probe
+        .get("format")
+        .and_then(|f| f.get("duration"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|&d| d.is_finite() && d > 0.0);
     // WebView2 can't switch audio tracks itself (no HTMLMediaElement.audioTracks), so a chosen
     // non-default track gets its own copy of the file with only that track in it.
     let chosen_audio = audio_index.filter(|&i| i > 0 && i < audio_stream_count(&probe));
-    if chosen_audio.is_none() && !media_needs_audio_conversion(&canonical, &probe) {
+    if !force_remux && chosen_audio.is_none() && !media_needs_audio_conversion(&canonical, &probe) {
         return Ok(canonical.to_string_lossy().into_owned());
     }
     let ffmpeg = ffmpeg?;
-    let subtitle_indices = compatible_subtitle_indices(&probe);
 
     let metadata = std::fs::metadata(&canonical).map_err(|e| e.to_string())?;
     let modified = metadata
@@ -1122,18 +1305,25 @@ fn prepare_local_media_file(
         canonical.to_string_lossy().as_bytes(),
         &metadata.len().to_le_bytes(),
         &modified.to_le_bytes(),
-        b"abixcine-local-mp4-aac-v4",
+        b"abixcine-local-mp4-aac-v5",
         &chosen_audio.map(|i| i.to_le_bytes()).unwrap_or([0xff; 4]),
     ]);
     let output = cache_dir.join(format!("{key:016x}.mp4"));
     if output.metadata().map(|m| m.len() > 0).unwrap_or(false) {
         return Ok(output.to_string_lossy().into_owned());
     }
+    if is_prepare_superseded(expected_gen) {
+        return Err("cancelled".into());
+    }
+    prune_local_media_cache(&cache_dir, LOCAL_MEDIA_CACHE_CAP_BYTES, Some(&output));
 
     let partial = output.with_extension("partial.mp4");
     let _ = std::fs::remove_file(&partial);
     let mut command = background_command(&ffmpeg);
     command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i"])
         .arg(&canonical)
         // `V` (capital) skips attached pictures: `v:0` picked an MKV's embedded cover JPEG over the film.
@@ -1142,9 +1332,6 @@ fn prepare_local_media_file(
             Some(i) => format!("0:a:{i}"),
             None => "0:a?".to_string(),
         });
-    for index in &subtitle_indices {
-        command.arg("-map").arg(format!("0:{index}"));
-    }
     // Audio the browser already plays is copied (a remux takes seconds, not minutes). Anything
     // else becomes stereo AAC: 5.1 squeezed into 192k sounded thin, and browsers downmix
     // multichannel AAC unpredictably.
@@ -1156,16 +1343,16 @@ fn prepare_local_media_file(
         None => mp4_audio_compatible(&probe),
     };
     if copy_audio {
-        command.args(["-c:v", "copy", "-c:a", "copy", "-map_metadata", "0", "-dn"]);
+        command.args(["-c:v", "copy", "-c:a", "copy", "-map_metadata", "0", "-sn", "-dn"]);
     } else {
         let target_channels = chosen_audio
             .and_then(|i| nth_audio_channels(&probe, i))
             .or_else(|| nth_audio_channels(&probe, 0));
+        command.args(["-c:v", "copy"]);
+        if let Some(af) = audio_downmix_filter(target_channels) {
+            command.args(["-af", af]);
+        }
         command.args([
-            "-c:v",
-            "copy",
-            "-af",
-            audio_downmix_filter(target_channels),
             "-c:a",
             "aac",
             "-ac",
@@ -1174,22 +1361,94 @@ fn prepare_local_media_file(
             "256k",
             "-map_metadata",
             "0",
+            "-sn",
             "-dn",
         ]);
     }
-    if !subtitle_indices.is_empty() {
-        command.args(["-c:s", "mov_text"]);
-    }
     command
-        .args(["-movflags", "+faststart", "-f", "mp4"])
+        .args(["-movflags", "+faststart", "-f", "mp4", "-progress", "pipe:1"])
         .arg(&partial);
-    let result = run_background_output(&mut command)
+    let mut child = command
+        .spawn()
         .map_err(|e| format!("Could not convert local audio: {e}"))?;
-    if !result.status.success() || !partial.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+    let child_pid = child.id();
+    let _guard = ActivePidGuard::new(child_pid);
+    if let Some(g) = expected_gen {
+        let mut slot = local_prepare_pid_slot().lock().unwrap_or_else(|e| e.into_inner());
+        *slot = Some((g, child_pid));
+        drop(slot);
+        if is_prepare_superseded(expected_gen) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&partial);
+            return Err("cancelled".into());
+        }
+    }
+    let stderr_handle = child.stderr.take().map(|mut se| {
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = se.read_to_string(&mut s);
+            s
+        })
+    });
+    if let Some(stdout) = child.stdout.take() {
+        let event_path = raw_path.unwrap_or_else(|| canonical.to_string_lossy().into_owned());
+        let reader = BufReader::new(stdout);
+        let mut last_emit = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(200))
+            .unwrap_or_else(std::time::Instant::now);
+        let mut last_pct = -1.0_f64;
+        for line in reader.lines().map_while(Result::ok) {
+            if let Some(val) = line.strip_prefix("out_time_us=") {
+                if let (Ok(us), Some(tot)) = (val.trim().parse::<u64>(), duration_sec) {
+                    let pct = (((us as f64) / 1_000_000.0) / tot * 100.0).clamp(0.0, 99.0);
+                    if pct - last_pct >= 1.0 || last_emit.elapsed().as_millis() >= 150 {
+                        last_pct = pct;
+                        last_emit = std::time::Instant::now();
+                        if let Some(ref handle) = app {
+                            let _ = handle.emit(
+                                "abx://local-prepare-progress",
+                                LocalPrepareProgress {
+                                    path: event_path.clone(),
+                                    percent: pct,
+                                },
+                            );
+                        }
+                    }
+                }
+            } else if line.trim() == "progress=end" {
+                if let Some(ref handle) = app {
+                    let _ = handle.emit(
+                        "abx://local-prepare-progress",
+                        LocalPrepareProgress {
+                            path: event_path.clone(),
+                            percent: 100.0,
+                        },
+                    );
+                }
+            }
+        }
+    }
+    let status = child
+        .wait()
+        .map_err(|e| format!("Could not convert local audio: {e}"))?;
+    if expected_gen.is_some() {
+        let mut slot = local_prepare_pid_slot().lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_some_and(|(g, _)| Some(g) == expected_gen) {
+            *slot = None;
+        }
+    }
+    let detail = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    if is_prepare_superseded(expected_gen) {
         let _ = std::fs::remove_file(&partial);
-        let detail = String::from_utf8_lossy(&result.stderr);
-        let detail = detail.chars().rev().take(900).collect::<String>().chars().rev().collect::<String>();
-        return Err(format!("Could not convert local audio: {detail}"));
+        return Err("cancelled".into());
+    }
+    if !status.success() || !partial.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+        let _ = std::fs::remove_file(&partial);
+        let tail = detail.chars().rev().take(900).collect::<String>().chars().rev().collect::<String>();
+        return Err(format!("Could not convert local audio: {tail}"));
     }
     std::fs::rename(&partial, &output).map_err(|e| {
         let _ = std::fs::remove_file(&partial);
@@ -1273,7 +1532,13 @@ fn parse_local_audio_tracks(probe: &serde_json::Value) -> Vec<LocalAudioTrack> {
 }
 
 #[tauri::command]
-async fn prepare_local_media(app: tauri::AppHandle, path: String, audio_index: Option<u32>) -> Result<String, String> {
+async fn prepare_local_media(
+    app: tauri::AppHandle,
+    path: String,
+    audio_index: Option<u32>,
+    force_remux: Option<bool>,
+) -> Result<String, String> {
+    let raw_path = path.clone();
     let path = PathBuf::from(path);
     let cache_dir = app.path().app_cache_dir().map_err(|e| e.to_string())?.join("local-media");
     std::fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
@@ -1281,9 +1546,34 @@ async fn prepare_local_media(app: tauri::AppHandle, path: String, audio_index: O
     scope.allow_directory(&cache_dir, true).map_err(|e| e.to_string())?;
     let ffmpeg = ffmpeg_tool(&app, "ffmpeg");
     let ffprobe = ffprobe_tool(&app)?;
+    let app_handle = app.clone();
+    let my_gen = LOCAL_PREPARE_GEN.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+    let stale_pid = {
+        let mut slot = local_prepare_pid_slot().lock().unwrap_or_else(|e| e.into_inner());
+        match *slot {
+            Some((owner_gen, pid)) if owner_gen < my_gen => {
+                *slot = None;
+                Some(pid)
+            }
+            _ => None,
+        }
+    };
+    if let Some(pid) = stale_pid {
+        terminate_pid(pid);
+    }
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = MEDIA_PREPARE_LOCK.lock().map_err(|e| e.to_string())?;
-        prepare_local_media_file(path, cache_dir, ffmpeg, ffprobe, audio_index)
+        prepare_local_media_file(
+            Some(app_handle),
+            Some(raw_path),
+            path,
+            cache_dir,
+            ffmpeg,
+            ffprobe,
+            audio_index,
+            force_remux.unwrap_or(false),
+            Some(my_gen),
+        )
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1608,8 +1898,12 @@ fn save_sidecar_subtitle_in_roots(
     let parent = canonical_video
         .parent()
         .ok_or_else(|| "Video file has no parent directory".to_string())?;
-    let canonical_parent = std::fs::canonicalize(parent).map_err(|e| e.to_string())?;
-    if !canonical_parent.is_dir() || !allowed_roots.iter().any(|root| canonical_parent.starts_with(root)) {
+    let canonical_parent = strip_verbatim_prefix(std::fs::canonicalize(parent).map_err(|e| e.to_string())?);
+    if !canonical_parent.is_dir()
+        || !allowed_roots
+            .iter()
+            .any(|root| canonical_parent.starts_with(strip_verbatim_prefix(root.clone())))
+    {
         return Err("The requested folder is not inside a selected library folder".into());
     }
     let target = canonical_parent.join(&sanitized);
@@ -1631,11 +1925,7 @@ async fn save_sidecar_subtitle(
 ) -> Result<String, String> {
     let video_path = PathBuf::from(video_path);
     let saved = tauri::async_runtime::spawn_blocking(move || {
-        let allowed_roots = LIBRARY_ROOTS
-            .get_or_init(|| Mutex::new(Vec::new()))
-            .lock()
-            .map_err(|e| e.to_string())?
-            .clone();
+        let allowed_roots = all_allowed_roots()?;
         save_sidecar_subtitle_in_roots(&video_path, &filename, &content, &allowed_roots)
     })
     .await
@@ -1809,7 +2099,11 @@ pub fn run() {
             // Zero-copy loopback transport for proxied streams (gateway.rs); abxs: stays as fallback.
             gateway::start();
             if let Ok(cache) = app.path().app_cache_dir() {
-                std::thread::spawn(move || sweep_partials(&cache.join("local-media")));
+                std::thread::spawn(move || {
+                    let dir = cache.join("local-media");
+                    sweep_partials(&dir);
+                    prune_local_media_cache(&dir, LOCAL_MEDIA_CACHE_CAP_BYTES, None);
+                });
             }
             // Ad, tracker and pop-up shield on the main window, covering every embedded frame.
             if let Some(w) = app.get_webview_window("main") {
@@ -1915,6 +2209,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             scan_library,
             prepare_local_media,
+            cancel_local_prepare,
             probe_local_audio,
             probe_local_subtitles,
             extract_local_subtitle,
@@ -1941,10 +2236,12 @@ pub fn run() {
             downloads::download_switch_source,
             downloads::download_cancel,
             downloads::download_cancel_all,
+            downloads::download_resolve_quality,
             downloads::download_remove,
             downloads::download_clear_failed,
             downloads::download_list,
             downloads::download_open_folder,
+            downloads::download_organize_vault,
             prepare_for_update_exit,
             get_window_fullscreen,
             set_window_fullscreen,

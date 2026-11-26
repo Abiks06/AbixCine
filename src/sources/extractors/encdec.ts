@@ -3,7 +3,7 @@ import { abortError, fetchWithAbort, isAbortError } from "./common";
 
 /**
  * Shared client for the `enc-dec.app` crypto microservice (`smy778/EncDecEndpoints`), used by
- * Hexa, Vidup, Cinejoy, MeowTV, VidLink and KissKH, whose sites rotate their client-side crypto.
+ * Hexa, Cinejoy, MeowTV, VidLink and KissKH, whose sites rotate their client-side crypto.
  *
  * - A 3-slot queue: a session starts every extractor at once, and an unthrottled burst of ~15
  *   calls is exactly what makes the service answer 429.

@@ -327,9 +327,9 @@ pub fn client() -> &'static reqwest::Client {
             .pool_max_idle_per_host(16)
             .pool_idle_timeout(Duration::from_secs(90))
             .connect_timeout(Duration::from_secs(10))
-            // A stalled socket gives up quickly; a slow but steady large read still finishes.
+            // A stalled socket gives up quickly; open-ended progressive media streams must not
+            // have a total request lifetime cap (per-request timeouts are applied on short fetches).
             .read_timeout(Duration::from_secs(20))
-            .timeout(Duration::from_secs(120))
             // Every hop is re-checked against the same rules as the first URL (see the SSRF guard).
             .redirect(reqwest::redirect::Policy::custom(|attempt| {
                 if attempt.previous().len() >= 8 {
@@ -1110,7 +1110,7 @@ pub(crate) async fn handle_with(req: Request<Vec<u8>>, base: &str, streaming: bo
     // A HEAD probe asks for the headers only. It used to be sent upstream as a GET, which
     // downloaded (and returned) a whole chunk of media just to learn its length.
     if req.method() == tauri::http::Method::HEAD {
-        return match apply(client().head(&target), &h).send().await {
+        return match apply(client().head(&target), &h).timeout(Duration::from_secs(20)).send().await {
             Ok(r) => {
                 let mut b = cors(Response::builder().status(r.status().as_u16()));
                 for name in [header::CONTENT_LENGTH, header::ACCEPT_RANGES, header::CONTENT_RANGE] {
@@ -1143,6 +1143,9 @@ pub(crate) async fn handle_with(req: Request<Vec<u8>>, base: &str, streaming: bo
     let mut res_opt = None;
     for attempt in 0..2 {
         let mut rb = apply(client().get(&target), &h);
+        if !streaming {
+            rb = rb.timeout(Duration::from_secs(45));
+        }
         if let Some(ref rng) = outbound_range {
             rb = rb.header(header::RANGE, rng.as_str());
         }
@@ -1619,7 +1622,10 @@ fn build_http_request(
     body: Option<Vec<u8>>,
 ) -> Result<reqwest::RequestBuilder, String> {
     let m = reqwest::Method::from_bytes(method.as_deref().unwrap_or("GET").as_bytes()).map_err(|e| e.to_string())?;
-    let mut rb = client().request(m, url).header(header::USER_AGENT, UA);
+    let mut rb = client()
+        .request(m, url)
+        .timeout(Duration::from_secs(30))
+        .header(header::USER_AGENT, UA);
     for (k, v) in headers.unwrap_or_default() {
         rb = rb.header(k, v);
     }

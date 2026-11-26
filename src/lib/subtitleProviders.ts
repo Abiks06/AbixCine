@@ -1,12 +1,15 @@
 /**
- * Online subtitle discovery & downloading across Wyzie Subs, OpenSubtitles v3 (Stremio API,
- * including local-file OSHash matching), and SubDL (with optional API key + ZIP extraction).
- * Uses `httpFetch` / `httpFetchBytes` from `../sources/native` to bypass webview CORS on desktop,
- * with timeout, AbortSignal cancellation, LRU caching, language normalization, scoring, and dedup.
+ * Online subtitle discovery & downloading across OpenSubtitles v3 (with OSHash), SubSense,
+ * MeowSubs, installed Stremio subtitle addons, Wyzie Subs, and SubDL.
+ * Enriches missing IMDb/TMDB IDs via Cinemeta and Fribb/Anibridge anime mappings, and uses
+ * `httpFetch` / `httpFetchBytes` from `../sources/native` to bypass webview CORS on desktop.
  */
 
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import { resolveAnimeIds } from "./animeMapping";
+import { parseYear, pickTitleMatch } from "../sources/titleMatch";
 import { DEFAULT_UA, httpFetch, httpFetchBytes, PROXY_URL_RX, unwrapProxyUrl } from "../sources/native";
+import { fetchStremioSubtitles, listStremioAddons } from "../sources/stremio";
 import { decryptKisskhSubtitle, isEncryptedSubCandidateUrl } from "./kisskhSubs";
 import {
   decodeSubtitle,
@@ -18,9 +21,14 @@ import {
   type SubHIFilter,
 } from "./subtitles";
 
+export type OnlineSubtitleProvider = "wyzie" | "opensubtitles" | "subdl" | "subsense" | "meowtv" | "stremio";
+
 export interface OnlineSubtitleQuery {
   tmdbId?: number;
   imdbId?: string;
+  anilistId?: number;
+  malId?: number;
+  mediaKey?: string;
   title?: string;
   year?: number;
   kind?: "movie" | "tv" | "anime";
@@ -42,7 +50,7 @@ export interface OnlineSubtitleQuery {
 
 export interface OnlineSubtitleResult {
   id: string;
-  provider: "wyzie" | "opensubtitles" | "subdl";
+  provider: OnlineSubtitleProvider;
   lang: string;
   langName: string;
   release: string;
@@ -57,11 +65,59 @@ export interface OnlineSubtitleResult {
 
 const PROVIDER_TIMEOUT_MS = 8_000;
 const FETCH_TIMEOUT_MS = 12_000;
+const ENRICH_TIMEOUT_MS = 5_000;
 const CACHE_TTL_MS = 10 * 60_000;
 const CACHE_MAX = 50;
 const WYZIE_HOSTS = ["https://sub.wyzie.io", "https://sub.wyzie.ru"] as const;
+const SUBSENSE_BASE = "https://subsense.nepiraw.com";
+const MEOW_SUBS_BASE = "https://api.meowtv.ru";
+const CINEMETA_BASE = "https://v3-cinemeta.strem.io";
 const SUBDL_API_URL = "https://api.subdl.com/api/v1/subtitles";
 const SUBDL_DL_BASE = "https://dl.subdl.com";
+
+const ISO2_TO_3: Record<string, string> = {
+  en: "eng",
+  es: "spa",
+  fr: "fra",
+  de: "deu",
+  pt: "por",
+  it: "ita",
+  ja: "jpn",
+  ko: "kor",
+  zh: "zho",
+  ar: "ara",
+  ru: "rus",
+  hi: "hin",
+  tr: "tur",
+  pl: "pol",
+  nl: "nld",
+  sv: "swe",
+  no: "nor",
+  da: "dan",
+  fi: "fin",
+  id: "ind",
+  ms: "msa",
+  th: "tha",
+  vi: "vie",
+  uk: "ukr",
+  cs: "ces",
+  ro: "ron",
+  el: "ell",
+  he: "heb",
+  hu: "hun",
+  bg: "bul",
+  hr: "hrv",
+  sr: "srp",
+  sk: "slk",
+  fa: "fas",
+};
+
+function toIso3Lang(code: string): string | null {
+  const base = langBase(normalizeLangCode(code));
+  if (!base || base === "und") return null;
+  if (ISO2_TO_3[base]) return ISO2_TO_3[base];
+  return /^[a-z]{3}$/.test(base) ? base : null;
+}
 
 const searchCache = new Map<string, { at: number; results: OnlineSubtitleResult[] }>();
 
@@ -204,7 +260,7 @@ function resolveSubdlApiKey(query: OnlineSubtitleQuery): string | undefined {
 
 interface RawOnlineSub {
   id: string;
-  provider: "wyzie" | "opensubtitles" | "subdl";
+  provider: OnlineSubtitleProvider;
   lang: string;
   langName: string;
   release: string;
@@ -531,6 +587,264 @@ async function querySubDL(query: OnlineSubtitleQuery, signal?: AbortSignal): Pro
   return { ok: true, queried: true, items };
 }
 
+async function querySubSense(
+  query: OnlineSubtitleQuery,
+  preferredLangs: string[],
+  signal?: AbortSignal,
+): Promise<ProviderOutcome> {
+  const imdb = normalizeImdbId(query.imdbId);
+  if (!imdb || !/^tt\d+$/i.test(imdb)) return { ok: true, queried: false, items: [] };
+
+  const isEpisodic = query.kind === "tv" || query.season != null || query.episode != null;
+  if (isEpisodic && query.episode == null) return { ok: true, queried: false, items: [] };
+
+  const targetBase =
+    isEpisodic && query.episode != null
+      ? `series/${encodeURIComponent(imdb)}:${query.season ?? 1}:${query.episode}`
+      : `movie/${encodeURIComponent(imdb)}`;
+
+  const langs3 = [...new Set(preferredLangs.map(toIso3Lang).filter((l): l is string => Boolean(l)))];
+  const cfgPrefix = langs3.length ? `languages=${langs3.join(",")}|noredirect` : "noredirect";
+  const url = `${SUBSENSE_BASE}/${cfgPrefix}/subtitles/${targetBase}.json`;
+
+  const res = await withTimeoutAndAbort(
+    httpFetch(url, { Accept: "application/json", "User-Agent": DEFAULT_UA }),
+    PROVIDER_TIMEOUT_MS,
+    signal,
+  );
+  if (res.status < 200 || res.status >= 300) return { ok: false, queried: true, items: [] };
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(res.body);
+  } catch {
+    return { ok: false, queried: true, items: [] };
+  }
+  const list = parsed && typeof parsed === "object" ? (parsed as { subtitles?: unknown }).subtitles : null;
+  if (!Array.isArray(list)) return { ok: false, queried: true, items: [] };
+
+  const items: RawOnlineSub[] = [];
+  for (let i = 0; i < list.length; i++) {
+    const row = list[i];
+    if (!row || typeof row !== "object") continue;
+    const rec = row as Record<string, unknown>;
+    if (!isValidHttpUrl(rec.url)) continue;
+
+    const lang = normalizeLangCode(typeof rec.lang === "string" ? rec.lang : undefined);
+    const releaseRaw =
+      (typeof rec.fileName === "string" && rec.fileName.trim()) ||
+      (typeof rec.releaseName === "string" && rec.releaseName.trim()) ||
+      (typeof rec.label === "string" && rec.label.trim()) ||
+      "SubSense";
+    const format = inferOnlineFormat(rec.format, rec.url, releaseRaw);
+    const hearingImpaired = Boolean(rec.hearingImpaired ?? rec.hi) || /\b(sdh|cc|hi)\b/i.test(releaseRaw);
+    const forced = Boolean(rec.forced) || /\bforced\b/i.test(releaseRaw);
+
+    items.push({
+      id: `subsense-${typeof rec.id === "string" || typeof rec.id === "number" ? String(rec.id) : i}`,
+      provider: "subsense",
+      lang,
+      langName: langLabel(lang),
+      release: releaseRaw,
+      format,
+      url: rec.url.trim(),
+      hearingImpaired,
+      forced,
+    });
+  }
+  return { ok: true, queried: true, items };
+}
+
+async function queryMeowSubs(query: OnlineSubtitleQuery, signal?: AbortSignal): Promise<ProviderOutcome> {
+  const tmdb = query.tmdbId != null && Number.isFinite(query.tmdbId) && query.tmdbId > 0 ? Math.trunc(query.tmdbId) : 0;
+  if (!tmdb) return { ok: true, queried: false, items: [] };
+
+  const isEpisodic = query.kind === "tv" || query.season != null || query.episode != null;
+  if (isEpisodic && query.episode == null) return { ok: true, queried: false, items: [] };
+
+  const path =
+    isEpisodic && query.episode != null
+      ? `tv/${tmdb}/${query.season ?? 1}/${query.episode}`
+      : `movie/${tmdb}`;
+  const url = `${MEOW_SUBS_BASE}/subs/${path}`;
+
+  const res = await withTimeoutAndAbort(
+    httpFetch(url, {
+      Accept: "application/json",
+      Origin: "https://meowtv.ru",
+      Referer: "https://meowtv.ru/",
+      "User-Agent": DEFAULT_UA,
+    }),
+    PROVIDER_TIMEOUT_MS,
+    signal,
+  );
+  if (res.status < 200 || res.status >= 300) return { ok: false, queried: true, items: [] };
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(res.body);
+  } catch {
+    return { ok: false, queried: true, items: [] };
+  }
+  if (!Array.isArray(parsed)) return { ok: false, queried: true, items: [] };
+
+  const perLang = new Map<string, number>();
+  const items: RawOnlineSub[] = [];
+  for (let i = 0; i < parsed.length; i++) {
+    const row = parsed[i];
+    if (!row || typeof row !== "object") continue;
+    const rec = row as Record<string, unknown>;
+    if (!isValidHttpUrl(rec.file)) continue;
+
+    const labelStr = typeof rec.label === "string" ? rec.label.trim() : "";
+    const lang = normalizeLangCode(labelStr);
+    const seenN = perLang.get(lang) ?? 0;
+    if (seenN >= 3) continue;
+    perLang.set(lang, seenN + 1);
+
+    const fileUrl = rec.file.trim();
+    const release = labelStr ? `MeowSubs · ${labelStr}` : "MeowSubs";
+    items.push({
+      id: `meow-${tmdb}-${i}`,
+      provider: "meowtv",
+      lang,
+      langName: langLabel(lang),
+      release,
+      format: inferOnlineFormat(undefined, fileUrl, labelStr),
+      url: fileUrl,
+      hearingImpaired: /\b(sdh|cc|hi)\b/i.test(labelStr),
+      forced: /\bforced\b/i.test(labelStr),
+    });
+  }
+  return { ok: true, queried: true, items };
+}
+
+async function queryInstalledStremioAddons(
+  query: OnlineSubtitleQuery,
+  oshash: string | undefined,
+  signal?: AbortSignal,
+): Promise<ProviderOutcome> {
+  const addons = listStremioAddons().filter((a) => {
+    if (a.enabled === false) return false;
+    const base = a.baseUrl.toLowerCase();
+    return !base.includes("opensubtitles-v3.strem.io") && !base.includes("subsense.nepiraw.com");
+  });
+  if (!addons.length) return { ok: true, queried: false, items: [] };
+
+  const imdb = normalizeImdbId(query.imdbId);
+  if (!imdb && !oshash) return { ok: true, queried: false, items: [] };
+
+  const subs = await fetchStremioSubtitles(
+    addons,
+    {
+      imdbId: imdb,
+      kind: query.kind,
+      season: query.season,
+      episode: query.episode,
+      videoHash: oshash,
+      videoSize: query.fileSize,
+      filename: query.filename?.trim() || basenameFromPath(query.localPath),
+    },
+    signal,
+  );
+  const items: RawOnlineSub[] = subs.map((s) => ({
+    id: `stremio-${s.id}`,
+    provider: "stremio",
+    lang: normalizeLangCode(s.lang),
+    langName: s.langName || langLabel(s.lang),
+    release: s.addonName ? `${s.addonName} · ${s.label}` : s.label,
+    format: inferOnlineFormat(s.format, s.url, s.label),
+    url: s.url,
+    hearingImpaired: Boolean(s.isHearingImpaired),
+    forced: Boolean(s.isForced),
+  }));
+  return { ok: true, queried: true, items };
+}
+
+async function enrichSubtitleQueryIds(
+  query: OnlineSubtitleQuery,
+  signal?: AbortSignal,
+): Promise<OnlineSubtitleQuery> {
+  if (signal?.aborted) return query;
+  let next: OnlineSubtitleQuery = { ...query };
+  let imdb = normalizeImdbId(next.imdbId);
+
+  const isAnime =
+    next.kind === "anime" ||
+    Boolean(next.anilistId) ||
+    Boolean(next.malId) ||
+    Boolean(next.mediaKey?.startsWith("anilist:"));
+
+  if (!imdb && isAnime && (next.anilistId || next.malId || next.tmdbId || next.mediaKey)) {
+    try {
+      const mapped = await resolveAnimeIds(
+        {
+          anilistId: next.anilistId,
+          malId: next.malId,
+          tmdbId: next.tmdbId,
+          key: next.mediaKey,
+          kind: next.kind,
+          season: next.season,
+          episode: next.episode,
+        },
+        signal,
+      );
+      if (mapped.imdbId && !imdb) {
+        imdb = normalizeImdbId(mapped.imdbId);
+        next.imdbId = imdb;
+      }
+      if (mapped.tmdbId && !next.tmdbId) next.tmdbId = mapped.tmdbId;
+      if (mapped.tmdbKind === "movie") next.kind = "movie";
+      else if (mapped.tmdbKind === "tv") {
+        if (next.season == null && mapped.tmdbSeason != null) next.season = mapped.tmdbSeason;
+        if (next.episode == null && mapped.courEpisode != null) next.episode = mapped.courEpisode;
+      }
+    } catch {
+      /* ignore optional anime ID lookup errors */
+    }
+  }
+
+  const title = next.title?.trim();
+  if (!imdb && title && !signal?.aborted) {
+    const isEpisodic = next.kind === "tv" || next.kind === "anime" || next.season != null || next.episode != null;
+    const ctype = isEpisodic ? "series" : "movie";
+    const cinUrl = `${CINEMETA_BASE}/catalog/${ctype}/top/search=${encodeURIComponent(title)}.json`;
+    try {
+      const res = await withTimeoutAndAbort(
+        httpFetch(cinUrl, { Accept: "application/json", "User-Agent": DEFAULT_UA }),
+        ENRICH_TIMEOUT_MS,
+        signal,
+      );
+      if (res.status >= 200 && res.status < 300) {
+        const parsed = JSON.parse(res.body) as {
+          metas?: { id?: string; imdb_id?: string; name?: string; releaseInfo?: string; year?: string | number }[];
+        };
+        const metas = Array.isArray(parsed?.metas) ? parsed.metas : [];
+        if (metas.length) {
+          const hit = pickTitleMatch(
+            metas,
+            { titles: [title], year: next.year, kind: isEpisodic ? "tv" : "movie" },
+            (m) => ({
+              titles: [m.name],
+              year: parseYear(m.releaseInfo ?? m.year),
+              imdbId: m.imdb_id ?? (m.id && /^tt\d+$/i.test(m.id) ? m.id : undefined),
+            }),
+          );
+          const candidateId = hit?.item?.imdb_id || hit?.item?.id;
+          const resolvedImdb = normalizeImdbId(candidateId);
+          if (resolvedImdb && /^tt\d+$/i.test(resolvedImdb)) {
+            next.imdbId = resolvedImdb;
+          }
+        }
+      }
+    } catch {
+      /* ignore optional Cinemeta lookup errors */
+    }
+  }
+
+  return next;
+}
+
 function scoreOnlineSub(
   item: RawOnlineSub,
   preferredLangs: string[],
@@ -581,7 +895,7 @@ function deduplicateResults(results: OnlineSubtitleResult[]): OnlineSubtitleResu
   }
 
   const byRelease = new Map<string, OnlineSubtitleResult>();
-  const genericReleases = new Set(["wyzie", "opensubtitles", "subdl", "subtitles", "subtitle"]);
+  const genericReleases = new Set(["wyzie", "opensubtitles", "subdl", "subsense", "meowsubs", "stremio", "subtitles", "subtitle"]);
   const out: OnlineSubtitleResult[] = [];
 
   for (const r of byUrl.values()) {
@@ -643,6 +957,9 @@ export async function searchOnlineSubtitles(
   if (local.size && query.fileSize == null) query = { ...query, fileSize: local.size };
   if (signal?.aborted) return [];
 
+  query = await enrichSubtitleQueryIds(query, signal);
+  if (signal?.aborted) return [];
+
   const cacheKey = buildCacheKey(query, preferredLangs, hiFilter, oshash);
 
   const now = Date.now();
@@ -655,9 +972,12 @@ export async function searchOnlineSubtitles(
   }
 
   const settled = await Promise.allSettled([
-    queryWyzie(query, signal),
     queryOpenSubtitles(query, oshash, signal),
+    querySubSense(query, preferredLangs, signal),
+    queryMeowSubs(query, signal),
+    queryWyzie(query, signal),
     querySubDL(query, signal),
+    queryInstalledStremioAddons(query, oshash, signal),
   ]);
 
   if (signal?.aborted) return [];

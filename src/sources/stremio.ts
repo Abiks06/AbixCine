@@ -416,21 +416,14 @@ export interface StremioAddonPreset {
   note: string;
 }
 
-/** Curated public direct-HTTP Stremio addons verified without Debrid keys. */
+/** Curated public HTTP stream & subtitle Stremio addons verified without Debrid keys. */
 export const PUBLIC_HTTP_STREMIO_PRESETS: readonly StremioAddonPreset[] = [
-  {
-    id: "absolute-cinema",
-    name: "Absolute Cinema",
-    manifestUrl: "https://cinema.debrid.in/manifest.json",
-    types: ["movie", "series"],
-    note: "Direct HTTP MP4/MKV streams for movies and series",
-  },
   {
     id: "flix-streams",
     name: "Flix-Streams Free",
     manifestUrl: "https://free.flixnest.app/manifest.json",
     types: ["movie", "series"],
-    note: "Multi-mirror HTTP streams for movies and series",
+    note: "Multi-mirror HTTP & 4K MKV streams for movies and series",
   },
   {
     id: "motchill-direct",
@@ -440,18 +433,18 @@ export const PUBLIC_HTTP_STREMIO_PRESETS: readonly StremioAddonPreset[] = [
     note: "Direct HLS (.m3u8) streams for movies",
   },
   {
-    id: "stravo-ii",
-    name: "Stravo II",
-    manifestUrl: "https://v2.stravo.site/local/manifest.json",
-    types: ["movie"],
-    note: "Direct HTTP MP4 streams for movies",
+    id: "opensubtitles-v3",
+    name: "OpenSubtitles v3",
+    manifestUrl: "https://opensubtitles-v3.strem.io/manifest.json",
+    types: ["movie", "series"],
+    note: "Official OpenSubtitles v3 multi-language subtitle catalog",
   },
   {
-    id: "hyper-stravo",
-    name: "Hyper",
-    manifestUrl: "https://hyper.stravo.site/local/manifest.json",
-    types: ["movie"],
-    note: "Direct HTTP MP4/DASH streams for movies",
+    id: "subsense-subs",
+    name: "SubSense",
+    manifestUrl: "https://subsense.nepiraw.com/noredirect/manifest.json",
+    types: ["movie", "series"],
+    note: "SubSource, SubDL, YTS & AnimeTosho subtitle aggregator",
   },
 ];
 

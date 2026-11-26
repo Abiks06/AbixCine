@@ -370,6 +370,29 @@ describe("anikotoProvider", () => {
     expect(mirrorOut).toHaveLength(1);
     expect(mirrorOut[0].label).toContain("HD-2");
     expect(unwrapProxyUrl(mirrorOut[0].url).url).toBe("https://cdn.ak.example/mirror.m3u8");
+
+    // Rejects wrong season cards when requesting season 1
+    mockHttpFetch.mockImplementation(async (url: string) => {
+      if (url.startsWith("https://anikototv.bz/filter?")) {
+        return {
+          status: 200,
+          url,
+          body: `<div class="item"><a class="name d-title" href="/watch/frieren-s2/ep-1">Frieren: Beyond Journey's End Season 2</a><span class="ep-status sub">SUB</span></div>`,
+        };
+      }
+      return { status: 404, url, body: "" };
+    });
+    const wrongSeasonOut = await anikotoProvider.find(
+      {
+        media: makeMedia({ key: "tmdb:tv:209867", anilistId: undefined, malId: undefined }),
+        season: 1,
+        episode: 1,
+        audio: "sub",
+      },
+      makeSettings(),
+      new AbortController().signal,
+    );
+    expect(wrongSeasonOut).toEqual([]);
   });
 });
 
@@ -688,7 +711,7 @@ describe("extractors barrel index", () => {
     expect(DIRECT_EXTRACTORS).toHaveLength(15);
 
     const ids = DIRECT_EXTRACTORS.map((p) => p.id);
-    for (const id of ["castle", "animeheaven", "hexa-direct", "vidup", "cinejoy", "meowtv", "megaplay"]) {
+    for (const id of ["castle", "animeheaven", "flixnest", "hexa-direct", "cinejoy", "meowtv", "megaplay"]) {
       expect(ids).toContain(id);
     }
     expect(new Set(ids).size).toBe(15);

@@ -1,6 +1,8 @@
 import { isTauri } from "@tauri-apps/api/core";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { useDownloadPrefs } from "../lib/downloadOverrides";
+import { rankDownloadOptions } from "../lib/downloadRank";
 import { findOfflineDetail, findOfflineSeasonEpisodes, startDownload } from "../lib/downloads";
 import { Player, type EpisodeNav } from "../components/Player";
 import { Art, sized } from "../components/Art";
@@ -55,6 +57,7 @@ export function Watch() {
   // saved with progress or My List instead of spinning forever.
   const list = useWatchlist();
   const canonicalKey = detail.data?.canonicalKey ?? detail.data?.key ?? key;
+  const dlPrefs = useDownloadPrefs(canonicalKey);
   const courKeys = useMemo(
     () =>
       detail.data
@@ -605,7 +608,19 @@ export function Watch() {
               snap={snap}
               busyKey={busyKey}
               onPick={(c) => void playFrom(c)}
-              onDownload={req && isTauri() ? (c) => void startDownload(req, c, d ?? undefined) : undefined}
+              onDownload={
+                req && isTauri()
+                  ? (c) =>
+                      void startDownload(req, c, d ?? undefined, undefined, {
+                        fallbacks: rankDownloadOptions(snap.candidates, dlPrefs.quality)
+                          .filter((x) => x !== c)
+                          .slice(0, 6),
+                        preferredQuality: dlPrefs.quality,
+                        preferredFormat: dlPrefs.format,
+                        replaceExisting: true,
+                      })
+                  : undefined
+              }
             />
           )}
           <div className="rlog">

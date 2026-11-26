@@ -3,6 +3,7 @@ import type shaka from "shaka-player";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { useSlidingIndicators } from "../lib/useSlidingIndicator";
+import { useModalFocusTrap } from "../lib/useModalFocusTrap";
 import { fmtTime } from "../lib/format";
 import { ENHANCE_MODES, upscalerAvailable } from "../lib/enhance";
 import { useEnhance } from "./player/useEnhance";
@@ -152,6 +153,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
   /** The video reached its end (Up next stays up then, with autoplay off). */
   const [ended, setEnded] = useState(false);
   const [preparingLocal, setPreparingLocal] = useState(false);
+  const [localPreparePct, setLocalPreparePct] = useState<number | null>(null);
   const [preparingTorrent, setPreparingTorrent] = useState(false);
   const activeTorrentIdRef = useRef<number | null>(null);
   const stopActiveTorrent = useCallback(() => {
@@ -182,6 +184,8 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
   const bumpTimer = useRef<number>();
   const [timeLeft, setTimeLeft] = useState(() => localStorage.getItem(TIME_LEFT_KEY) === "1");
   const [keysOpen, setKeysOpen] = useState(false);
+  const pkeysRef = useRef<HTMLDivElement>(null);
+  useModalFocusTrap(keysOpen, pkeysRef);
 
   const idx = useMemo(() => candidates.findIndex((c) => candKey(c) === activeId), [candidates, activeId]);
   const cur = idx >= 0 ? candidates[idx] : undefined;
@@ -408,7 +412,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
   }, [cur?.url, retrySeq]);
 
   // Stream engine (player/useStreamEngine.ts): attach, audio tracks, watchdog. One block, same hook order.
-  const { armStall, chooseAudioTrack } = useStreamEngine({
+  const { armStall, chooseAudioTrack, handleLocalMediaError } = useStreamEngine({
     activeCurUrlRef,
     activeSessionRef,
     activeTorrentIdRef,
@@ -460,6 +464,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     setNativeSubs,
     setPlaying,
     setPreparingLocal,
+    setLocalPreparePct,
     setPreparingTorrent,
     setRecovering,
     setRetrySeq,
@@ -971,7 +976,14 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
   const spinner = showsSpinner({ waiting, failed: !!fatal, isEmbed, hasStarted, playing, preparing });
   const paused = !isEmbed && !playing && !spinner;
   const hasOtherServer = candidates.some((c) => candKey(c) !== activeKey);
-  const stage = loadingStage({ recovering, preparingTorrent, preparingLocal, hasStarted, server: cur?.providerName });
+  const stage = loadingStage({
+    recovering,
+    preparingTorrent,
+    preparingLocal,
+    localPreparePct,
+    hasStarted,
+    server: cur?.providerName,
+  });
   // A connect or rebuffer that drags on offers the next server, rather than leaving you to watch a
   // spinner until the 15-20 s watchdog gives up on its own.
   const [slow, setSlow] = useState(false);
@@ -1110,6 +1122,9 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
                 if (!upNextDismissedRef.current) onEnded?.();
               }}
               onError={() => {
+                // Direct local files fast-path around FFmpeg; if the webview rejects the file on
+                // initial load, fall back once to forced FFmpeg remux before triggering failover.
+                if (handleLocalMediaError()) return;
                 // hls.js and Shaka report their own errors. A plain <video> (a file, or HLS played
                 // natively) has no one else to notice: without this it sat silent until a 20 s timeout.
                 if (cur && cur.kind !== "embed" && !hlsRef.current && !shakaRef.current) failover("unsupported or unreachable stream");
@@ -1172,6 +1187,18 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
               <span className="pload-ring" aria-hidden />
               <span className="pload-tx">
                 <strong>{stage}</strong>
+                {preparingLocal && localPreparePct != null && localPreparePct > 0 && (
+                  <div
+                    className="pload-bar"
+                    role="progressbar"
+                    aria-label="Audio optimization progress"
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={Math.round(localPreparePct)}
+                  >
+                    <span style={{ width: `${Math.min(100, Math.max(0, localPreparePct))}%` }} />
+                  </div>
+                )}
                 {!hasStarted && <span className="pload-sub">{[title, subtitle].filter(Boolean).join(" · ")}</span>}
               </span>
               {slow && hasOtherServer && !recovering && (
@@ -1393,12 +1420,12 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
       <aside ref={sheetInd} className={`psheet ${sheet ? "open" : ""}`} aria-hidden={!sheet} {...(sheet ? {} : { inert: "" })}>
         <div className="ps-head">
           <div className="ps-tabs" role="tablist">
-            <button role="tab" className={sheet === "servers" ? "on" : ""} onClick={() => setSheet("servers")}>Servers</button>
-            {episodes && <button role="tab" className={sheet === "episodes" ? "on" : ""} onClick={() => setSheet("episodes")}>Episodes</button>}
-            <button role="tab" className={sheet === "subtitles" ? "on" : ""} onClick={() => setSheet("subtitles")}>Subtitles</button>
-            {!isEmbed && <button role="tab" className={sheet === "transcript" ? "on" : ""} onClick={() => setSheet("transcript")}>Transcript</button>}
-            <button role="tab" className={sheet === "audio" ? "on" : ""} onClick={() => setSheet("audio")}>Audio</button>
-            <button role="tab" className={sheet === "picture" ? "on" : ""} onClick={() => setSheet("picture")}>Picture</button>
+            <button role="tab" aria-selected={sheet === "servers"} className={sheet === "servers" ? "on" : ""} onClick={() => setSheet("servers")}>Servers</button>
+            {episodes && <button role="tab" aria-selected={sheet === "episodes"} className={sheet === "episodes" ? "on" : ""} onClick={() => setSheet("episodes")}>Episodes</button>}
+            <button role="tab" aria-selected={sheet === "subtitles"} className={sheet === "subtitles" ? "on" : ""} onClick={() => setSheet("subtitles")}>Subtitles</button>
+            {!isEmbed && <button role="tab" aria-selected={sheet === "transcript"} className={sheet === "transcript" ? "on" : ""} onClick={() => setSheet("transcript")}>Transcript</button>}
+            <button role="tab" aria-selected={sheet === "audio"} className={sheet === "audio" ? "on" : ""} onClick={() => setSheet("audio")}>Audio</button>
+            <button role="tab" aria-selected={sheet === "picture"} className={sheet === "picture" ? "on" : ""} onClick={() => setSheet("picture")}>Picture</button>
           </div>
           <button className="pbtn icon" onClick={() => setSheet(null)} aria-label="Close"><Icon name="x" size={16} /></button>
         </div>
@@ -1448,7 +1475,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
               onlineLoading={onlineLoading}
               onlineSearched={onlineSearched}
               onlineError={onlineError}
-              onSearchOnline={(qTitle, qLang) => void searchOnline(qTitle, qLang)}
+              onSearchOnline={(qTitle, qLang, epOverride) => void searchOnline(qTitle, qLang, epOverride)}
               onLoadOnline={(res, asDual) => void loadOnlineResult(res, asDual)}
               loadingOnlineId={loadingOnlineId}
               loadedOnlineMap={loadedOnlineMap}
@@ -1601,21 +1628,6 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
               )}
               {!isEmbed && (
                 <div className="ps-block">
-                  <div className="ps-label">Sound</div>
-                  <div className="opt-list">
-                    <button className={`opt ${audioFx.night ? "on" : ""}`} onClick={() => toggleAudioFx("night")} aria-pressed={audioFx.night}>
-                      <span>Night mode</span>
-                      <small>Evens out loud and quiet scenes, so explosions don't wake the house</small>
-                    </button>
-                    <button className={`opt ${audioFx.dialogue ? "on" : ""}`} onClick={() => toggleAudioFx("dialogue")} aria-pressed={audioFx.dialogue}>
-                      <span>Dialogue boost</span>
-                      <small>Lifts voices above music and effects</small>
-                    </button>
-                  </div>
-                </div>
-              )}
-              {!isEmbed && (
-                <div className="ps-block">
                   <div className="ps-label">Speed</div>
                   <div className="seg3 wrap">
                     {SPEEDS.map((sp) => <button key={sp} className={sp === speed ? "on" : ""} onClick={() => setSpeed(sp)}>{sp}×</button>)}
@@ -1678,7 +1690,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
 
       {keysOpen && (
         <div className="pkeys-scrim" onClick={() => setKeysOpen(false)}>
-          <div className="pkeys" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts" onClick={(e) => e.stopPropagation()}>
+          <div ref={pkeysRef} className="pkeys" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts" tabIndex={-1} onClick={(e) => e.stopPropagation()}>
             {/* Focus moves into the card (it's modal), and lands back on the page when it closes. */}
             <div className="pkeys-h">Keyboard shortcuts <button className="pbtn icon" onClick={() => setKeysOpen(false)} aria-label="Close" autoFocus><Icon name="x" size={16} /></button></div>
             <dl>

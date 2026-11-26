@@ -7,6 +7,7 @@ export interface Media {
   kind: MediaKind;
   title: string;
   originalTitle?: string;
+  synonyms?: string[];
   overview: string;
   year?: number;
   rating?: number; // 0-10

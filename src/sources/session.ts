@@ -168,7 +168,7 @@ const isAbxsProxied = (url: string) => /^(?:https?:\/\/abxs\.localhost(?:[/:?]|$
 const ANIME_ONLY_DIRECT_IDS = new Set(["hianime", "megaplay", "anizone", "kickassanime", "anikoto", "animeheaven"]);
 /** TMDB-keyed movie/TV extractors that only carry the original audio, so never an anime dub. */
 const NO_ANIME_DUB_DIRECT_IDS = new Set([
-  "vixsrc", "castle", "hexa-direct", "vidup", "cinejoy", "meowtv", "zxcstreams", "vidrock", "vidlink-direct",
+  "vixsrc", "castle", "flixnest", "hexa-direct", "cinejoy", "meowtv", "zxcstreams", "vidrock", "vidlink-direct",
 ]);
 const ASIAN_DRAMA_DIRECT_IDS = new Set(["kisskh", "onetouchtv"]);
 const ASIAN_DRAMA_LANGS = new Set(["ko", "zh", "cn", "ja", "th", "tw", "tl", "id", "vi"]);

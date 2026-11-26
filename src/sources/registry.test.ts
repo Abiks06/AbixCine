@@ -187,8 +187,8 @@ describe("true stream readiness validation", () => {
 });
 
 describe("header, proxy & watch-history hygiene", () => {
-  it("configures all 14 embed servers with normalized Referer, Origin, and User-Agent headers", () => {
-    expect(availableSources).toHaveLength(14);
+  it("configures all 17 embed servers with normalized Referer, Origin, and User-Agent headers", () => {
+    expect(availableSources).toHaveLength(17);
     const s = getSettings();
     for (const src of availableSources) {
       expect(src.headers?.referer).toMatch(/^https:\/\/[^/]+\/$/);

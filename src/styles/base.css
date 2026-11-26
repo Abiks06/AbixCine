@@ -25,7 +25,7 @@
   /* warm archival stock ink */
   --fg: #f5f1e8;
   --fg2: #beb9ae;
-  --fg3: #8c877d;
+  --fg3: #a49e93;
   --ink-04: color-mix(in oklab, var(--fg) 4%, transparent);
   --ink-08: color-mix(in oklab, var(--fg) 8%, transparent);
   --ink-14: color-mix(in oklab, var(--fg) 14%, transparent);
@@ -109,7 +109,7 @@
   --s3: #331e2c;
   --fg: #f7eef0;
   --fg2: #c7b6bc;
-  --fg3: #948088;
+  --fg3: #af98a1;
   --line: rgb(247 238 240 / 0.085);
   --line-2: rgb(247 238 240 / 0.15);
   --line-3: rgb(247 238 240 / 0.28);
@@ -132,7 +132,7 @@
   --s3: #223054;
   --fg: #eef4fc;
   --fg2: #b4c1d6;
-  --fg3: #7f8ea8;
+  --fg3: #9aaac4;
   --line: rgb(238 244 252 / 0.085);
   --line-2: rgb(238 244 252 / 0.15);
   --line-3: rgb(238 244 252 / 0.28);
@@ -155,7 +155,7 @@
   --s3: #21372e;
   --fg: #eff6f1;
   --fg2: #b5c5ba;
-  --fg3: #819487;
+  --fg3: #97ad9e;
   --line: rgb(239 246 241 / 0.085);
   --line-2: rgb(239 246 241 / 0.15);
   --line-3: rgb(239 246 241 / 0.28);
@@ -171,26 +171,26 @@
 }
 
 :root[data-theme="violet"] {
-  --bg: #090612;
-  --s0: #110d1f;
-  --s1: #171129;
-  --s2: #211838;
-  --s3: #2c214a;
-  --fg: #f3effb;
-  --fg2: #c0b7d1;
-  --fg3: #8e82a3;
-  --line: rgb(243 239 251 / 0.085);
-  --line-2: rgb(243 239 251 / 0.15);
-  --line-3: rgb(243 239 251 / 0.28);
-  --brand: oklch(0.77 0.18 302);
+  --bg: #090a12;
+  --s0: #0f111d;
+  --s1: #131524;
+  --s2: #1b1e32;
+  --s3: #252942;
+  --fg: #f0f2fa;
+  --fg2: #b8bdd6;
+  --fg3: #9ca0b8;
+  --line: rgb(240 242 250 / 0.085);
+  --line-2: rgb(240 242 250 / 0.15);
+  --line-3: rgb(240 242 250 / 0.28);
+  --brand: oklch(0.74 0.11 264);
   --tone: var(--brand);
-  --tone-2: oklch(0.79 0.14 220);
-  --tone-ink: oklch(0.88 0.13 302);
-  --tone-deep: oklch(0.24 0.06 302);
-  --on-tone: #100718;
-  --on-fg: #090612;
-  --l1: #2f184c;
-  --l2: #122844;
+  --tone-2: oklch(0.76 0.10 218);
+  --tone-ink: oklch(0.84 0.09 264);
+  --tone-deep: oklch(0.24 0.04 264);
+  --on-tone: #090a12;
+  --on-fg: #090a12;
+  --l1: #1b2242;
+  --l2: #12283c;
 }
 
 :root[data-theme="solstice"] {
@@ -201,7 +201,7 @@
   --s3: #36251c;
   --fg: #f7f0e8;
   --fg2: #c8bab0;
-  --fg3: #968579;
+  --fg3: #b29f92;
   --line: rgb(247 240 232 / 0.085);
   --line-2: rgb(247 240 232 / 0.15);
   --line-3: rgb(247 240 232 / 0.28);
@@ -250,7 +250,7 @@
   --s3: #cec2ae;
   --fg: #181614;
   --fg2: #4f4a43;
-  --fg3: #756e65;
+  --fg3: #5c564e;
   --line: rgb(24 22 20 / 0.1);
   --line-2: rgb(24 22 20 / 0.17);
   --line-3: rgb(24 22 20 / 0.3);
@@ -262,7 +262,7 @@
   --on-tone: #faf6ef;
   --on-fg: #f8f4ec;
   --ok: oklch(0.5 0.16 155);
-  --warn: oklch(0.58 0.15 72);
+  --warn: oklch(0.44 0.14 68);
   --bad: oklch(0.54 0.2 22);
   --gold: oklch(0.58 0.15 72);
   --l1: #e6cbc0;
@@ -277,7 +277,7 @@
   --s3: #cfbdc5;
   --fg: #1d151a;
   --fg2: #54464e;
-  --fg3: #7a6a73;
+  --fg3: #61515a;
   --line: rgb(29 21 26 / 0.1);
   --line-2: rgb(29 21 26 / 0.17);
   --line-3: rgb(29 21 26 / 0.3);
@@ -289,7 +289,7 @@
   --on-tone: #fdf7f9;
   --on-fg: #fbf6f8;
   --ok: oklch(0.5 0.15 156);
-  --warn: oklch(0.58 0.15 68);
+  --warn: oklch(0.44 0.14 68);
   --bad: oklch(0.54 0.2 18);
   --gold: oklch(0.58 0.14 78);
   --l1: #ecccd8;
@@ -430,6 +430,26 @@ kbd { font: 500 10.5px/1.4 var(--f-mono); color: var(--fg2); padding: 1px 5px; b
 .rail-idx { font: 600 9px/1 var(--f-mono); letter-spacing: 0.08em; color: var(--fg3); }
 .rail-link.active .rail-idx { color: var(--tone-ink); }
 .rail-lbl { font: 550 9.5px/1 var(--f-ui); letter-spacing: 0.02em; white-space: nowrap; }
+.rail-badge {
+  position: absolute;
+  top: 4px;
+  right: 5px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 999px;
+  display: inline-grid;
+  place-items: center;
+  background: var(--tone);
+  color: var(--on-tone);
+  font: 700 9.5px/1 var(--f-mono);
+  font-variant-numeric: tabular-nums;
+  box-shadow: 0 0 0 2px var(--s0);
+}
+.rail-badge.warn {
+  background: var(--warn);
+  color: var(--on-tone);
+}
 
 .rail-foot {
   position: relative; width: 100%; padding: 10px 0 12px; border-top: 1px solid var(--line);
@@ -468,7 +488,7 @@ kbd { font: 500 10.5px/1.4 var(--f-mono); color: var(--fg2); padding: 1px 5px; b
 }
 .topbar::before {
   content: ""; position: absolute; inset: 0; z-index: -1; pointer-events: none;
-  background-color: var(--glass-bg);
+  background-color: color-mix(in oklab, var(--bg) 82%, transparent);
   background-image: var(--frost-grain), var(--glass-sheen);
   background-size: var(--glass-size); background-repeat: var(--glass-repeat);
   backdrop-filter: blur(32px) saturate(2.1); -webkit-backdrop-filter: blur(32px) saturate(2.1);
@@ -637,17 +657,17 @@ button.chip:active:not(:disabled) { transform: scale(0.97); }
 .chip.score { color: var(--gold); background: color-mix(in oklab, var(--gold) 10%, var(--s0)); box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--gold) 30%, transparent); }
 .chip.cert { color: var(--fg); font: 600 10.5px var(--f-mono); letter-spacing: 0.04em; box-shadow: inset 0 0 0 1px var(--line-3); background: none; border-radius: var(--r-xs); height: 22px; padding: 0 7px; }
 .chip.muted { opacity: 0.6; height: 26px; }
-.chip small { font: 500 10.5px var(--f-mono); opacity: 0.65; }
+.chip small { font: 500 10.5px var(--f-mono); font-variant-numeric: tabular-nums; opacity: 0.72; }
 .chip.path { max-width: min(280px, 100%); }
 .chip.path > svg { flex: none; }
 .chip.path > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.badge { font: 600 9.5px/1 var(--f-mono); letter-spacing: 0.09em; text-transform: uppercase; padding: 3px 6px; border-radius: var(--r-xs); background: var(--ink-08); color: var(--fg2); white-space: nowrap; }
+.badge { font: 600 9.5px/1 var(--f-mono); font-variant-numeric: tabular-nums; letter-spacing: 0.09em; text-transform: uppercase; padding: 3px 6px; border-radius: var(--r-xs); background: var(--ink-08); color: var(--fg2); white-space: nowrap; }
 .badge.dim { background: var(--ink-04); color: var(--fg3); }
 .badge.on { background: color-mix(in oklab, var(--ok) 15%, transparent); color: var(--ok); }
-.q { font: 700 9.5px/1 var(--f-mono); padding: 3px 5px; border-radius: var(--r-xs); letter-spacing: 0.05em; background: var(--gold); color: #1c1400; }
+.q { font: 700 9.5px/1 var(--f-mono); font-variant-numeric: tabular-nums; padding: 3px 5px; border-radius: var(--r-xs); letter-spacing: 0.05em; background: var(--gold); color: #1c1400; }
 .q.hd { background: var(--ink-14); color: var(--fg); }
 .star { color: var(--gold); font-weight: 600; white-space: nowrap; font-variant-numeric: tabular-nums; }
-.move { font: 600 10px var(--f-mono); padding: 2px 6px; border-radius: var(--r-xs); white-space: nowrap; }
+.move { font: 600 10px var(--f-mono); font-variant-numeric: tabular-nums; padding: 2px 6px; border-radius: var(--r-xs); white-space: nowrap; }
 .move.up { color: var(--ok); background: color-mix(in oklab, var(--ok) 13%, transparent); }
 .move.dn { color: var(--bad); background: color-mix(in oklab, var(--bad) 14%, transparent); }
 .move.new { color: var(--tone-ink); background: color-mix(in oklab, var(--tone) 14%, transparent); }
@@ -754,7 +774,7 @@ button.chip:active:not(:disabled) { transform: scale(0.97); }
   --s3: #332e3d;
   --fg: #f5f1e8;
   --fg2: #cac4b8;
-  --fg3: #969084;
+  --fg3: #a8a196;
   --on-fg: #100e13;
   --line: rgb(255 255 255 / 0.1);
   --line-2: rgb(255 255 255 / 0.18);
@@ -777,6 +797,7 @@ button.chip:active:not(:disabled) { transform: scale(0.97); }
   --glass-shadow: 0 28px 72px -18px rgb(0 0 0 / 0.72), 0 8px 24px -8px rgb(0 0 0 / 0.42), 0 14px 48px -24px color-mix(in oklab, var(--tone) 34%, transparent);
   color: var(--fg);
 }
+:root[data-mode="light"] .q { color: #faf6ef; }
 :root[data-mode="light"] .tp-stage {
   background: #100e13;
 }
@@ -940,9 +961,8 @@ input[type="range"]:disabled::-webkit-slider-thumb { background: var(--fg3); tra
   color: var(--tone-ink);
 }
 .topbar-dl.has-failed {
-  box-shadow: var(--glass-rim-hi);
+  box-shadow: var(--glass-rim-hi), inset 0 0 0 1px color-mix(in oklab, var(--bad) 55%, transparent);
   background-color: color-mix(in oklab, var(--bad) 18%, var(--glass-bg-subtle));
-  border-color: color-mix(in oklab, var(--bad) 45%, transparent);
   color: var(--bad);
 }
 .dl-ring { display: block; flex: none; }
@@ -1226,7 +1246,7 @@ input[type="range"]:disabled::-webkit-slider-thumb { background: var(--fg3); tra
 .hp-specs span:not(:last-child)::after {
   content: "·";
   margin-left: 10px;
-  color: var(--fg4);
+  color: var(--fg3);
 }
 .hp-genres {
   display: flex;
