@@ -8,9 +8,29 @@ import { tmdbProxy } from "./tmdb.js";
 const EMAIL_RX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const KEY_RX = /^[a-z]+:[a-z0-9:]+$/i; // e.g. tmdb:movie:603, anilist:21
 // Settings that follow the user across devices. Device-specific things (library folders) stay local.
-const SYNCED_SETTINGS = ["preferredQuality", "autoplayNext", "reduceMotion", "animeAudio", "audioByTitle", "subtitlePref", "disabledSources", "enabledExtras"];
+const SYNCED_SETTINGS = [
+  "preferredQuality",
+  "autoplayNext",
+  "reduceMotion",
+  "animeAudio",
+  "audioByTitle",
+  "subtitlePref",
+  "disabledSources",
+  "enabledExtras",
+  "downloadQuality",
+  "downloadFormat",
+  "downloadQualityPolicy",
+  "theme",
+  "dynamicLight",
+];
 const QUALITIES = new Set([2160, 1080, 720, 480]);
+const DL_QUALITIES = new Set([2160, 1080, 720, 480, 360]);
+const DL_FORMATS = new Set(["mp4", "mkv"]);
+const DL_POLICIES = new Set(["ask", "strict", "best"]);
+const THEMES = new Set(["noir", "crimson", "indigo", "emerald", "violet", "solstice", "alabaster", "washi"]);
 const AUDIO = new Set(["sub", "dub"]);
+const EP_KEY_RX = /^(main|s\d+:e\d+)$/;
+const MAX_EPISODES = 2500;
 const MAX_AUDIO_TITLES = 2000;
 const MAX_SOURCE_IDS = 300;
 const idList = (v) => Array.isArray(v) && v.length <= MAX_SOURCE_IDS && v.every((x) => typeof x === "string" && x.length > 0 && x.length <= 80);
@@ -30,6 +50,8 @@ const SUBTITLE_ENUMS = {
   bg: new Set(["glass", "box", "none"]),
   edge: new Set(["shadow", "outline", "raised", "none"]),
   preferHearingImpaired: new Set(["any", "avoid", "prefer"]),
+  signLayout: new Set(["separate", "positioned", "hide"]),
+  assMode: new Set(["native", "clean"]),
 };
 
 function sanitizeSubtitlePref(raw) {
@@ -99,6 +121,16 @@ function sanitizeSettings(body) {
     } else if (k === "enabledExtras") {
       // null means "never chosen" on the client, which is different from an empty list.
       if (v === null || idList(v)) clean[k] = v;
+    } else if (k === "downloadQuality") {
+      if (v === null || DL_QUALITIES.has(v)) clean[k] = v;
+    } else if (k === "downloadFormat") {
+      if (DL_FORMATS.has(v)) clean[k] = v;
+    } else if (k === "downloadQualityPolicy") {
+      if (DL_POLICIES.has(v)) clean[k] = v;
+    } else if (k === "theme") {
+      if (typeof v === "string" && THEMES.has(v)) clean[k] = v;
+    } else if (k === "dynamicLight") {
+      if (typeof v === "boolean") clean[k] = v;
     } else if (k === "subtitlePref") {
       clean[k] = v; // validated separately by the route
     }
@@ -106,10 +138,50 @@ function sanitizeSettings(body) {
   return clean;
 }
 
+function sanitizeEpisodes(raw) {
+  if (!isPlainObject(raw)) return undefined;
+  const out = {};
+  const entries = Object.entries(raw);
+  for (let i = 0; i < entries.length && Object.keys(out).length < MAX_EPISODES; i++) {
+    const [epk, val] = entries[i];
+    if (!EP_KEY_RX.test(epk) || !isPlainObject(val)) continue;
+    const pos = typeof val.position === "number" && Number.isFinite(val.position) && val.position >= 0 && val.position < 1e7 ? val.position : null;
+    const dur = typeof val.duration === "number" && Number.isFinite(val.duration) && val.duration >= 0 && val.duration < 1e7 ? val.duration : null;
+    const uat = typeof val.updatedAt === "number" && Number.isFinite(val.updatedAt) && val.updatedAt >= 0 ? Math.min(val.updatedAt, Date.now() + MAX_SKEW_MS) : Date.now();
+    if (pos === null || dur === null) continue;
+    if (!optInt(val.season) || !optInt(val.episode)) continue;
+    if (val.audio !== undefined && val.audio !== null && !AUDIO.has(val.audio)) continue;
+    out[epk] = {
+      ...(val.season != null ? { season: val.season } : {}),
+      ...(val.episode != null ? { episode: val.episode } : {}),
+      ...(val.audio ? { audio: val.audio } : {}),
+      position: pos,
+      duration: dur,
+      updatedAt: uat,
+      ...(val.completed === true ? { completed: true } : {}),
+    };
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+function mergeEpisodes(a, b) {
+  if (!a && !b) return undefined;
+  const out = { ...(a ?? {}) };
+  for (const [k, ep] of Object.entries(b ?? {})) {
+    if (!out[k] || ep.updatedAt > out[k].updatedAt) out[k] = ep;
+  }
+  const entries = Object.entries(out);
+  if (entries.length > MAX_EPISODES) {
+    entries.sort((x, y) => y[1].updatedAt - x[1].updatedAt);
+    return Object.fromEntries(entries.slice(0, MAX_EPISODES));
+  }
+  return entries.length ? out : undefined;
+}
+
 export async function buildApp({ logger = true } = {}) {
   // Trust only Render's own proxy hop(s); `true` would let a client spoof X-Forwarded-For and dodge rate limits.
   const hops = Number(process.env.TRUST_PROXY_HOPS ?? 1);
-  const app = Fastify({ logger, bodyLimit: 64 * 1024, trustProxy: Number.isInteger(hops) && hops >= 0 && hops <= 5 ? hops : 1 });
+  const app = Fastify({ logger, bodyLimit: 512 * 1024, trustProxy: Number.isInteger(hops) && hops >= 0 && hops <= 5 ? hops : 1 });
 
   // Never leak SQL errors or upstream messages to clients.
   app.setErrorHandler((err, req, reply) => {
@@ -267,14 +339,68 @@ export async function buildApp({ logger = true } = {}) {
     // Every client reads `media.key` off these rows: a row without its title would break their sync.
     if (!updatedAt || !mediaOk(e.media) || !optInt(e.season) || !optInt(e.episode)) return bad;
     if (e.audio !== undefined && e.audio !== null && !AUDIO.has(e.audio)) return bad;
-    // Last write wins, but never let an older device overwrite a newer one.
-    await q(
-      `INSERT INTO progress (user_id, media_key, data, updated_at) VALUES ($1, $2, $3, $4)
-       ON CONFLICT (user_id, media_key) DO UPDATE SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at, deleted_at = NULL
-       WHERE progress.updated_at < EXCLUDED.updated_at
-         AND (progress.deleted_at IS NULL OR progress.deleted_at < EXCLUDED.updated_at)`,
-      [userId, key, JSON.stringify({ media: e.media, season: e.season ?? undefined, episode: e.episode ?? undefined, audio: e.audio ?? undefined, position: e.position, duration: e.duration, ...(e.upNext === true ? { upNext: true } : {}), ...(e.finished === true ? { finished: true } : {}) }), updatedAt],
-    );
+
+    // Union-merge per-episode timestamps across devices rather than letting one episode overwrite all prior ones.
+    const existingRes = await q(`SELECT data, updated_at, deleted_at FROM progress WHERE user_id = $1 AND media_key = $2`, [userId, key]);
+    const existing = existingRes.rows[0];
+    const existingDeleted = existing?.deleted_at ? new Date(existing.deleted_at) : null;
+    const isRevive = Boolean(existingDeleted && existingDeleted < updatedAt);
+    const activeExisting = existing && (!existingDeleted || isRevive) ? existing : null;
+    const existingUpdatedAt = activeExisting ? new Date(activeExisting.updated_at) : null;
+
+    let incomingEpisodes = sanitizeEpisodes(e.episodes);
+    const existingEpisodes = !existingDeleted ? sanitizeEpisodes(activeExisting?.data?.episodes) : undefined;
+    if (!incomingEpisodes && existingEpisodes && (e.position > 0 || e.finished === true || e.caughtUp === true) && !e.upNext) {
+      const k = e.season == null && e.episode == null ? "main" : `s${e.season ?? 0}:e${e.episode ?? 1}`;
+      incomingEpisodes = {
+        [k]: {
+          ...(e.season != null ? { season: e.season } : {}),
+          ...(e.episode != null ? { episode: e.episode } : {}),
+          ...(e.audio ? { audio: e.audio } : {}),
+          position: e.position,
+          duration: e.duration,
+          updatedAt: updatedAt.getTime(),
+          ...(e.finished === true || e.caughtUp === true ? { completed: true } : {}),
+        },
+      };
+    }
+    const mergedEpisodes = mergeEpisodes(existingEpisodes, incomingEpisodes);
+
+    const isCursorNewer = !existingUpdatedAt || existingUpdatedAt < updatedAt || isRevive;
+    const cursorSource = isCursorNewer
+      ? {
+          media: e.media,
+          season: e.season ?? undefined,
+          episode: e.episode ?? undefined,
+          audio: e.audio ?? undefined,
+          position: e.position,
+          duration: e.duration,
+          ...(e.upNext === true ? { upNext: true } : {}),
+          ...(e.caughtUp === true ? { caughtUp: true } : {}),
+          ...(e.finished === true ? { finished: true } : {}),
+        }
+      : {
+          ...activeExisting.data,
+          media: { ...activeExisting.data.media, ...(e.media.nextAiring ? { nextAiring: e.media.nextAiring } : {}) },
+        };
+
+    const nextPayload = {
+      ...cursorSource,
+      ...(mergedEpisodes ? { episodes: mergedEpisodes, schemaVersion: 2 } : e.schemaVersion === 2 ? { schemaVersion: 2 } : {}),
+    };
+    const finalUpdatedAt = isCursorNewer ? updatedAt : existingUpdatedAt;
+
+    if (!existing) {
+      await q(
+        `INSERT INTO progress (user_id, media_key, data, updated_at, deleted_at) VALUES ($1, $2, $3, $4, NULL)`,
+        [userId, key, JSON.stringify(nextPayload), finalUpdatedAt],
+      );
+    } else if (!existingDeleted || isRevive) {
+      await q(
+        `UPDATE progress SET data = $3, updated_at = $4, deleted_at = NULL WHERE user_id = $1 AND media_key = $2`,
+        [userId, key, JSON.stringify(nextPayload), finalUpdatedAt],
+      );
+    }
     return ok;
   }
 
@@ -352,7 +478,7 @@ export async function buildApp({ logger = true } = {}) {
     if (path === "/settings" && method === "PUT") return (u, b) => putSettings(u, b ?? {});
     return null;
   }
-  app.post("/sync/batch", { preHandler: requireUser, bodyLimit: 512 * 1024 }, async (req, reply) => {
+  app.post("/sync/batch", { preHandler: requireUser, bodyLimit: 2 * 1024 * 1024 }, async (req, reply) => {
     const ops = req.body?.ops;
     if (!Array.isArray(ops) || ops.length > MAX_BATCH) return reply.code(400).send({ error: "bad_request" });
     const results = [];

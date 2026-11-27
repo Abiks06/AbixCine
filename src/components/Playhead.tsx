@@ -1,4 +1,4 @@
-import { memo, useSyncExternalStore, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
+import { memo, useSyncExternalStore, type KeyboardEvent, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
 import { fmtTime } from "../lib/format";
 import { clampTip } from "../lib/playerControls";
 
@@ -104,6 +104,7 @@ export const Scrubber = memo(function Scrubber({
   onPointerUp,
   onPointerCancel,
   onPointerLeave,
+  onSeekTo,
 }: {
   ph: PlayheadStore;
   dur: number;
@@ -121,24 +122,45 @@ export const Scrubber = memo(function Scrubber({
   /** The drag ended without a release (capture lost: Alt+Tab, a system dialog, a cancelled touch). */
   onPointerCancel: (e: ReactPointerEvent) => void;
   onPointerLeave: () => void;
+  onSeekTo?: (t: number) => void;
 }) {
   // Whole seconds for the slider's accessible value; the bar itself follows every update.
   const time = usePlayhead(ph, (t) => t);
   const buffered = usePlayhead(ph, (_, b) => b);
   const hover = useSyncExternalStore(hoverStore.subscribe, hoverStore.get);
-  const pct = dur ? Math.max(0, Math.min(100, (time / dur) * 100)) : 0;
+  const ratio = dur > 0 ? Math.max(0, Math.min(1, time / dur)) : 0;
+  const bufRatio = dur > 0 ? Math.max(0, Math.min(1, buffered / dur)) : 0;
+  const hoverRatio = hover && hover.w > 0 ? Math.max(0, Math.min(1, hover.x / hover.w)) : 0;
+  const pct = ratio * 100;
   const part = hover && dur > 0 ? partAt(hover.t) : null;
   const tipHalf = thumb ? 101 : 34;
+
+  const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
+    if (!onSeekTo || dur <= 0) return;
+    const step = e.shiftKey ? 30 : 5;
+    let next: number | null = null;
+    if (e.key === "ArrowLeft" || e.key === "ArrowDown") next = Math.max(0, time - step);
+    else if (e.key === "ArrowRight" || e.key === "ArrowUp") next = Math.min(dur, time + step);
+    else if (e.key === "Home") next = 0;
+    else if (e.key === "End") next = dur;
+    if (next == null) return;
+    e.preventDefault();
+    e.stopPropagation();
+    onSeekTo(next);
+  };
+
   return (
     <div
       ref={scrubRef}
       className={`scrub ${dragging ? "drag" : ""}`}
       role="slider"
+      tabIndex={0}
       aria-label="Seek"
       aria-valuemin={0}
       aria-valuemax={Math.round(dur)}
       aria-valuenow={Math.round(time)}
       aria-valuetext={`${fmtTime(time)} of ${fmtTime(dur)}`}
+      onKeyDown={onKeyDown}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
@@ -147,9 +169,9 @@ export const Scrubber = memo(function Scrubber({
       onPointerLeave={onPointerLeave}
     >
       <div className="c">
-        <span className="buf" style={{ width: `${dur ? Math.min(100, (buffered / dur) * 100) : 0}%` }} />
-        {hover && <span className="ghost" style={{ width: hover.x }} />}
-        <i style={{ width: `${pct}%` }} />
+        <span className="buf" style={{ transform: `scaleX(${bufRatio})` }} />
+        {hover && <span className="ghost" style={{ transform: `scaleX(${hoverRatio})` }} />}
+        <i style={{ transform: `scaleX(${ratio})` }} />
         {dur > 0 && intro && intro[0] < dur && (
           <span className="part" style={{ left: `${(intro[0] / dur) * 100}%`, width: `${((Math.min(dur, intro[1]) - intro[0]) / dur) * 100}%` }} />
         )}

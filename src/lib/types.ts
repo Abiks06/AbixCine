@@ -40,8 +40,15 @@ export interface Media {
   releaseDate?: string;
   /** Catalog release status (e.g. "Released", "Returning Series", "NOT_YET_RELEASED", "Planned"). */
   status?: string;
-  /** Next upcoming episode airtime (anime simulcasts & ongoing shows). */
-  nextAiring?: { episode: number; at: number };
+  /** Next upcoming episode airtime (anime simulcasts & ongoing series). */
+  nextAiring?: {
+    episode: number;
+    season?: number;
+    at: number;
+    /** True when the catalog only provides an air date without an exact broadcast time (e.g. TMDB). */
+    dateOnly?: boolean;
+    title?: string;
+  };
 }
 
 /** A feature film, whether it came from TMDB or is an AniList anime film. */

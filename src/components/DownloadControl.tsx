@@ -15,7 +15,7 @@ import {
   resolveQualityMismatch,
   resumeDownload,
   switchDownloadToNextServer,
-  useDownloads,
+  useSwitchingDownloadIds,
   type DownloadJob,
   type DownloadedEntry,
 } from "../lib/downloads";
@@ -187,7 +187,7 @@ export function EpisodeDownloadControl({
   onPlayOffline?: () => void;
 }) {
   const dlPrefs = useDownloadPrefs();
-  const { switchingIds } = useDownloads();
+  const switchingIds = useSwitchingDownloadIds();
   const [open, setOpen] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const wrapRef = useRef<HTMLDivElement>(null);

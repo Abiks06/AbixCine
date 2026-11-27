@@ -289,6 +289,17 @@ export async function tmdbDetail(key: string): Promise<MediaDetail> {
     if (kind === "tv") await whenAnimeMappingsHydrated();
     const lastEpisode = ep(r.last_episode_to_air);
     const nextEpisode = ep(r.next_episode_to_air);
+    const nextAirMs = nextEpisode?.airDate ? new Date(`${nextEpisode.airDate}T12:00:00`).getTime() : NaN;
+    const synthesizedNextAiring =
+      nextEpisode && Number.isFinite(nextAirMs)
+        ? {
+            episode: nextEpisode.episode,
+            season: nextEpisode.season,
+            at: nextAirMs,
+            dateOnly: true as const,
+            ...(nextEpisode.name ? { title: nextEpisode.name } : {}),
+          }
+        : undefined;
     const normalizedSeasons =
       kind === "tv"
         ? normalizeTmdbSeasons(r.seasons, base.key, Number(id), {
@@ -334,6 +345,7 @@ export async function tmdbDetail(key: string): Promise<MediaDetail> {
       collection: r.belongs_to_collection?.name,
       lastEpisode,
       nextEpisode,
+      ...(synthesizedNextAiring ? { nextAiring: synthesizedNextAiring } : {}),
       totalEpisodes: r.number_of_episodes,
       fetchedAt: Date.now(),
     };

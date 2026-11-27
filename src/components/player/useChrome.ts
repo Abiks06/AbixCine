@@ -215,14 +215,17 @@ export function usePip(video: RefObject<HTMLVideoElement>, isEmbed: boolean, fla
       flash("Picture-in-picture isn't available for this stream");
     }
   };
-  // Picture-in-picture must not outlive the player that owns the video.
+  // Only leave PiP if we exited /watch completely (episode switches keep /watch mounted).
   useEffect(
     () => () => {
-      if (document.pictureInPictureElement) void document.exitPictureInPicture().catch(() => {});
+      if (document.pictureInPictureElement && !window.location.hash.startsWith("#/watch") && !window.location.pathname.startsWith("/watch")) {
+        void document.exitPictureInPicture().catch(() => {});
+      }
     },
     [],
   );
   // The PiP button shows whether the picture is popped out (closing the PiP window counts too).
+  const vNow = video.current;
   useEffect(() => {
     const v = video.current;
     if (!v || isEmbed) {
@@ -237,6 +240,6 @@ export function usePip(video: RefObject<HTMLVideoElement>, isEmbed: boolean, fla
       v.removeEventListener("enterpictureinpicture", sync);
       v.removeEventListener("leavepictureinpicture", sync);
     };
-  }, [isEmbed]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [isEmbed, vNow]); // eslint-disable-line react-hooks/exhaustive-deps
   return { pipOk, pipOn, togglePip };
 }

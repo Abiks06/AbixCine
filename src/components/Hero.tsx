@@ -1,12 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
+import { getTrackingState, useAiringFor, useNowMinute } from "../lib/airing";
 import { encodeKey, isUnreleasedMedia } from "../lib/catalog";
 import { openDossier, registerMedia } from "../lib/dossier";
-import { fmtRuntime } from "../lib/format";
+import { fmtEpCode, fmtRuntime } from "../lib/format";
 import { useFeatured, type Featured } from "../lib/useLogos";
 import { toggleList, useSaved } from "../lib/watchlist";
-import { playHref } from "../lib/play";
+import { playHref, watchHref } from "../lib/play";
 import { setStageLight } from "../lib/light";
+import { useMatchedProgress, RESUME_MIN_SEC } from "../lib/progress";
 import { burst } from "../lib/burst";
 import { useSettings } from "../lib/settings";
 import type { Media } from "../lib/types";
@@ -42,9 +44,14 @@ export function Hero({ items, label, onActive, loading = true }: { items: Media[
   const [paused, setPaused] = useState(false);
   const [userPaused, setUserPaused] = useState(false);
   const [trailer, setTrailer] = useState<{ id: string; title: string } | null>(null);
+  const stripRef = useRef<HTMLDivElement>(null);
   const n = picks.length;
   const cur = n ? i % n : 0;
   const m = picks[cur];
+
+  useEffect(() => {
+    setI(0);
+  }, [label]);
 
   const [leaving, setLeaving] = useState<{ m: Featured; n: number } | null>(null);
   const shownRef = useRef<{ m: Featured; n: number } | null>(null);
@@ -113,8 +120,14 @@ export function Hero({ items, label, onActive, loading = true }: { items: Media[
         onBlur={(e) => !e.currentTarget.contains(e.relatedTarget) && setPaused(false)}
         onKeyDown={(e) => {
           if (n < 2) return;
-          if (e.key === "ArrowRight") setI((cur + 1) % n);
-          else if (e.key === "ArrowLeft") setI((cur - 1 + n) % n);
+          if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+            const nextIdx = e.key === "ArrowRight" ? (cur + 1) % n : (cur - 1 + n) % n;
+            setI(nextIdx);
+            const activeInCopy = document.activeElement instanceof HTMLElement && Boolean(document.activeElement.closest(".hero-copy"));
+            if (activeInCopy) {
+              requestAnimationFrame(() => stripRef.current?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[nextIdx]?.focus({ preventScroll: true }));
+            }
+          }
         }}
       >
         <div className="hero-plinth">
@@ -127,7 +140,7 @@ export function Hero({ items, label, onActive, loading = true }: { items: Media[
 
           {n > 1 && (
             <div className="hero-strip-row">
-              <div className="hero-strip" role="tablist" aria-label="Programme slides">
+              <div className="hero-strip" role="tablist" aria-label="Programme slides" ref={stripRef}>
                 {picks.map((p, j) => (
                   <button
                     key={p.key}
@@ -210,8 +223,27 @@ function HeroCopy({
 }) {
   const nav = useNavigate();
   const saved = useSaved(m.key);
+  const prog = useMatchedProgress([m.key]);
+  const airSnap = useAiringFor(m.key);
+  const nowMs = useNowMinute();
+  const tracking = getTrackingState(m, prog, airSnap, nowMs);
   const len = length(m);
   const unreleased = isUnreleasedMedia(m);
+  const canResume = Boolean(prog && !prog.caughtUp && (prog.position > RESUME_MIN_SEC || prog.upNext));
+  const playTarget =
+    tracking.kind === "new-episode" && tracking.nextPlay
+      ? watchHref(m.key, tracking.nextPlay.season ?? prog?.season, tracking.nextPlay.episode, prog?.audio)
+      : canResume && prog
+        ? watchHref(m.key, prog.season, prog.episode, prog.audio)
+        : playHref(m);
+  const playTxt =
+    tracking.kind === "new-episode" && tracking.nextPlay
+      ? `Play ${fmtEpCode(tracking.nextPlay.season ?? prog?.season, tracking.nextPlay.episode)}`
+      : canResume && prog
+        ? isFilm(m)
+          ? "Resume"
+          : `Resume ${fmtEpCode(prog.season, prog.episode)}`
+        : "Play";
   return (
     <div
       className={`hero-copy ${out ? "out" : ""}`}
@@ -222,6 +254,7 @@ function HeroCopy({
         <b>№ {pad2(n)}/{pad2(total)}</b>
         <i />
         <em>{label}</em>
+        {tracking.badge && <><i /><span className={`hero-air-tag ${tracking.kind}`}>{tracking.badge}</span></>}
       </div>
       <TitleArt media={m} />
       <div className="specs">
@@ -235,8 +268,8 @@ function HeroCopy({
       <p className="desc">{m.overview}</p>
       <div className="acts">
         {!unreleased && (
-          <button className="btn play" onClick={() => nav(playHref(m), { viewTransition: true, state: { from: "app" } })}>
-            <Icon name="play" size={15} /> Play
+          <button className="btn play" onClick={() => nav(playTarget, { viewTransition: true, state: { from: "app" } })}>
+            <Icon name="play" size={15} /> {playTxt}
           </button>
         )}
         <Link
@@ -249,14 +282,14 @@ function HeroCopy({
             if (art) art.style.viewTransitionName = "hero-title";
           }}
         >
-          Dossier <Icon name="arrowUR" size={14} />
+          Details <Icon name="arrowUR" size={14} />
         </Link>
         <button
           type="button"
           className="btn glass icon"
           onClick={() => openDossier(m)}
-          aria-label={`Quick pass for ${m.title}`}
-          title="Quick screening pass (I)"
+          aria-label={`Quick view for ${m.title}`}
+          title="Quick view (I)"
         >
           <Icon name="layers" size={16} />
         </button>

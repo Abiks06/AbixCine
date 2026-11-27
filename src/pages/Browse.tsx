@@ -89,6 +89,7 @@ function useCatalogFilter(lists: (Media[] | undefined)[]) {
 }
 
 function BrowseToolbar({
+  kicker,
   title,
   accent,
   filter,
@@ -106,6 +107,7 @@ function BrowseToolbar({
     <div className="browse-bar pad">
       <div className="browse-bar-top">
         <div>
+          {kicker && <div className="overline">{kicker}</div>}
           <h1 className="browse-title">{title} <em>{accent}</em></h1>
         </div>
         <div className="browse-ctrls">

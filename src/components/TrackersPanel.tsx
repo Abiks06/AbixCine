@@ -106,7 +106,14 @@ function Tracker({ service }: { service: Service }) {
           </div>
           <div className="field-row">
             {service === "anilist" && (
-              <a className={`btn btn-glass sm ${clientId.trim() ? "" : "disabled"}`} aria-disabled={!clientId.trim()} href={clientId.trim() ? anilistAuthorizeUrl(clientId) : undefined} target="_blank" rel="noreferrer">
+              <a
+                className={`btn btn-glass sm ${clientId.trim() ? "" : "disabled"}`}
+                aria-disabled={!clientId.trim()}
+                href={clientId.trim() ? anilistAuthorizeUrl(clientId) : undefined}
+                onClick={(e) => { if (!clientId.trim()) e.preventDefault(); }}
+                target="_blank"
+                rel="noreferrer"
+              >
                 Get a token <Icon name="arrowUR" size={13} />
               </a>
             )}
@@ -117,7 +124,7 @@ function Tracker({ service }: { service: Service }) {
             >
               {busy ? "Connecting…" : "Connect"}
             </button>
-            {err && <span className="muted warn">{err}</span>}
+            {err && <span className="muted warn" role="alert">{err}</span>}
           </div>
         </>
       )}

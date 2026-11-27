@@ -123,8 +123,35 @@ export function getDetail(key: string): Promise<MediaDetail> {
         reconciled.initialSeason,
       );
 
+      // Propagate live airing node (even from a sequel season/cour when opened on canonical S1).
+      const airingNode = nodes
+        .filter((n) => n.nextAiringEpisode && typeof n.nextAiringEpisode.airingAt === "number")
+        .sort((a, b) => (a.nextAiringEpisode!.airingAt ?? 0) - (b.nextAiringEpisode!.airingAt ?? 0))[0];
+      let propagatedNextAiring = base.nextAiring;
+      if (airingNode?.nextAiringEpisode && typeof airingNode.nextAiringEpisode.airingAt === "number") {
+        const mappedSeason = reconciled.seasons.find(
+          (s) =>
+            s.anilistId === airingNode.id ||
+            s.cours?.some((c) => c.anilistId === airingNode.id || c.key === `anilist:${airingNode.id}`),
+        );
+        const courMatch = mappedSeason?.cours?.find(
+          (c) => c.anilistId === airingNode.id || c.key === `anilist:${airingNode.id}`,
+        );
+        const epNum = courMatch
+          ? courMatch.startEpisode + airingNode.nextAiringEpisode.episode - 1
+          : airingNode.nextAiringEpisode.episode;
+        propagatedNextAiring = {
+          episode: epNum,
+          ...(mappedSeason ? { season: mappedSeason.number } : {}),
+          at: airingNode.nextAiringEpisode.airingAt * 1000,
+        };
+      }
+      const releasingNode = nodes.find((n) => n.status === "RELEASING") ?? airingNode;
+
       return {
         ...base,
+        ...(propagatedNextAiring ? { nextAiring: propagatedNextAiring } : {}),
+        ...(releasingNode?.status ? { status: releasingNode.status } : {}),
         seasons: reconciled.seasons.length > 0 ? reconciled.seasons : undefined,
         specials: reconciled.specials.length > 0 ? reconciled.specials : undefined,
         upcomingSeasons: reconciled.upcomingSeasons.length > 0 ? reconciled.upcomingSeasons : undefined,

@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { ActiveReel } from "../components/ActiveReel";
+import { AiringStrip } from "../components/AiringStrip";
 import { ChartLedger, type ChartTab } from "../components/ChartLedger";
 import { DownloadsVault } from "../components/DownloadsVault";
 import { DriveSection } from "../components/Drive";
@@ -8,37 +9,26 @@ import { EditorialSpread } from "../components/EditorialSpread";
 import { FilmReel } from "../components/FilmReel";
 import { FitsTonight } from "../components/FitsTonight";
 import { Hero } from "../components/Hero";
+import { HomeWelcome, type HomeLens } from "../components/HomeWelcome";
 import { Icon } from "../components/Icon";
 import { NextWatchDeck } from "../components/NextWatchDeck";
 import { Row } from "../components/Row";
 import { useAuth } from "../lib/account";
 import { ANIME_FEEDS, loadAnimeFeed, peekAnimeFeed } from "../lib/anilist";
 import { getDetail } from "../lib/catalog";
+import { dismissRecommendation, undismissRecommendation, useDismissed, useTasteSeeds } from "../lib/dismissed";
 import { useHasDownloadedItems } from "../lib/downloads";
 import { useFreshness } from "../lib/fresh";
 import { useOnlineStatus } from "../lib/online";
 import { removeProgress, restoreProgress, useContinueWatching, useProgressStore, type ProgressEntry } from "../lib/progress";
-import { buildRecommendations, type RecommendMode, type SeedRelated } from "../lib/recommend";
+import { buildRecommendations, buildTasteShelves, type RecommendMode, type SeedRelated } from "../lib/recommend";
 import { laneOf, mixByTaste, useTaste, type Lane } from "../lib/taste";
 import { toast } from "../lib/toast";
 import { useSettings } from "../lib/settings";
 import { FEEDS, hasTmdb, loadFeed, peekFeed, TOP10 } from "../lib/tmdb";
 import { type Media } from "../lib/types";
 import { useAsync, useProgressiveFeeds } from "../lib/useAsync";
-import { useSlidingIndicator } from "../lib/useSlidingIndicator";
 import { useWatchlist } from "../lib/watchlist";
-
-/** How long the hero holds out for films and series before opening on anime alone. */
-const CATALOG_GRACE_MS = 2500;
-const NO_MEDIA: Media[] = [];
-
-type Lens = "all" | Lane;
-const LENSES: { id: Lens; label: string }[] = [
-  { id: "all", label: "All" },
-  { id: "film", label: "Films" },
-  { id: "series", label: "Series" },
-  { id: "anime", label: "Anime" },
-];
 
 export function Home() {
   const s = useSettings();
@@ -46,11 +36,12 @@ export function Home() {
   const isOnline = useOnlineStatus();
   const hasDownloads = useHasDownloadedItems();
   const fresh = useFreshness();
-  const lensInd = useSlidingIndicator();
-  const [lens, setLens] = useState<Lens>("all");
+  const [lens, setLens] = useState<HomeLens>("all");
   const [recMode, setRecMode] = useState<RecommendMode>("for-you");
+  const [selectedSeedKey, setSelectedSeedKey] = useState<string | undefined>(undefined);
   const [shuffleOffset, setShuffleOffset] = useState(0);
-  const [dismissed, setDismissed] = useState<Set<string>>(() => new Set());
+  const { keys: dismissedKeys, records: dismissedRecords } = useDismissed();
+  const tasteSeeds = useTasteSeeds();
 
   const homeFeedsList = useMemo(() => [...FEEDS.home, TOP10.movie, TOP10.tv], []);
   const feeds = useProgressiveFeeds(
@@ -69,18 +60,25 @@ export function Home() {
     keepPrevious: true,
     initialData: peekAnimeFeed(ANIME_FEEDS[0]),
   });
+  const animeTop = useAsync(() => loadAnimeFeed(ANIME_FEEDS[3], 3), [fresh], {
+    keepPrevious: true,
+    initialData: peekAnimeFeed(ANIME_FEEDS[3]),
+  });
   const cont = useContinueWatching();
   const taste = useTaste();
   const watchlist = useWatchlist();
-  const [patient, setPatient] = useState(true);
-  useEffect(() => {
-    const t = setTimeout(() => setPatient(false), CATALOG_GRACE_MS);
-    return () => clearTimeout(t);
-  }, []);
   const store = useProgressStore();
   const progressList = useMemo(() => Object.values(store), [store]);
+
+  // Filter seeds to genuine engaged watches (not accidental 20s clicks) and match active lens when filtered.
   const seeds = useMemo(() => {
-    const byRecent = [...progressList].sort((a, b) => b.updatedAt - a.updatedAt);
+    const byRecent = [...progressList]
+      .filter((p) => {
+        if (lens !== "all" && laneOf(p.media) !== lens) return false;
+        const epCount = Object.keys(p.episodes ?? {}).length;
+        return Boolean(p.finished || p.caughtUp || p.upNext || p.position > 180 || epCount > 1);
+      })
+      .sort((a, b) => b.updatedAt - a.updatedAt);
     const touchedKeys = new Set(progressList.map((p) => p.media.key));
     const list: Media[] = [];
     const seen = new Set<string>();
@@ -89,9 +87,10 @@ export function Home() {
         seen.add(p.media.key);
         list.push(p.media);
       }
-      if (list.length >= 2) break;
+      if (list.length >= 3) break;
     }
     for (const w of watchlist) {
+      if (lens !== "all" && laneOf(w.media) !== lens) continue;
       if (!touchedKeys.has(w.media.key) && !seen.has(w.media.key)) {
         seen.add(w.media.key);
         list.push(w.media);
@@ -99,7 +98,8 @@ export function Home() {
       }
     }
     return list;
-  }, [progressList, watchlist]);
+  }, [progressList, watchlist, lens]);
+
   const seedSig = seeds.map((x) => x.key).join("|");
   const seedRelatedRes = useAsync(
     async (): Promise<SeedRelated[]> => {
@@ -118,12 +118,20 @@ export function Home() {
   const poolLoading = catalog && [1, 2, 3, 4].some((i) => !feeds.settled[i]) && ![1, 2, 3, 4].some((i) => d[i]?.length);
 
   const seedRelated = useMemo(() => seedRelatedRes.data ?? [], [seedRelatedRes.data]);
+  const activeSeedKey =
+    selectedSeedKey && seedRelated.some((sr) => sr.source.key === selectedSeedKey)
+      ? selectedSeedKey
+      : seedRelated[0]?.source.key;
+  const activeSeedTitle = seedRelated.find((sr) => sr.source.key === activeSeedKey)?.source.title ?? seeds[0]?.title;
+
   const effectiveRecMode: RecommendMode =
     recMode === "queue" && watchlist.length === 0
       ? "for-you"
       : recMode === "because" && !seedRelated.length
         ? "for-you"
         : recMode;
+
+  const dismissedGenres = useMemo(() => dismissedRecords.flatMap((r) => r.genres), [dismissedRecords]);
 
   const recs = useMemo(
     () =>
@@ -134,16 +142,19 @@ export function Home() {
         catalogPools: [
           { label: "fresh", items: [...(d[4] ?? []), ...(d[5] ?? [])] },
           { label: "popular", items: [...(d[0] ?? []), ...(d[1] ?? []), ...(d[2] ?? [])] },
-          { label: "acclaimed", items: [...(d[3] ?? []), ...(d[7] ?? []), ...(d[8] ?? [])] },
+          { label: "acclaimed", items: [...(d[3] ?? []), ...(d[7] ?? []), ...(d[8] ?? []), ...(animeTop.data ?? [])] },
           { label: "airing", items: [...(anime.data ?? []), ...(animeTrending.data ?? [])] },
         ],
         lens,
         mode: effectiveRecMode,
-        dismissed,
+        dismissed: dismissedKeys,
+        dismissedGenres,
+        seedGenres: tasteSeeds,
+        seedKey: activeSeedKey,
         shuffleOffset,
         limit: 5,
       }),
-    [progressList, watchlist, seedRelated, d, anime.data, animeTrending.data, lens, effectiveRecMode, dismissed, shuffleOffset],
+    [progressList, watchlist, seedRelated, d, anime.data, animeTrending.data, animeTop.data, lens, effectiveRecMode, dismissedKeys, dismissedGenres, tasteSeeds, activeSeedKey, shuffleOffset],
   );
 
   const pool = useMemo(() => {
@@ -176,9 +187,8 @@ export function Home() {
     return mixByTaste(pools, taste, 6);
   }, [d[0], d[1], d[2], animeTrending.data, taste, lens]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const catalogPending = catalog && !feeds.settled[0] && !d[0];
-  const shownStage = catalogPending && patient ? NO_MEDIA : stage;
-  const staging = shownStage.length === 0 && (catalogPending || (animeTrending.loading && !animeTrending.data));
+  const catalogPending = catalog && !feeds.settled[0] && !d[0] && !d[1] && !d[2];
+  const staging = stage.length === 0 && (catalogPending || (animeTrending.loading && !animeTrending.data));
 
   const chartTabs: ChartTab[] = useMemo(
     () => [
@@ -201,6 +211,29 @@ export function Home() {
   const seriesPct = Math.round(taste.share.series * 100);
   const animePct = Math.max(0, 100 - filmPct - seriesPct);
 
+  const tasteShelves = useMemo(() => {
+    const exclude = new Set([
+      ...recs.picks.map((p) => p.media.key),
+      ...cont.map((c) => c.media.key),
+      ...dismissedKeys,
+    ]);
+    return buildTasteShelves({
+      topGenres: recs.topGenres,
+      hasSignals: recs.hasSignals,
+      progress: progressList,
+      candidates: [
+        ...seedRelated.flatMap((sr) => sr.items),
+        ...(d[1] ?? []),
+        ...(d[2] ?? []),
+        ...(d[3] ?? []),
+        ...(animeTrending.data ?? []),
+        ...(animeTop.data ?? []),
+      ],
+      excludeKeys: exclude,
+      lens,
+    });
+  }, [recs.topGenres, recs.hasSignals, recs.picks, cont, dismissedKeys, progressList, seedRelated, d, animeTrending.data, animeTop.data, lens]);
+
   const handleRemoveReel = useCallback((p: ProgressEntry) => {
     const gone = removeProgress(p.media.key);
     if (gone) toast(`Removed “${p.media.title}” from Continue watching`, { icon: "x", action: { label: "Undo", run: () => restoreProgress(gone) } });
@@ -211,39 +244,19 @@ export function Home() {
 
   return (
     <div className="page-flush">
-      <Hero items={shownStage} label={heroLabel} loading={staging} />
+      <Hero items={stage} label={heroLabel} loading={staging} />
 
-      <div className="taste-ribbon pad">
-        <div className="taste-meter" title="Your automatic Home programme calibration from recent watches and My List">
-          <span className="taste-kicker">CALIBRATED MIX</span>
-          <div className="taste-bar" aria-hidden>
-            <i className="tb-film" style={{ width: `${filmPct}%` }} />
-            <i className="tb-series" style={{ width: `${seriesPct}%` }} />
-            <i className="tb-anime" style={{ width: `${animePct}%` }} />
-          </div>
-          <span className="taste-stats">{filmPct}% FILM · {seriesPct}% SERIES · {animePct}% ANIME</span>
-          {recs.topGenres.length > 0 && (
-            <span className="taste-genres">
-              {recs.topGenres.slice(0, 3).map((g) => (
-                <span key={g} className="badge dim">{g}</span>
-              ))}
-            </span>
-          )}
-        </div>
-        <div className="seg-pills" role="tablist" aria-label="Filter home programme" ref={lensInd}>
-          {LENSES.filter((l) => catalog || l.id === "all" || l.id === "anime").map((l) => (
-            <button
-              key={l.id}
-              role="tab"
-              aria-selected={lens === l.id}
-              className={lens === l.id ? "on" : ""}
-              onClick={() => setLens(l.id)}
-            >
-              {l.label}
-            </button>
-          ))}
-        </div>
-      </div>
+      <HomeWelcome
+        lens={lens}
+        onLens={setLens}
+        catalog={catalog}
+        filmPct={filmPct}
+        seriesPct={seriesPct}
+        animePct={animePct}
+        topGenres={recs.topGenres}
+        hasSignals={recs.hasSignals}
+        hasDownloads={hasDownloads}
+      />
 
       <div className="shelves pad">
         {!isOnline && hasDownloads && <DownloadsVault compact limit={8} />}
@@ -258,6 +271,8 @@ export function Home() {
 
         <ActiveReel items={cont} onRemove={handleRemoveReel} />
 
+        <AiringStrip lens={lens} />
+
         <NextWatchDeck
           picks={recs.picks}
           topGenres={recs.topGenres}
@@ -265,17 +280,20 @@ export function Home() {
           loading={recsLoading}
           mode={effectiveRecMode}
           onMode={setRecMode}
-          seedTitle={seedRelated[0]?.source.title ?? seeds[0]?.title}
+          seeds={seedRelated.map((sr) => ({ key: sr.source.key, title: sr.source.title }))}
+          selectedSeedKey={activeSeedKey}
+          onSelectSeed={setSelectedSeedKey}
+          seedTitle={activeSeedTitle}
           hasWatchlist={watchlist.length > 0}
           hasBecause={seedRelated.length > 0}
           onShuffle={() => setShuffleOffset((n) => n + 1)}
-          onDismiss={(key) => {
-            setDismissed((prev) => new Set(prev).add(key));
-            toast("Recommendation skipped for this session", {
+          onDismiss={(media) => {
+            dismissRecommendation(media);
+            toast(`Hid “${media.title}”`, {
               icon: "info",
               action: {
-                label: "Reset",
-                run: () => setDismissed(new Set()),
+                label: "Undo",
+                run: () => undismissRecommendation(media.key),
               },
             });
           }}
@@ -283,8 +301,19 @@ export function Home() {
 
         {(catalog || pool.some((m) => !isNaN(m.year ?? NaN))) && <FitsTonight pool={pool} loading={poolLoading} />}
 
+        {tasteShelves.map((shelf) => (
+          <Row
+            key={shelf.id}
+            eyebrow={shelf.eyebrow}
+            title={shelf.title}
+            accentWord={shelf.accentWord}
+            variant="poster"
+            frames
+            items={shelf.items}
+          />
+        ))}
+
         <ChartLedger
-          key={defaultChart}
           eyebrow="Daily charts"
           title="Top 10"
           accentWord="right now"
@@ -354,6 +383,32 @@ export function Home() {
             frames
             items={d[2]}
             loading={rowLoading(2)}
+          />
+        )}
+
+        {lens === "series" && catalog && (
+          <Row
+            eyebrow="Top 10 series today"
+            title="Critically rated"
+            accentWord="series"
+            to="/series"
+            variant="poster"
+            frames
+            items={(d[8] ?? []).filter((m) => (m.rating ?? 0) >= 7.5)}
+            loading={rowLoading(8)}
+          />
+        )}
+
+        {lens === "anime" && (
+          <Row
+            eyebrow="Highest rated anime"
+            title="Critically acclaimed"
+            accentWord="anime"
+            to="/anime"
+            variant="poster"
+            frames
+            items={animeTop.data}
+            loading={animeTop.loading && !animeTop.data}
           />
         )}
 

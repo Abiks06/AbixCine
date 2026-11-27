@@ -41,6 +41,10 @@ export interface EpisodeNav {
   fallbackStill?: string;
   /** "S1 · E5 · Title" of the next one, for the Up next card. */
   nextLabel?: string;
+  /** Canonical key + alias keys so EpisodeSheet can read per-episode progress & watched checkmarks. */
+  mediaKey?: string;
+  aliasKeys?: string[];
+  nextAiring?: { episode: number; season?: number; at: number; dateOnly?: boolean; title?: string };
 }
 
 export interface ExtractedSubtitleResult {
@@ -80,13 +84,14 @@ export const SHORTCUTS: [string, string][] = [
   ["S · E", "Servers · Episodes"],
   ["I", "Title details"],
   ["N", "Next episode"],
+  ["X", "Skip intro / credits"],
   ["F · double-click", "Fullscreen (F11 too)"],
   ["P", "Picture-in-picture"],
   ["?", "This list"],
   ["Esc", "Close panel, leave fullscreen, go back"],
 ];
 /** Pointer over these keeps the controls up: they don't fade from under a resting cursor. */
-export const HOLD_CHROME = ".ptop-actions, .ptop > .pbtn, .ptitle-btn, .pbot, .upnext, .skip-btn, .psheet, .perr-card, .pload-next";
+export const HOLD_CHROME = ".ptop-actions, .ptop > .pbtn, .ptitle-btn, .center-controls, .pbot, .upnext, .skip-btn, .psheet, .perr-card, .pload-next";
 export const ENHANCE_KEY = "abx.enhance.v1";
 export const SUB_FILE_EXT_RX = /\.(srt|vtt|ass|ssa)$/i;
 export const SUB_LANG_HINT_RX = /(?:^|[._ -])(en|eng|english|ja|jpn|japanese|fr|fra|fre|french|es|spa|spanish|de|deu|ger|german|pt|pt-br|por|portuguese|it|ita|italian|ar|ara|arabic|ko|kor|korean|zh|chi|zho|chinese|ru|rus|russian|hi|hin|tr|tur|pl|pol|nl|nld)(?:[._ -]|$)/i;

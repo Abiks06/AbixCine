@@ -180,7 +180,7 @@ export function Search() {
                 <span className="th-eyebrow">Top result</span>
                 <strong>{top.title}</strong>
                 <span className="meta">
-                  <span className="badge">{kindLabel(top.kind)}</span>
+                  <span className="badge">{kindLabel(top.kind, top.format)}</span>
                   {top.seasonCount ? "All seasons" : top.year}
                   {top.rating ? <span className="star">★ {top.rating.toFixed(1)}</span> : null}
                   {top.genres.slice(0, 2).join(" · ")}

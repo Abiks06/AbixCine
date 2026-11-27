@@ -57,6 +57,8 @@ interface Props {
   right?: ReactNode;
   label?: string;
   progress?: number;
+  /** Live tracking/airing badge state (new episode, caught up, next air date). */
+  tracking?: import("../lib/airing").TrackingState;
   to?: string;
   /** Optional direct navigation target for a secondary info button (e.g. Continue watching cards). */
   infoTo?: string;
@@ -112,6 +114,7 @@ export const Card = memo(function Card({
   right,
   label,
   progress,
+  tracking,
   to,
   infoTo,
   onRemove,
@@ -177,11 +180,19 @@ export const Card = memo(function Card({
             {sub ?? (
               <>
                 <span className="badge">{kindLabel(media.kind, media.format)}</span>
-                {media.year && <span>{media.year}</span>}
-                {unreleased ? (
-                  <span className="badge dim">Soon</span>
+                {tracking?.badge ? (
+                  <span className={`badge tracking-${tracking.kind}`} title={tracking.detail || tracking.badge}>
+                    {tracking.badge}
+                  </span>
                 ) : (
-                  media.kind === "anime" ? <span className="badge dim">Sub·Dub</span> : media.genres[0] && <span className="card-genre">{media.genres[0]}</span>
+                  <>
+                    {media.year && <span>{media.year}</span>}
+                    {unreleased ? (
+                      <span className="badge dim">Soon</span>
+                    ) : (
+                      media.kind === "anime" ? <span className="badge dim">Sub·Dub</span> : media.genres[0] && <span className="card-genre">{media.genres[0]}</span>
+                    )}
+                  </>
                 )}
               </>
             )}
@@ -210,8 +221,8 @@ export const Card = memo(function Card({
         ) : null}
         <button
           className="act inspect"
-          aria-label={`Quick inspect ${media.title}`}
-          title="Quick dossier (I)"
+          aria-label={`Quick view ${media.title}`}
+          title="Quick view (I)"
           onClick={() => openDossier(media)}
         >
           <Icon name="layers" size={12} />
@@ -220,7 +231,7 @@ export const Card = memo(function Card({
           <button
             className="act info"
             aria-label={`Details for ${media.title}`}
-            title="Full dossier"
+            title="Details"
             onClick={() => {
               onOpen?.();
               nav(infoTo, { viewTransition: true, state: seedState(media) });

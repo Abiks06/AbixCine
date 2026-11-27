@@ -38,11 +38,13 @@ export function DownloadMenu({
   detail,
   what,
   episodeTitle,
+  size = "md",
 }: {
   req: PlaybackRequest;
   detail?: MediaDetail;
   what: string;
   episodeTitle?: string;
+  size?: "md" | "sm";
 }) {
   const desktop = isTauri();
   const dlPrefs = useDownloadPrefs();
@@ -163,12 +165,13 @@ export function DownloadMenu({
   const activeEta = activeJob ? fmtEta(activeJob.etaSec) : "";
   const activeSwitching = activeJob ? switchingIds.has(activeJob.id) : false;
 
+  const btnSz = size === "sm" ? " sm" : "";
   return (
     <div className={`dl-wrap ${open ? "open" : ""}`} ref={wrapRef}>
       <div className={`dl-split ${saved && !isBusy && !isPaused && !isAwaiting && !isFailed ? "on" : ""} ${isBusy ? "busy" : ""} ${isAwaiting ? "awaiting" : ""} ${isFailed ? "failed" : ""}`}>
         <button
           type="button"
-          className="btn glass dl-split-main"
+          className={`btn glass${btnSz} dl-split-main`}
           onClick={onMainClick}
           title={
             saved
@@ -183,7 +186,7 @@ export function DownloadMenu({
         </button>
         <button
           type="button"
-          className={`btn glass dl-split-caret ${open ? "on" : ""}`}
+          className={`btn glass${btnSz} dl-split-caret ${open ? "on" : ""}`}
           aria-expanded={open}
           aria-haspopup="dialog"
           aria-label={`Download options for ${what}`}

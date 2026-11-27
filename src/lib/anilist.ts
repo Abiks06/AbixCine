@@ -262,8 +262,23 @@ export async function searchAnime(q: string): Promise<Media[]> {
         const pool = airedMembers.length > 0 ? airedMembers : members;
         const first = [...pool].sort((x, y) => order(x) - order(y))[0];
         const reconciled = reconcileAnimeSeasons(members);
+        // Propagate active airing sequel status & nextAiring onto the folded franchise card.
+        const airingMember = [...members]
+          .filter((x) => x.nextAiringEpisode && typeof x.nextAiringEpisode.airingAt === "number")
+          .sort((a, b) => (a.nextAiringEpisode!.airingAt) - (b.nextAiringEpisode!.airingAt))[0];
+        const releasingMember = members.find((x) => x.status === "RELEASING") ?? airingMember;
+        const firstMedia = toMedia(first);
         out.push({
-          ...toMedia(first),
+          ...firstMedia,
+          ...(releasingMember ? { status: releasingMember.status ?? "RELEASING" } : {}),
+          ...(airingMember?.nextAiringEpisode
+            ? {
+                nextAiring: {
+                  episode: airingMember.nextAiringEpisode.episode,
+                  at: airingMember.nextAiringEpisode.airingAt * 1000,
+                },
+              }
+            : {}),
           seasonCount: reconciled.seasons.length > 1 ? reconciled.seasons.length : undefined,
         });
       }
@@ -343,6 +358,42 @@ export async function animeFranchiseNodes(key: string): Promise<RawAnilistNode[]
     }
     return nodes;
   });
+}
+
+export interface AnilistAiringBatchNode {
+  id: number;
+  status?: string | null;
+  episodes?: number | null;
+  nextAiringEpisode?: { episode: number; airingAt: number } | null;
+  relations?: {
+    edges?: {
+      relationType?: string | null;
+      node?: {
+        id: number;
+        status?: string | null;
+        format?: string | null;
+        episodes?: number | null;
+        nextAiringEpisode?: { episode: number; airingAt: number } | null;
+      } | null;
+    }[] | null;
+  } | null;
+}
+
+/** Batch-fetch airing status & next episode timestamps for up to 50 AniList IDs per GraphQL call. */
+export async function fetchAnilistAiringBatch(ids: number[]): Promise<AnilistAiringBatchNode[]> {
+  const unique = [...new Set(ids.filter((id) => Number.isInteger(id) && id > 0))];
+  const out: AnilistAiringBatchNode[] = [];
+  for (let i = 0; i < unique.length; i += 50) {
+    const chunk = unique.slice(i, i + 50);
+    const d = await gql<{ Page?: { media?: AnilistAiringBatchNode[] } }>(
+      `query($ids:[Int]){ Page(perPage:50){ media(id_in:$ids,type:ANIME){ id status episodes nextAiringEpisode { episode airingAt }
+        relations { edges { relationType node { id status format episodes nextAiringEpisode { episode airingAt }
+          relations { edges { relationType node { id status format episodes nextAiringEpisode { episode airingAt } } } } } } } } } }`,
+      { ids: chunk },
+    );
+    for (const m of d.Page?.media ?? []) out.push(m);
+  }
+  return out;
 }
 
 /**

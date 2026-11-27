@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ProgressEntry } from "./progress";
-import { buildRecommendations } from "./recommend";
+import { buildRecommendations, buildTasteShelves, normalizeGenres } from "./recommend";
 import type { Media } from "./types";
 
 const NOW = Date.UTC(2026, 10, 20);
@@ -119,5 +119,96 @@ describe("buildRecommendations", () => {
       dismissed: new Set(["an1"]),
     });
     expect(skipped.picks.map((p) => p.media.key)).not.toContain("an1");
+  });
+
+  it("normalizes compound genres, hides fake match % on cold start, and caps My List share in for-you", () => {
+    expect(normalizeGenres(["Sci-Fi & Fantasy", "Science Fiction", "Action & Adventure"])).toEqual([
+      "Sci-Fi",
+      "Fantasy",
+      "Action",
+      "Adventure",
+    ]);
+
+    const cold = buildRecommendations({
+      progress: [],
+      watchlist: [],
+      seedRelated: [],
+      catalogPools: [
+        {
+          label: "popular",
+          items: [
+            media("c1", "movie", { genres: ["Sci-Fi & Fantasy"], rating: 8.4 }),
+            media("c2", "tv", { genres: ["Action & Adventure"], rating: 8.2 }),
+          ],
+        },
+      ],
+      lens: "all",
+      mode: "for-you",
+      now: NOW,
+    });
+    expect(cold.hasSignals).toBe(false);
+    expect(cold.picks.every((p) => p.showMatchPct === false)).toBe(true);
+
+    const wl1 = media("wl1", "movie", { genres: ["Sci-Fi"], rating: 8.8 });
+    const wl2 = media("wl2", "movie", { genres: ["Sci-Fi"], rating: 8.7 });
+    const cat1 = media("cat1", "tv", { genres: ["Sci-Fi & Fantasy"], rating: 8.1 });
+    const cat2 = media("cat2", "anime", { genres: ["Sci-Fi"], rating: 8.0 });
+    const caught = media("caught", "anime", { genres: ["Action"], status: "RELEASING" });
+
+    const warm = buildRecommendations({
+      progress: [
+        progressEntry(media("seed", "movie", { genres: ["Science Fiction"] }), 1, { finished: true }),
+        progressEntry(caught, 1, { caughtUp: true, position: 0 }),
+      ],
+      watchlist: [
+        { media: wl1, addedAt: NOW - DAY },
+        { media: wl2, addedAt: NOW - DAY },
+      ],
+      seedRelated: [],
+      catalogPools: [{ label: "popular", items: [cat1, cat2, caught] }],
+      lens: "all",
+      mode: "for-you",
+      limit: 3,
+      now: NOW,
+    });
+    const keys = warm.picks.map((p) => p.media.key);
+    expect(keys).not.toContain("caught");
+    expect(warm.picks.filter((p) => p.media.key === "wl1" || p.media.key === "wl2").length).toBeLessThanOrEqual(1);
+    expect(warm.picks.every((p) => p.showMatchPct === true)).toBe(true);
+  });
+
+  it("supports cold-start seedGenres and builds tuned below-the-fold taste shelves", () => {
+    const items = [
+      media("m1", "movie", { genres: ["Cyberpunk", "Sci-Fi & Fantasy"], rating: 8.5 }),
+      media("m2", "movie", { genres: ["Sci-Fi"], rating: 8.2 }),
+      media("m3", "tv", { genres: ["Sci-Fi"], rating: 8.1 }),
+      media("m4", "anime", { genres: ["Science Fiction"], rating: 8.0 }),
+      media("m5", "movie", { genres: ["Mystery"], rating: 8.4 }),
+      media("m6", "tv", { genres: ["Mystery"], rating: 8.1 }),
+      media("m7", "anime", { genres: ["Mystery"], rating: 7.9 }),
+      media("m8", "movie", { genres: ["Mystery"], rating: 7.8 }),
+    ];
+    const seeded = buildRecommendations({
+      progress: [],
+      watchlist: [],
+      seedRelated: [],
+      catalogPools: [{ label: "popular", items }],
+      lens: "all",
+      mode: "for-you",
+      seedGenres: ["Sci-Fi", "Mystery"],
+      now: NOW,
+    });
+    expect(seeded.hasSignals).toBe(true);
+    expect(seeded.topGenres).toContain("Sci-Fi");
+
+    const shelves = buildTasteShelves({
+      topGenres: seeded.topGenres,
+      hasSignals: seeded.hasSignals,
+      progress: [],
+      candidates: items,
+      lens: "all",
+    });
+    expect(shelves.length).toBeGreaterThanOrEqual(1);
+    expect(shelves[0].items.length).toBeGreaterThanOrEqual(4);
   });
 });

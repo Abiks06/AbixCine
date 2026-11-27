@@ -43,11 +43,16 @@ export function ChartLedger({
   const nav = useNavigate();
   const tabInd = useSlidingIndicator();
   const visibleTabs = tabs.filter((t) => t.loading || (t.items?.length ?? 0) > 0);
-  const [tabId, setTabId] = useState(defaultTab ?? tabs[0]?.id);
-  const activeTab = visibleTabs.find((t) => t.id === tabId) ?? visibleTabs[0];
+  const [userPickedTab, setUserPickedTab] = useState<string | undefined>(undefined);
+  const desiredTab = userPickedTab ?? defaultTab ?? tabs[0]?.id;
+  const activeTab = visibleTabs.find((t) => t.id === desiredTab) ?? visibleTabs[0];
   const list = useMemo(() => (activeTab?.items ?? []).slice(0, 10), [activeTab?.items]);
   const [cursor, setCursor] = useState(0);
   const [moves, setMoves] = useState<Record<string, Move> | null>(null);
+
+  useEffect(() => {
+    setUserPickedTab(undefined);
+  }, [defaultTab]);
 
   useEffect(() => {
     setCursor(0);
@@ -82,7 +87,7 @@ export function ChartLedger({
                   role="tab"
                   aria-selected={activeTab?.id === t.id}
                   className={activeTab?.id === t.id ? "on" : ""}
-                  onClick={() => setTabId(t.id)}
+                  onClick={() => setUserPickedTab(t.id)}
                 >
                   {t.label}
                 </button>
@@ -194,10 +199,10 @@ export function ChartLedger({
                     </button>
                   )}
                   <button type="button" className="btn glass sm" onClick={() => openDossier(activeMedia)}>
-                    <Icon name="layers" size={14} /> Pass
+                    <Icon name="layers" size={14} /> Quick view
                   </button>
                   <Link className="btn glass sm" to={`/title/${encodeKey(activeMedia.key)}`} state={seedState(activeMedia)} viewTransition>
-                    Dossier <Icon name="arrowUR" size={13} />
+                    Details <Icon name="arrowUR" size={13} />
                   </Link>
                   <button
                     type="button"

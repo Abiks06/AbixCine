@@ -270,6 +270,46 @@ export function useOfflineCountForMedia(canonicalKey: string, mediaKey: string):
   );
 }
 
+/**
+ * Title-scoped selector for Title.tsx: avoids re-rendering the entire Title page 4x/sec
+ * when unrelated shows have active download ticks.
+ */
+const titleDownloadsCache = new Map<string, { sig: string; value: { root: string | null; items: DownloadedEntry[]; jobs: DownloadJob[]; switchingIds: ReadonlySet<string> } }>();
+
+export function useDownloadsForMedia(canonicalKey: string, mediaKey?: string) {
+  return useSyncExternalStore(
+    (cb) => {
+      listeners.add(cb);
+      return () => listeners.delete(cb);
+    },
+    () => {
+      const items = state.items.filter(
+        (e) => e.canonicalKey === canonicalKey || e.mediaKey === canonicalKey || (mediaKey && (e.canonicalKey === mediaKey || e.mediaKey === mediaKey)),
+      );
+      const jobs = state.jobs.filter(
+        (j) => j.canonicalKey === canonicalKey || j.mediaKey === canonicalKey || (mediaKey && (j.canonicalKey === mediaKey || j.mediaKey === mediaKey)),
+      );
+      const sig = `${state.root ?? ""}|${itemSignature(items)}|${jobs.map((j) => `${j.id}:${j.status}:${Math.round(j.percent)}:${j.resolvedQuality ?? ""}`).join(",")}|${[...state.switchingIds].filter((id) => jobs.some((j) => j.id === id)).join(",")}`;
+      const prev = titleDownloadsCache.get(canonicalKey);
+      if (prev && prev.sig === sig) return prev.value;
+      const value = { root: state.root, items, jobs, switchingIds: state.switchingIds };
+      titleDownloadsCache.set(canonicalKey, { sig, value });
+      return value;
+    },
+  );
+}
+
+/** Selector returning only the set of job IDs currently switching servers. */
+export function useSwitchingDownloadIds(): ReadonlySet<string> {
+  return useSyncExternalStore(
+    (cb) => {
+      listeners.add(cb);
+      return () => listeners.delete(cb);
+    },
+    () => state.switchingIds,
+  );
+}
+
 let badgeSnap: { active: number; awaiting: number } = { active: 0, awaiting: 0 };
 
 function getBadgeSnapshot(): { active: number; awaiting: number } {

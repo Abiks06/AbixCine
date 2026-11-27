@@ -42,7 +42,7 @@ import { loadShowSpeed, saveShowSpeed, showKeyFor } from "../lib/showSpeed";
 import { SubtitleOverlay } from "./SubtitleOverlay";
 import { SubtitleSheet } from "./SubtitleSheet";
 import { MAX_VOL, SHORTCUTS, SLOW_MS, SPEEDS, TIME_LEFT_KEY, bufferedAhead, candKey, readEmbedMessage, withStart, type Sheet, type EpisodeNav, type PlayerMedia } from "./player/shared";
-import { EpisodeSheet, ServerSheet, UpNext } from "./player/sheets";
+import { EpisodeSheet, ServerSheet, UpNext, CaughtUpCard } from "./player/sheets";
 import { Ambilight } from "./player/Ambilight";
 
 export type { EpisodeNav };
@@ -72,12 +72,14 @@ interface Props {
   season?: number;
   episode?: number;
   media?: PlayerMedia;
+  nextAiring?: import("../lib/types").Media["nextAiring"];
+  ongoing?: boolean;
 }
 
 /** The toast's level bar for a volume, notched at 100% on the 0–200% boost range. */
 const volMeter = (n: number) => ({ v: n / MAX_VOL, mark: 1 / MAX_VOL });
 
-export function Player({ session, initialSource, title, subtitle, startAt, onProgress, onEnded, onNext, autoNext, nextLabel, onBack, onInfo, onRetry, audio, onAudio, originalLanguage, episodes, media, season, episode }: Props) {
+export function Player({ session, initialSource, title, subtitle, startAt, onProgress, onEnded, onNext, autoNext, nextLabel, onBack, onInfo, onRetry, audio, onAudio, originalLanguage, episodes, media, season, episode, nextAiring, ongoing }: Props) {
   const wrap = useRef<HTMLDivElement>(null);
   const video = useRef<HTMLVideoElement>(null);
   // The side sheet's tabs and every segmented picker inside it (subtitle sheet included) glide.
@@ -779,8 +781,12 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
   // click also paused and resumed, which stutters the picture.
   const clickTimer = useRef<number>();
   useEffect(() => () => clearTimeout(clickTimer.current), []);
+  // Flush latest playhead when navigating away cleanly (mouse Back, Alt+Left, Command Palette).
+  useEffect(() => () => saveNowRef.current(), []);
+
   // With autoplay off the card used to vanish exactly at the end (0.5 s left), when it's needed most.
   const showUpNext = upNextVisible({ hasNext: !!onNext, dismissed: upNextDismissed, remaining, duration: clock.duration, ended });
+  const showCaughtUp = !onNext && !upNextDismissed && (ongoing || Boolean(nextAiring)) && (ended || (clock.duration > 120 && remaining <= UP_NEXT_AT && remaining > 0.5));
 
   // Keyboard shortcuts (player/shortcuts.ts), bound once; this render's actions are read through a ref.
   usePlayerShortcuts({
@@ -806,6 +812,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     toggleFull,
     setFull,
     togglePip,
+    skipActive: () => skipActiveRef.current(),
     goNext,
     goInfo,
     leave,
@@ -962,6 +969,21 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
   const outroEnd = sk?.outro ? (Number.isFinite(sk.outro[1]) ? sk.outro[1] : (dur > 0 ? dur : Infinity)) : undefined;
   const inIntro = usePlayhead(playhead, (t) => !!sk?.intro && t >= sk.intro[0] && t < sk.intro[1] - 1.5);
   const inOutro = usePlayhead(playhead, (t) => !!sk?.outro && outroEnd != null && t >= sk.outro[0] && t < outroEnd - 1.5);
+  const skipActive = () => {
+    const v = video.current;
+    const target = inIntro ? sk?.intro?.[1] : inOutro ? sk?.outro?.[1] : undefined;
+    if (!v || target == null) return;
+    const clamped = Number.isFinite(target)
+      ? (v.duration ? Math.min(v.duration - 0.25, target) : target)
+      : (v.duration ? Math.max(0, v.duration - 0.25) : undefined);
+    if (clamped != null && Number.isFinite(clamped)) {
+      v.currentTime = clamped;
+      setTime(clamped);
+      flash(inIntro ? "Skipped intro" : "Skipped credits");
+    }
+  };
+  const skipActiveRef = useRef(skipActive);
+  skipActiveRef.current = skipActive;
   const isPrimAss = Boolean(primTrack && (primTrack.format === "ass" || primTrack.format === "ssa") && primTrack.raw);
   // Subtitles toggled off with C: keep handing the overlay the ASS track it was rendering (marked
   // disabled), so it hides the renderer instead of destroying and later reloading its WASM worker.
@@ -997,8 +1019,9 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
   return (
     <div
       ref={wrap}
-      className={`player ${isEmbed ? "is-embed" : ""} ${hide || embedHide ? "idle" : ""} ${isFull ? "is-full" : ""} ${sheet ? "has-sheet" : ""} ${paused ? "is-paused" : ""}`}
+      className={`player ${isEmbed ? "is-embed" : ""} ${hide || embedHide ? "idle" : ""} ${isFull ? "is-full" : ""} ${sheet ? "has-sheet" : ""} ${paused ? "is-paused" : ""} ${showUpNext || showCaughtUp ? "has-upnext" : ""}`}
       onMouseMove={onPointerActivity}
+      onPointerDown={() => poke(true)}
       onMouseLeave={() => {
         overChromeRef.current = false;
       }}
@@ -1201,7 +1224,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
                 )}
                 {!hasStarted && <span className="pload-sub">{[title, subtitle].filter(Boolean).join(" · ")}</span>}
               </span>
-              {slow && hasOtherServer && !recovering && (
+              {slow && hasOtherServer && !recovering && !preparingLocal && (
                 <button
                   type="button"
                   className="pload-next"
@@ -1295,6 +1318,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
               onPointerUp={onScrubUp}
               onPointerCancel={onScrubCancel}
               onPointerLeave={onScrubLeave}
+              onSeekTo={seekTo}
             />
             <div className="prow">
               <div className="pc">
@@ -1350,22 +1374,13 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
         )}
       </div>
 
-      {!isEmbed && (inIntro || (inOutro && !showUpNext)) && (
+      {!isEmbed && (inIntro || inOutro) && (
         <button
           className="skip-btn"
+          title="Shortcut: X"
           onClick={(e) => {
             e.stopPropagation();
-            const v = video.current;
-            const target = inIntro ? sk?.intro?.[1] : sk?.outro?.[1];
-            if (v && target != null) {
-              const clamped = Number.isFinite(target)
-                ? (v.duration ? Math.min(v.duration - 0.25, target) : target)
-                : (v.duration ? Math.max(0, v.duration - 0.25) : undefined);
-              if (clamped != null && Number.isFinite(clamped)) {
-                v.currentTime = clamped;
-                setTime(clamped);
-              }
-            }
+            skipActive();
           }}
         >
           {inIntro ? "Skip intro" : "Skip credits"} <Icon name="next" size={16} />
@@ -1379,6 +1394,19 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
           seconds={ended || !Number.isFinite(remaining) ? 0 : Math.ceil(remaining)}
           auto={!!autoNext}
           onPlay={goNext}
+          onDismiss={() => setUpNextDismissed(true)}
+        />
+      )}
+
+      {showCaughtUp && (
+        <CaughtUpCard
+          nextAiring={nextAiring ?? episodes?.nextAiring}
+          still={media?.backdrop}
+          onBackToShow={() => {
+            saveNowRef.current();
+            if (onInfo) goInfo();
+            else leave();
+          }}
           onDismiss={() => setUpNextDismissed(true)}
         />
       )}

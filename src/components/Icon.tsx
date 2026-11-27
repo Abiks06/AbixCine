@@ -55,6 +55,7 @@ const P: Record<string, string> = {
   puzzle: "M9 4h4v2.5a1.5 1.5 0 1 0 3 0V4h4v5h-2.5a1.5 1.5 0 1 0 0 3H20v8h-5v-2.5a1.5 1.5 0 1 0-3 0V20H4v-6h2.5a1.5 1.5 0 1 0 0-3H4V4z",
   palette: "M12 2.5a9.5 9.5 0 1 0 0 19c1.4 0 2.3-.8 2.3-2 0-.6-.2-1-.6-1.4-.4-.4-.6-.9-.6-1.4 0-1.1.9-2 2-2h2.2c2.3 0 4.2-1.8 4.2-4.1C21.5 6 17.2 2.5 12 2.5z",
   shuffle: "M16 3h5v5M4 20 21 3M21 16v5h-5M15 15l6 6M4 4l5 5",
+  trash: "M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2M19 6l-1 14a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1L5 6M10 11v6M14 11v6",
 };
 
 const FILLED = new Set(["play", "pause", "star", "next", "rew", "fwd", "bookmarkOn"]);

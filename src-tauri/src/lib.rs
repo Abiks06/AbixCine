@@ -1257,6 +1257,9 @@ fn prepare_local_media_file(
     use std::io::{BufRead, BufReader, Read};
     use std::process::Stdio;
 
+    if is_prepare_superseded(expected_gen) {
+        return Err("cancelled".into());
+    }
     let canonical = ensure_in_library_roots(&path)?;
     let extension = canonical.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     if !ext_in(&canonical, VIDEO_EXTS) || extension == "m3u8" {
@@ -1286,10 +1289,12 @@ fn prepare_local_media_file(
         .and_then(serde_json::Value::as_str)
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|&d| d.is_finite() && d > 0.0);
-    // WebView2 can't switch audio tracks itself (no HTMLMediaElement.audioTracks), so a chosen
-    // non-default track gets its own copy of the file with only that track in it.
-    let chosen_audio = audio_index.filter(|&i| i > 0 && i < audio_stream_count(&probe));
-    if !force_remux && chosen_audio.is_none() && !media_needs_audio_conversion(&canonical, &probe) {
+    // WebView2 can't switch audio tracks itself (no HTMLMediaElement.audioTracks), so choosing
+    // a specific track (including returning to Track 0 on a multi-audio file) prepares an isolated track copy.
+    let audio_count = audio_stream_count(&probe);
+    let chosen_audio = audio_index.filter(|&i| i < audio_count && (i > 0 || audio_count > 1));
+    let can_fast_path_default = chosen_audio.is_none() || chosen_audio == Some(0);
+    if !force_remux && can_fast_path_default && !media_needs_audio_conversion(&canonical, &probe) {
         return Ok(canonical.to_string_lossy().into_owned());
     }
     let ffmpeg = ffmpeg?;

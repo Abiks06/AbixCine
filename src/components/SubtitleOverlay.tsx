@@ -111,7 +111,10 @@ export const SubtitleOverlay = memo(function SubtitleOverlay({
 }: SubtitleOverlayProps) {
   const wantNativeAss = subPref.assMode !== "clean" && subPref.signLayout !== "hide";
   const assTrack = !preview && wantNativeAss && (assFormat === "ass" || assFormat === "ssa") && Boolean(assRaw);
-  const jassubKey = assTrack && assRaw ? `${assFormat}:${assRaw.length}:${assRaw.slice(0, 64)}` : "";
+  const midOff = assRaw ? Math.floor(assRaw.length / 2) : 0;
+  const jassubKey = assTrack && assRaw
+    ? `${assFormat}:${assRaw.length}:${assRaw.slice(0, 64)}:${assRaw.slice(midOff, midOff + 64)}:${assRaw.slice(-64)}`
+    : "";
   // The renderer (a 2.2 MB WASM worker) starts the first time subtitles are on for this track and
   // then stays: toggling subtitles (C) only hides its canvas instead of tearing the worker down.
   const [armedKey, setArmedKey] = useState("");
@@ -273,7 +276,8 @@ export const SubtitleOverlay = memo(function SubtitleOverlay({
   // Secondary subtitles render in a distinct top-center band by default so they never collide
   // with standard bottom-center dialogue. If primary already occupies top-center/signs/songs
   // without bottom-center, park secondary at bottom-center; if both bands are occupied, offset below.
-  const hasTopBand = zoneMap.has(8) || signs.length > 0 || songs.length > 0;
+  const hasAssTopBand = Boolean(usingJassub && assRaw && /\\an[789]|Dialogue:[^,\n]*,[^,\n]*,[^,\n]*,[^,\n]*(?:title|sign|op|ed|song|top)/i.test(assRaw));
+  const hasTopBand = zoneMap.has(8) || signs.length > 0 || songs.length > 0 || hasAssTopBand;
   const hasBottomCenter = zoneMap.has(2);
   const secondaryPosClass = hasTopBand && !hasBottomCenter
     ? "at-bottom"

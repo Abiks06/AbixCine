@@ -532,9 +532,12 @@ export function Settings() {
     const id = loc.hash.replace(/^#/, "");
     if (!id) return;
     // Wait a frame: on first arrival the page hasn't laid out yet.
-    const raf = requestAnimationFrame(() => document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" }));
+    const reduce = s.reduceMotion || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    const raf = requestAnimationFrame(() =>
+      document.getElementById(id)?.scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: "start" }),
+    );
     return () => cancelAnimationFrame(raf);
-  }, [loc.hash]);
+  }, [loc.hash, s.reduceMotion]);
 
   const addFolder = async () => {
     try {

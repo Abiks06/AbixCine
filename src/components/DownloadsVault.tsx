@@ -34,7 +34,7 @@ import {
 } from "../lib/downloads";
 import { fmtSize, qualityBadge } from "../lib/library";
 import { useOnlineStatus } from "../lib/online";
-import { getProgress, isDone, useProgressStore } from "../lib/progress";
+import { isDone, isEpisodeWatched, getEpisodeProgress, getEpisodesMap, getResumePosition, markEpisodeWatched, restoreProgress, RESUME_MIN_SEC, useProgressStore } from "../lib/progress";
 import { useSettings } from "../lib/settings";
 import { toast } from "../lib/toast";
 import { Art } from "./Art";
@@ -46,28 +46,49 @@ import { SectionHead } from "./SectionHead";
 type KindFilter = "all" | "movie" | "tv" | "anime";
 type FormatFilter = "all" | "mp4" | "mkv";
 
-function pickPlayTarget(g: DownloadedTitleGroup): { entry: DownloadedTitleGroup["entries"][number] | undefined; resume: boolean } {
+function pickPlayTarget(g: DownloadedTitleGroup): { entry: DownloadedTitleGroup["entries"][number] | undefined; resume: boolean; resumeSec?: number } {
+  const aliasKeys = [g.media.key, ...g.entries.map((e) => e.mediaKey)];
   if (g.isFilm) {
     const first = g.entries[0];
-    const p = first ? getProgress(g.canonicalKey, undefined, undefined, [g.media.key, first.mediaKey]) : undefined;
-    const resume = Boolean(p && p.position > 10 && !isDone(p.position, p.duration) && !p.finished);
-    return { entry: first, resume };
+    const ep = first ? getEpisodeProgress(g.canonicalKey, undefined, undefined, aliasKeys) : undefined;
+    const resumeSec = first ? getResumePosition(g.canonicalKey, undefined, undefined, aliasKeys) : undefined;
+    return { entry: first, resume: Boolean(resumeSec), resumeSec: resumeSec ?? (ep && !ep.completed && ep.position > RESUME_MIN_SEC ? ep.position : undefined) };
   }
-  for (let i = 0; i < g.entries.length; i++) {
-    const ep = g.entries[i];
-    const p = getProgress(g.canonicalKey, ep.season ?? 1, ep.episode ?? 1, [g.media.key, ep.mediaKey]);
-    if (!p) continue;
-    if (p.upNext) return { entry: ep, resume: false };
-    if (!isDone(p.position, p.duration) && !p.finished) return { entry: ep, resume: p.position > 10 };
-    if (i + 1 < g.entries.length) return { entry: g.entries[i + 1], resume: false };
-    return { entry: ep, resume: false };
+
+  const map = getEpisodesMap(g.canonicalKey, aliasKeys);
+  const entryByEp = g.entries.map((entry) => {
+    const s = entry.season ?? 1;
+    const e = entry.episode ?? 1;
+    const ep = map[`s${s}:e${e}`] ?? (s === 1 ? map[`s0:e${e}`] : undefined);
+    const watched = Boolean(ep && (ep.completed || isDone(ep.position, ep.duration)));
+    const inProgress = Boolean(ep && !watched && ep.position > RESUME_MIN_SEC);
+    return { entry, ep, watched, inProgress };
+  });
+
+  // 1. Most recently updated incomplete downloaded episode wins (so accidental E4 skip never loses E3!).
+  const active = entryByEp
+    .filter((x) => x.inProgress)
+    .sort((a, b) => (b.ep?.updatedAt ?? 0) - (a.ep?.updatedAt ?? 0))[0];
+  if (active) return { entry: active.entry, resume: true, resumeSec: active.ep?.position };
+
+  // 2. First unwatched episode after the highest watched downloaded episode (or first unwatched overall).
+  let lastWatchedIdx = -1;
+  entryByEp.forEach((x, idx) => {
+    if (x.watched) lastWatchedIdx = idx;
+  });
+  if (lastWatchedIdx >= 0 && lastWatchedIdx + 1 < entryByEp.length) {
+    const nextUnwatched = entryByEp.slice(lastWatchedIdx + 1).find((x) => !x.watched);
+    if (nextUnwatched) return { entry: nextUnwatched.entry, resume: false };
   }
+  const firstUnwatched = entryByEp.find((x) => !x.watched);
+  if (firstUnwatched) return { entry: firstUnwatched.entry, resume: false };
+
   return { entry: g.entries[0], resume: false };
 }
 
 function playTargetUrl(g: DownloadedTitleGroup, ep?: DownloadedTitleGroup["entries"][number]): string {
   const chosen = ep ?? g.entries[0];
-  const base = `/watch/${encodeKey(chosen?.mediaKey || g.canonicalKey)}`;
+  const base = `/watch/${encodeKey(g.canonicalKey || chosen?.mediaKey || g.media.key)}`;
   const params = new URLSearchParams();
   if (!g.isFilm && chosen) {
     if (chosen.season != null) params.set("s", String(chosen.season));
@@ -76,6 +97,7 @@ function playTargetUrl(g: DownloadedTitleGroup, ep?: DownloadedTitleGroup["entri
   if (chosen?.audio && chosen.audio !== "dual" && chosen.audio !== "unknown") {
     params.set("a", chosen.audio);
   }
+  params.set("srv", "downloads");
   const q = params.toString();
   return q ? `${base}?${q}` : base;
 }
@@ -111,8 +133,9 @@ export function DownloadsVault({
   const [formatFilter, setFormatFilter] = useState<FormatFilter>("all");
   const [sortBy, setSortBy] = useState<DownloadVaultSort>("recent");
   const [tidying, setTidying] = useState(false);
-  const [expanded, setExpanded] = useState<string | null>(null);
+  const [expandedKeys, setExpandedKeys] = useState<Set<string>>(() => new Set());
   const [confirmGroup, setConfirmGroup] = useState<string | null>(null);
+  const [confirmCleanGroup, setConfirmCleanGroup] = useState<string | null>(null);
   const [confirmEntry, setConfirmEntry] = useState<string | null>(null);
   const [confirmStopAll, setConfirmStopAll] = useState(false);
   const [confirmSeasonKey, setConfirmSeasonKey] = useState<string | null>(null);
@@ -230,7 +253,27 @@ export function DownloadsVault({
       await removeDownloadedItem(entry.id, true);
     }
     setConfirmGroup(null);
-    if (expanded === g.canonicalKey) setExpanded(null);
+    setConfirmCleanGroup(null);
+    setExpandedKeys((prev) => {
+      if (!prev.has(g.canonicalKey)) return prev;
+      const next = new Set(prev);
+      next.delete(g.canonicalKey);
+      return next;
+    });
+    toast(`Deleted “${g.media.title}” · freed ${fmtSize(g.totalSize)}`, { icon: "check" });
+  };
+
+  const cleanWatchedForGroup = async (_g: DownloadedTitleGroup, watchedEntries: DownloadedTitleGroup["entries"]) => {
+    let freed = 0;
+    for (const entry of watchedEntries) {
+      freed += entry.fileSize || 0;
+      await removeDownloadedItem(entry.id, true);
+    }
+    setConfirmCleanGroup(null);
+    toast(
+      `Cleaned ${watchedEntries.length} watched episode${watchedEntries.length === 1 ? "" : "s"} · freed ${fmtSize(freed)}`,
+      { icon: "check" },
+    );
   };
 
   return (
@@ -689,13 +732,20 @@ export function DownloadsVault({
       ) : (
       <div className="dlv-grid">
         {shown.map((g) => {
-          const isExp = expanded === g.canonicalKey;
+          const isExp = expandedKeys.has(g.canonicalKey);
           const isConfirm = confirmGroup === g.canonicalKey;
+          const isConfirmClean = confirmCleanGroup === g.canonicalKey;
           const qBadge = qualityBadge(g.bestQuality);
           const playTarget = pickPlayTarget(g);
           const playEntry = playTarget.entry;
+          const aliasKeys = [g.media.key, ...g.entries.map((e) => e.mediaKey)];
+          const watchedEntries = !g.isFilm
+            ? g.entries.filter((e) => isEpisodeWatched(g.canonicalKey, e.season ?? 1, e.episode ?? 1, aliasKeys))
+            : [];
+          const watchedBytes = watchedEntries.reduce((s, e) => s + (e.fileSize || 0), 0);
           const summaryMeta = [
             g.isFilm ? "Film" : `${g.entries.length} episode${g.entries.length === 1 ? "" : "s"}`,
+            !g.isFilm && watchedEntries.length > 0 ? `${watchedEntries.length}/${g.entries.length} watched` : null,
             g.media.year,
             fmtSize(g.totalSize),
           ]
@@ -817,12 +867,43 @@ export function DownloadsVault({
                       aria-expanded={isExp}
                       onClick={() => {
                         setConfirmGroup(null);
-                        setExpanded(isExp ? null : g.canonicalKey);
+                        setExpandedKeys((prev) => {
+                          const next = new Set(prev);
+                          if (next.has(g.canonicalKey)) next.delete(g.canonicalKey);
+                          else next.add(g.canonicalKey);
+                          return next;
+                        });
                       }}
                     >
                       <Icon name="rows" size={14} />
                       <span>{g.entries.length}</span>
                     </button>
+                  )}
+
+                  {!compact && !g.isFilm && watchedEntries.length > 0 && (
+                    isConfirmClean ? (
+                      <div className="dlv-confirm">
+                        <button
+                          type="button"
+                          className="chip danger"
+                          onClick={() => void cleanWatchedForGroup(g, watchedEntries)}
+                        >
+                          Remove {watchedEntries.length} ({fmtSize(watchedBytes)})
+                        </button>
+                        <button type="button" className="chip" onClick={() => setConfirmCleanGroup(null)}>
+                          Keep
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        className="chip"
+                        title={`Delete ${watchedEntries.length} watched episode file${watchedEntries.length === 1 ? "" : "s"} to free ${fmtSize(watchedBytes)}`}
+                        onClick={() => setConfirmCleanGroup(g.canonicalKey)}
+                      >
+                        Clean {watchedEntries.length} watched
+                      </button>
+                    )
                   )}
 
                   {!compact &&
@@ -866,18 +947,33 @@ export function DownloadsVault({
                     return g.entries.map((e) => {
                       const epConfirm = confirmEntry === e.id;
                       const sNum = e.season ?? 1;
+                      const eNum = e.episode ?? 1;
                       const needHdr = showSeasonHdr && sNum !== lastSeason;
                       lastSeason = sNum;
-                      const code = `S${String(sNum).padStart(2, "0")}E${String(e.episode ?? 1).padStart(2, "0")}`;
+                      const code = `S${String(sNum).padStart(2, "0")}E${String(eNum).padStart(2, "0")}`;
+                      const epProg = getEpisodeProgress(g.canonicalKey, sNum, eNum, aliasKeys);
+                      const watched = isEpisodeWatched(g.canonicalKey, sNum, eNum, aliasKeys);
+                      const resumeSec = getResumePosition(g.canonicalKey, sNum, eNum, aliasKeys);
+                      const epPct =
+                        epProg && epProg.duration > 0
+                          ? watched
+                            ? 100
+                            : Math.min(99, Math.max(4, Math.round((epProg.position / epProg.duration) * 100)))
+                          : 0;
+                      const leftMin =
+                        resumeSec != null && epProg && epProg.duration > 0
+                          ? Math.max(1, Math.round((epProg.duration - resumeSec) / 60))
+                          : null;
                       return (
                         <div key={e.id}>
                           {needHdr && <div className="dlv-ep-season">Season {sNum}</div>}
-                          <div className="dlv-ep">
+                          <div className={`dlv-ep ${watched ? "seen" : ""} ${resumeSec != null ? "in-prog" : ""}`}>
                             <div className="dlv-ep-main">
                               <b>{code}</b>
-                              <span>{e.episodeTitle || `Episode ${e.episode ?? 1}`}</span>
+                              <span>{e.episodeTitle || `Episode ${eNum}`}</span>
                               <small>
                                 {[
+                                  watched ? "Watched ✓" : leftMin != null ? `${leftMin}m left` : null,
                                   formatQualityTag(e.quality, e.qualityVerified),
                                   entryContainer(e),
                                   e.videoCodec,
@@ -888,6 +984,11 @@ export function DownloadsVault({
                                   .filter(Boolean)
                                   .join(" · ")}
                               </small>
+                              {epPct > 0 && (
+                                <div className="dlv-ep-bar" aria-hidden>
+                                  <i style={{ transform: `scaleX(${epPct / 100})` }} />
+                                </div>
+                              )}
                             </div>
                             <div className="dlv-ep-acts">
                               {(e.subtitlePaths?.length ?? 0) > 0 ? (
@@ -907,7 +1008,30 @@ export function DownloadsVault({
                               ) : null}
                               <button
                                 type="button"
-                                className="chip"
+                                className={`chip ${watched ? "on" : ""}`}
+                                title={watched ? `Mark ${code} unwatched` : `Mark ${code} watched`}
+                                onClick={() => {
+                                  const prevSnap = markEpisodeWatched(
+                                    { ...g.media, canonicalKey: g.canonicalKey },
+                                    sNum,
+                                    eNum,
+                                    !watched,
+                                    epProg?.duration || 1440,
+                                    aliasKeys,
+                                  );
+                                  toast(`${code} marked ${!watched ? "watched" : "unwatched"}`, {
+                                    icon: "check",
+                                    action: prevSnap
+                                      ? { label: "Undo", run: () => restoreProgress(prevSnap) }
+                                      : undefined,
+                                  });
+                                }}
+                              >
+                                <Icon name="check" size={11} /> {watched ? "Watched" : "Mark watched"}
+                              </button>
+                              <button
+                                type="button"
+                                className={`chip ${resumeSec != null ? "play" : ""}`}
                                 onClick={() =>
                                   nav(playTargetUrl(g, e), {
                                     viewTransition: true,
@@ -915,7 +1039,7 @@ export function DownloadsVault({
                                   })
                                 }
                               >
-                                <Icon name="play" size={11} /> Play
+                                <Icon name="play" size={11} /> {resumeSec != null ? "Resume" : watched ? "Rewatch" : "Play"}
                               </button>
                               {epConfirm ? (
                                 <>
@@ -924,7 +1048,9 @@ export function DownloadsVault({
                                     className="chip danger"
                                     onClick={() => {
                                       setConfirmEntry(null);
-                                      void removeDownloadedItem(e.id, true);
+                                      void removeDownloadedItem(e.id, true).then(() => {
+                                        toast(`Deleted ${code} · freed ${fmtSize(e.fileSize)}`, { icon: "check" });
+                                      });
                                     }}
                                   >
                                     Delete

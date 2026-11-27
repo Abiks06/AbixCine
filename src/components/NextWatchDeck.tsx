@@ -32,6 +32,9 @@ export function NextWatchDeck({
   loading,
   mode,
   onMode,
+  seeds,
+  selectedSeedKey,
+  onSelectSeed,
   seedTitle,
   hasWatchlist,
   hasBecause,
@@ -44,11 +47,14 @@ export function NextWatchDeck({
   loading?: boolean;
   mode: RecommendMode;
   onMode: (m: RecommendMode) => void;
+  seeds?: { key: string; title: string }[];
+  selectedSeedKey?: string;
+  onSelectSeed?: (key: string) => void;
   seedTitle?: string;
   hasWatchlist: boolean;
   hasBecause: boolean;
   onShuffle: () => void;
-  onDismiss: (key: string) => void;
+  onDismiss: (media: RecommendedPick["media"]) => void;
 }) {
   const nav = useNavigate();
   const modeInd = useSlidingIndicator();
@@ -90,6 +96,20 @@ export function NextWatchDeck({
         accentWord="up for you"
         right={
           <div className="nw-ctrls">
+            {mode === "because" && seeds && seeds.length > 1 && onSelectSeed && (
+              <div className="nw-seed-pills" role="group" aria-label="Because you watched">
+                {seeds.map((s) => (
+                  <button
+                    key={s.key}
+                    type="button"
+                    className={`chip ${selectedSeedKey === s.key ? "on" : ""}`}
+                    onClick={() => onSelectSeed(s.key)}
+                  >
+                    {s.title.length > 18 ? `${s.title.slice(0, 17)}…` : s.title}
+                  </button>
+                ))}
+              </div>
+            )}
             <div className="seg-pills" role="tablist" aria-label="Recommendation focus" ref={modeInd}>
               {modes.map((m) => (
                 <button
@@ -141,7 +161,7 @@ export function NextWatchDeck({
             >
               <Art media={leadMedia} variant="backdrop" hd eager />
               <span className="gate-brackets" aria-hidden><i /></span>
-              <span className="nw-match">{lead.matchPct}% MATCH</span>
+              {lead.showMatchPct && <span className="nw-match">{lead.matchPct}% MATCH</span>}
               <span className="nw-reason-tag">{BADGE_LABEL[lead.badge]}</span>
             </Link>
 
@@ -171,10 +191,10 @@ export function NextWatchDeck({
                   </button>
                 )}
                 <button type="button" className="btn glass sm" onClick={() => openDossier(leadMedia)}>
-                  <Icon name="layers" size={14} /> Pass
+                  <Icon name="layers" size={14} /> Quick view
                 </button>
                 <Link className="btn glass sm" to={`/title/${encodeKey(leadMedia.key)}`} state={seedState(leadMedia)} viewTransition>
-                  Dossier <Icon name="arrowUR" size={13} />
+                  Details <Icon name="arrowUR" size={13} />
                 </Link>
                 <button
                   type="button"
@@ -192,9 +212,9 @@ export function NextWatchDeck({
                 <button
                   type="button"
                   className="btn glass sm icon nw-skip"
-                  onClick={() => onDismiss(leadMedia.key)}
-                  aria-label={`Skip ${leadMedia.title}`}
-                  title="Show a different pick"
+                  onClick={() => onDismiss(leadMedia)}
+                  aria-label={`Not interested in ${leadMedia.title}`}
+                  title="Not interested"
                 >
                   <Icon name="x" size={14} />
                 </button>
@@ -211,7 +231,7 @@ export function NextWatchDeck({
                 variant="landscape"
                 extra={
                   <span className="nw-tag" title={pick.reason}>
-                    {pick.badge === "taste" ? `${pick.matchPct}%` : BADGE_LABEL[pick.badge]}
+                    {pick.badge === "taste" && pick.showMatchPct ? `${pick.matchPct}%` : BADGE_LABEL[pick.badge]}
                   </span>
                 }
                 sub={

@@ -2,7 +2,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Art, sized } from "./Art";
 import { getAuth, leaveGuest, signOut } from "../lib/account";
+import { getTrackingState, useAiringMap, useNowMinute } from "../lib/airing";
 import { encodeKey, isUnreleasedMedia } from "../lib/catalog";
+import { groupDownloadedTitles, useDownloads } from "../lib/downloads";
+import { useAllProgress } from "../lib/progress";
 import { playHref } from "../lib/play";
 import { matchParts, peekSearch, searchAll } from "../lib/search";
 import { rememberQuery, rememberTitle, useSearchHistory } from "../lib/history";
@@ -10,7 +13,7 @@ import { previewLight, tonesFor } from "../lib/light";
 import { getSettings, updateSettings } from "../lib/settings";
 import { useSlidingIndicator } from "../lib/useSlidingIndicator";
 import type { Media } from "../lib/types";
-import { toggleList, useSaved } from "../lib/watchlist";
+import { toggleList, useSaved, useWatchlist } from "../lib/watchlist";
 import { kindLabel, seedState } from "./Card";
 import { Icon } from "./Icon";
 
@@ -50,6 +53,11 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
   const box = useRef<HTMLDivElement>(null);
   const returnTo = useRef<HTMLElement | null>(null);
   const history = useSearchHistory();
+  const { items: dlItems } = useDownloads();
+  const watchlist = useWatchlist();
+  const allProgress = useAllProgress();
+  const airingMap = useAiringMap();
+  const nowMs = useNowMinute();
   const qRef = useRef(q);
   qRef.current = q;
   const onCloseRef = useRef(onClose);
@@ -165,16 +173,46 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
             nav(playHref(m), { viewTransition: true, state: { from: "app" } });
           },
     });
-    // Empty box: recent searches (fill the box) and titles you opened from search.
+    // Empty box: recent searches, local vault/tracked highlights, and recent titles.
+    const progressByKey = new Map(allProgress.map((p) => [p.media.key, p]));
+    const offlineGroups = groupDownloadedTitles(dlItems);
+
     if (!low) {
       return [
         ...history.queries.slice(0, 5).map((h): Item => ({ id: `q:${h.q}`, group: "Recent", label: h.q, hint: "Recent search", icon: "clock", keep: true, run: () => setQ(h.q) })),
-        ...history.titles.slice(0, 4).map((h) => title(h.media, [kindLabel(h.media.kind), h.media.year].filter(Boolean).join(" · "), false)),
+        ...history.titles.slice(0, 4).map((h) => {
+          const st = getTrackingState(h.media, progressByKey.get(h.media.key), airingMap[h.media.key], nowMs);
+          return title(h.media, [kindLabel(h.media.kind, h.media.format), st.badge || h.media.year].filter(Boolean).join(" · "), false);
+        }),
         ...actions,
       ];
     }
+
+    // Local-first offline vault, My List, and active progress matches work instantaneously & offline.
+    const localPool = new Map<string, { media: Media; sourceHint: string }>();
+    for (const g of offlineGroups) {
+      localPool.set(g.canonicalKey, { media: g.media, sourceHint: g.isFilm ? "Offline film" : `Offline · ${g.entries.length} ep` });
+    }
+    for (const w of watchlist) {
+      if (!localPool.has(w.media.key)) localPool.set(w.media.key, { media: w.media, sourceHint: "My List" });
+    }
+    for (const p of allProgress) {
+      if (!localPool.has(p.media.key)) localPool.set(p.media.key, { media: p.media, sourceHint: p.caughtUp ? "Caught up" : "Watching" });
+    }
+    const localHits = [...localPool.values()]
+      .filter(({ media }) => `${media.title} ${media.originalTitle ?? ""}`.toLowerCase().includes(low))
+      .slice(0, 4);
+    const localKeys = new Set(localHits.map((x) => x.media.key));
+
     return [
-      ...results.slice(0, MAX_TITLES).map((m) => title(m, [kindLabel(m.kind), m.seasonCount ? "All seasons" : m.year].filter(Boolean).join(" · "), true)),
+      ...localHits.map(({ media, sourceHint }) => {
+        const st = getTrackingState(media, progressByKey.get(media.key), airingMap[media.key], nowMs);
+        return title(media, [sourceHint, st.badge].filter(Boolean).join(" · "), true);
+      }),
+      ...results
+        .filter((m) => !localKeys.has(m.key))
+        .slice(0, MAX_TITLES)
+        .map((m) => title(m, [kindLabel(m.kind, m.format), m.seasonCount ? "All seasons" : m.year].filter(Boolean).join(" · "), true)),
       ...(results.length > 0
         ? [{ id: "all", group: "Titles", label: `See all ${results.length} results for “${term}”`, icon: "search", run: () => (rememberQuery(term), nav(`/search?q=${encodeURIComponent(term)}`, { viewTransition: true })) } satisfies Item]
         : []),
@@ -182,7 +220,7 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
     ];
     // `shown` refreshes the action labels (they read settings) each time the palette opens.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [low, results, history, shown]);
+  }, [low, results, history, shown, dlItems, watchlist, allProgress, airingMap, nowMs]);
 
   useEffect(() => setSel(0), [q, results]);
   useEffect(() => {
@@ -358,7 +396,7 @@ function Preview({ m }: { m: Media }) {
         <div className="pp-title">{m.title}</div>
         <div className="specs">
           {m.rating ? <span className="star">★ {m.rating.toFixed(1)}</span> : null}
-          <span>{kindLabel(m.kind)}</span>
+          <span>{kindLabel(m.kind, m.format)}</span>
           {m.seasonCount ? <span>All seasons</span> : m.year ? <span>{m.year}</span> : null}
           {m.genres[0] && <span>{m.genres[0]}</span>}
         </div>

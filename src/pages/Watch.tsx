@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { useDownloadPrefs } from "../lib/downloadOverrides";
 import { rankDownloadOptions } from "../lib/downloadRank";
-import { findOfflineDetail, findOfflineSeasonEpisodes, startDownload } from "../lib/downloads";
+import { findOfflineDetail, findOfflineSeasonEpisodes, startDownload, useDownloads } from "../lib/downloads";
 import { Player, type EpisodeNav } from "../components/Player";
 import { Art, sized } from "../components/Art";
 import { seedState } from "../components/Card";
@@ -25,7 +25,7 @@ import {
 } from "../lib/catalog";
 import { fmtDate } from "../lib/format";
 import type { MediaDetail } from "../lib/types";
-import { getEntry, getProgress, isDone, saveProgress } from "../lib/progress";
+import { getEntry, getResumePosition, isDone, isOngoingMedia, saveProgress } from "../lib/progress";
 import { scrobble, watchedFrom } from "../lib/scrobble";
 import { useWatchlist } from "../lib/watchlist";
 import { audioFor, setAudioFor, useSettings, type Audio } from "../lib/settings";
@@ -68,13 +68,14 @@ export function Watch() {
         : [],
     [detail.data],
   );
+  const { items: dlItems } = useDownloads();
   const savedEntry = getEntry(canonicalKey, [key, detail.data?.key, ...courKeys]);
   const preferOffline =
     Boolean((loc.state as { offline?: boolean } | null)?.offline) ||
     (typeof navigator !== "undefined" && navigator.onLine === false);
   const offlineDetail = useMemo(
-    () => findOfflineDetail(key) ?? findOfflineDetail(canonicalKey),
-    [key, canonicalKey],
+    () => findOfflineDetail(key, dlItems) ?? findOfflineDetail(canonicalKey, dlItems),
+    [key, canonicalKey, dlItems],
   );
   const d: MediaDetail | undefined = useMemo(() => {
     if (detail.data) return detail.data;
@@ -127,9 +128,6 @@ export function Watch() {
   // render late: switching sub/dub or episode onto an already-cached session mounted the player
   // with the previous session's choice for a frame and tore it down again.
   const [startState, setStartState] = useState<{ session: SourceSession; key: string } | null>(null);
-  const start = startState && startState.session === session ? startState.key : null;
-  const setStart = useCallback((key: string | null) => setStartState(key && session ? { session, key } : null), [session]);
-  /** A server being checked because the viewer asked to play from it. */
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const live = useRef(session);
@@ -138,6 +136,13 @@ export function Watch() {
     setBusyKey(null);
     setNote(null);
   }, [session]);
+
+  const prefFor = useRef<unknown>(null);
+  const prefPending = !!preferred && prefFor.current !== session;
+  const pickKey = snap?.pick ? candKey(snap.pick) : undefined;
+  const explicitStart = startState && startState.session === session ? startState.key : null;
+  const start = explicitStart ?? ((quick || settings.reduceMotion) && !busyKey && !prefPending && pickKey ? pickKey : null);
+  const setStart = useCallback((key: string | null) => setStartState(key && session ? { session, key } : null), [session]);
 
   /** Play from a server the viewer picked: straight away if it's ready, after a check if not. */
   const playFrom = useCallback(
@@ -158,8 +163,6 @@ export function Watch() {
   );
 
   // A server chosen on the title page: go to it as soon as the session knows it.
-  const prefFor = useRef<unknown>(null);
-  const prefPending = !!preferred && prefFor.current !== session;
   useEffect(() => {
     if (!session || !snap || !preferred || prefFor.current === session) return;
     const c = session.find(preferred);
@@ -169,7 +172,6 @@ export function Watch() {
   }, [session, snap, preferred, playFrom]);
 
   // Hold the result on screen for a beat so you see which server won, then play.
-  const pickKey = snap?.pick ? candKey(snap.pick) : undefined;
   useEffect(() => {
     if (!pickKey || start || busyKey || prefPending) return;
     const t = setTimeout(() => setStart(pickKey), settings.reduceMotion || quick ? 0 : 280);
@@ -228,6 +230,7 @@ export function Watch() {
       saveProgress(
         { media: { ...d, key: canonicalKey, canonicalKey }, season, episode, audio, position, duration },
         next && { season: next.s, episode: next.e },
+        { aliasKeys: [key, d.key, ...courKeys], ongoing: isOngoingMedia(d) },
       );
       if (
         next &&
@@ -243,7 +246,7 @@ export function Watch() {
             prefetchedKeyRef.current = k;
             const nextSession = acquireSession(nextReq);
             nextSession.retain();
-            nextSession.start(1);
+            nextSession.start(2);
             prefetchedSessionRef.current = nextSession;
           }
         }
@@ -309,8 +312,11 @@ export function Watch() {
       go: goEp,
       fallbackStill: sized(d.backdrop, "w300"),
       nextLabel,
+      mediaKey: canonicalKey,
+      aliasKeys: [key, d.key, ...courKeys].filter((k): k is string => Boolean(k)),
+      nextAiring: d.nextAiring,
     };
-  }, [d, key, season, episode, next, goEp]);
+  }, [d, key, canonicalKey, courKeys, season, episode, next, goEp]);
 
   if (start && session?.get(start) && d && req) {
     return (
@@ -321,13 +327,13 @@ export function Watch() {
         title={d.title}
         subtitle={epLabel}
         startAt={
-          getProgress(canonicalKey, season, episode, [key, d.key, ...courKeys])?.position ??
+          getResumePosition(canonicalKey, season, episode, [key, d.key, ...courKeys]) ??
           (savedEntry && savedEntry.season == null && savedEntry.episode != null
             ? (() => {
                 const cour = [...(d.seasons ?? []), ...(d.specials ?? [])]
                   .find((s) => s.number === season)
                   ?.cours?.find((c) => c.key === savedEntry.media.key);
-                return cour && cour.startEpisode + savedEntry.episode - 1 === episode ? savedEntry.position : undefined;
+                return cour && cour.startEpisode + savedEntry.episode - 1 === episode && !savedEntry.finished && savedEntry.position > 15 ? savedEntry.position : undefined;
               })()
             : undefined)
         }
@@ -338,6 +344,8 @@ export function Watch() {
         media={d}
         season={season}
         episode={episode}
+        nextAiring={d.nextAiring}
+        ongoing={isOngoingMedia(d)}
         onProgress={onProgress}
         onEnded={() => settings.autoplayNext && goNext()}
         autoNext={settings.autoplayNext}

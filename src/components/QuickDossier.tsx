@@ -11,14 +11,17 @@ import {
   resolvePlaybackRequest,
 } from "../lib/catalog";
 import { closeDossier, useDossier } from "../lib/dossier";
-import { fmtDate, fmtRuntime } from "../lib/format";
+import { getTrackingState, useAiringFor, useNowMinute } from "../lib/airing";
+import { fmtAirBadge, fmtDate, fmtRuntime } from "../lib/format";
 import { previewLight } from "../lib/light";
 import { playHref } from "../lib/play";
+import { useMatchedProgress } from "../lib/progress";
 import { audioFor, setAudioFor, useSettings } from "../lib/settings";
 import { burst } from "../lib/burst";
 import { isYouTubeId } from "../lib/trailer";
 import { isFilm, type Media, type MediaDetail } from "../lib/types";
 import { useAsync } from "../lib/useAsync";
+import { useModalFocusTrap } from "../lib/useModalFocusTrap";
 import { toggleList, useSaved } from "../lib/watchlist";
 import { Art } from "./Art";
 import { AudioToggle } from "./AudioToggle";
@@ -76,7 +79,10 @@ function DrawerBody({ media, closing }: { media: Media; closing: boolean }) {
   );
   const [trailerOpen, setTrailerOpen] = useState(false);
   const [serversOpen, setServersOpen] = useState(false);
+  const drawerRef = useRef<HTMLElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
+
+  useModalFocusTrap(!closing, drawerRef);
 
   useEffect(() => {
     closeRef.current?.focus({ preventScroll: true });
@@ -107,12 +113,22 @@ function DrawerBody({ media, closing }: { media: Media; closing: boolean }) {
   const unreleased = detail ? isUnreleasedMedia(d) : false;
   const theatrical = detail ? !unreleased && film && isTheatricalOnly(d) : false;
 
-  const activeSeason = useMemo(() => (film ? undefined : clampSeason(d, d.initialSeason)), [d, film]);
-  const startS = activeSeason?.number;
-  const startE = useMemo(
-    () => (film ? undefined : clampEpisode(activeSeason, 1, d.episodeCount)),
-    [film, activeSeason, d.episodeCount],
+  const progressKeys = useMemo(() => [key, d.key, canonicalKey], [key, d.key, canonicalKey]);
+  const matchedProgress = useMatchedProgress(progressKeys);
+  const snapAiring = useAiringFor(canonicalKey) ?? useAiringFor(d.key);
+  const nowMs = useNowMinute();
+  const tracking = getTrackingState(d, matchedProgress, snapAiring, nowMs);
+
+  const activeSeason = useMemo(
+    () => (film ? undefined : clampSeason(d, matchedProgress?.season ?? d.initialSeason)),
+    [d, film, matchedProgress?.season],
   );
+  const startS = activeSeason?.number;
+  const startE = useMemo(() => {
+    if (film) return undefined;
+    if (tracking.kind === "new-episode" && tracking.nextPlay) return tracking.nextPlay.episode;
+    return clampEpisode(activeSeason, matchedProgress?.episode ?? 1, d.episodeCount);
+  }, [film, tracking, activeSeason, matchedProgress?.episode, d.episodeCount]);
 
   const hasPlayable = film ? !unreleased : !!((d.seasons && d.seasons.length > 0) || (d.specials && d.specials.length > 0) || (d.episodeCount && d.episodeCount > 0));
   const req = useMemo(
@@ -162,13 +178,13 @@ function DrawerBody({ media, closing }: { media: Media; closing: boolean }) {
   return (
     <>
       <div className={`qd-scrim ${closing ? "closing" : ""}`} onMouseDown={(e) => e.target === e.currentTarget && closeDossier()}>
-        <aside className="qd-drawer" role="dialog" aria-modal="true" aria-label={`${d.title} screening pass`}>
+        <aside ref={drawerRef} className="qd-drawer" role="dialog" aria-modal="true" aria-label={`${d.title} quick view`} tabIndex={-1}>
           <div className="qd-head">
             <div className="qd-pass-id">
-              <b>SCREENING PASS</b>
+              <b>QUICK VIEW</b>
               {endsAt && <span>START NOW → ENDS {endsAt}</span>}
             </div>
-            <button ref={closeRef} type="button" className="icon-btn" onClick={closeDossier} aria-label="Close quick dossier">
+            <button ref={closeRef} type="button" className="icon-btn" onClick={closeDossier} aria-label="Close quick view">
               <Icon name="x" size={16} />
             </button>
           </div>
@@ -212,22 +228,40 @@ function DrawerBody({ media, closing }: { media: Media; closing: boolean }) {
               {theatrical && (
                 <div className="airing"><Icon name="clock" size={14} /> In cinemas now</div>
               )}
+              {(d.nextAiring || tracking.kind === "caught-up" || tracking.kind === "new-episode") && (
+                <div className={`airing ${tracking.kind}`}>
+                  <Icon name={tracking.kind === "caught-up" ? "check" : "clock"} size={14} />{" "}
+                  {tracking.kind === "new-episode"
+                    ? tracking.detail || tracking.badge
+                    : tracking.kind === "caught-up"
+                      ? tracking.badge || "Caught up"
+                      : d.nextAiring
+                        ? `Next ${fmtAirBadge(d.nextAiring, nowMs)}`
+                        : null}
+                </div>
+              )}
 
               <div className="qd-acts">
-                {!unreleased && (
+                {!unreleased && !theatrical && (
                   <button type="button" className="btn play sm" onClick={() => watchNow()}>
-                    <Icon name="play" size={14} /> Play now
+                    <Icon name="play" size={14} />{" "}
+                    {tracking.kind === "new-episode"
+                      ? `Play E${startE ?? 1}`
+                      : matchedProgress && !matchedProgress.caughtUp && matchedProgress.position > 15
+                        ? film ? "Resume" : `Resume S${startS ?? 1}·E${startE ?? 1}`
+                        : "Play now"}
                   </button>
                 )}
                 {req && (
                   <DownloadMenu
                     req={req}
                     detail={d}
+                    size="sm"
                     what={film ? "this film" : `S${startS ?? 1} E${startE ?? 1}`}
                   />
                 )}
                 <button type="button" className="btn glass sm" onClick={openMonograph}>
-                  Full dossier <Icon name="arrowR" size={14} />
+                  Details <Icon name="arrowR" size={14} />
                 </button>
                 {isYouTubeId(d.trailerYouTubeId) && (
                   <button type="button" className="btn glass sm icon" onClick={() => setTrailerOpen(true)} title="Watch trailer" aria-label="Watch trailer">

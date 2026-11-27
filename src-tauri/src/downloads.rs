@@ -3216,13 +3216,15 @@ impl DownloadManager {
                     }
 
                     if let Some(stop) = post_stop {
-                        let _ = std::fs::remove_file(&final_path);
+                        if !matches!(stop, JobStop::Paused) {
+                            let _ = std::fs::remove_file(&final_path);
+                        }
                         match stop {
                             JobStop::Paused => {
                                 if !sig.resume_requested.load(Ordering::Relaxed) {
                                     self.update_job(&job.id, true, |j| {
                                         j.status = DownloadStatus::Paused;
-                                        j.stage = Some("Paused".into());
+                                        j.stage = Some("Paused (awaiting finish)".into());
                                         j.speed_bps = 0;
                                         j.eta_sec = None;
                                     });
@@ -3321,6 +3323,17 @@ impl DownloadManager {
                         }
                     }
                     if let Some(stop) = mux_stop {
+                        if matches!(stop, JobStop::Paused) {
+                            if !sig.resume_requested.load(Ordering::Relaxed) {
+                                self.update_job(&job.id, true, |j| {
+                                    j.status = DownloadStatus::Paused;
+                                    j.stage = Some("Paused (awaiting subtitle mux)".into());
+                                    j.speed_bps = 0;
+                                    j.eta_sec = None;
+                                });
+                            }
+                            break;
+                        }
                         let _ = std::fs::remove_file(&final_path);
                         for s in &subtitle_paths {
                             let _ = std::fs::remove_file(s);

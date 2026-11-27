@@ -73,9 +73,9 @@ export function tonesFrom(h1: number, c1: number, h2 = (h1 + 40) % 360, c2 = c1)
   const soft = clamp(c2 * 1.2, 0.045, 0.16);
   if (isLightTheme(resolveTheme(getSettings().theme))) {
     return {
-      tone: oklch(0.54, vivid, h1),
-      ink: oklch(0.42, Math.min(vivid, 0.17), h1),
-      deep: oklch(0.92, Math.min(vivid, 0.045), h1),
+      tone: oklch(0.49, vivid, h1),
+      ink: oklch(0.36, Math.min(vivid, 0.17), h1),
+      deep: oklch(0.91, Math.min(vivid, 0.045), h1),
       l1: oklch(0.75, Math.min(vivid, 0.11), h1),
       l2: oklch(0.79, Math.min(soft, 0.095), h2),
     };
@@ -184,6 +184,7 @@ function artOf(m: Media | undefined) {
 }
 function paintArt(src: string | undefined) {
   if (typeof document === "undefined") return;
+  if (prefersReducedMotion()) src = undefined;
   if (src === artSrc) return;
   artSrc = src;
   const t = ++artToken;
@@ -217,6 +218,9 @@ function remember(src: string | undefined, tones: Tones) {
   }
 }
 const dynamicEnabled = () => getSettings().dynamicLight !== false;
+const prefersReducedMotion = () =>
+  getSettings().reduceMotion ||
+  (typeof window !== "undefined" && !!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches);
 
 function setRootTones(t: Tones) {
   const r = document.documentElement.style;
@@ -318,7 +322,7 @@ export function setStageLight(m: Media | undefined) {
  */
 let hoverTimer: ReturnType<typeof setTimeout> | undefined;
 export function previewLight(m: Media | null) {
-  if (!dynamicEnabled()) return;
+  if (!dynamicEnabled() || prefersReducedMotion()) return;
   clearTimeout(hoverTimer);
   hoverTimer = setTimeout(
     () => {

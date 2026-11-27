@@ -14,12 +14,12 @@ export function useModalFocusTrap(active: boolean, containerRef: RefObject<HTMLE
     if (!container) return;
 
     const opener = document.activeElement as HTMLElement | null;
-    const body = document.body;
-    const prevOverflow = body.style.overflow;
-    const prevPad = body.style.paddingRight;
-    const gap = window.innerWidth - document.documentElement.clientWidth;
-    body.style.overflow = "hidden";
-    if (gap > 0) body.style.paddingRight = `${gap}px`;
+    const scroller = document.querySelector<HTMLElement>(".main") ?? document.body;
+    const prevOverflow = scroller.style.overflow;
+    const prevPad = scroller.style.paddingRight;
+    const gap = Math.max(0, scroller.offsetWidth - scroller.clientWidth);
+    scroller.style.overflow = "hidden";
+    if (gap > 0) scroller.style.paddingRight = `${gap}px`;
 
     const focusables = () =>
       Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
@@ -63,8 +63,8 @@ export function useModalFocusTrap(active: boolean, containerRef: RefObject<HTMLE
     return () => {
       window.removeEventListener("keydown", onKey, true);
       document.removeEventListener("focusin", onFocusIn);
-      body.style.overflow = prevOverflow;
-      body.style.paddingRight = prevPad;
+      scroller.style.overflow = prevOverflow;
+      scroller.style.paddingRight = prevPad;
       opener?.focus?.({ preventScroll: true });
     };
   }, [active, containerRef]);

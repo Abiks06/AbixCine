@@ -4,6 +4,7 @@
  */
 import { useEffect, useRef, useState, type MutableRefObject, type RefObject } from "react";
 import { TrickplayEngine } from "../../lib/trickplay";
+import { playbackUrl } from "../../sources/native";
 import type { StreamCandidate } from "../../sources/types";
 import { useHover, type createHoverStore } from "../Playhead";
 
@@ -34,8 +35,8 @@ export function useTrickplay(opts: {
     if (!c || !v || isEmbed || /^magnet:/i.test(c.url)) return;
     const kind = c.kind === "hls" ? "hls" : c.kind === "file" ? "file" : null;
     if (!kind) return;
-    // Files play from what the player actually loaded (a converted copy, a torrent's local URL).
-    const src = kind === "file" ? v.currentSrc || c.url : c.url;
+    // Files play from what the player actually loaded; HLS flows through the loopback gateway to avoid buffered IPC stalls.
+    const src = kind === "file" ? v.currentSrc || c.url : playbackUrl(c.url);
     if (!src) return;
     let live = true;
     const t = window.setTimeout(() => {

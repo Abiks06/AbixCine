@@ -9,8 +9,15 @@ export function Splash({ skip }: { skip: boolean }) {
   const [gone, setGone] = useState(skip);
   useEffect(() => {
     if (skip) return;
-    const t = setTimeout(() => setGone(true), 1800);
-    return () => clearTimeout(t);
+    const dismiss = () => setGone(true);
+    const t = setTimeout(dismiss, 750);
+    window.addEventListener("pointerdown", dismiss, { once: true });
+    window.addEventListener("keydown", dismiss, { once: true });
+    return () => {
+      clearTimeout(t);
+      window.removeEventListener("pointerdown", dismiss);
+      window.removeEventListener("keydown", dismiss);
+    };
   }, [skip]);
   if (gone) return null;
   return (

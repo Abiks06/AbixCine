@@ -1,5 +1,7 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { closeHoverPreviewNow } from "../lib/hoverPreview";
 import { rankMoves, type Move } from "../lib/ranks";
+import { getSettings } from "../lib/settings";
 import type { Media } from "../lib/types";
 import { Card, CardSkeleton, type CardVariant } from "./Card";
 import { Icon } from "./Icon";
@@ -52,6 +54,7 @@ export const Row = memo(function Row({
     setEdges((e) => (e.left === left && e.right === rightEdge ? e : { left, right: rightEdge }));
   };
   const update = () => {
+    closeHoverPreviewNow();
     if (frame.current) return;
     frame.current = requestAnimationFrame(() => {
       frame.current = 0;
@@ -70,7 +73,9 @@ export const Row = memo(function Row({
   }, [items, loading]);
 
   const page = (dir: 1 | -1) => {
-    ref.current?.scrollBy({ left: dir * ref.current.clientWidth * 0.82, behavior: "smooth" });
+    closeHoverPreviewNow();
+    const reduce = getSettings().reduceMotion || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    ref.current?.scrollBy({ left: dir * ref.current.clientWidth * 0.82, behavior: reduce ? "auto" : "smooth" });
   };
 
   if (!loading && !children && !items?.length) return null;

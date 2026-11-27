@@ -49,14 +49,13 @@ export const downloadsProvider: SourceProvider = {
           entry.audio === "sub" || entry.audio === "dub" || entry.audio === "dual"
             ? entry.audio
             : undefined;
-        const container = (entry.container ?? "").toLowerCase();
         return buildLocalStreamCandidate(fakeFile, {
           providerId: "downloads",
           providerName: "Downloaded",
           quality: entry.quality,
           audio,
           signal,
-          skipSubtitleProbe: container === "mp4",
+          skipSubtitleProbe: /\.mp4$/i.test(entry.filePath) && entry.subtitlePaths.length > 0,
           localWebReady: Boolean(entry.webReady),
         });
       }),

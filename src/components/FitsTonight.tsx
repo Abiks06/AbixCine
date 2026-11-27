@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { encodeKey, getDetail, isUnreleasedMedia } from "../lib/catalog";
 import { openDossier, registerMedia } from "../lib/dossier";
@@ -45,8 +45,9 @@ export function FitsTonight({ pool, loading }: { pool: Media[]; loading?: boolea
   const opts = useMemo(() => cutoffs(now), [now.getHours() * 60 + now.getMinutes()]); // eslint-disable-line react-hooks/exhaustive-deps
   const [sel, setSel] = useState(0);
   const [runtimes, setRuntimes] = useState<Record<string, number>>({});
+  const runtimeCache = useRef<Map<string, number>>(new Map());
   const [settled, setSettled] = useState("");
-  const keys = pool.map((m) => m.key).join("|");
+  const keys = pool.slice(0, 18).map((m) => m.key).join("|");
 
   useEffect(() => {
     const t = setInterval(() => setNow(new Date()), 60_000);
@@ -55,39 +56,52 @@ export function FitsTonight({ pool, loading }: { pool: Media[]; loading?: boolea
 
   useEffect(() => {
     let live = true;
-    let batch: Record<string, number> = {};
-    let flushTimer: ReturnType<typeof setTimeout> | undefined;
-    const flush = () => {
-      flushTimer = undefined;
-      if (!live || !Object.keys(batch).length) return;
-      const found = batch;
-      batch = {};
-      setRuntimes((r) => ({ ...r, ...found }));
-    };
-    const jobs = pool.slice(0, 18).map((m) =>
-      getDetail(m.key)
-        .then((d) => {
-          if (!live || !d.runtime || isUnreleasedMedia(d)) return;
+    const toFetch: Media[] = [];
+    const immediate: Record<string, number> = {};
+    for (const m of pool.slice(0, 18)) {
+      const hit = runtimeCache.current.get(m.key);
+      if (hit != null) immediate[m.key] = hit;
+      else if (m.runtime && m.runtime > 0 && !isUnreleasedMedia(m)) {
+        runtimeCache.current.set(m.key, m.runtime);
+        immediate[m.key] = m.runtime;
+      } else {
+        toFetch.push(m);
+      }
+    }
+    if (Object.keys(immediate).length) {
+      setRuntimes((r) => ({ ...r, ...immediate }));
+    }
+    if (!toFetch.length) {
+      setSettled(keys);
+      return;
+    }
+
+    let cursor = 0;
+    const CONCURRENCY = 4;
+    const worker = async () => {
+      while (live && cursor < toFetch.length) {
+        const m = toFetch[cursor++];
+        try {
+          const d = await getDetail(m.key);
+          if (!live || !d.runtime || isUnreleasedMedia(d)) continue;
           if (!isFilm(d)) {
             const hasAired =
               [...(d.seasons ?? []), ...(d.specials ?? [])].some((s) => s.episodeCount > 0 && s.status !== "upcoming") ||
               ((d.episodeCount ?? 0) > 0 && !isUnreleasedMedia(d));
-            if (!hasAired) return;
+            if (!hasAired) continue;
           }
-          batch[m.key] = d.runtime;
-          flushTimer ??= setTimeout(flush, 150);
-        })
-        .catch(() => {}),
-    );
-    void Promise.allSettled(jobs).then(() => {
-      if (!live) return;
-      clearTimeout(flushTimer);
-      flush();
-      setSettled(keys);
+          runtimeCache.current.set(m.key, d.runtime);
+          setRuntimes((r) => (r[m.key] === d.runtime ? r : { ...r, [m.key]: d.runtime! }));
+        } catch {
+          /* ignore */
+        }
+      }
+    };
+    void Promise.all(Array.from({ length: Math.min(CONCURRENCY, toFetch.length) }, worker)).then(() => {
+      if (live) setSettled(keys);
     });
     return () => {
       live = false;
-      clearTimeout(flushTimer);
     };
   }, [keys]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -167,7 +181,7 @@ export function FitsTonight({ pool, loading }: { pool: Media[]; loading?: boolea
                   </div>
                   <strong className="tt-title">{m.title}</strong>
                   <div className="tt-bar" title={`Runs ${fmtRuntime(rt)}`}>
-                    <i style={{ width: `${spanPct}%` }} />
+                    <i style={{ transform: `scaleX(${spanPct / 100})` }} />
                   </div>
                 </div>
               </Link>

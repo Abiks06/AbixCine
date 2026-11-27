@@ -7,7 +7,7 @@ import { getSettings } from "./settings";
  */
 const MAGNETS = ":is(.hero, .tp-top) .btn.play:not(:disabled), .cc-btn.main";
 const GLASS =
-  ".hero-plinth, .topbar-search, .topbar-theme, .topbar-dl, .search-box, .btn.glass, .btn-glass, .hero-next, .palette, .theme-popover, .dl-queue-pop, .dl-pop, .dl-modal, .qd-drawer, .auth-card, .smart, .tp-telemetry-card, .nw-spotlight, .lp-card, .spread-lead, .reel-lead, .filmreel, .panel, .dlv-card, .dlv-setup, .dlv-queue, .ep-season-prog, .top-hit, .pbot, .psheet, .hover-preview";
+  ".topbar-search, .topbar-theme, .topbar-dl, .search-box, .btn.glass, .btn-glass, .hero-next, .palette, .theme-popover, .dl-queue-pop, .dl-pop, .dl-modal, .qd-drawer, .tp-telemetry-card, .nw-spotlight, .lp-card, .spread-lead, .reel-lead, .top-hit, .pbot, .psheet, .hover-preview";
 const MAGNET_PX = 4;
 
 export function installPointerLight() {
@@ -51,6 +51,11 @@ export function installPointerLight() {
       return;
     }
     const target = e.target as Element | null;
+    if (target?.closest?.(".player.idle")) {
+      unmag();
+      unglass();
+      return;
+    }
 
     const m = target?.closest?.<HTMLElement>(MAGNETS) ?? null;
     if (m !== mag) unmag();

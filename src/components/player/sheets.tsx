@@ -4,8 +4,10 @@
  */
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { isUnairedEpisode } from "../../lib/catalog";
+import { fmtAirBadge } from "../../lib/format";
 import { UP_NEXT_AT } from "../../lib/playerControls";
-import type { Episode } from "../../lib/types";
+import { getEpisodeProgress, getResumePosition, isEpisodeWatched, useProgressStore } from "../../lib/progress";
+import type { Episode, Media } from "../../lib/types";
 import type { SessionSnapshot } from "../../sources/session";
 import type { StreamCandidate } from "../../sources/types";
 import { Icon } from "../Icon";
@@ -78,6 +80,7 @@ export const ServerSheet = memo(function ServerSheet({
 const PAGE = 50;
 
 export const EpisodeSheet = memo(function EpisodeSheet({ nav, onPick }: { nav: EpisodeNav; onPick: (s: number | undefined, e: number) => void }) {
+  useProgressStore();
   const validSeasons = useMemo(() => (nav.seasons ?? []).filter((s) => s.episodeCount > 0), [nav.seasons]);
   const initialSeason = useMemo(() => {
     if (!validSeasons.length) return nav.season;
@@ -88,6 +91,7 @@ export const EpisodeSheet = memo(function EpisodeSheet({ nav, onPick }: { nav: E
   const [season, setSeason] = useState(initialSeason);
   const [eps, setEps] = useState<Episode[] | null>(null);
   const curRef = useRef<HTMLButtonElement>(null);
+  const scrolledSeasonRef = useRef<number | undefined>(undefined);
   const total = nav.count ?? 0;
   const safeNavEp = Number.isFinite(nav.episode) && nav.episode >= 1 ? Math.floor(nav.episode) : 1;
   // Long-running anime (1000+ episodes) is paged in blocks of 50 around the current one.
@@ -112,8 +116,11 @@ export const EpisodeSheet = memo(function EpisodeSheet({ nav, onPick }: { nav: E
     };
   }, [season, nav.loadSeason]);
   useEffect(() => {
-    curRef.current?.scrollIntoView({ block: "center" });
-  }, [eps, page]);
+    if (scrolledSeasonRef.current === season) return;
+    if (!curRef.current) return;
+    scrolledSeasonRef.current = season;
+    curRef.current.scrollIntoView({ block: "center" });
+  }, [eps, season]);
 
   const fullList: Episode[] =
     season != null
@@ -157,12 +164,17 @@ export const EpisodeSheet = memo(function EpisodeSheet({ nav, onPick }: { nav: E
           const isCur = e.number === safeNavEp && (season ?? undefined) === nav.season;
           const unaired = isUnairedEpisode(e);
           const still = e.still ?? nav.fallbackStill;
+          const epProg = nav.mediaKey ? getEpisodeProgress(nav.mediaKey, season, e.number, nav.aliasKeys) : undefined;
+          const watched = nav.mediaKey ? isEpisodeWatched(nav.mediaKey, season, e.number, nav.aliasKeys) : false;
+          const resumeSec = nav.mediaKey && !isCur ? getResumePosition(nav.mediaKey, season, e.number, nav.aliasKeys) : undefined;
+          const leftMin = resumeSec != null && epProg && epProg.duration > 0 ? Math.max(1, Math.round((epProg.duration - resumeSec) / 60)) : null;
+          const barPct = epProg && epProg.duration > 0 ? (watched ? 100 : Math.min(99, Math.max(4, Math.round((epProg.position / epProg.duration) * 100)))) : 0;
           return (
             <button
               key={e.number}
               ref={isCur ? curRef : undefined}
               disabled={unaired}
-              className={`ep-row ${isCur ? "cur" : ""} ${unaired ? "unaired" : ""}`}
+              className={`ep-row ${isCur ? "cur" : ""} ${watched ? "seen" : ""} ${unaired ? "unaired" : ""}`}
               style={{ ["--i" as any]: Math.min(i, 10) }}
               title={unaired ? `Not aired yet${e.airDate ? ` (${e.airDate})` : ""}` : undefined}
               onClick={() => !isCur && !unaired && onPick(season, e.number)}
@@ -171,14 +183,30 @@ export const EpisodeSheet = memo(function EpisodeSheet({ nav, onPick }: { nav: E
                 {still ? <img src={still} alt="" loading="lazy" /> : null}
                 <b>{e.number}</b>
                 {isCur && <span className="eq small" aria-label="Playing"><i /><i /><i /><i /></span>}
+                {!isCur && watched && <span className="ep-seen" aria-label="Watched"><Icon name="check" size={11} /></span>}
+                {barPct > 0 && !isCur && <span className="ep-prog" aria-hidden><i style={{ transform: `scaleX(${barPct / 100})` }} /></span>}
               </span>
               <span className="ep-tx">
-                <span className="ep-t">{e.title}{unaired ? " · Upcoming" : ""}</span>
+                <span className="ep-t">
+                  {e.title}
+                  {unaired ? " · Upcoming" : watched && !isCur ? " · Watched" : leftMin != null ? ` · ${leftMin}m left` : ""}
+                </span>
                 <span className="ep-d">{unaired && e.airDate ? `Airs ${e.airDate}` : [e.runtime ? `${e.runtime}m` : null, e.overview].filter(Boolean).join(" · ")}</span>
               </span>
             </button>
           );
         })}
+        {nav.nextAiring && (season == null || nav.nextAiring.season == null || nav.nextAiring.season === season) && (
+          <div className="ep-row unaired ep-airing-row" aria-disabled="true">
+            <span className="ep-th">
+              <b>{nav.nextAiring.episode}</b>
+            </span>
+            <span className="ep-tx">
+              <span className="ep-t">{nav.nextAiring.title || `Episode ${nav.nextAiring.episode}`} · Coming next</span>
+              <span className="ep-d">Airs {fmtAirBadge(nav.nextAiring)}</span>
+            </span>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -202,6 +230,39 @@ export function UpNext({ label, still, seconds, auto, onPlay, onDismiss }: { lab
         <strong>{label}</strong>
         <div className="un-acts">
           <button className="btn play sm" onClick={onPlay}>Play now</button>
+          <button className="btn glass sm" onClick={onDismiss}>Keep watching</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ caught up */
+
+export function CaughtUpCard({
+  nextAiring,
+  still,
+  onBackToShow,
+  onDismiss,
+}: {
+  nextAiring?: Media["nextAiring"];
+  still?: string;
+  onBackToShow: () => void;
+  onDismiss: () => void;
+}) {
+  const airLine = nextAiring ? `Next ${fmtAirBadge(nextAiring)}` : "Waiting for the next episode";
+  return (
+    <div className="upnext caught-up" onClick={(e) => e.stopPropagation()}>
+      <div className="un-th" style={still ? { backgroundImage: `url(${still})` } : undefined}>
+        <span className="un-play" aria-hidden>
+          <Icon name={nextAiring ? "clock" : "check"} size={18} />
+        </span>
+      </div>
+      <div className="un-tx">
+        <small>You're caught up</small>
+        <strong>{airLine}</strong>
+        <div className="un-acts">
+          <button className="btn play sm" onClick={onBackToShow}>Back to show</button>
           <button className="btn glass sm" onClick={onDismiss}>Keep watching</button>
         </div>
       </div>

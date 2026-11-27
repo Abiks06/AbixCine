@@ -85,16 +85,23 @@ export function useSubtitles(ctx: SubtitlesContext) {
   const epNumber = episode ?? episodes?.episode;
   const epRef = useRef<{ season?: number; episode?: number }>({});
   epRef.current = { season: epSeason ?? undefined, episode: epNumber ?? undefined };
-  const subMemoryKey = useMemo(() => {
-    const base =
+  const showMemoryKey = useMemo(
+    () =>
+      media?.canonicalKey ||
       media?.key ||
       (media?.tmdbId ? `tmdb:${media.kind ?? "media"}:${media.tmdbId}` : "") ||
       (media?.imdbId ? `imdb:${media.imdbId}` : "") ||
       cur?.localPath ||
-      title;
-    if (!base) return "";
-    return epNumber != null ? `${base}:s${epSeason ?? 0}e${epNumber}` : base;
-  }, [media?.key, media?.tmdbId, media?.imdbId, media?.kind, cur?.localPath, title, epSeason, epNumber]);
+      title ||
+      "",
+    [media?.canonicalKey, media?.key, media?.tmdbId, media?.imdbId, media?.kind, cur?.localPath, title],
+  );
+  const subMemoryKey = useMemo(() => {
+    if (!showMemoryKey) return "";
+    return epNumber != null ? `${showMemoryKey}:s${epSeason ?? 0}e${epNumber}` : showMemoryKey;
+  }, [showMemoryKey, epSeason, epNumber]);
+  const showMemoryKeyRef = useRef(showMemoryKey);
+  showMemoryKeyRef.current = showMemoryKey;
   const subMemoryKeyRef = useRef(subMemoryKey);
   subMemoryKeyRef.current = subMemoryKey;
 
@@ -109,6 +116,12 @@ export function useSubtitles(ctx: SubtitlesContext) {
     const key = subMemoryKeyRef.current;
     if (!key) return;
     saveSubTrackMemory(key, entry);
+    // Persist language / track selection / enabled toggle show-wide so moving S1E3 -> S1E4 keeps your subtitle choice.
+    const showKey = showMemoryKeyRef.current;
+    if (showKey && showKey !== key) {
+      const { offsetSec: _o, secondaryOffsetSec: _so, ...showEntry } = entry;
+      if (Object.keys(showEntry).length > 0) saveSubTrackMemory(showKey, showEntry);
+    }
   }, []);
 
   const dragDepthRef = useRef(0);
@@ -498,7 +511,16 @@ export function useSubtitles(ctx: SubtitlesContext) {
     if (manualSub.current) return;
 
     const p = prefRef.current;
-    const mem = subMemoryKey ? loadSubTrackMemory(subMemoryKey) : null;
+    const epMem = subMemoryKey ? loadSubTrackMemory(subMemoryKey) : null;
+    const showMem = showMemoryKey && showMemoryKey !== subMemoryKey ? loadSubTrackMemory(showMemoryKey) : null;
+    const mem = epMem ?? showMem
+      ? {
+          enabled: epMem?.enabled ?? showMem?.enabled,
+          selectedLabel: epMem?.selectedLabel ?? showMem?.selectedLabel,
+          selectedLang: epMem?.selectedLang ?? showMem?.selectedLang,
+          secondaryLang: epMem?.secondaryLang ?? showMem?.secondaryLang,
+        }
+      : null;
     const wantOn =
       mem?.enabled !== undefined
         ? mem.enabled

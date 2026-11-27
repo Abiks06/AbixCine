@@ -52,18 +52,18 @@ export function TrailerModal({ id, title, onClose }: { id: string; title?: strin
   // Scroll lock, background hush, focus in and back out.
   useEffect(() => {
     const opener = document.activeElement as HTMLElement | null;
-    const body = document.body;
-    const prevOverflow = body.style.overflow;
-    const prevPad = body.style.paddingRight;
-    const gap = window.innerWidth - document.documentElement.clientWidth;
-    body.style.overflow = "hidden";
-    if (gap > 0) body.style.paddingRight = `${gap}px`;
+    const scroller = document.querySelector<HTMLElement>(".main") ?? document.body;
+    const prevOverflow = scroller.style.overflow;
+    const prevPad = scroller.style.paddingRight;
+    const gap = Math.max(0, scroller.offsetWidth - scroller.clientWidth);
+    scroller.style.overflow = "hidden";
+    if (gap > 0) scroller.style.paddingRight = `${gap}px`;
     const resume = hushBackground();
     closeBtn.current?.focus({ preventScroll: true });
     return () => {
       window.clearTimeout(timer.current);
-      body.style.overflow = prevOverflow;
-      body.style.paddingRight = prevPad;
+      scroller.style.overflow = prevOverflow;
+      scroller.style.paddingRight = prevPad;
       resume();
       opener?.focus?.({ preventScroll: true });
     };

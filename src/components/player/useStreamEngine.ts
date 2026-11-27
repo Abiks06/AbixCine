@@ -873,14 +873,24 @@ export function useStreamEngine(ctx: StreamEngineContext) {
             .then((list) => {
               if (cancelled || list.length < 2) return;
               localAudioModeRef.current = true;
-              setAudioTracks(
-                list.map((a) => {
-                  const ch = a.channels === 6 ? " 5.1" : a.channels === 8 ? " 7.1" : a.channels === 1 ? " mono" : "";
-                  const base = a.title || (a.language ? langLabel(a.language) : `Track ${a.index + 1}`);
-                  return { id: a.index, label: `${base}${ch}`, lang: a.language ?? "und" };
-                }),
-              );
-              setSelectedAudioTrack(audioIndex ?? Math.max(0, list.findIndex((a) => a.isDefault)));
+              const formatted = list.map((a) => {
+                const ch = a.channels === 6 ? " 5.1" : a.channels === 8 ? " 7.1" : a.channels === 1 ? " mono" : "";
+                const base = a.title || (a.language ? langLabel(a.language) : `Track ${a.index + 1}`);
+                return { id: a.index, label: `${base}${ch}`, lang: a.language ?? "und" };
+              });
+              setAudioTracks(formatted);
+              const defIdx = Math.max(0, list.findIndex((a) => a.isDefault));
+              setSelectedAudioTrack(audioIndex ?? defIdx);
+              if (audioIndex == null && !manualAudio.current && audio) {
+                const preferredIdx = preferredAudioTrackIndex(
+                  formatted.map((t) => ({ name: t.label, lang: t.lang })),
+                  audio,
+                  originalLanguage,
+                );
+                if (preferredIdx >= 0 && formatted[preferredIdx] && formatted[preferredIdx].id !== defIdx) {
+                  chooseAudioTrack(formatted[preferredIdx].id);
+                }
+              }
             })
             .catch(() => {});
         };
@@ -1001,6 +1011,9 @@ export function useStreamEngine(ctx: StreamEngineContext) {
     attachStream(c);
     return () => {
       cancelled = true;
+      if (c.localPath && isTauri()) {
+        void invoke("cancel_local_prepare").catch(() => {});
+      }
       unlistenProgress?.();
       unlistenProgress = null;
       localDirectPathRef.current = null;

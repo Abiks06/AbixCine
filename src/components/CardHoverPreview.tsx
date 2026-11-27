@@ -6,7 +6,9 @@ import { burst } from "../lib/burst";
 import { encodeKey, isUnreleasedMedia } from "../lib/catalog";
 import { openDossier } from "../lib/dossier";
 import { useOfflineCountForMedia } from "../lib/downloads";
-import { fmtRuntime, languageName } from "../lib/format";
+import { fmtAirBadge, fmtRuntime, languageName } from "../lib/format";
+import { getTrackingState, useAiringFor, useNowMinute } from "../lib/airing";
+import { useProgressStore } from "../lib/progress";
 import {
   cancelHoverPreview,
   closeHoverPreviewNow,
@@ -25,17 +27,6 @@ import { Icon } from "./Icon";
 function fmtFinishClock(runtimeMin: number): string {
   const finish = new Date(Date.now() + runtimeMin * 60_000);
   return finish.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false });
-}
-
-function fmtNextAir(next?: Media["nextAiring"]): string | null {
-  if (!next) return null;
-  const diff = next.at - Date.now();
-  if (diff <= 0) return `Ep ${next.episode} out now`;
-  const hours = Math.round(diff / 3_600_000);
-  if (hours < 24) return `Ep ${next.episode} in ${Math.max(1, hours)}h`;
-  const day = new Date(next.at).toLocaleDateString(undefined, { weekday: "short" });
-  const tm = new Date(next.at).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false });
-  return `Ep ${next.episode} · ${day} ${tm}`;
 }
 
 function PreviewCard({
@@ -85,7 +76,17 @@ function PreviewCard({
   const epRuntimeSpec = !film && d.runtime ? `${d.runtime}m/ep` : null;
   const endsAt = film && d.runtime && !unreleased ? fmtFinishClock(d.runtime) : null;
   const langSpec = d.originalLanguage ? languageName(d.originalLanguage) : null;
-  const airingText = fmtNextAir(d.nextAiring);
+  const progressMap = useProgressStore();
+  const snap = useAiringFor(canonicalKey) ?? useAiringFor(d.key);
+  const nowMs = useNowMinute();
+  const tracking = getTrackingState(d, progressMap[canonicalKey] ?? progressMap[d.key], snap, nowMs);
+  const nextAir = tracking.nextAiring ?? d.nextAiring;
+  const airingText =
+    tracking.kind === "new-episode" || tracking.kind === "caught-up"
+      ? tracking.badge ?? null
+      : nextAir
+        ? fmtAirBadge(nextAir, nowMs)
+        : null;
   const statusPill =
     airingText ??
     (unreleased

@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useLayoutEffect, useRef, useState } from "react";
 import type { Media } from "../lib/types";
 
 /** sm: thumbnails · md: shelf cards · lg: full-bleed stages (hero, title page, player). */
@@ -98,7 +98,7 @@ export const Art = memo(function Art({
     }
   };
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const img = imgRef.current;
     if (img && src && img.complete && img.naturalWidth > 0) {
       measureAndLoad(img, src);

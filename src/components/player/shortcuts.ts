@@ -30,6 +30,7 @@ export interface ShortcutContext {
   toggleFull: () => void;
   setFull: (on: boolean) => Promise<void>;
   togglePip: () => Promise<void>;
+  skipActive?: () => void;
   goNext: () => void;
   goInfo: () => void;
   leave: () => void;
@@ -129,6 +130,7 @@ export function handlePlayerKey(e: KeyboardEvent, ctx: ShortcutContext) {
     // The Windows fullscreen key, for people who reach for it out of habit.
     case "F11": e.preventDefault(); ctx.toggleFull(); break;
     case "p": void ctx.togglePip(); break;
+    case "x": ctx.skipActive?.(); break;
     case "n": ctx.goNext(); break;
     case "i": ctx.goInfo(); break;
     case "?": ctx.setKeysOpen((x) => !x); break;

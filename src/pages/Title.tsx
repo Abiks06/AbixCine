@@ -19,17 +19,10 @@ import {
   selectMissingEpisodes,
   useBatchDownloads,
 } from "../lib/batchDownload";
-import {
-  cancelAllDownloads,
-  computeSeasonDownloadProgress,
-  findDownloadedEpisode,
-  findOfflineDetail,
-  fmtSpeed,
-  pauseAllDownloads,
-  refreshDownloads,
-  resumeAllDownloads,
-  useDownloads,
-} from "../lib/downloads";
+import { cancelAllDownloads, computeSeasonDownloadProgress, findDownloadedEpisode, findOfflineDetail, fmtSpeed, pauseAllDownloads, refreshDownloads, resumeAllDownloads, useDownloadsForMedia } from "../lib/downloads";
+import { fmtAirBadge, fmtAgo, fmtDate, fmtMoney, fmtRuntime, languageName } from "../lib/format";
+import { getEpisodeProgress, getResumePosition, isEpisodeWatched, markEpisodeWatched, markSeasonWatched, restoreProgress, RESUME_MIN_SEC, useMatchedProgress, useProgressStore } from "../lib/progress";
+import { getTrackingState, useAiringRadar } from "../lib/airing";
 import { openExternal } from "../lib/external";
 import { useSourceSession } from "../sources/useSourceSession";
 import { isYouTubeId } from "../lib/trailer";
@@ -48,9 +41,7 @@ import {
   parseSeasonEpisodeParams,
   resolvePlaybackRequest,
 } from "../lib/catalog";
-import { fmtAgo, fmtDate, fmtMoney, fmtRuntime, languageName } from "../lib/format";
 import { useDownloadPrefs } from "../lib/downloadOverrides";
-import { getProgress, useMatchedProgress, useProgressStore } from "../lib/progress";
 import { audioFor, setAudioFor, useSettings } from "../lib/settings";
 import { toast } from "../lib/toast";
 import { isFilm, type CanonicalSeason, type Episode, type Media, type MediaDetail } from "../lib/types";
@@ -90,7 +81,7 @@ export function Title() {
   const loc = useLocation();
 
   useSettings();
-  const dl = useDownloads();
+  const dl = useDownloadsForMedia(key);
   const batch = useBatchDownloads();
   const desktop = isTauri();
 
@@ -118,7 +109,14 @@ export function Title() {
     return [...out];
   }, [d, key]);
   const latest = useMatchedProgress(progressKeys);
-  useProgressStore();
+  const progressStore = useProgressStore();
+  const canonicalKey = d?.canonicalKey ?? d?.key ?? key;
+  const radarList = useMemo(() => (d ? [d] : []), [d]);
+  const { airingMap, nowMs } = useAiringRadar(radarList);
+  const tracking = useMemo(
+    () => (d ? getTrackingState(d, latest, airingMap[canonicalKey] ?? airingMap[d.key], nowMs) : undefined),
+    [d, latest, airingMap, canonicalKey, nowMs, progressStore], // eslint-disable-line react-hooks/exhaustive-deps
+  );
 
   const matchedProgress = useMemo(() => {
     if (!d || !latest) return undefined;
@@ -197,7 +195,6 @@ export function Title() {
     setPage(Math.max(0, Math.floor((resumeEpisode - 1) / PAGE)));
   }, [key, season, resumeEpisode]);
 
-  const canonicalKey = d?.canonicalKey ?? d?.key ?? key;
   const dlPrefs = useDownloadPrefs(canonicalKey);
   const dlTargetQuality = dlPrefs.quality;
   const dlTargetFormat = dlPrefs.format;
@@ -286,10 +283,15 @@ export function Title() {
     validProgress && startE != null
       ? `${startS != null && (d.seasons?.length ?? 0) > 1 ? `S${startS} · ` : startS === 0 ? "Specials · " : ""}E${startE}`
       : "";
-  const playLabel = validProgress && hasPlayableEps
-    ? validProgress.upNext ? `Play ${epTag}` : epTag ? `Resume ${epTag}` : "Resume"
-    : validProgress && film && validProgress.position > 30 ? "Resume"
-    : hasPlayableEps ? "Play E1" : "Play";
+  const playLabel =
+    tracking?.kind === "new-episode" && tracking.nextPlay
+      ? `Play new E${tracking.nextPlay.episode}`
+      : tracking?.kind === "caught-up"
+        ? "Caught up · Rewatch latest"
+        : validProgress && hasPlayableEps
+          ? validProgress.upNext ? `Play ${epTag}` : epTag ? `Resume ${epTag}` : "Resume"
+          : validProgress && film && validProgress.position > RESUME_MIN_SEC ? "Resume"
+          : hasPlayableEps ? "Play E1" : "Play";
 
   const firstSeason = d.seasons?.[0];
   const mainlineCount = d.seasons?.length ?? 0;
@@ -452,8 +454,19 @@ export function Title() {
                 {d.digitalReleaseDate ? `In cinemas now · streaming from ${fmtDate(d.digitalReleaseDate)}` : "In cinemas now · no digital release announced yet"}
               </div>
             )}
-            {d.nextAiring && (
-              <div className="airing"><Icon name="clock" size={14} /> Episode {d.nextAiring.episode} airs {new Date(d.nextAiring.at).toLocaleString(undefined, { weekday: "long", hour: "numeric", minute: "2-digit" })}</div>
+            {(d.nextAiring || tracking?.kind === "caught-up" || tracking?.kind === "new-episode") && (
+              <div className={`airing ${tracking?.kind === "caught-up" ? "caught-up" : tracking?.kind === "new-episode" ? "new-ep" : ""}`}>
+                <Icon name={tracking?.kind === "caught-up" ? "check" : "clock"} size={14} />{" "}
+                {tracking?.kind === "new-episode"
+                  ? tracking.detail || tracking.badge
+                  : tracking?.kind === "caught-up"
+                    ? d.nextAiring
+                      ? `Caught up · Next ${fmtAirBadge(d.nextAiring, nowMs)}`
+                      : "You're caught up on all aired episodes"
+                    : d.nextAiring
+                      ? `Next ${fmtAirBadge(d.nextAiring, nowMs)}`
+                      : null}
+              </div>
             )}
 
             <div className="acts">
@@ -573,6 +586,34 @@ export function Title() {
                     <button className={view !== "grid" ? "on" : ""} aria-pressed={view !== "grid"} title="Editorial list" aria-label="Editorial list" onClick={() => chooseView("list")}><Icon name="rows" size={15} /></button>
                     <button className={view === "grid" ? "on" : ""} aria-pressed={view === "grid"} title="Compact grid" aria-label="Compact grid" onClick={() => chooseView("grid")}><Icon name="grid" size={15} /></button>
                   </div>
+                  {epList.length > 0 && (() => {
+                    const airedList = epList.filter((ep) => !isUnairedEpisode(ep, { airedCount, seriesStatus: d.status }));
+                    const allWatched = airedList.length > 0 && airedList.every((ep) => isEpisodeWatched(canonicalKey, season, ep.number, [d.key, ...progressKeys]));
+                    return (
+                      <button
+                        type="button"
+                        className={`chip ${allWatched ? "on" : ""}`}
+                        onClick={() => {
+                          const prevSnap = markSeasonWatched(
+                            { ...d, canonicalKey },
+                            season,
+                            airedList,
+                            !allWatched,
+                            progressKeys,
+                          );
+                          toast(`Season ${season} marked ${!allWatched ? "watched" : "unwatched"}`, {
+                            icon: "check",
+                            action: prevSnap
+                              ? { label: "Undo", run: () => restoreProgress(prevSnap) }
+                              : undefined,
+                          });
+                        }}
+                        title={allWatched ? `Mark Season ${season} unwatched` : `Mark all Season ${season} episodes watched`}
+                      >
+                        <Icon name="check" size={12} /> {allWatched ? `S${season} watched` : `Mark S${season} watched`}
+                      </button>
+                    );
+                  })()}
                   {desktop && epList.length > 0 && (
                     <>
                       <DownloadPrefsPill />
@@ -855,10 +896,12 @@ export function Title() {
                       }
                       const pKey = e.sourceKey ?? d.key;
                       const pEp = e.courEpisode ?? e.number;
-                      const p = getProgress(canonicalKey, season, e.number, [d.key, pKey]) ?? getProgress(pKey, undefined, pEp);
+                      const aliasList = [d.key, pKey, ...progressKeys];
+                      const epProg = getEpisodeProgress(canonicalKey, season, e.number, aliasList) ?? getEpisodeProgress(pKey, undefined, pEp, aliasList);
                       const isCur = upNext === e.number && (validProgress?.season ?? season) === season;
-                      const watched = !!p && p.duration > 0 && p.position / p.duration > 0.92;
-                      const left = p && p.duration > 0 && !watched ? Math.max(1, Math.round((p.duration - p.position) / 60)) : null;
+                      const watched = isEpisodeWatched(canonicalKey, season, e.number, aliasList) || isEpisodeWatched(pKey, undefined, pEp, aliasList);
+                      const resumeSec = getResumePosition(canonicalKey, season, e.number, aliasList) ?? getResumePosition(pKey, undefined, pEp, aliasList);
+                      const left = resumeSec != null && epProg && epProg.duration > 0 ? Math.max(1, Math.round((epProg.duration - resumeSec) / 60)) : null;
 
                       const epEntry = desktop ? findDownloadedEpisode(canonicalKey, season, e.number, audio, dl.items) : undefined;
                       const epJob = desktop
@@ -888,11 +931,12 @@ export function Title() {
                           <div className="ec-th">
                             {still && <img src={still} alt="" loading="lazy" decoding="async" className={e.still ? "" : "dim"} />}
                             <span className="ec-num">{e.number}</span>
-                            {isCur && <span className="ec-ribbon">{p && p.position > 30 ? "Resume" : "Up next"}</span>}
+                            {isCur && <span className="ec-ribbon">{resumeSec != null ? "Resume" : validProgress?.caughtUp ? "Caught up" : "Up next"}</span>}
+                            {!isCur && resumeSec != null && <span className="ec-ribbon">Resume</span>}
                             {watched && <span className="ec-seen" aria-label="Watched"><Icon name="check" size={12} /></span>}
                             {e.runtime ? <span className="ec-rt">{e.runtime}m</span> : null}
                             <span className="ec-play"><Icon name="play" size={18} /></span>
-                            {p && p.duration > 0 && !watched && <div className="ec-bar"><i style={{ transform: `scaleX(${Math.min(1, p.position / p.duration)})` }} /></div>}
+                            {epProg && epProg.duration > 0 && !watched && resumeSec != null && <div className="ec-bar"><i style={{ transform: `scaleX(${Math.min(1, epProg.position / epProg.duration)})` }} /></div>}
                             {(epBusy || epPaused) && epJob && (
                               <div className="ec-dl-bar" aria-hidden>
                                 <i style={{ transform: `scaleX(${Math.max(0.03, (epJob.percent || 0) / 100)})` }} />
@@ -901,29 +945,71 @@ export function Title() {
                           </div>
                           <div className="ec-tx">
                             <div className="ec-t">{e.title}</div>
-                            <div className="ec-d">{layout === "list" ? [left != null ? `${left}m left` : null, e.overview || fallback].filter(Boolean).join(" · ") : left != null ? `${left}m left` : e.overview || fallback}</div>
+                            <div className="ec-d">{layout === "list" ? [left != null ? `${left}m left` : watched ? "Watched" : null, e.overview || fallback].filter(Boolean).join(" · ") : left != null ? `${left}m left` : watched ? "Watched" : e.overview || fallback}</div>
                           </div>
                         </button>
                       );
 
-                      if (!desktop) return cardEl;
+                      const watchToggleBtn = (
+                        <button
+                          type="button"
+                          className={`ep-mark-btn ${watched ? "on" : ""}`}
+                          title={watched ? `Mark E${e.number} unwatched` : `Mark E${e.number} watched`}
+                          aria-label={watched ? `Mark E${e.number} unwatched` : `Mark E${e.number} watched`}
+                          onClick={(ev) => {
+                            ev.stopPropagation();
+                            const prevSnap = markEpisodeWatched(
+                              { ...d, canonicalKey },
+                              season,
+                              e.number,
+                              !watched,
+                              epProg?.duration || ((e.runtime ?? d.runtime ?? 24) * 60),
+                              aliasList,
+                            );
+                            toast(`S${season}·E${e.number} marked ${!watched ? "watched" : "unwatched"}`, {
+                              icon: "check",
+                              action: prevSnap ? { label: "Undo", run: () => restoreProgress(prevSnap) } : undefined,
+                            });
+                          }}
+                        >
+                          <Icon name="check" size={12} />
+                        </button>
+                      );
 
                       return (
                         <div key={e.number} className="ep-slot">
                           {cardEl}
-                          <EpisodeDownloadControl
-                            detail={d}
-                            season={season}
-                            ep={e}
-                            audio={audio}
-                            entry={epEntry}
-                            job={epJob}
-                            resolving={epResolving}
-                            onPlayOffline={() => watch(season, e.number, "downloads")}
-                          />
+                          <div className="ep-slot-acts">
+                            {watchToggleBtn}
+                            {desktop && (
+                              <EpisodeDownloadControl
+                                detail={d}
+                                season={season}
+                                ep={e}
+                                audio={audio}
+                                entry={epEntry}
+                                job={epJob}
+                                resolving={epResolving}
+                                onPlayOffline={() => watch(season, e.number, "downloads")}
+                              />
+                            )}
+                          </div>
                         </div>
                       );
                     })}
+                    {d.nextAiring && (d.nextAiring.season == null || d.nextAiring.season === season) && !shown.some((e) => e.number === d.nextAiring!.episode) && (
+                      <div className="ep-card unaired" aria-disabled="true">
+                        <div className="ec-th">
+                          {d.backdrop && <img src={sized(d.backdrop, "w780")} alt="" loading="lazy" decoding="async" className="dim" />}
+                          <span className="ec-num">{d.nextAiring.episode}</span>
+                          <span className="ec-ribbon muted">{fmtAirBadge(d.nextAiring, nowMs)}</span>
+                        </div>
+                        <div className="ec-tx">
+                          <div className="ec-t">{d.nextAiring.title || `Episode ${d.nextAiring.episode}`} · Coming next</div>
+                          <div className="ec-d">Airs {fmtAirBadge(d.nextAiring, nowMs)}</div>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 </>
               )}
@@ -1044,12 +1130,12 @@ export function Title() {
                         <div className="tp-roi-bars">
                           <div className="tp-roi-row">
                             <span>Budget</span>
-                            <div className="tp-roi-track"><i style={{ width: `${Math.max(8, Math.round((d.budget! / maxMoney) * 100))}%` }} /></div>
+                            <div className="tp-roi-track"><i style={{ transform: `scaleX(${Math.max(0.08, (d.budget! / maxMoney))})` }} /></div>
                             <b>{fmtMoney(d.budget)}</b>
                           </div>
                           <div className="tp-roi-row rev">
                             <span>Revenue</span>
-                            <div className="tp-roi-track"><i style={{ width: `${Math.max(8, Math.round((d.revenue! / maxMoney) * 100))}%` }} /></div>
+                            <div className="tp-roi-track"><i style={{ transform: `scaleX(${Math.max(0.08, (d.revenue! / maxMoney))})` }} /></div>
                             <b>{fmtMoney(d.revenue)}</b>
                           </div>
                         </div>
@@ -1216,7 +1302,7 @@ function Details({ d, anime }: { d: MediaDetail; anime: boolean }) {
     [
       "Next episode",
       ep(d.nextEpisode) ||
-        (d.nextAiring ? `E${d.nextAiring.episode} · ${new Date(d.nextAiring.at).toLocaleString(undefined, { weekday: "short", day: "numeric", month: "short", hour: "numeric", minute: "2-digit" })}` : ""),
+        (d.nextAiring ? fmtAirBadge(d.nextAiring) : ""),
     ],
     ["Status", d.status ? nice(d.status) : ""],
     ["Budget", fmtMoney(d.budget)],

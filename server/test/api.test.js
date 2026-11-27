@@ -279,3 +279,104 @@ test("batched writes apply in order and answer each one", async () => {
   assert.equal((await call("POST", "/sync/batch", { ops: "x" }, t)).statusCode, 400);
   assert.equal((await call("POST", "/sync/batch", { ops: [] })).statusCode, 401);
 });
+
+test("progress sync performs per-episode CRDT merge and persists caughtUp + full settings", async () => {
+  const t = tokens.accessToken;
+  const base = Date.now();
+  const media = {
+    key: "anilist:170942",
+    kind: "anime",
+    title: "Solo Leveling",
+    genres: ["Action"],
+    overview: "",
+    status: "RELEASING",
+    nextAiring: { episode: 5, at: base + 86_400_000 },
+  };
+
+  // Device A watches ep 3 to 410s at base - 2000
+  let r = await call(
+    "PUT",
+    "/progress/anilist:170942",
+    {
+      media,
+      episode: 3,
+      position: 410,
+      duration: 1440,
+      updatedAt: base - 2000,
+      episodes: {
+        "s0:e3": { episode: 3, position: 410, duration: 1440, updatedAt: base - 2000 },
+      },
+      schemaVersion: 2,
+    },
+    t,
+  );
+  assert.equal(r.statusCode, 200);
+
+  // Device B watches ep 4 and catches up at base - 1000, without sending ep 3
+  r = await call(
+    "PUT",
+    "/progress/anilist:170942",
+    {
+      media,
+      episode: 4,
+      position: 0,
+      duration: 1440,
+      caughtUp: true,
+      updatedAt: base - 1000,
+      episodes: {
+        "s0:e4": { episode: 4, position: 1440, duration: 1440, completed: true, updatedAt: base - 1000 },
+      },
+      schemaVersion: 2,
+    },
+    t,
+  );
+  assert.equal(r.statusCode, 200);
+
+  // Legacy v1 write (no `episodes` map) on ep 5 should still preserve s0:e3 and s0:e4
+  r = await call(
+    "PUT",
+    "/progress/anilist:170942",
+    {
+      media,
+      episode: 5,
+      position: 120,
+      duration: 1440,
+      updatedAt: base,
+    },
+    t,
+  );
+  assert.equal(r.statusCode, 200);
+
+  const synced = (await call("GET", "/sync", null, t)).json();
+  const row = synced.progress.find((p) => p.media.key === "anilist:170942");
+  assert.ok(row);
+  assert.equal(row.episode, 5);
+  assert.equal(row.position, 120);
+  assert.equal(row.episodes["s0:e3"]?.position, 410);
+  assert.equal(row.episodes["s0:e4"]?.completed, true);
+  assert.equal(row.episodes["s0:e5"]?.position, 120);
+
+  // Newly synced settings fields persist across /settings -> /sync
+  const sRes = await call(
+    "PUT",
+    "/settings",
+    {
+      downloadQuality: 1080,
+      downloadFormat: "mp4",
+      downloadQualityPolicy: "ask",
+      theme: "alabaster",
+      dynamicLight: false,
+      subtitlePref: { signLayout: "positioned", assMode: "native" },
+    },
+    t,
+  );
+  assert.equal(sRes.statusCode, 200);
+  const s = (await call("GET", "/sync", null, t)).json().settings;
+  assert.equal(s.downloadQuality, 1080);
+  assert.equal(s.downloadFormat, "mp4");
+  assert.equal(s.downloadQualityPolicy, "ask");
+  assert.equal(s.theme, "alabaster");
+  assert.equal(s.dynamicLight, false);
+  assert.equal(s.subtitlePref.signLayout, "positioned");
+  assert.equal(s.subtitlePref.assMode, "native");
+});

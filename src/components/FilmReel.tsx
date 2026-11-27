@@ -2,6 +2,7 @@ import { memo, type PointerEvent as ReactPointerEvent, type RefObject, useEffect
 import { Link, useNavigate } from "react-router-dom";
 import { encodeKey, isUnreleasedMedia } from "../lib/catalog";
 import { openDossier, registerMedia } from "../lib/dossier";
+import { fmtAirBadge } from "../lib/format";
 import { cancelHoverPreview, closeHoverPreviewNow, scheduleHoverPreview } from "../lib/hoverPreview";
 import { previewLight } from "../lib/light";
 import { playHref } from "../lib/play";
@@ -29,12 +30,7 @@ const SPEEDS = [0.75, 1, 1.6] as const;
 
 function fmtAiringChip(nextAiring?: Media["nextAiring"]) {
   if (!nextAiring) return null;
-  const diffMs = nextAiring.at - Date.now();
-  if (diffMs <= 0) return `EP ${nextAiring.episode} · OUT`;
-  const hours = Math.round(diffMs / 3_600_000);
-  if (hours < 24) return `EP ${nextAiring.episode} · ${Math.max(1, hours)}H`;
-  const day = new Date(nextAiring.at).toLocaleDateString(undefined, { weekday: "short" }).toUpperCase();
-  return `EP ${nextAiring.episode} · ${day}`;
+  return fmtAirBadge(nextAiring).toUpperCase();
 }
 
 function ReelSpool({ innerRef }: { innerRef: RefObject<SVGSVGElement> }) {
@@ -82,10 +78,10 @@ const ReelFrame = memo(function ReelFrame({
       className={`fr-frame card ${port ? "port" : ""}`}
       data-media-key={media.key}
       onPointerEnter={(e) => {
-        if (!clone && e.pointerType !== "touch") scheduleHoverPreview(media, frameRef.current);
+        if (e.pointerType !== "touch") scheduleHoverPreview(media, frameRef.current);
       }}
       onPointerLeave={(e) => {
-        if (!clone && e.pointerType !== "touch") cancelHoverPreview();
+        if (e.pointerType !== "touch") cancelHoverPreview();
       }}
     >
       <div className="fr-head">
