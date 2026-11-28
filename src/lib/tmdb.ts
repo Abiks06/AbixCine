@@ -3,7 +3,9 @@ import { cached, peekCache } from "./cache";
 import { api, getAuth, isWakingError, whenServerAwake } from "./account";
 import { isFutureIsoDate, normalizeEpisodes, normalizeTmdbSeasons, tmdbReleaseWindows, todayIso, type RawTmdbSeason } from "./normalizer";
 import { getSettings } from "./settings";
-import type { Episode, Media, MediaDetail } from "./types";
+import type { Episode, Media, MediaDetail, PersonCredit, PersonDetail } from "./types";
+
+export type { PersonCredit, PersonDetail };
 
 const API = "https://api.themoviedb.org/3";
 const IMG = "https://image.tmdb.org/t/p";
@@ -57,10 +59,10 @@ interface TmdbDetailPayload extends TmdbRawMedia {
   videos?: { results?: { site?: string; type?: string; official?: boolean; key?: string }[] };
   release_dates?: { results?: { iso_3166_1?: string; release_dates?: { certification?: string; type?: number; release_date?: string }[] }[] };
   content_ratings?: { results?: { iso_3166_1?: string; rating?: string }[] };
-  created_by?: { name?: string; profile_path?: string | null }[];
+  created_by?: { id?: number; name?: string; profile_path?: string | null }[];
   credits?: {
-    cast?: { name?: string; character?: string; profile_path?: string | null }[];
-    crew?: { name?: string; job?: string; profile_path?: string | null }[];
+    cast?: { id?: number; name?: string; character?: string; profile_path?: string | null }[];
+    crew?: { id?: number; name?: string; job?: string; profile_path?: string | null }[];
   };
   recommendations?: TmdbListResponse;
   similar?: TmdbListResponse;
@@ -82,7 +84,7 @@ interface TmdbDetailPayload extends TmdbRawMedia {
   external_ids?: { imdb_id?: string };
   homepage?: string;
   vote_count?: number;
-  belongs_to_collection?: { name?: string };
+  belongs_to_collection?: { id?: number; name?: string; poster_path?: string | null; backdrop_path?: string | null };
   number_of_episodes?: number;
 }
 
@@ -247,7 +249,7 @@ export async function tmdbDetail(key: string): Promise<MediaDetail> {
   const [, kind, id] = key.split(":") as [string, "movie" | "tv", string];
   if ((kind !== "movie" && kind !== "tv") || !id) throw new Error(`Invalid TMDB key: ${key}`);
 
-  return cached(`tmdb:detail:v5:${kind}:${id}`, 3 * HOUR, async () => {
+  return cached(`tmdb:detail:v6:${kind}:${id}`, 3 * HOUR, async () => {
     const extra = kind === "movie" ? "release_dates" : "content_ratings";
     const r = await get<TmdbDetailPayload>(`/${kind}/${id}`, {
       append_to_response: `videos,credits,recommendations,similar,images,external_ids,${extra}`,
@@ -264,7 +266,7 @@ export async function tmdbDetail(key: string): Promise<MediaDetail> {
         ? (["" + reg, "US"].map((c) => r.release_dates?.results?.find((x) => x.iso_3166_1 === c)?.release_dates?.find((d) => d.certification)?.certification).find(Boolean))
         : ([reg, "US"].map((c) => r.content_ratings?.results?.find((x) => x.iso_3166_1 === c)?.rating).find(Boolean));
     // Crew: one line per person, jobs merged ("Director, Writer"), ordered by importance.
-    const crewMap = new Map<string, { name: string; job: string; photo?: string; rank: number }>();
+    const crewMap = new Map<string, { id?: number; name: string; job: string; photo?: string; rank: number }>();
     const people = [
       ...(r.created_by ?? []).map((c) => ({ ...c, job: "Creator" })),
       ...(r.credits?.crew ?? []),
@@ -277,7 +279,8 @@ export async function tmdbDetail(key: string): Promise<MediaDetail> {
       if (cur) {
         if (!cur.job.split(", ").includes(c.job)) cur.job += `, ${c.job}`;
         cur.rank = Math.min(cur.rank, rank);
-      } else crewMap.set(c.name, { name: c.name, job: c.job, photo: img(c.profile_path, "w185"), rank });
+        if (cur.id == null && c.id != null) cur.id = c.id;
+      } else crewMap.set(c.name, { id: c.id, name: c.name, job: c.job, photo: img(c.profile_path, "w185"), rank });
     }
     const ep = (e?: TmdbEpisodeSummaryRaw) =>
       e && e.season_number != null && e.episode_number != null
@@ -326,8 +329,17 @@ export async function tmdbDetail(key: string): Promise<MediaDetail> {
       cast: (r.credits?.cast ?? [])
         .slice(0, 24)
         .filter((c): c is typeof c & { name: string } => Boolean(c.name))
-        .map((c) => ({ name: c.name, character: c.character, photo: img(c.profile_path, "w185") })),
-      crew: [...crewMap.values()].sort((a, b) => a.rank - b.rank).slice(0, 12).map(({ rank: _r, ...c }) => c),
+        .map((c) => ({
+          ...(c.id != null ? { id: c.id } : {}),
+          source: "tmdb" as const,
+          name: c.name,
+          character: c.character,
+          photo: img(c.profile_path, "w185"),
+        })),
+      crew: [...crewMap.values()]
+        .sort((a, b) => a.rank - b.rank)
+        .slice(0, 12)
+        .map(({ rank: _r, ...c }) => ({ ...c, source: "tmdb" as const })),
       related: (related.length ? related : list(r.similar?.results ?? [], kind)).slice(0, 18),
       releaseDate: r.release_date || r.first_air_date || undefined,
       ...(kind === "movie" ? releaseWindowFields(r.release_dates?.results) : {}),
@@ -343,6 +355,7 @@ export async function tmdbDetail(key: string): Promise<MediaDetail> {
       homepage: r.homepage || undefined,
       voteCount: r.vote_count,
       collection: r.belongs_to_collection?.name,
+      collectionId: r.belongs_to_collection?.id,
       lastEpisode,
       nextEpisode,
       ...(synthesizedNextAiring ? { nextAiring: synthesizedNextAiring } : {}),
@@ -384,5 +397,121 @@ export async function tmdbSeason(key: string, season: number): Promise<Episode[]
     });
   } catch {
     return [];
+  }
+}
+
+export interface TmdbCollection {
+  id: number;
+  name: string;
+  overview?: string;
+  backdrop?: string;
+  parts: Media[];
+}
+
+/** Fetch all films belonging to a TMDB collection (franchise / trilogy / saga) in chronological order. */
+export async function tmdbCollection(collectionId: number): Promise<TmdbCollection | null> {
+  if (!Number.isInteger(collectionId) || collectionId <= 0 || !hasTmdb()) return null;
+  try {
+    return await cached(`tmdb:collection:v1:${collectionId}`, 6 * HOUR, async () => {
+      const r = await get<{
+        id?: number;
+        name?: string;
+        overview?: string;
+        backdrop_path?: string | null;
+        parts?: TmdbRawMedia[];
+      }>(`/collection/${collectionId}`);
+      const parts = list(r?.parts, "movie")
+        .filter((p) => p.poster || p.backdrop)
+        .sort((a, b) => {
+          const da = a.releaseDate || (a.year ? `${a.year}-12-31` : "9999-12-31");
+          const db = b.releaseDate || (b.year ? `${b.year}-12-31` : "9999-12-31");
+          return da.localeCompare(db);
+        });
+      if (parts.length < 2) return null;
+      return {
+        id: r?.id ?? collectionId,
+        name: r?.name || "Collection",
+        overview: r?.overview || undefined,
+        backdrop: img(r?.backdrop_path, "w1280"),
+        parts,
+      };
+    });
+  } catch {
+    return null;
+  }
+}
+
+interface TmdbCreditRaw extends TmdbRawMedia {
+  character?: string;
+  job?: string;
+  popularity?: number;
+  vote_count?: number;
+}
+
+/** Fetch an actor or filmmaker's biography and combined TMDB credits. */
+export async function tmdbPerson(id: number, fallbackName?: string): Promise<PersonDetail | null> {
+  if (!Number.isInteger(id) || id <= 0) return null;
+  if (!hasTmdb()) {
+    return fallbackName ? { id, source: "tmdb", name: fallbackName, credits: [] } : null;
+  }
+  try {
+    return await cached(`tmdb:person:v1:${id}`, 6 * HOUR, async () => {
+      const r = await get<{
+        id?: number;
+        name?: string;
+        profile_path?: string | null;
+        known_for_department?: string;
+        biography?: string;
+        birthday?: string;
+        deathday?: string;
+        place_of_birth?: string;
+        combined_credits?: { cast?: TmdbCreditRaw[]; crew?: TmdbCreditRaw[] };
+      }>(`/person/${id}`, { append_to_response: "combined_credits" });
+
+      const byKey = new Map<string, { credit: PersonCredit; score: number }>();
+      const pushCredit = (raw: TmdbCreditRaw, roleText?: string) => {
+        const media = toMedia(raw);
+        if (!media || !(media.poster || media.backdrop)) return;
+        // Skip Talk / News guest appearances when building filmography spotlights
+        if (raw.genre_ids?.some((g) => g === 10763 || g === 10767)) return;
+        const cleanRole = roleText?.trim() || undefined;
+        const pop = (raw.popularity ?? 0) + (raw.vote_count ?? 0) * 0.04 + (media.rating ?? 0) * 1.5;
+        const prev = byKey.get(media.key);
+        if (prev) {
+          if (cleanRole && (!prev.credit.role || !prev.credit.role.includes(cleanRole))) {
+            prev.credit.role = prev.credit.role ? `${prev.credit.role} · ${cleanRole}` : cleanRole;
+          }
+          prev.score = Math.max(prev.score, pop);
+        } else {
+          byKey.set(media.key, {
+            credit: { ...media, ...(cleanRole ? { role: cleanRole } : {}) },
+            score: pop,
+          });
+        }
+      };
+
+      for (const c of r?.combined_credits?.cast ?? []) pushCredit(c, c.character);
+      for (const c of r?.combined_credits?.crew ?? []) pushCredit(c, c.job);
+
+      const credits = [...byKey.values()]
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 36)
+        .map((x) => x.credit);
+
+      return {
+        id: r?.id ?? id,
+        source: "tmdb",
+        name: r?.name || fallbackName || "Person",
+        photo: img(r?.profile_path, "h632"),
+        knownFor: r?.known_for_department || undefined,
+        biography: r?.biography || undefined,
+        birthday: r?.birthday || undefined,
+        deathday: r?.deathday || undefined,
+        placeOfBirth: r?.place_of_birth || undefined,
+        credits,
+      };
+    });
+  } catch {
+    return fallbackName ? { id, source: "tmdb", name: fallbackName, credits: [] } : null;
   }
 }

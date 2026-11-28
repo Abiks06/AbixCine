@@ -29,6 +29,7 @@ function ctx(over: Partial<ShortcutContext> = {}) {
     toggleFull: vi.fn(),
     setFull: vi.fn(async () => {}),
     togglePip: vi.fn(async () => {}),
+    cycleFit: vi.fn(),
     goNext: vi.fn(),
     goInfo: vi.fn(),
     leave: vi.fn(),
@@ -49,6 +50,7 @@ describe("handlePlayerKey (PERF-06 extraction)", () => {
     handlePlayerKey(key("m"), c);
     handlePlayerKey(key("C", { shiftKey: true }), c);
     handlePlayerKey(key("]"), c);
+    handlePlayerKey(key("z"), c);
     handlePlayerKey(key("i"), c);
     expect(c.toggle).toHaveBeenCalledOnce();
     expect(c.seek).toHaveBeenNthCalledWith(1, -30);
@@ -57,6 +59,7 @@ describe("handlePlayerKey (PERF-06 extraction)", () => {
     expect(c.toggleMute).toHaveBeenCalledWith(true);
     expect(c.cycleSub).toHaveBeenCalledOnce();
     expect(c.nudge).toHaveBeenCalledWith(0.5);
+    expect(c.cycleFit).toHaveBeenCalledOnce();
     expect(c.goInfo).toHaveBeenCalledOnce();
   });
 

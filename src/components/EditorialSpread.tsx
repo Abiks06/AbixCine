@@ -98,7 +98,7 @@ export function EditorialSpread({
                     openDossier(lead);
                   }}
                 >
-                  <Icon name="layers" size={14} /> Pass
+                  <Icon name="layers" size={14} /> Quick view
                 </button>
                 <button
                   type="button"

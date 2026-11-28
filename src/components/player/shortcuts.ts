@@ -31,6 +31,7 @@ export interface ShortcutContext {
   setFull: (on: boolean) => Promise<void>;
   togglePip: () => Promise<void>;
   skipActive?: () => void;
+  cycleFit?: () => void;
   goNext: () => void;
   goInfo: () => void;
   leave: () => void;
@@ -131,6 +132,7 @@ export function handlePlayerKey(e: KeyboardEvent, ctx: ShortcutContext) {
     case "F11": e.preventDefault(); ctx.toggleFull(); break;
     case "p": void ctx.togglePip(); break;
     case "x": ctx.skipActive?.(); break;
+    case "z": ctx.cycleFit?.(); break;
     case "n": ctx.goNext(); break;
     case "i": ctx.goInfo(); break;
     case "?": ctx.setKeysOpen((x) => !x); break;

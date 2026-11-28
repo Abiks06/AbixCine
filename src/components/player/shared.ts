@@ -61,7 +61,17 @@ export interface TrackCueCache {
   error?: string;
 }
 
-export type Sheet = "servers" | "episodes" | "subtitles" | "transcript" | "audio" | "picture";
+export type Sheet = "servers" | "episodes" | "subtitles" | "transcript" | "audio" | "picture" | "cast";
+
+export type VideoFit = "contain" | "cover" | "fill";
+export const VIDEO_FITS: { id: VideoFit; label: string; hint: string }[] = [
+  { id: "contain", label: "Fit", hint: "Original frame" },
+  { id: "cover", label: "Fill", hint: "Crop to screen" },
+  { id: "fill", label: "Stretch", hint: "Full width & height" },
+];
+
+export type SleepTimer = null | { kind: "episode" } | { kind: "at"; endsAt: number };
+export const SLEEP_PRESETS = [15, 30, 45, 60] as const;
 
 export const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2];
 export const MAX_VOL = 2; // Up to 200% pre-amp boost via Web Audio + brickwall safety limiter
@@ -85,6 +95,7 @@ export const SHORTCUTS: [string, string][] = [
   ["I", "Title details"],
   ["N", "Next episode"],
   ["X", "Skip intro / credits"],
+  ["Z", "Cycle picture fit (Fit / Fill)"],
   ["F · double-click", "Fullscreen (F11 too)"],
   ["P", "Picture-in-picture"],
   ["?", "This list"],

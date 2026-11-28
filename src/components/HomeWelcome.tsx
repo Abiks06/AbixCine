@@ -120,10 +120,15 @@ export function HomeWelcome({
                 <Icon name="download" size={12} /> Vault ready
               </Link>
             )}
-            {hasSignals && (
-              <span className="hw-mix" title="Automatic home balance across films, series and anime">
-                {filmPct}% Film · {seriesPct}% Series · {animePct}% Anime
-              </span>
+            {allProgress.length > 0 && (
+              <Link
+                to="/list?tab=history"
+                viewTransition
+                className="hw-pill"
+                title={hasSignals ? `Home mix: ${filmPct}% Film · ${seriesPct}% Series · ${animePct}% Anime` : "View watch history and stats"}
+              >
+                <Icon name="clock" size={12} /> Activity
+              </Link>
             )}
           </div>
         </div>

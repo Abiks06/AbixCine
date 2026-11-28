@@ -143,6 +143,9 @@ test("tmdb proxy is off without a key", async () => {
   delete process.env.TMDB_KEY;
   const r = await call("GET", "/tmdb/movie/popular", null, tokens.accessToken);
   assert.equal(r.statusCode, 501);
+  const p = await call("GET", "/tmdb/person/525", null, tokens.accessToken);
+  assert.notEqual(p.statusCode, 400);
+  assert.equal(p.statusCode, 501);
 });
 
 test("subtitlePref sync validates, sanitizes, and enforces size limits", async () => {

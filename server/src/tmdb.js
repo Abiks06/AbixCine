@@ -1,4 +1,4 @@
-const ALLOWED = /^(trending\/(all|movie|tv)\/(day|week)|movie\/(popular|top_rated|now_playing|upcoming|\d+)|tv\/(popular|top_rated|on_the_air|airing_today|\d+)|tv\/\d+\/season\/\d+|collection\/\d+|discover\/(movie|tv)|search\/(multi|movie|tv))$/;
+const ALLOWED = /^(trending\/(all|movie|tv)\/(day|week)|movie\/(popular|top_rated|now_playing|upcoming|\d+)|tv\/(popular|top_rated|on_the_air|airing_today|\d+)|tv\/\d+\/season\/\d+|collection\/\d+|person\/\d+|discover\/(movie|tv)|search\/(multi|movie|tv))$/;
 /** Only parameters the app actually sends. Anything else would just be a cache-buster. */
 const PARAMS = new Set([
   "page", "language", "query", "region", "include_adult", "with_genres", "sort_by", "year", "first_air_date_year",

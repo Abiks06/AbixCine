@@ -144,7 +144,7 @@ const ReelFrame = memo(function ReelFrame({
           tabIndex={clone ? -1 : undefined}
           className="act inspect"
           aria-label={`Quick inspect ${media.title}`}
-          title="Quick dossier"
+          title="Quick view"
           onClick={() => openDossier(media)}
         >
           <Icon name="layers" size={12} />

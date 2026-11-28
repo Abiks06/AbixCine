@@ -82,27 +82,27 @@
   --card-shadow: 0 18px 40px -22px rgb(0 0 0 / 0.88), 0 2px 8px rgb(0 0 0 / 0.4);
   --card-hover-shadow: 0 28px 60px -22px rgb(0 0 0 / 0.92), 0 14px 44px -24px color-mix(in oklab, var(--tone) 42%, transparent);
   --float: 0 28px 72px -24px rgb(0 0 0 / 0.92), 0 2px 8px rgb(0 0 0 / 0.45);
-  /* liquid vibrancy glass tokens (2-layer sheen matches 3-layer --glass-size / --glass-repeat with --frost-grain) */
-  --frost-grain: url("../assets/frost-grain.png");
-  --glass-size: 180px 180px, 100% 100%, 100% 100%;
-  --glass-repeat: repeat, no-repeat, no-repeat;
-  --glass-bg: color-mix(in oklab, var(--s1) 34%, transparent);
-  --glass-bg-strong: color-mix(in oklab, var(--s0) 48%, transparent);
-  --glass-bg-subtle: color-mix(in oklab, #ffffff 9%, color-mix(in oklab, var(--s1) 24%, transparent));
-  --glass-bg-pane: color-mix(in oklab, var(--s1) 28%, transparent);
-  --glass-blur: blur(28px) saturate(2.05) brightness(1.06);
-  --glass-blur-sm: blur(18px) saturate(1.85) brightness(1.04);
-  --glass-blur-lg: blur(42px) saturate(2.15) brightness(0.94);
+  /* crystal-clear optical liquid glass tokens */
+  --frost-grain: none;
+  --glass-size: 100% 100%, 100% 100%;
+  --glass-repeat: no-repeat, no-repeat;
+  --glass-bg: rgb(16 17 24 / 0.62);
+  --glass-bg-strong: rgb(13 14 20 / 0.80);
+  --glass-bg-subtle: rgb(255 255 255 / 0.065);
+  --glass-bg-pane: rgb(16 17 24 / 0.54);
+  --glass-blur: blur(28px) saturate(1.85);
+  --glass-blur-sm: blur(18px) saturate(1.7);
+  --glass-blur-lg: blur(40px) saturate(1.95);
   --glass-sheen:
-    radial-gradient(125% 75% at 10% -12%, rgb(255 255 255 / 0.22) 0%, rgb(255 255 255 / 0.06) 40%, transparent 70%),
-    linear-gradient(148deg, color-mix(in oklab, var(--tone) 10%, rgb(255 255 255 / 0.11)) 0%, rgb(255 255 255 / 0.025) 48%, color-mix(in oklab, var(--tone-2) 9%, rgb(0 0 0 / 0.09)) 100%);
-  --glass-edge: linear-gradient(148deg, rgb(255 255 255 / 0.56) 0%, rgb(255 255 255 / 0.18) 24%, color-mix(in oklab, var(--tone-2) 26%, rgb(255 255 255 / 0.08)) 54%, color-mix(in oklab, var(--tone) 44%, rgb(255 255 255 / 0.24)) 100%);
-  --glass-spot: rgb(255 255 255 / 0.26);
-  --glass-rim: inset 0 1px 0 rgb(255 255 255 / 0.34), inset 1px 0 0 rgb(255 255 255 / 0.12), inset 0 -1px 0 rgb(255 255 255 / 0.08), inset 0 0 0 1px rgb(255 255 255 / 0.16);
-  --glass-rim-hi: inset 0 1px 0 rgb(255 255 255 / 0.52), inset 0 0 0 1px color-mix(in oklab, var(--tone) 60%, rgb(255 255 255 / 0.3));
-  --glass-shadow: 0 28px 72px -18px rgb(0 0 0 / 0.72), 0 8px 24px -8px rgb(0 0 0 / 0.42), 0 14px 48px -24px color-mix(in oklab, var(--tone) 34%, transparent);
-  --glass-media: rgb(18 17 24 / 0.36);
-  --glass-media-rim: inset 0 1px 0 rgb(255 255 255 / 0.38), inset 0 0 0 1px rgb(255 255 255 / 0.22);
+    linear-gradient(180deg, rgb(255 255 255 / 0.09) 0%, rgb(255 255 255 / 0.02) 44%, transparent 100%);
+  --glass-edge:
+    linear-gradient(160deg, rgb(255 255 255 / 0.30) 0%, rgb(255 255 255 / 0.09) 34%, rgb(255 255 255 / 0.035) 68%, rgb(255 255 255 / 0.14) 100%);
+  --glass-spot: rgb(255 255 255 / 0.18);
+  --glass-rim: inset 0 1px 0 rgb(255 255 255 / 0.18), inset 0 0 0 1px rgb(255 255 255 / 0.08);
+  --glass-rim-hi: inset 0 1px 0 rgb(255 255 255 / 0.28), inset 0 0 0 1px color-mix(in oklab, var(--tone) 44%, rgb(255 255 255 / 0.18));
+  --glass-shadow: 0 24px 64px -16px rgb(0 0 0 / 0.72), 0 4px 16px -4px rgb(0 0 0 / 0.42);
+  --glass-media: rgb(12 13 18 / 0.64);
+  --glass-media-rim: inset 0 1px 0 rgb(255 255 255 / 0.22), inset 0 0 0 1px rgb(255 255 255 / 0.12);
 }
 
 :root[data-theme="crimson"] {
@@ -229,20 +229,20 @@
   --card-shadow: 0 14px 30px -18px rgb(24 22 20 / 0.22), 0 2px 6px rgb(24 22 20 / 0.08);
   --card-hover-shadow: 0 24px 48px -18px rgb(24 22 20 / 0.32), 0 10px 26px -16px color-mix(in oklab, var(--tone) 32%, transparent);
   --float: 0 24px 56px -18px rgb(24 22 20 / 0.28), 0 2px 8px rgb(24 22 20 / 0.08);
-  --glass-bg: rgb(255 253 248 / 0.48);
-  --glass-bg-strong: rgb(255 253 248 / 0.64);
-  --glass-bg-subtle: rgb(255 255 255 / 0.58);
-  --glass-bg-pane: rgb(255 253 248 / 0.52);
-  --glass-blur: blur(28px) saturate(1.9) brightness(1.04);
-  --glass-blur-sm: blur(18px) saturate(1.75) brightness(1.03);
-  --glass-blur-lg: blur(40px) saturate(2.0) brightness(1.03);
+  --glass-bg: rgb(255 253 250 / 0.74);
+  --glass-bg-strong: rgb(255 254 252 / 0.88);
+  --glass-bg-subtle: rgb(255 255 255 / 0.68);
+  --glass-bg-pane: rgb(255 253 250 / 0.76);
+  --glass-blur: blur(28px) saturate(1.7);
+  --glass-blur-sm: blur(18px) saturate(1.6);
+  --glass-blur-lg: blur(40px) saturate(1.8);
   --glass-sheen:
-    radial-gradient(125% 75% at 10% -12%, rgb(255 255 255 / 0.92) 0%, rgb(255 255 255 / 0.34) 42%, transparent 72%),
-    linear-gradient(148deg, rgb(255 255 255 / 0.72) 0%, rgb(255 255 255 / 0.18) 45%, color-mix(in oklab, var(--tone-2) 6%, rgb(24 22 20 / 0.03)) 100%);
-  --glass-edge: linear-gradient(148deg, rgb(255 255 255 / 0.96) 0%, rgb(255 255 255 / 0.55) 26%, color-mix(in oklab, var(--tone-2) 20%, rgb(24 22 20 / 0.12)) 55%, color-mix(in oklab, var(--tone) 34%, rgb(255 255 255 / 0.7)) 100%);
-  --glass-spot: rgb(255 255 255 / 0.72);
-  --glass-rim: inset 0 1px 0 rgb(255 255 255 / 0.94), inset 1px 0 0 rgb(255 255 255 / 0.45), inset 0 0 0 1px rgb(24 22 20 / 0.11);
-  --glass-rim-hi: inset 0 1px 0 rgb(255 255 255 / 0.98), inset 0 0 0 1px color-mix(in oklab, var(--tone) 52%, rgb(24 22 20 / 0.18));
+    linear-gradient(180deg, rgb(255 255 255 / 0.72) 0%, rgb(255 255 255 / 0.14) 48%, transparent 100%);
+  --glass-edge: linear-gradient(160deg, rgb(255 255 255 / 0.92) 0%, rgb(24 22 20 / 0.08) 44%, rgb(24 22 20 / 0.12) 100%);
+  --glass-spot: rgb(255 255 255 / 0.65);
+  --glass-rim: inset 0 1px 0 rgb(255 255 255 / 0.88), inset 0 0 0 1px rgb(24 22 20 / 0.09);
+  --glass-rim-hi: inset 0 1px 0 rgb(255 255 255 / 0.96), inset 0 0 0 1px color-mix(in oklab, var(--tone) 46%, rgb(24 22 20 / 0.16));
+  --glass-shadow: 0 20px 52px -16px rgb(24 22 20 / 0.20), 0 4px 14px -4px rgb(24 22 20 / 0.08);
   --glass-shadow: 0 22px 54px -18px rgb(24 22 20 / 0.2), 0 4px 14px -4px rgb(24 22 20 / 0.09);
 }
 
@@ -338,27 +338,26 @@ kbd { font: 500 10.5px/1.4 var(--f-mono); color: var(--fg2); padding: 1px 5px; b
   position: absolute; inset: 0; z-index: 0; pointer-events: none; overflow: hidden; contain: strict;
   transition: --l1 var(--amb) var(--ease), --l2 var(--amb) var(--ease);
   background:
-    radial-gradient(62% 52% at 86% 6%, color-mix(in oklab, var(--l1) 66%, transparent), transparent 72%),
-    radial-gradient(56% 58% at 10% 88%, color-mix(in oklab, var(--l2) 56%, transparent), transparent 72%),
-    radial-gradient(46% 40% at 48% 36%, color-mix(in oklab, var(--tone) 20%, transparent), transparent 70%),
-    radial-gradient(40% 38% at 78% 82%, color-mix(in oklab, var(--tone-2) 15%, transparent), transparent 70%),
+    radial-gradient(60% 50% at 86% 6%, color-mix(in oklab, var(--l1) 32%, transparent), transparent 72%),
+    radial-gradient(54% 56% at 10% 88%, color-mix(in oklab, var(--l2) 24%, transparent), transparent 72%),
+    radial-gradient(42% 38% at 50% 34%, color-mix(in oklab, var(--tone) 9%, transparent), transparent 70%),
     var(--bg);
 }
 .light::before, .light::after {
   content: ""; position: absolute; inset: -6%; background: center / cover no-repeat;
-  filter: blur(56px) contrast(0.72) saturate(2.15) brightness(0.68);
+  filter: blur(64px) contrast(0.84) saturate(1.35) brightness(0.56);
   opacity: 0; transition: opacity var(--amb) var(--ease); will-change: opacity;
 }
 .light::before { background-image: var(--art-a, none); }
 .light::after { background-image: var(--art-b, none); }
-.light[data-art="a"]::before, .light[data-art="b"]::after { opacity: 0.48; }
-/* Subtle celluloid film grain over the darkroom floor. */
-.app::after { content: ""; position: absolute; inset: 0; z-index: 1; pointer-events: none; background: url("../assets/noise.png"); opacity: 0.42; }
-:root[data-mode="light"] .app::after { opacity: 0.14; }
+.light[data-art="a"]::before, .light[data-art="b"]::after { opacity: 0.18; }
+/* Subtle atmospheric noise without muting deep darks. */
+.app::after { content: ""; position: absolute; inset: 0; z-index: 1; pointer-events: none; background: url("../assets/noise.png"); opacity: 0.05; }
+:root[data-mode="light"] .app::after { opacity: 0.03; }
 :root[data-mode="light"] .light[data-art="a"]::before,
 :root[data-mode="light"] .light[data-art="b"]::after {
-  opacity: 0.22;
-  filter: blur(52px) contrast(0.8) saturate(1.55) brightness(1.08);
+  opacity: 0.14;
+  filter: blur(56px) contrast(0.85) saturate(1.3) brightness(1.06);
 }
 .is-watching .light, .app.is-watching::after { display: none; }
 
@@ -397,10 +396,9 @@ kbd { font: 500 10.5px/1.4 var(--f-mono); color: var(--fg2); padding: 1px 5px; b
 .rail::before {
   content: ""; position: absolute; inset: 0; z-index: -1; pointer-events: none;
   background-color: var(--glass-bg);
-  background-image: var(--frost-grain), var(--glass-sheen);
-  background-size: var(--glass-size); background-repeat: var(--glass-repeat);
-  backdrop-filter: blur(32px) saturate(2.1); -webkit-backdrop-filter: blur(32px) saturate(2.1);
-  box-shadow: inset -1px 0 0 rgb(255 255 255 / 0.1);
+  background-image: var(--glass-sheen);
+  backdrop-filter: var(--glass-blur); -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: inset -1px 0 0 rgb(255 255 255 / 0.06);
 }
 .rail-brand {
   width: 100%; height: var(--top); display: grid; place-items: center;
@@ -415,7 +413,7 @@ kbd { font: 500 10.5px/1.4 var(--f-mono); color: var(--fg2); padding: 1px 5px; b
 }
 .rail-link {
   position: relative; display: flex; flex-direction: column; align-items: center; justify-content: center;
-  gap: 3px; height: 50px; width: calc(100% - 12px); margin-inline: auto; border-radius: 10px; color: var(--fg3);
+  gap: 4px; height: 46px; width: calc(100% - 12px); margin-inline: auto; border-radius: 10px; color: var(--fg3);
   transition: color var(--fast), background var(--fast), box-shadow var(--fast), transform var(--fast) var(--ease-ios);
 }
 .rail-link::before {
@@ -492,11 +490,14 @@ kbd { font: 500 10.5px/1.4 var(--f-mono); color: var(--fg2); padding: 1px 5px; b
 }
 .topbar::before {
   content: ""; position: absolute; inset: 0; z-index: -1; pointer-events: none;
-  background-color: color-mix(in oklab, var(--bg) 82%, transparent);
-  background-image: var(--frost-grain), var(--glass-sheen);
-  background-size: var(--glass-size); background-repeat: var(--glass-repeat);
-  backdrop-filter: blur(32px) saturate(2.1); -webkit-backdrop-filter: blur(32px) saturate(2.1);
-  box-shadow: inset 0 -1px 0 rgb(255 255 255 / 0.14);
+  background-color: color-mix(in oklab, var(--bg) 56%, transparent);
+  background-image: var(--glass-sheen);
+  backdrop-filter: var(--glass-blur); -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: inset 0 -1px 0 var(--line);
+  transition: background-color var(--base) var(--ease);
+}
+.app[data-scrolled] .topbar::before {
+  background-color: var(--glass-bg-strong);
 }
 .topbar-left { display: flex; align-items: center; gap: 12px; min-width: 0; }
 .topbar-sep { width: 1px; height: 14px; background: var(--line-2); flex: none; }
@@ -511,8 +512,7 @@ kbd { font: 500 10.5px/1.4 var(--f-mono); color: var(--fg2); padding: 1px 5px; b
   height: 28px; min-width: 224px; justify-content: space-between;
   display: inline-flex; align-items: center; gap: 10px; padding: 0 9px 0 12px;
   border-radius: 999px;
-  background-color: var(--glass-bg-subtle); background-image: var(--frost-grain), var(--glass-sheen);
-  background-size: var(--glass-size); background-repeat: var(--glass-repeat);
+  background-color: var(--glass-bg-subtle); background-image: var(--glass-sheen);
   backdrop-filter: var(--glass-blur-sm); -webkit-backdrop-filter: var(--glass-blur-sm);
   box-shadow: var(--glass-rim);
   color: var(--fg2); font: 500 12px var(--f-ui); white-space: nowrap;
@@ -541,8 +541,7 @@ kbd { font: 500 10.5px/1.4 var(--f-mono); color: var(--fg2); padding: 1px 5px; b
 .theme-popover {
   position: absolute; right: 0; top: 38px; z-index: 60; width: 312px;
   padding: 12px; border-radius: var(--r-lg);
-  background-color: var(--glass-bg-strong); background-image: var(--frost-grain), var(--glass-sheen);
-  background-size: var(--glass-size); background-repeat: var(--glass-repeat);
+  background-color: var(--glass-bg-strong); background-image: var(--glass-sheen);
   backdrop-filter: var(--glass-blur-lg); -webkit-backdrop-filter: var(--glass-blur-lg);
   border: 0; box-shadow: var(--glass-rim), var(--glass-shadow);
   will-change: transform, opacity;
@@ -585,8 +584,7 @@ kbd { font: 500 10.5px/1.4 var(--f-mono); color: var(--fg2); padding: 1px 5px; b
 .menu-wrap { position: relative; display: grid; }
 .menu-scrim { position: fixed; inset: 0; z-index: 49; }
 .menu { position: absolute; z-index: 50; right: 0; top: 42px; width: 264px; padding: 6px; border-radius: var(--r-lg); transform-origin: top right; animation: pop 240ms var(--spring-ios) both;
-  background-color: var(--glass-bg-strong); background-image: var(--frost-grain), var(--glass-sheen);
-  background-size: var(--glass-size); background-repeat: var(--glass-repeat);
+  background-color: var(--glass-bg-strong); background-image: var(--glass-sheen);
   backdrop-filter: var(--glass-blur-lg); -webkit-backdrop-filter: var(--glass-blur-lg);
   box-shadow: var(--glass-rim), var(--glass-shadow); will-change: transform, opacity; }
 .menu-head { display: flex; gap: 12px; align-items: center; padding: 10px 10px 12px; border-bottom: 1px solid var(--line); margin-bottom: 4px; }
@@ -864,7 +862,7 @@ button.chip:active:not(:disabled) { transform: scale(0.97); }
 .toasts { position: fixed; left: calc(50% + var(--rail-w) / 2); transform: translateX(-50%); bottom: 24px; z-index: 450; display: flex; flex-direction: column; align-items: center; gap: 8px; pointer-events: none; }
 .is-watching .toasts { left: 50%; }
 .toast { pointer-events: auto; display: flex; align-items: center; gap: 10px; max-width: min(520px, calc(100vw - 32px)); padding: 9px 12px 9px 16px; border-radius: 999px; font-size: 13px; color: var(--fg);
-  background-color: var(--glass-bg-strong); background-image: var(--frost-grain), var(--glass-sheen); background-size: var(--glass-size); background-repeat: var(--glass-repeat);
+  background-color: var(--glass-bg-strong); background-image: var(--glass-sheen);
   backdrop-filter: var(--glass-blur); -webkit-backdrop-filter: var(--glass-blur);
   box-shadow: var(--glass-rim), var(--glass-shadow); animation: toastIn 360ms var(--spring-ios) both; }
 .toast > svg { color: var(--tone-ink); flex: none; }
@@ -876,7 +874,7 @@ button.chip:active:not(:disabled) { transform: scale(0.97); }
 .toast > button.toast-close:hover { background: var(--ink-08); color: var(--fg); }
 @keyframes toastIn { from { opacity: 0; transform: translateY(14px) scale(0.96); } }
 .update-toast { position: fixed; right: 20px; bottom: 20px; z-index: 400; width: 356px; padding: 16px; border-radius: 16px; display: flex; flex-direction: column; gap: 10px;
-  background-color: var(--glass-bg-strong); background-image: var(--frost-grain), var(--glass-sheen); background-size: var(--glass-size); background-repeat: var(--glass-repeat);
+  background-color: var(--glass-bg-strong); background-image: var(--glass-sheen);
   backdrop-filter: var(--glass-blur-lg); -webkit-backdrop-filter: var(--glass-blur-lg);
   box-shadow: var(--glass-rim), var(--glass-shadow); will-change: transform, opacity; animation: pop 320ms var(--spring-ios) both; }
 .update-toast .ut-h { display: flex; align-items: center; gap: 10px; font-weight: 600; }
@@ -1002,8 +1000,7 @@ input[type="range"]:disabled::-webkit-slider-thumb { background: var(--fg3); tra
   padding: 12px;
   border-radius: var(--r-lg);
   background-color: var(--glass-bg-strong);
-  background-image: var(--frost-grain), var(--glass-sheen);
-  background-size: var(--glass-size); background-repeat: var(--glass-repeat);
+  background-image: var(--glass-sheen);
   backdrop-filter: var(--glass-blur-lg);
   -webkit-backdrop-filter: var(--glass-blur-lg);
   box-shadow: var(--glass-rim), var(--glass-shadow);
@@ -1155,12 +1152,10 @@ input[type="range"]:disabled::-webkit-slider-thumb { background: var(--fg3); tra
 .hover-preview {
   position: fixed;
   z-index: 260;
-  border-radius: 16px;
+  border-radius: 18px;
   overflow: hidden;
   background-color: var(--glass-bg-strong);
-  background-image: var(--frost-grain), var(--glass-sheen);
-  background-size: var(--glass-size);
-  background-repeat: var(--glass-repeat);
+  background-image: var(--glass-sheen);
   backdrop-filter: var(--glass-blur-lg);
   -webkit-backdrop-filter: var(--glass-blur-lg);
   box-shadow: var(--glass-rim), var(--glass-shadow);

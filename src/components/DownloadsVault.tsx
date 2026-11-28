@@ -743,15 +743,16 @@ export function DownloadsVault({
             ? g.entries.filter((e) => isEpisodeWatched(g.canonicalKey, e.season ?? 1, e.episode ?? 1, aliasKeys))
             : [];
           const watchedBytes = watchedEntries.reduce((s, e) => s + (e.fileSize || 0), 0);
+          const distinctFormats = [...new Set(g.entries.map((e) => entryContainer(e)))];
+          const techSpec = [distinctFormats.join("/"), g.entries[0]?.videoCodec, g.audioTags.map((a) => a.toUpperCase()).join("·")].filter(Boolean).join(" · ");
           const summaryMeta = [
-            g.isFilm ? "Film" : `${g.entries.length} episode${g.entries.length === 1 ? "" : "s"}`,
+            g.isFilm ? "Film" : `${g.entries.length} ep${g.entries.length === 1 ? "" : "s"}`,
             !g.isFilm && watchedEntries.length > 0 ? `${watchedEntries.length}/${g.entries.length} watched` : null,
-            g.media.year,
+            techSpec || null,
             fmtSize(g.totalSize),
           ]
             .filter(Boolean)
             .join(" · ");
-          const distinctFormats = [...new Set(g.entries.map((e) => entryContainer(e)))];
 
           return (
             <article key={g.canonicalKey} className={`dlv-card ${isExp ? "open" : ""}`}>
@@ -793,32 +794,18 @@ export function DownloadsVault({
                     );
                   })()}
                   <div className="dlv-badges">
-                    <span className="badge offline">OFFLINE</span>
+                    <span className="badge offline">Offline</span>
                     {g.bestQuality && (
                       <span
                         className={`q ${qBadge === "4K" ? "" : "hd"}`}
                         title={g.entries.some((e) => e.qualityVerified) ? "Verified via FFprobe" : undefined}
                       >
                         {qBadge}
-                        {g.entries.some((e) => e.qualityVerified) ? " ✓" : ""}
                       </span>
                     )}
-                    {distinctFormats.map((fmt) => (
-                      <span key={fmt} className="badge dim">
-                        {fmt}
-                      </span>
-                    ))}
-                    {g.entries[0]?.videoCodec && (
-                      <span className="badge dim">{g.entries[0].videoCodec}</span>
-                    )}
-                    {g.audioTags.map((a) => (
-                      <span key={a} className="badge dim">
-                        {a.toUpperCase()}
-                      </span>
-                    ))}
                     {g.entries.some((e) => (e.subtitlePaths?.length ?? 0) > 0) && (
                       <span className="badge dim" title="Offline subtitles saved">
-                        SUBS
+                        Subtitles
                       </span>
                     )}
                   </div>

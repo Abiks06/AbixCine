@@ -9,7 +9,9 @@
   display: grid;
   place-items: center;
   padding: clamp(16px, 4vw, 56px);
-  background: rgb(4 4 6 / 0.84);
+  background: rgb(4 4 8 / 0.72);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
   animation: trailerScrimIn 200ms var(--ease) both;
 }
 .trailer-scrim.closing {
@@ -20,15 +22,18 @@
 .trailer-pane {
   position: relative;
   isolation: isolate;
-  width: min(1120px, 100%, calc((100vh - 150px) * 16 / 9 + 24px));
+  width: min(1120px, 100%, calc((100vh - 150px) * 16 / 9 + 28px));
   display: flex;
   flex-direction: column;
   gap: 10px;
-  padding: 10px 12px 12px;
-  border-radius: var(--r-lg);
-  background: var(--s0);
-  border: 1px solid var(--line-2);
-  box-shadow: var(--float);
+  padding: 12px 14px 14px;
+  border-radius: 20px;
+  background-color: var(--glass-bg-strong);
+  background-image: var(--glass-sheen);
+  backdrop-filter: var(--glass-blur-lg);
+  -webkit-backdrop-filter: var(--glass-blur-lg);
+  border: 0;
+  box-shadow: var(--glass-rim), var(--glass-shadow);
   transform-origin: 50% 55%;
   animation: trailerIn 300ms var(--ease-out) both;
 }
@@ -73,7 +78,7 @@
   position: relative;
   aspect-ratio: 16 / 9;
   width: 100%;
-  border-radius: var(--r-sm);
+  border-radius: 12px;
   overflow: hidden;
   background: #000;
   border: 1px solid var(--line);

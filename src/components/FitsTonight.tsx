@@ -204,8 +204,8 @@ export function FitsTonight({ pool, loading }: { pool: Media[]; loading?: boolea
                   <button
                     type="button"
                     className="tt-btn"
-                    title="Quick dossier"
-                    aria-label={`Quick inspect ${m.title}`}
+                    title="Quick view"
+                    aria-label={`Quick view ${m.title}`}
                     onClick={() => openDossier(m)}
                   >
                     <Icon name="layers" size={12} />

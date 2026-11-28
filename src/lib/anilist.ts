@@ -9,7 +9,7 @@ import {
   type RawAnilistNode,
   type ReconciledSeasons,
 } from "./normalizer";
-import type { Episode, Media, MediaDetail } from "./types";
+import type { Episode, Media, MediaDetail, PersonCredit, PersonDetail } from "./types";
 
 // AniList's public GraphQL API needs no key (rate limit ~90 req/min).
 const API = "https://graphql.anilist.co";
@@ -43,13 +43,13 @@ interface AnilistDetailItem extends AnilistMediaItem {
   streamingEpisodes?: { title?: string; thumbnail?: string }[] | null;
   studios?: { nodes?: { name?: string | null }[] | null } | null;
   staff?: {
-    edges?: { role?: string | null; node?: { name?: { full?: string | null } | null; image?: { medium?: string | null } | null } | null }[] | null;
+    edges?: { role?: string | null; node?: { id?: number | null; name?: { full?: string | null } | null; image?: { medium?: string | null } | null } | null }[] | null;
   } | null;
   characters?: {
     edges?: {
       role?: string | null;
       node?: { name?: { full?: string | null } | null; image?: { medium?: string | null } | null } | null;
-      voiceActors?: { name?: { full?: string | null } | null }[] | null;
+      voiceActors?: { id?: number | null; name?: { full?: string | null } | null }[] | null;
     }[] | null;
   } | null;
   recommendations?: { nodes?: { mediaRecommendation?: AnilistMediaItem | null }[] | null } | null;
@@ -430,15 +430,15 @@ export async function anilistDetail(key: string): Promise<MediaDetail> {
   const id = Number(key.split(":")[1]);
   if (!id || !Number.isFinite(id)) throw new Error(`Invalid AniList key: ${key}`);
 
-  return cached(`anilist:detail:v5:${id}`, 3 * HOUR, async () => {
+  return cached(`anilist:detail:v6:${id}`, 3 * HOUR, async () => {
     const d = await gql<{ Media?: AnilistDetailItem }>(
       `query($id:Int){ Media(id:$id,type:ANIME){ ${FIELDS} nextAiringEpisode { episode airingAt }
         trailer { id site }
         source season seasonYear endDate { year month day } popularity
         streamingEpisodes { title thumbnail }
         studios(isMain:true){ nodes { name } }
-        staff(perPage:12,sort:RELEVANCE){ edges { role node { name { full } image { medium } } } }
-        characters(perPage:16,sort:[ROLE,RELEVANCE]){ edges { role node { name { full } image { medium } } voiceActors(language:JAPANESE,sort:RELEVANCE){ name { full } } } }
+        staff(perPage:12,sort:RELEVANCE){ edges { role node { id name { full } image { medium } } } }
+        characters(perPage:16,sort:[ROLE,RELEVANCE]){ edges { role node { name { full } image { medium } } voiceActors(language:JAPANESE,sort:RELEVANCE){ id name { full } } } }
         recommendations(perPage:14,sort:RATING_DESC){ nodes { mediaRecommendation { ${FIELDS} } } } } }`,
       { id },
     );
@@ -464,14 +464,22 @@ export async function anilistDetail(key: string): Promise<MediaDetail> {
       cast: (m.characters?.edges ?? [])
         .filter((e): e is typeof e & { node: { name: { full: string }; image?: { medium?: string | null } | null } } => Boolean(e?.node?.name?.full))
         .map((e) => ({
+          ...(e.voiceActors?.[0]?.id != null ? { id: e.voiceActors[0].id } : {}),
+          source: "anilist" as const,
           name: e.node.name.full,
           character: e.role ? e.role[0] + e.role.slice(1).toLowerCase() : undefined,
           photo: e.node.image?.medium ?? undefined,
           actor: e.voiceActors?.[0]?.name?.full ?? undefined,
         })),
       crew: (m.staff?.edges ?? [])
-        .filter((e): e is typeof e & { node: { name: { full: string }; image?: { medium?: string | null } | null }; role: string } => Boolean(e?.node?.name?.full && e.role && STAFF_ROLE.test(e.role)))
-        .map((e) => ({ name: e.node.name.full, job: e.role.replace(/\s*\(.*\)$/, ""), photo: e.node.image?.medium ?? undefined })),
+        .filter((e): e is typeof e & { node: { id?: number | null; name: { full: string }; image?: { medium?: string | null } | null }; role: string } => Boolean(e?.node?.name?.full && e.role && STAFF_ROLE.test(e.role)))
+        .map((e) => ({
+          ...(e.node.id != null ? { id: e.node.id } : {}),
+          source: "anilist" as const,
+          name: e.node.name.full,
+          job: e.role.replace(/\s*\(.*\)$/, ""),
+          photo: e.node.image?.medium ?? undefined,
+        })),
       companies: (m.studios?.nodes ?? []).map((n) => n.name).filter((n): n is string => Boolean(n)),
       endDate: isoDate(m.endDate),
       source: m.source ? titleCase(m.source) : undefined,
@@ -550,4 +558,87 @@ export async function animeEpisodes(key: string, seasonNumber = 1, expectedCount
   });
 
   return normalizeEpisodes(rawList, seasonNumber, expectedCount, defaultRuntime, { key });
+}
+
+/** Fetch an AniList staff member or voice actor profile and filmography. */
+export async function anilistStaff(id: number, fallbackName?: string): Promise<PersonDetail | null> {
+  if (!Number.isInteger(id) || id <= 0) return null;
+  try {
+    return await cached(`anilist:staff:v1:${id}`, 6 * HOUR, async () => {
+      interface StaffRes {
+        Staff?: {
+          id?: number;
+          name?: { full?: string | null; native?: string | null } | null;
+          image?: { large?: string | null } | null;
+          description?: string | null;
+          homeTown?: string | null;
+          primaryOccupations?: (string | null)[] | null;
+          dateOfBirth?: { year?: number | null; month?: number | null; day?: number | null } | null;
+          staffMedia?: {
+            edges?: { staffRole?: string | null; node?: (AnilistMediaItem & { popularity?: number | null }) | null }[] | null;
+          } | null;
+          characterMedia?: {
+            edges?: { characters?: ({ name?: { full?: string | null } | null } | null)[] | null; node?: (AnilistMediaItem & { popularity?: number | null }) | null }[] | null;
+          } | null;
+        } | null;
+      }
+      const d = await gql<StaffRes>(
+        `query($id:Int){ Staff(id:$id){
+          id name { full native } image { large } description(asHtml:false) homeTown primaryOccupations
+          dateOfBirth { year month day }
+          staffMedia(sort:POPULARITY_DESC,perPage:20){ edges { staffRole node { ${FIELDS} popularity } } }
+          characterMedia(sort:POPULARITY_DESC,perPage:20){ edges { characters { name { full } } node { ${FIELDS} popularity } } }
+        } }`,
+        { id },
+      );
+      const s = d?.Staff;
+      if (!s) return null;
+
+      const byKey = new Map<string, { credit: PersonCredit; score: number }>();
+      const pushNode = (node: (AnilistMediaItem & { popularity?: number | null }) | null | undefined, roleText?: string | null) => {
+        if (!node) return;
+        const media = toMedia(node);
+        const cleanRole = roleText?.trim() || undefined;
+        const score = (node.popularity ?? 0) + (media.rating ?? 0) * 50;
+        const prev = byKey.get(media.key);
+        if (prev) {
+          if (cleanRole && (!prev.credit.role || !prev.credit.role.includes(cleanRole))) {
+            prev.credit.role = prev.credit.role ? `${prev.credit.role} · ${cleanRole}` : cleanRole;
+          }
+          prev.score = Math.max(prev.score, score);
+        } else {
+          byKey.set(media.key, {
+            credit: { ...media, ...(cleanRole ? { role: cleanRole } : {}) },
+            score,
+          });
+        }
+      };
+
+      for (const e of s.staffMedia?.edges ?? []) pushNode(e?.node, e?.staffRole);
+      for (const e of s.characterMedia?.edges ?? []) {
+        const charNames = (e?.characters ?? []).map((c) => c?.name?.full).filter(Boolean).slice(0, 2).join(", ");
+        pushNode(e?.node, charNames ? `Voice · ${charNames}` : "Voice");
+      }
+
+      const credits = [...byKey.values()]
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 32)
+        .map((x) => x.credit);
+
+      const dob = s.dateOfBirth?.year ? isoDate(s.dateOfBirth) : undefined;
+      return {
+        id: s.id ?? id,
+        source: "anilist",
+        name: s.name?.full || fallbackName || "Staff",
+        photo: s.image?.large ?? undefined,
+        knownFor: (s.primaryOccupations ?? []).filter((x): x is string => Boolean(x)).slice(0, 2).join(" · ") || undefined,
+        biography: stripHtml(s.description ?? "") || undefined,
+        birthday: dob,
+        placeOfBirth: s.homeTown ?? undefined,
+        credits,
+      };
+    });
+  } catch {
+    return fallbackName ? { id, source: "anilist", name: fallbackName, credits: [] } : null;
+  }
 }

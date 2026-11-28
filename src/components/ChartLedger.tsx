@@ -149,8 +149,8 @@ export function ChartLedger({
                       <button
                         type="button"
                         className="icon-btn"
-                        title="Quick dossier"
-                        aria-label={`Quick inspect ${m.title}`}
+                        title="Quick view"
+                        aria-label={`Quick view ${m.title}`}
                         onClick={() => openDossier(m)}
                       >
                         <Icon name="layers" size={13} />

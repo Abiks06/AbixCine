@@ -252,7 +252,8 @@ export function EpisodeDownloadControl({
               ? `E${ep.number} saved offline (${[savedQTag, savedFmt].filter(Boolean).join(" ")}) — click for options`
               : `Download E${ep.number} (${qLabel} ${fmtLabel})`;
 
-  const onButtonClick = () => {
+  const onButtonClick = (ev: React.MouseEvent) => {
+    ev.stopPropagation();
     if (resolving) return;
     if (hasPopoverState) {
       setOpen((x) => !x);
@@ -273,8 +274,8 @@ export function EpisodeDownloadControl({
           aria-haspopup="dialog"
           onClick={onButtonClick}
         >
-          <Icon name="check" size={12} />
-          <span>{[savedQTag, savedFmt].filter(Boolean).join(" ") || "Saved"}</span>
+          <Icon name="check" size={11} />
+          <span>{savedQTag || savedFmt || "Saved"}</span>
         </button>
       ) : (
         <button

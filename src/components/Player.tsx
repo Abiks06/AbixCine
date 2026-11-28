@@ -36,12 +36,14 @@ import { langBase } from "../lib/subtitles";
 import { type Audio, updateSettings, useSettings } from "../lib/settings";
 import type { StreamCandidate } from "../sources/types";
 import type { SourceSession } from "../sources/session";
+import { getDetail, peekDetail } from "../lib/catalog";
+import type { MediaDetail } from "../lib/types";
 import { AudioToggle } from "./AudioToggle";
 import { Icon } from "./Icon";
 import { loadShowSpeed, saveShowSpeed, showKeyFor } from "../lib/showSpeed";
 import { SubtitleOverlay } from "./SubtitleOverlay";
 import { SubtitleSheet } from "./SubtitleSheet";
-import { MAX_VOL, SHORTCUTS, SLOW_MS, SPEEDS, TIME_LEFT_KEY, bufferedAhead, candKey, readEmbedMessage, withStart, type Sheet, type EpisodeNav, type PlayerMedia } from "./player/shared";
+import { MAX_VOL, SHORTCUTS, SLEEP_PRESETS, SLOW_MS, SPEEDS, TIME_LEFT_KEY, VIDEO_FITS, bufferedAhead, candKey, readEmbedMessage, withStart, type Sheet, type EpisodeNav, type PlayerMedia, type SleepTimer, type VideoFit } from "./player/shared";
 import { EpisodeSheet, ServerSheet, UpNext, CaughtUpCard } from "./player/sheets";
 import { Ambilight } from "./player/Ambilight";
 
@@ -167,6 +169,13 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     }
   }, []);
   const [sheet, setSheet] = useState<Sheet | null>(null);
+  const [videoFit, setVideoFit] = useState<VideoFit>("contain");
+  const [sleepTimer, setSleepTimer] = useState<SleepTimer>(null);
+  const sleepTimerRef = useRef<SleepTimer>(null);
+  sleepTimerRef.current = sleepTimer;
+  const [, setSleepTick] = useState(0);
+  const [castDetail, setCastDetail] = useState<MediaDetail | null>(() => (media?.key ? peekDetail(media.key) ?? null : null));
+  const [castLoading, setCastLoading] = useState(false);
   /**
    * One toast at a time. A new message while one is up swaps the text in place (keeping its id, so
    * it doesn't re-enter on every wheel notch); `out` plays the exit before it unmounts. Keyed on the
@@ -511,6 +520,11 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
         const p = embedPos.current;
         if (p.duration) onProgress?.(p.duration, p.duration);
         setEnded(true);
+        if (sleepTimerRef.current?.kind === "episode") {
+          setSleepTimer(null);
+          flash("Sleep timer — stopped after episode");
+          return;
+        }
         // "Keep watching" means stay, here as for our own video.
         if (!upNextDismissedRef.current) onEnded?.();
       }
@@ -639,6 +653,66 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     const last = Math.max(1, SPEEDS.length - 1);
     flash(n === 1 ? "Normal speed" : `Speed ${n}×`, { v: SPEEDS.indexOf(n) / last, mark: SPEEDS.indexOf(1) / last });
   };
+  const cycleFit = () => {
+    const order: VideoFit[] = ["contain", "cover", "fill"];
+    const next = order[(order.indexOf(videoFit) + 1) % order.length];
+    setVideoFit(next);
+    flash(next === "contain" ? "Picture: Fit" : next === "cover" ? "Picture: Fill (crop)" : "Picture: Stretch");
+  };
+  const pickSleepTimer = (next: SleepTimer) => {
+    setSleepTimer(next);
+    if (!next) flash("Sleep timer off");
+    else if (next.kind === "episode") flash("Sleep timer · after this episode");
+    else {
+      const mins = Math.max(1, Math.round((next.endsAt - Date.now()) / 60_000));
+      flash(`Sleep timer · ${mins}m`);
+    }
+  };
+  useEffect(() => {
+    if (!sleepTimer || sleepTimer.kind !== "at") return;
+    const check = () => {
+      if (Date.now() >= sleepTimer.endsAt) {
+        video.current?.pause();
+        setSleepTimer(null);
+        flash("Sleep timer — playback paused");
+      } else {
+        setSleepTick((n) => n + 1);
+      }
+    };
+    const id = window.setInterval(check, 5000);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sleepTimer]);
+  useEffect(() => {
+    const k = media?.key;
+    if (!k) {
+      setCastDetail(null);
+      return;
+    }
+    setCastDetail(peekDetail(k) ?? null);
+  }, [media?.key]);
+  useEffect(() => {
+    if (sheet !== "cast" || !media?.key) return;
+    const cached = peekDetail(media.key);
+    if (cached) {
+      setCastDetail(cached);
+      return;
+    }
+    if (castDetail?.key === media.key) return;
+    let live = true;
+    setCastLoading(true);
+    getDetail(media.key)
+      .then((res) => {
+        if (live && mountedRef.current) setCastDetail(res);
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (live && mountedRef.current) setCastLoading(false);
+      });
+    return () => {
+      live = false;
+    };
+  }, [sheet, media?.key, castDetail?.key]);
   // Volume from the mouse wheel, over the picture or the volume control.
   const onWheelVolume = (e: React.WheelEvent) => {
     if (isEmbed || sheet || !e.deltaY) return;
@@ -813,6 +887,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
     setFull,
     togglePip,
     skipActive: () => skipActiveRef.current(),
+    cycleFit,
     goNext,
     goInfo,
     leave,
@@ -1050,7 +1125,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
       }}
     >
       <div
-        className="screen"
+        className={`screen fit-${videoFit}`}
         onClick={(e) => {
           if (sheet) return setSheet(null);
           if (isEmbed) return toggle();
@@ -1141,6 +1216,11 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
                 const v = video.current;
                 if (v) onProgress?.(v.duration, v.duration);
                 setEnded(true);
+                if (sleepTimerRef.current?.kind === "episode") {
+                  setSleepTimer(null);
+                  flash("Sleep timer — stopped after episode");
+                  return;
+                }
                 // "Keep watching" means stay here: don't auto-advance behind the viewer's back.
                 if (!upNextDismissedRef.current) onEnded?.();
               }}
@@ -1261,6 +1341,21 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
             </div>
           )}
           <div className="ptop-actions">
+            {sleepTimer && (
+              <button
+                type="button"
+                className="pbtn sleep-pill on"
+                onClick={() => openSheet("picture")}
+                title="Sleep timer active — click to adjust"
+              >
+                <Icon name="clock" size={14} />
+                <span>
+                  {sleepTimer.kind === "episode"
+                    ? "After ep"
+                    : `${Math.max(1, Math.ceil((sleepTimer.endsAt - Date.now()) / 60_000))}m`}
+                </span>
+              </button>
+            )}
             {isEmbed && audio && onAudio && <AudioToggle compact value={audio} onChange={changeAudio} />}
             <button className={`server-pill ${sheet === "servers" ? "on" : ""}`} onClick={() => openSheet("servers")} title="Servers (S)">
               <span className={`sp-dot ${spDotClass}`} />
@@ -1392,7 +1487,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
           label={episodes?.nextLabel ?? nextLabel ?? "Next episode"}
           still={media?.backdrop}
           seconds={ended || !Number.isFinite(remaining) ? 0 : Math.ceil(remaining)}
-          auto={!!autoNext}
+          auto={!!autoNext && sleepTimer?.kind !== "episode"}
           onPlay={goNext}
           onDismiss={() => setUpNextDismissed(true)}
         />
@@ -1454,6 +1549,7 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
             {!isEmbed && <button role="tab" aria-selected={sheet === "transcript"} className={sheet === "transcript" ? "on" : ""} onClick={() => setSheet("transcript")}>Transcript</button>}
             <button role="tab" aria-selected={sheet === "audio"} className={sheet === "audio" ? "on" : ""} onClick={() => setSheet("audio")}>Audio</button>
             <button role="tab" aria-selected={sheet === "picture"} className={sheet === "picture" ? "on" : ""} onClick={() => setSheet("picture")}>Picture</button>
+            {media?.key && <button role="tab" aria-selected={sheet === "cast"} className={sheet === "cast" ? "on" : ""} onClick={() => setSheet("cast")}>Cast</button>}
           </div>
           <button className="pbtn icon" onClick={() => setSheet(null)} aria-label="Close"><Icon name="x" size={16} /></button>
         </div>
@@ -1656,6 +1752,65 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
               )}
               {!isEmbed && (
                 <div className="ps-block">
+                  <div className="ps-label">Picture fit <span className="ps-sub">Z</span></div>
+                  <div className="seg3 wrap">
+                    {VIDEO_FITS.map((f) => (
+                      <button
+                        key={f.id}
+                        className={videoFit === f.id ? "on" : ""}
+                        title={f.hint}
+                        onClick={() => {
+                          setVideoFit(f.id);
+                          flash(`Picture: ${f.label}`);
+                        }}
+                      >
+                        {f.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {!isEmbed && (
+                <div className="ps-block">
+                  <div className="ps-label">
+                    Sleep timer
+                    {sleepTimer && (
+                      <span className="ps-sub">
+                        {sleepTimer.kind === "episode"
+                          ? "End of ep"
+                          : `${Math.max(1, Math.ceil((sleepTimer.endsAt - Date.now()) / 60_000))}m left`}
+                      </span>
+                    )}
+                  </div>
+                  <div className="seg3 wrap">
+                    <button className={!sleepTimer ? "on" : ""} onClick={() => pickSleepTimer(null)}>Off</button>
+                    {SLEEP_PRESETS.map((mins) => {
+                      const activePreset =
+                        sleepTimer?.kind === "at" &&
+                        Math.abs(Math.ceil((sleepTimer.endsAt - Date.now()) / 60_000) - mins) <= 2;
+                      return (
+                        <button
+                          key={mins}
+                          className={activePreset ? "on" : ""}
+                          onClick={() => pickSleepTimer({ kind: "at", endsAt: Date.now() + mins * 60_000 })}
+                        >
+                          {mins}m
+                        </button>
+                      );
+                    })}
+                    {episodes && (
+                      <button
+                        className={sleepTimer?.kind === "episode" ? "on" : ""}
+                        onClick={() => pickSleepTimer({ kind: "episode" })}
+                      >
+                        End of ep
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+              {!isEmbed && (
+                <div className="ps-block">
                   <div className="ps-label">Speed</div>
                   <div className="seg3 wrap">
                     {SPEEDS.map((sp) => <button key={sp} className={sp === speed ? "on" : ""} onClick={() => setSpeed(sp)}>{sp}×</button>)}
@@ -1703,6 +1858,64 @@ export function Player({ session, initialSource, title, subtitle, startAt, onPro
                     ))}
                   </div>
                 </div>
+              )}
+            </div>
+          )}
+          {sheet === "cast" && (
+            <div className="ps-section">
+              {media?.overview && <p className="ps-note ps-cast-overview">{media.overview}</p>}
+              {castLoading && !castDetail ? (
+                <div className="ps-cast-list">
+                  {Array.from({ length: 6 }, (_, i) => <div key={i} className="ep-row skeleton" />)}
+                </div>
+              ) : (
+                <>
+                  {castDetail?.crew && castDetail.crew.length > 0 && (
+                    <div className="ps-block">
+                      <div className="ps-label">Creators &amp; Crew</div>
+                      <div className="ps-cast-list">
+                        {castDetail.crew.slice(0, 6).map((c, i) => (
+                          <div key={`${c.name}-${c.job}-${i}`} className="ps-cast-item">
+                            <span className="ps-cast-av" style={c.photo ? { backgroundImage: `url(${c.photo})` } : undefined}>
+                              {!c.photo && c.name[0]}
+                            </span>
+                            <div className="ps-cast-tx">
+                              <strong>{c.name}</strong>
+                              <small>{c.job}</small>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {castDetail?.cast && castDetail.cast.length > 0 ? (
+                    <div className="ps-block">
+                      <div className="ps-label">Cast</div>
+                      <div className="ps-cast-list">
+                        {castDetail.cast.slice(0, 14).map((c, i) => (
+                          <div key={`${c.name}-${i}`} className="ps-cast-item">
+                            <span className="ps-cast-av" style={c.photo ? { backgroundImage: `url(${c.photo})` } : undefined}>
+                              {!c.photo && c.name[0]}
+                            </span>
+                            <div className="ps-cast-tx">
+                              <strong>{c.name}</strong>
+                              {(c.character || c.actor) && (
+                                <small>{[c.character, c.actor ? `CV ${c.actor}` : null].filter(Boolean).join(" · ")}</small>
+                              )}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    !castLoading && <p className="ps-note">No cast details available for this title.</p>
+                  )}
+                </>
+              )}
+              {onInfo && (
+                <button type="button" className="btn glass sm" onClick={goInfo}>
+                  <Icon name="info" size={14} /> Open full title page
+                </button>
               )}
             </div>
           )}

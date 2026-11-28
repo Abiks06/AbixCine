@@ -119,9 +119,9 @@ export interface MediaDetail extends Media {
   /** Absolute episode count (anime). */
   episodeCount?: number;
   trailerYouTubeId?: string;
-  cast: { name: string; character?: string; photo?: string; /** Anime: the voice actor. */ actor?: string }[];
+  cast: { id?: number; source?: "tmdb" | "anilist"; name: string; character?: string; photo?: string; /** Anime: the voice actor. */ actor?: string }[];
   /** Key people behind it: directors, writers, creators, composers, studios' staff. */
-  crew: { name: string; job: string; photo?: string }[];
+  crew: { id?: number; source?: "tmdb" | "anilist"; name: string; job: string; photo?: string }[];
   endDate?: string;
   budget?: number;
   revenue?: number;
@@ -135,6 +135,7 @@ export interface MediaDetail extends Media {
   homepage?: string;
   voteCount?: number;
   collection?: string;
+  collectionId?: number;
   /** Series: what aired last and what airs next. */
   lastEpisode?: { season: number; episode: number; name?: string; airDate?: string };
   nextEpisode?: { season: number; episode: number; name?: string; airDate?: string };
@@ -153,6 +154,23 @@ export interface MediaDetail extends Media {
   /** When this record was fetched, so the UI can say how fresh it is. */
   fetchedAt?: number;
   related: Media[];
+}
+
+export interface PersonCredit extends Media {
+  role?: string;
+}
+
+export interface PersonDetail {
+  id: number;
+  source: "tmdb" | "anilist";
+  name: string;
+  photo?: string;
+  knownFor?: string;
+  biography?: string;
+  birthday?: string;
+  deathday?: string;
+  placeOfBirth?: string;
+  credits: PersonCredit[];
 }
 
 /** What the player asks the source layer to find. */

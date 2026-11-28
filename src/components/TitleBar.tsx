@@ -29,15 +29,15 @@ const NAV = [
 ] as const;
 
 function routeEdition(path: string): string {
-  if (path === "/") return "PROGRAMME";
-  if (path.startsWith("/movies")) return "FILMS · CATALOG";
-  if (path.startsWith("/series")) return "SERIES · INDEX";
-  if (path.startsWith("/anime")) return "ANIME · SIMULCAST";
-  if (path.startsWith("/library")) return "VAULT · LOCAL FIRST";
+  if (path === "/") return "HOME";
+  if (path.startsWith("/movies")) return "FILMS";
+  if (path.startsWith("/series")) return "SERIES";
+  if (path.startsWith("/anime")) return "ANIME";
+  if (path.startsWith("/library")) return "VAULT";
   if (path.startsWith("/list")) return "MY LIST";
-  if (path.startsWith("/search")) return "ARCHIVE SEARCH";
-  if (path.startsWith("/settings")) return "PROJECTION CONSOLE";
-  if (path.startsWith("/title/")) return "FILM MONOGRAPH";
+  if (path.startsWith("/search")) return "SEARCH";
+  if (path.startsWith("/settings")) return "SETTINGS";
+  if (path.startsWith("/title/")) return "TITLE";
   return "ABIXCINE";
 }
 
@@ -222,8 +222,7 @@ export function TitleBar({ onOpenPalette }: { onOpenPalette: () => void }) {
               title={`${n.code} · ${n.full}`}
               viewTransition
             >
-              <span className="rail-idx">{n.code}</span>
-              <Icon name={n.icon} size={16} />
+              <Icon name={n.icon} size={17} />
               <span className="rail-lbl">{n.label}</span>
               {n.to === "/library" && (activeDownloads > 0 || awaitingDownloads > 0) && (
                 <span

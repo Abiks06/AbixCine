@@ -171,9 +171,9 @@ export function Browse({ kind }: { kind: "movie" | "tv" }) {
         <Hero items={stage} label={kind === "movie" ? "Popular films" : "Popular series"} loading={!data.settled[1] && !d[1]} />
       )}
       <BrowseToolbar
-        kicker={kind === "movie" ? "Edition // Catalog" : "Edition // Television"}
-        title={kind === "movie" ? "Screening" : "Television"}
-        accent={kind === "movie" ? "Catalog" : "Index"}
+        kicker="Browse"
+        title={kind === "movie" ? "Films" : "TV"}
+        accent={kind === "movie" ? "catalog" : "series"}
         filter={filter}
         count={filter.filtered.length}
       />
@@ -254,9 +254,9 @@ export function Anime() {
       {filter.archiveMode && filter.filtered[0] && <Ambient media={filter.filtered[0]} />}
       {!filter.archiveMode && <Hero items={stage} label="This season" loading={!data.settled[1] && !d[1]} />}
       <BrowseToolbar
-        kicker="Edition // Simulcast · Sub & Dub"
-        title="Simulcast"
-        accent="Board"
+        kicker="Sub & Dub"
+        title="Anime"
+        accent="simulcasts"
         filter={filter}
         count={filter.filtered.length}
       />

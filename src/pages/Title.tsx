@@ -4,11 +4,13 @@ import { useLocation, useNavigate, useParams, useSearchParams } from "react-rout
 import { AudioToggle } from "../components/AudioToggle";
 import { Ambient } from "../components/Ambient";
 import { Art, sized } from "../components/Art";
-import { Card, CardSkeleton, kindLabel } from "../components/Card";
+import { Card, CardSkeleton, kindLabel, seedState } from "../components/Card";
+import { CollectionPicker } from "../components/CollectionPicker";
 import { DownloadPrefsPill, EpisodeDownloadControl } from "../components/DownloadControl";
 import { DownloadMenu } from "../components/DownloadMenu";
 import { openQualityReviewModal } from "../components/DownloadQualityModal";
 import { Icon } from "../components/Icon";
+import { PersonModal, type PersonTarget } from "../components/PersonModal";
 import { SmartSource } from "../components/SmartSource";
 import { TitleArt } from "../components/TitleArt";
 import { TrailerModal } from "../components/TrailerModal";
@@ -46,6 +48,7 @@ import { audioFor, setAudioFor, useSettings } from "../lib/settings";
 import { toast } from "../lib/toast";
 import { isFilm, type CanonicalSeason, type Episode, type Media, type MediaDetail } from "../lib/types";
 import { useAsync } from "../lib/useAsync";
+import { tmdbCollection } from "../lib/tmdb";
 import { useSlidingIndicator } from "../lib/useSlidingIndicator";
 import { burst } from "../lib/burst";
 import { toggleList, useSaved } from "../lib/watchlist";
@@ -185,10 +188,18 @@ export function Title() {
   useEffect(() => () => clearTimeout(swapTimer.current), []);
   const [view, setView] = useState<EpView | null>(loadView);
   const [synopsisFull, setSynopsisFull] = useState(false);
+  const [activePerson, setActivePerson] = useState<PersonTarget | null>(null);
 
   useEffect(() => {
     setSynopsisFull(false);
+    setActivePerson(null);
   }, [key]);
+
+  const collectionRes = useAsync(
+    () => (d?.collectionId ? tmdbCollection(d.collectionId) : Promise.resolve(null)),
+    [d?.collectionId],
+  );
+  const saga = collectionRes.data;
 
   const resumeEpisode = validProgress && (validProgress.season == null || validProgress.season === season) ? validProgress.episode ?? 1 : 1;
   useEffect(() => {
@@ -477,9 +488,10 @@ export function Title() {
               ) : null}
               {req && <DownloadMenu req={req} detail={d} what={what} />}
               {audio && <AudioToggle value={audio} onChange={changeAudio} />}
-              <button className={`btn glass ${saved ? "on" : ""}`} onClick={(e) => { if (!saved) burst(e.currentTarget); toggleList(d); }} aria-pressed={saved}>
+              <button type="button" className={`btn glass ${saved ? "on" : ""}`} onClick={(e) => { if (!saved) burst(e.currentTarget); toggleList(d); }} aria-pressed={saved}>
                 <Icon name={saved ? "check" : "bookmark"} size={17} /> {saved ? "In My List" : "My List"}
               </button>
+              <CollectionPicker media={d} />
               {isYouTubeId(d.trailerYouTubeId) && (
                 <button type="button" className="btn glass" onClick={() => setTrailerOpen(true)} aria-haspopup="dialog"><Icon name="film" size={17} /> Trailer</button>
               )}
@@ -727,9 +739,9 @@ export function Title() {
                 <div className="ep-season-prog" role="region" aria-label={`Season ${season} download progress`}>
                   <div className="ep-sp-head">
                     <span className="ep-sp-stat">
-                      <strong>Season {season} downloads</strong>
+                      <strong>Season {season} offline</strong>
                       <small>
-                        {seasonProg.completed}/{seasonProg.total} offline
+                        {seasonProg.completed} of {seasonProg.total} episodes offline
                         {batchForSeason ? ` · queueing E${batchForSeason.currentEp ?? "…"} (${batchForSeason.queued}/${batchForSeason.total})` : ""}
                         {seasonProg.active > 0 ? ` · ${seasonProg.active} downloading` : ""}
                         {seasonProg.awaitingQuality > 0 ? ` · ${seasonProg.awaitingQuality} awaiting choice` : ""}
@@ -750,12 +762,12 @@ export function Title() {
                       )}
                       {seasonProg.downloadingQualities.map((ql) => (
                         <span key={`dl-${ql}`} className="dlq-badge-q" title={`Currently downloading in ${ql}`}>
-                          Downloading {ql}
+                          {ql} ↓
                         </span>
                       ))}
                       {seasonProg.downloadedQualities.map((ql) => (
                         <span key={`sv-${ql}`} className="dlq-badge-q verified" title={`Saved offline in ${ql}`}>
-                          Saved {ql}
+                          {ql}
                         </span>
                       ))}
                       <b>{Math.round(seasonProg.percent)}%</b>
@@ -876,19 +888,25 @@ export function Title() {
                         return (
                           <div
                             key={e.number}
-                            className="ep-card unaired"
+                            className="ep-slot unaired"
                             aria-disabled="true"
                             style={{ ["--i" as string]: Math.min(i, 8) }}
                             title={e.airDate ? `Episode ${e.number} airs ${fmtDate(e.airDate)}` : `Episode ${e.number} hasn't aired yet`}
                           >
-                            <div className="ec-th">
-                              {still && <img src={still} alt="" loading="lazy" decoding="async" className="dim" />}
-                              <span className="ec-num">{e.number}</span>
-                              <span className="ec-ribbon muted">{airLabel}</span>
-                              {e.runtime ? <span className="ec-rt">{e.runtime}m</span> : null}
+                            <div className="ep-thumb-wrap">
+                              <div className="ep-thumb-hit">
+                                <div className="ec-th">
+                                  {still && <img src={still} alt="" loading="lazy" decoding="async" className="dim" />}
+                                  <span className="ec-num">{e.number}</span>
+                                  <span className="ec-ribbon muted">{airLabel}</span>
+                                  {e.runtime ? <span className="ec-rt">{e.runtime}m</span> : null}
+                                </div>
+                              </div>
                             </div>
-                            <div className="ec-tx">
-                              <div className="ec-t">{e.title}</div>
+                            <div className="ep-card-body">
+                              <div className="ep-card-head">
+                                <span className="ec-t">{e.title}</span>
+                              </div>
                               <div className="ec-d">{e.overview || fallback}</div>
                             </div>
                           </div>
@@ -921,91 +939,101 @@ export function Title() {
                       const epPaused = epJob?.status === "paused";
                       const epResolving = desktop && batch.pendingKeys.has(batchEpisodeKey(canonicalKey, season, e.number, audio));
 
-                      const cardEl = (
-                        <button
-                          key={desktop ? undefined : e.number}
-                          className={`ep-card ${isCur ? "cur" : ""} ${watched ? "seen" : ""}`}
+                      return (
+                        <div
+                          key={e.number}
+                          className={`ep-slot ${isCur ? "cur" : ""} ${watched ? "seen" : ""}`}
                           style={{ ["--i" as string]: Math.min(i, 8) }}
-                          onClick={() => watch(season, e.number)}
                         >
-                          <div className="ec-th">
-                            {still && <img src={still} alt="" loading="lazy" decoding="async" className={e.still ? "" : "dim"} />}
-                            <span className="ec-num">{e.number}</span>
-                            {isCur && <span className="ec-ribbon">{resumeSec != null ? "Resume" : validProgress?.caughtUp ? "Caught up" : "Up next"}</span>}
-                            {!isCur && resumeSec != null && <span className="ec-ribbon">Resume</span>}
-                            {watched && <span className="ec-seen" aria-label="Watched"><Icon name="check" size={12} /></span>}
-                            {e.runtime ? <span className="ec-rt">{e.runtime}m</span> : null}
-                            <span className="ec-play"><Icon name="play" size={18} /></span>
-                            {epProg && epProg.duration > 0 && !watched && resumeSec != null && <div className="ec-bar"><i style={{ transform: `scaleX(${Math.min(1, epProg.position / epProg.duration)})` }} /></div>}
-                            {(epBusy || epPaused) && epJob && (
-                              <div className="ec-dl-bar" aria-hidden>
-                                <i style={{ transform: `scaleX(${Math.max(0.03, (epJob.percent || 0) / 100)})` }} />
+                          <div className="ep-thumb-wrap">
+                            <button
+                              type="button"
+                              className="ep-thumb-hit"
+                              onClick={() => watch(season, e.number)}
+                              aria-label={`Play Episode ${e.number}: ${e.title}`}
+                            >
+                              <div className="ec-th">
+                                {still && <img src={still} alt="" loading="lazy" decoding="async" className={e.still ? "" : "dim"} />}
+                                <span className="ec-num">{e.number}</span>
+                                {isCur && <span className="ec-ribbon">{resumeSec != null ? "Resume" : validProgress?.caughtUp ? "Caught up" : "Up next"}</span>}
+                                {!isCur && resumeSec != null && <span className="ec-ribbon">Resume</span>}
+                                {e.runtime ? <span className="ec-rt">{e.runtime}m</span> : null}
+                                <span className="ec-play"><Icon name="play" size={18} /></span>
+                                {epProg && epProg.duration > 0 && !watched && resumeSec != null && <div className="ec-bar"><i style={{ transform: `scaleX(${Math.min(1, epProg.position / epProg.duration)})` }} /></div>}
+                                {(epBusy || epPaused) && epJob && (
+                                  <div className="ec-dl-bar" aria-hidden>
+                                    <i style={{ transform: `scaleX(${Math.max(0.03, (epJob.percent || 0) / 100)})` }} />
+                                  </div>
+                                )}
+                              </div>
+                            </button>
+                            <button
+                              type="button"
+                              className={`ep-mark-btn ${watched ? "on" : ""}`}
+                              title={watched ? `Mark E${e.number} unwatched` : `Mark E${e.number} watched`}
+                              aria-label={watched ? `Mark E${e.number} unwatched` : `Mark E${e.number} watched`}
+                              onClick={(ev) => {
+                                ev.stopPropagation();
+                                const prevSnap = markEpisodeWatched(
+                                  { ...d, canonicalKey },
+                                  season,
+                                  e.number,
+                                  !watched,
+                                  epProg?.duration || ((e.runtime ?? d.runtime ?? 24) * 60),
+                                  aliasList,
+                                );
+                                toast(`S${season}·E${e.number} marked ${!watched ? "watched" : "unwatched"}`, {
+                                  icon: "check",
+                                  action: prevSnap ? { label: "Undo", run: () => restoreProgress(prevSnap) } : undefined,
+                                });
+                              }}
+                            >
+                              <Icon name="check" size={12} />
+                            </button>
+                          </div>
+                          <div className="ep-card-body">
+                            <div className="ep-card-head">
+                              <button type="button" className="ec-t" onClick={() => watch(season, e.number)}>
+                                {e.title}
+                              </button>
+                              {desktop && (
+                                <EpisodeDownloadControl
+                                  detail={d}
+                                  season={season}
+                                  ep={e}
+                                  audio={audio}
+                                  entry={epEntry}
+                                  job={epJob}
+                                  resolving={epResolving}
+                                  onPlayOffline={() => watch(season, e.number, "downloads")}
+                                />
+                              )}
+                            </div>
+                            {(watched || left != null) && (
+                              <div className={`ec-status ${watched ? "seen" : ""}`}>
+                                {left != null ? `${left}m left` : "Watched"}
                               </div>
                             )}
-                          </div>
-                          <div className="ec-tx">
-                            <div className="ec-t">{e.title}</div>
-                            <div className="ec-d">{layout === "list" ? [left != null ? `${left}m left` : watched ? "Watched" : null, e.overview || fallback].filter(Boolean).join(" · ") : left != null ? `${left}m left` : watched ? "Watched" : e.overview || fallback}</div>
-                          </div>
-                        </button>
-                      );
-
-                      const watchToggleBtn = (
-                        <button
-                          type="button"
-                          className={`ep-mark-btn ${watched ? "on" : ""}`}
-                          title={watched ? `Mark E${e.number} unwatched` : `Mark E${e.number} watched`}
-                          aria-label={watched ? `Mark E${e.number} unwatched` : `Mark E${e.number} watched`}
-                          onClick={(ev) => {
-                            ev.stopPropagation();
-                            const prevSnap = markEpisodeWatched(
-                              { ...d, canonicalKey },
-                              season,
-                              e.number,
-                              !watched,
-                              epProg?.duration || ((e.runtime ?? d.runtime ?? 24) * 60),
-                              aliasList,
-                            );
-                            toast(`S${season}·E${e.number} marked ${!watched ? "watched" : "unwatched"}`, {
-                              icon: "check",
-                              action: prevSnap ? { label: "Undo", run: () => restoreProgress(prevSnap) } : undefined,
-                            });
-                          }}
-                        >
-                          <Icon name="check" size={12} />
-                        </button>
-                      );
-
-                      return (
-                        <div key={e.number} className="ep-slot">
-                          {cardEl}
-                          <div className="ep-slot-acts">
-                            {watchToggleBtn}
-                            {desktop && (
-                              <EpisodeDownloadControl
-                                detail={d}
-                                season={season}
-                                ep={e}
-                                audio={audio}
-                                entry={epEntry}
-                                job={epJob}
-                                resolving={epResolving}
-                                onPlayOffline={() => watch(season, e.number, "downloads")}
-                              />
-                            )}
+                            <div className="ec-d">{e.overview || fallback}</div>
                           </div>
                         </div>
                       );
                     })}
                     {d.nextAiring && (d.nextAiring.season == null || d.nextAiring.season === season) && !shown.some((e) => e.number === d.nextAiring!.episode) && (
-                      <div className="ep-card unaired" aria-disabled="true">
-                        <div className="ec-th">
-                          {d.backdrop && <img src={sized(d.backdrop, "w780")} alt="" loading="lazy" decoding="async" className="dim" />}
-                          <span className="ec-num">{d.nextAiring.episode}</span>
-                          <span className="ec-ribbon muted">{fmtAirBadge(d.nextAiring, nowMs)}</span>
+                      <div className="ep-slot unaired" aria-disabled="true">
+                        <div className="ep-thumb-wrap">
+                          <div className="ep-thumb-hit">
+                            <div className="ec-th">
+                              {d.backdrop && <img src={sized(d.backdrop, "w780")} alt="" loading="lazy" decoding="async" className="dim" />}
+                              <span className="ec-num">{d.nextAiring.episode}</span>
+                              <span className="ec-ribbon muted">{fmtAirBadge(d.nextAiring, nowMs)}</span>
+                            </div>
+                          </div>
                         </div>
-                        <div className="ec-tx">
-                          <div className="ec-t">{d.nextAiring.title || `Episode ${d.nextAiring.episode}`} · Coming next</div>
+                        <div className="ep-card-body">
+                          <div className="ep-card-head">
+                            <span className="ec-t">{d.nextAiring.title || `Episode ${d.nextAiring.episode}`} · Coming next</span>
+                          </div>
                           <div className="ec-d">Airs {fmtAirBadge(d.nextAiring, nowMs)}</div>
                         </div>
                       </div>
@@ -1013,6 +1041,56 @@ export function Title() {
                   </div>
                 </>
               )}
+            </section>
+          );
+        })()}
+
+        {/* Collection / Saga Order Strip */}
+        {saga && saga.parts.length >= 2 && (() => {
+          const watchedParts = saga.parts.filter((p) => Boolean(progressStore[p.key]?.finished)).length;
+          return (
+            <section className="tp-collection" aria-label={saga.name}>
+              <div className="tp-col-head">
+                <div>
+                  <span className="overline">Part of the saga</span>
+                  <h2>{saga.name}</h2>
+                </div>
+                <span className="shelf-note">
+                  {watchedParts > 0 ? `${watchedParts}/${saga.parts.length} watched` : `${saga.parts.length} films`}
+                </span>
+              </div>
+              <div className="tp-col-grid">
+                {saga.parts.map((part, idx) => {
+                  const isCurrent = part.key === d.key;
+                  const seenPart = Boolean(progressStore[part.key]?.finished);
+                  return (
+                    <button
+                      key={part.key}
+                      type="button"
+                      className={`tp-col-card ${isCurrent ? "current" : ""} ${seenPart ? "seen" : ""}`}
+                      onClick={() => !isCurrent && nav(`/title/${encodeKey(part.key)}`, { viewTransition: true, state: seedState(part) })}
+                      aria-current={isCurrent ? "page" : undefined}
+                    >
+                      <div className="tp-col-art">
+                        <Art media={part} variant="poster" size="sm" />
+                        <span className="tp-col-num">#{idx + 1}</span>
+                        {seenPart && (
+                          <span className="tp-col-seen" title="Watched">
+                            <Icon name="check" size={11} />
+                          </span>
+                        )}
+                      </div>
+                      <div className="tp-col-meta">
+                        <strong>{part.title}</strong>
+                        <small>
+                          {part.year ?? "TBA"}
+                          {isCurrent ? " · Viewing" : ""}
+                        </small>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
             </section>
           );
         })()}
@@ -1040,12 +1118,26 @@ export function Title() {
                   <div className="people">
                     {!ready && Array.from({ length: 6 }, (_, i) => <div key={i} className="person"><div className="person-img sk" /></div>)}
                     {d.cast.slice(0, 10).map((c, i) => (
-                      <div key={c.name + i} className="person" style={{ ["--i" as string]: Math.min(i, 10) }}>
+                      <button
+                        key={c.name + i}
+                        type="button"
+                        className="person person-btn"
+                        style={{ ["--i" as string]: Math.min(i, 10) }}
+                        onClick={() =>
+                          setActivePerson({
+                            id: c.id,
+                            source: c.source ?? (anime ? "anilist" : "tmdb"),
+                            name: c.actor || c.name,
+                            photo: c.photo,
+                            role: c.character ? `as ${c.character}` : undefined,
+                          })
+                        }
+                      >
                         <div className="person-img" style={c.photo ? { backgroundImage: `url(${c.photo})` } : undefined}>{!c.photo && c.name[0]}</div>
                         <div className="person-name">{c.name}</div>
                         {c.character && <div className="person-role">{c.character}</div>}
                         {c.actor && <div className="person-role">CV {c.actor}</div>}
-                      </div>
+                      </button>
                     ))}
                   </div>
                 </div>
@@ -1079,22 +1171,50 @@ export function Title() {
               {!ready && Array.from({ length: 8 }, (_, i) => <div key={i} className="person"><div className="person-img sk" /></div>)}
               {ready && d.cast.length === 0 && d.crew.length === 0 && <p className="muted">No cast listed.</p>}
               {d.cast.map((c, i) => (
-                <div key={c.name + i} className="person" style={{ ["--i" as string]: Math.min(i, 10) }}>
+                <button
+                  key={c.name + i}
+                  type="button"
+                  className="person person-btn"
+                  style={{ ["--i" as string]: Math.min(i, 10) }}
+                  onClick={() =>
+                    setActivePerson({
+                      id: c.id,
+                      source: c.source ?? (anime ? "anilist" : "tmdb"),
+                      name: c.actor || c.name,
+                      photo: c.photo,
+                      role: c.character ? `as ${c.character}` : undefined,
+                    })
+                  }
+                >
                   <div className="person-img" style={c.photo ? { backgroundImage: `url(${c.photo})` } : undefined}>{!c.photo && c.name[0]}</div>
                   <div className="person-name">{c.name}</div>
                   {c.character && <div className="person-role">{c.character}</div>}
                   {c.actor && <div className="person-role">CV {c.actor}</div>}
-                </div>
+                </button>
               ))}
               {d.crew.length > 0 && (
                 <>
                   <p className="overline people-hd">Behind the camera</p>
                   {d.crew.map((c, i) => (
-                    <div key={`${c.name}-${c.job}-${i}`} className="person crew" style={{ ["--i" as string]: Math.min(i, 10) }}>
+                    <button
+                      key={`${c.name}-${c.job}-${i}`}
+                      type="button"
+                      className="person crew person-btn"
+                      style={{ ["--i" as string]: Math.min(i, 10) }}
+                      onClick={() =>
+                        setActivePerson({
+                          id: c.id,
+                          source: c.source ?? (anime ? "anilist" : "tmdb"),
+                          name: c.name,
+                          photo: c.photo,
+                          role: c.job,
+                        })
+                      }
+                    >
                       <div className="person-img" style={c.photo ? { backgroundImage: `url(${c.photo})` } : undefined}>{!c.photo && c.name[0]}</div>
                       <div className="person-name">{c.name}</div>
                       <div className="person-role">{c.job}</div>
-                    </div>
+                    </button>
                   ))}
                 </>
               )}
@@ -1108,7 +1228,20 @@ export function Title() {
                   {creativeSlate.length > 0 && (
                     <div className="tp-slate">
                       {creativeSlate.map(({ role, person }) => (
-                        <div key={`${role}-${person.name}`} className="tp-credit">
+                        <button
+                          key={`${role}-${person.name}`}
+                          type="button"
+                          className="tp-credit tp-credit-btn"
+                          onClick={() =>
+                            setActivePerson({
+                              id: (person as { id?: number }).id,
+                              source: (person as { source?: "tmdb" | "anilist" }).source ?? (anime ? "anilist" : "tmdb"),
+                              name: person.name,
+                              photo: person.photo,
+                              role,
+                            })
+                          }
+                        >
                           <span className="tp-credit-av" style={person.photo ? { backgroundImage: `url(${person.photo})` } : undefined}>
                             {!person.photo && person.name[0]}
                           </span>
@@ -1116,7 +1249,7 @@ export function Title() {
                             <small>{role}</small>
                             <strong>{person.name}</strong>
                           </div>
-                        </div>
+                        </button>
                       ))}
                     </div>
                   )}
@@ -1161,6 +1294,7 @@ export function Title() {
       {trailerOpen && isYouTubeId(d.trailerYouTubeId) && (
         <TrailerModal id={d.trailerYouTubeId} title={d.title} onClose={() => setTrailerOpen(false)} />
       )}
+      <PersonModal person={activePerson} onClose={() => setActivePerson(null)} />
     </div>
   );
 }

@@ -251,8 +251,8 @@ function PreviewCard({
           <button
             type="button"
             className="btn glass sm icon"
-            aria-label={`Quick dossier for ${d.title}`}
-            title="Quick dossier (I)"
+            aria-label={`Quick view for ${d.title}`}
+            title="Quick view (I)"
             onClick={() => {
               closeHoverPreviewNow();
               openDossier(d);
